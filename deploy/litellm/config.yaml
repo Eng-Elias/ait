@@ -12,10 +12,9 @@
 model_list:
   - model_name: "default"
     litellm_params:
-      model: "Eng-Elias/qwen3-0.6b-terminal-instruct"
-      custom_llm_provider: "huggingface"
+      model: "openai/default"
       api_key: "os.environ/HF_TOKEN"
-      api_base: "os.environ/HF_ENDPOINT_URL"
+      api_base: "http://hf-proxy:8000/v1"  # Internal proxy service
 
 # ----- General Settings ---------------------------------------
 
@@ -37,8 +36,8 @@ general_settings:
 
 router_settings:
   routing_strategy: "simple-shuffle"    # load-balance across models
-  num_retries: 2
-  timeout: 30                           # seconds
+  num_retries: 3
+  timeout: 120                          # seconds (increased for HF cold starts)
   retry_after: 5                        # seconds between retries
 
 # Per-model rate limits (applied to all virtual keys by default)
