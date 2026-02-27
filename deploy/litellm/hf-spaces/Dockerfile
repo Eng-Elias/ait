@@ -8,17 +8,15 @@
 #   HF_TOKEN, HF_ENDPOINT_URL, LITELLM_MASTER_KEY, DATABASE_URL
 # ============================================================
 
-FROM python:3.11-slim
+FROM ghcr.io/berriai/litellm:main-stable
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    supervisor \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+USER root
 
-# Install Python dependencies
+# Install system dependencies (Alpine uses apk)
+RUN apk add --no-cache supervisor
+
+# Install proxy dependencies
 RUN pip install --no-cache-dir \
-    litellm[proxy] \
     fastapi \
     uvicorn \
     httpx
@@ -30,10 +28,11 @@ COPY config.yaml .
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY proxy/app.py ./proxy/
 
-# Create log directory
-RUN mkdir -p /var/log/supervisor
+# Create required directories for supervisord
+RUN mkdir -p /var/log/supervisor /var/run
 
 EXPOSE 7860
 
-# Start supervisord to manage both processes
+# Override entrypoint and start supervisord to manage both processes
+ENTRYPOINT []
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

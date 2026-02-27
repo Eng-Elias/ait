@@ -1,3 +1,12 @@
+---
+title: LiteLLM Proxy
+emoji: 🚀
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+---
+
 # LiteLLM + HF Endpoint Proxy — HuggingFace Spaces Deployment
 
 This directory contains the configuration for deploying LiteLLM with an integrated HF endpoint proxy on HuggingFace Spaces.
