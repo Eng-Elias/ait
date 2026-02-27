@@ -10,19 +10,12 @@
 # ----- Model Routing ------------------------------------------
 
 model_list:
-  # Primary: HuggingFace Inference Endpoint (or any HF-hosted model)
   - model_name: "default"
     litellm_params:
-      model: "huggingface/Qwen/Qwen2.5-Coder-0.5B-Instruct"
+      model: "Eng-Elias/qwen3-0.6b-terminal-instruct"
+      custom_llm_provider: "huggingface"
       api_key: "os.environ/HF_TOKEN"
-      # Uncomment and set if using a Dedicated Endpoint:
-      # api_base: "https://your-endpoint.aws.endpoints.huggingface.cloud"
-
-  # Fallback: OpenAI (optional, remove if not needed)
-  # - model_name: "openai-fallback"
-  #   litellm_params:
-  #     model: "openai/gpt-4o-mini"
-  #     api_key: "os.environ/OPENAI_API_KEY"
+      api_base: "os.environ/HF_ENDPOINT_URL"
 
 # ----- General Settings ---------------------------------------
 
@@ -34,7 +27,7 @@ general_settings:
   enable_user_auth: true
 
   # Global budget cap (USD). Set 0 to disable.
-  max_budget: 10.0
+  max_budget: 5
   budget_duration: "30d"
 
   # Dashboard access
@@ -57,9 +50,9 @@ rate_limits:
 # ----- LiteLLM Behaviour -------------------------------------
 
 litellm_settings:
-  telemetry: false
+  telemetry: true
   drop_params: true                     # silently drop unsupported params
-  set_verbose: false
+  set_verbose: true
   cache: true                           # enable in-memory response cache
   cache_params:
     type: "local"
