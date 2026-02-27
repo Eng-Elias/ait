@@ -1,0 +1,37 @@
+# ============================================================
+# LiteLLM Proxy Configuration — HuggingFace Spaces
+# ============================================================
+# This config uses the internal hf-proxy service running on port 8000.
+# Set secrets in Space Settings > Repository secrets:
+#   HF_TOKEN, HF_ENDPOINT_URL, LITELLM_MASTER_KEY, DATABASE_URL
+# ============================================================
+
+model_list:
+  - model_name: "default"
+    litellm_params:
+      model: "openai/default"
+      api_key: "os.environ/HF_TOKEN"
+      api_base: "http://127.0.0.1:8000/v1"  # Internal proxy service
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  database_url: "os.environ/DATABASE_URL"
+  enable_user_auth: true
+  max_budget: 5
+  budget_duration: "30d"
+  ui_access_mode: "admin_only"
+
+router_settings:
+  routing_strategy: "simple-shuffle"
+  num_retries: 3
+  timeout: 120
+  retry_after: 5
+
+litellm_settings:
+  telemetry: true
+  drop_params: true
+  set_verbose: true
+  cache: true
+  cache_params:
+    type: "local"
+    ttl: 600
