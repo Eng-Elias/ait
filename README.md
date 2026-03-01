@@ -1,12 +1,19 @@
+<p align="center">
+  <img src="logo.png" alt="AIT Logo" width="200">
+</p>
+
 # AIT (AI Terminal)
 
 **AI-powered terminal command generator** — describe what you want in plain English, get the shell command instantly.
 
 ```bash
 ait "find all PDF files modified in the last 7 days"
+# Output: find . -name "*.pdf" -mtime -7
 ```
 
 > **Module 2 Project** for the [LLM Engineering & Deployment](https://readytensor.ai) certification program by Ready Tensor.
+>
+> See the full [publication on Ready Tensor](https://app.readytensor.ai/publications/ait-ait-terminal-soybnfL7xMUl) for deployment details and cost analysis.
 
 ---
 
@@ -159,7 +166,7 @@ ait config
 ait config get model
 
 # Set a value
-ait config set model gpt-4
+ait config set model default
 
 # Run setup wizard again
 ait setup
@@ -170,41 +177,6 @@ ait setup
 ```bash
 ait version
 ```
-
----
-
-## Configuration Reference
-
-Configuration is stored in `~/.ait/config.json` (or `%USERPROFILE%\.ait\config.json` on Windows).
-
-```json
-{
-  "api_endpoint": "https://api.openai.com/v1/chat/completions",
-  "api_token": "sk-...",
-  "model": "gpt-4o-mini",
-  "shell": "auto"
-}
-```
-
-| Key            | Description                                          | Default                                          |
-|----------------|------------------------------------------------------|--------------------------------------------------|
-| `api_endpoint` | OpenAI-compatible chat completions URL               | `https://api.openai.com/v1/chat/completions`     |
-| `api_token`    | API bearer token                                     | *(required)*                                     |
-| `model`        | Model name to use                                    | `gpt-4o-mini`                                    |
-| `shell`        | Shell hint for prompt context                        | `auto`                                           |
-
----
-
-## API Compatibility
-
-AIT works with any OpenAI-compatible chat completions endpoint:
-
-| Provider   | Endpoint Example                                    |
-|------------|-----------------------------------------------------|
-| OpenAI     | `https://api.openai.com/v1/chat/completions`        |
-| LiteLLM    | `http://localhost:4000/v1/chat/completions`          |
-| Ollama     | `http://localhost:11434/v1/chat/completions`         |
-| Azure      | `https://<resource>.openai.azure.com/openai/deployments/<model>/chat/completions?api-version=2024-02-01` |
 
 ---
 
@@ -265,70 +237,22 @@ See [`deploy/litellm/hf-spaces/README.md`](deploy/litellm/hf-spaces/README.md) f
 
 ## Development
 
-### Prerequisites
-
-- Go 1.21 or later
-- Make (optional, for build targets)
-
-### Build
-
 ```bash
 make build          # Build for current platform
 make build-all      # Cross-compile for all platforms
 make test           # Run tests
-make dev            # Live reload with air
 ```
 
-### Project Structure
-
-```
-ait/
-├── main.go                    # Entry point
-├── cmd/
-│   ├── root.go                # Root command & CLI logic
-│   ├── config.go              # Config subcommands
-│   ├── generate.go            # Headless generation
-│   ├── setup.go               # Setup wizard
-│   └── version.go             # Version command
-├── internal/
-│   ├── ai/
-│   │   ├── client.go          # OpenAI API client
-│   │   └── client_test.go     # API client tests
-│   └── config/
-│       ├── config.go          # Configuration management
-│       └── config_test.go     # Config tests
-├── deploy/
-│   └── litellm/
-│       └── hf-spaces/         # HuggingFace Spaces deployment
-│           ├── Dockerfile
-│           ├── config.yaml
-│           ├── supervisord.conf
-│           └── proxy/
-│               └── app.py     # HF endpoint proxy
-├── docs/
-│   ├── architecture.md        # System architecture
-│   ├── deployment-guide.md    # Deployment instructions
-│   └── security.md            # Security considerations
-├── Makefile                   # Build targets
-├── go.mod
-├── go.sum
-├── LICENSE
-└── README.md
-```
+Requires Go 1.21+.
 
 ---
 
-## Contributing
+## Links
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes and add tests
-4. Run tests: `make test`
-5. Commit: `git commit -m "feat: add my feature"`
-6. Push: `git push origin feature/my-feature`
-7. Open a Pull Request
-
-Please follow [Conventional Commits](https://www.conventionalcommits.org/) for commit messages.
+- **GitHub**: [github.com/Eng-Elias/ait](https://github.com/Eng-Elias/ait)
+- **Fine-Tuned Model**: [huggingface.co/Eng-Elias/Qwen3-0.6B-terminal-instruct](https://huggingface.co/Eng-Elias/Qwen3-0.6B-terminal-instruct)
+- **LiteLLM Proxy**: [eng-elias-litellm.hf.space](https://eng-elias-litellm.hf.space)
+- **Module 1 Project**: [Fine-Tuning Qwen3 for Terminal Commands](https://app.readytensor.ai/publications/fine-tuning-qwen3-06b-for-cross-platform-terminal-command-generation-lnWR43YpgJaH)
 
 ---
 
