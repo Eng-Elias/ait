@@ -1,45 +1,76 @@
-~# aiterm
+# AIT (AI Terminal)
 
 **AI-powered terminal command generator** — describe what you want in plain English, get the shell command instantly.
 
 ```bash
-aiterm "find all PDF files modified in the last 7 days"
+ait "find all PDF files modified in the last 7 days"
 ```
+
+> **Module 2 Project** for the [LLM Engineering & Deployment](https://readytensor.ai) certification program by Ready Tensor.
 
 ---
 
 ## Features
 
-- **Simple CLI** — Just run `aiterm "your description"` and get a command
+- **Simple CLI** — Just run `ait "your description"` and get a command
 - **Auto-Detect OS** — Automatically generates commands for your current platform
 - **Target Any OS** — Use `-t win`, `-t linux`, or `-t mac` to generate for other platforms
-- **Command Confirmation** — Review the generated command before it runs
-- **Headless Mode** — `aiterm generate "..."` for scripting and piping
+- **Headless Mode** — `ait generate "..."` for scripting and piping
 - **OpenAI-Compatible** — Works with OpenAI, LiteLLM, Ollama, and any compatible endpoint
 - **Cross-Platform** — Linux, macOS, and Windows support
 - **Secure** — API tokens masked in output, config files with restricted permissions
+- **Custom Model Support** — Uses a fine-tuned Qwen3 model for terminal commands
+
+---
+
+## Architecture
+
+```
+┌─────────────┐     ┌─────────────────────────────────────────────┐
+│   AIT CLI   │────▶│  LiteLLM Proxy (HuggingFace Spaces)         │
+│  (Go binary)│     │  ┌─────────────┐    ┌────────────────────┐  │
+└─────────────┘     │  │  LiteLLM    │───▶│  HF Endpoint Proxy │  │
+                    │  │  (port 7860)│    │  (port 8000)       │  │
+                    │  └─────────────┘    └─────────┬──────────┘  │
+                    └───────────────────────────────┼─────────────┘
+                                                    │
+                    ┌───────────────────────────────▼─────────────┐
+                    │  HuggingFace Dedicated Inference Endpoint   │
+                    │  (Qwen3-0.6B Terminal Instruct)             │
+                    └─────────────────────────────────────────────┘
+```
 
 ---
 
 ## Installation
 
-### Download Binary
+### Option 1: Go Install (Recommended)
 
-Download the latest release for your platform from the [Releases](https://github.com/yourusername/aiterm/releases) page:
-
-| Platform       | Binary                      |
-|----------------|-----------------------------|
-| Linux (AMD64)  | `aiterm-linux-amd64`        |
-| Linux (ARM64)  | `aiterm-linux-arm64`        |
-| macOS (Intel)  | `aiterm-darwin-amd64`       |
-| macOS (Apple)  | `aiterm-darwin-arm64`       |
-| Windows        | `aiterm-windows-amd64.exe`  |
-
-### From Source
+If you have Go 1.21+ installed:
 
 ```bash
-git clone https://github.com/yourusername/aiterm.git
-cd aiterm
+go install github.com/Eng-Elias/ait@latest
+```
+
+This installs `ait` to your `$GOPATH/bin` (usually `~/go/bin`).
+
+### Option 2: Download Binary
+
+Download the latest release for your platform from the [Releases](https://github.com/Eng-Elias/ait/releases) page:
+
+| Platform       | Binary                  |
+|----------------|-------------------------|
+| Linux (AMD64)  | `ait-linux-amd64`       |
+| Linux (ARM64)  | `ait-linux-arm64`       |
+| macOS (Intel)  | `ait-darwin-amd64`      |
+| macOS (Apple)  | `ait-darwin-arm64`      |
+| Windows        | `ait-windows-amd64.exe` |
+
+### Option 3: Build from Source
+
+```bash
+git clone https://github.com/Eng-Elias/ait.git
+cd ait
 make build
 ```
 
@@ -58,7 +89,7 @@ This copies the binary to `/usr/local/bin` (Unix) or `%PROGRAMFILES%` (Windows).
 ### 1. Run Setup
 
 ```bash
-aiterm setup
+ait setup
 ```
 
 You will be prompted for:
@@ -71,10 +102,10 @@ The wizard will test your connection and save the configuration.
 ### 2. Generate a Command
 
 ```bash
-aiterm "list all files larger than 100MB"
+ait "list all files larger than 100MB"
 ```
 
-aiterm will:
+AIT will:
 1. Send your description to the AI
 2. Display the generated command
 3. Ask for confirmation (`Y/n`)
@@ -88,12 +119,12 @@ aiterm will:
 
 ```bash
 # Auto-detects your OS and generates the right command
-aiterm "show disk usage sorted by size"
+ait "show disk usage sorted by size"
 
 # Target a specific OS
-aiterm "find all log files" -t linux
-aiterm "list running processes" -t mac
-aiterm "check open ports" -t win
+ait "find all log files" -t linux
+ait "list running processes" -t mac
+ait "check open ports" -t win
 ```
 
 ### Target OS Flag (`-t`)
@@ -108,43 +139,43 @@ aiterm "check open ports" -t win
 ### Headless Mode
 
 ```bash
-aiterm generate "list all docker containers"
+ait generate "list all docker containers"
 # Output: docker ps -a
 ```
 
 Generates a command and prints it to stdout without confirmation. Useful for scripting:
 
 ```bash
-$(aiterm generate "count lines in all Python files")
+$(ait generate "count lines in all Python files")
 ```
 
 ### Configuration
 
 ```bash
 # Show current config
-aiterm config
+ait config
 
 # Get a specific value
-aiterm config get model
+ait config get model
 
 # Set a value
-aiterm config set model gpt-4
+ait config set model gpt-4
 
 # Run setup wizard again
-aiterm setup
+ait setup
 ```
 
 ### Version
 
 ```bash
-aiterm version
+ait version
 ```
 
 ---
 
 ## Configuration Reference
 
-Configuration is stored in `~/.aiterm/config.json` (or `%USERPROFILE%\.aiterm\config.json` on Windows).
+Configuration is stored in `~/.ait/config.json` (or `%USERPROFILE%\.ait\config.json` on Windows).
 
 ```json
 {
@@ -166,7 +197,7 @@ Configuration is stored in `~/.aiterm/config.json` (or `%USERPROFILE%\.aiterm\co
 
 ## API Compatibility
 
-aiterm works with any OpenAI-compatible chat completions endpoint:
+AIT works with any OpenAI-compatible chat completions endpoint:
 
 | Provider   | Endpoint Example                                    |
 |------------|-----------------------------------------------------|
@@ -181,20 +212,20 @@ aiterm works with any OpenAI-compatible chat completions endpoint:
 
 ### "AI not configured"
 
-Run `aiterm setup` to configure your API credentials.
+Run `ait setup` to configure your API credentials.
 
 ### "Authentication failed"
 
 Your API token is invalid or expired. Update it:
 
 ```bash
-aiterm config set api_token sk-your-new-token
+ait config set api_token sk-your-new-token
 ```
 
 ### "API request failed"
 
 - Check your internet connection
-- Verify the API endpoint is correct: `aiterm config get api_endpoint`
+- Verify the API endpoint is correct: `ait config get api_endpoint`
 - For local endpoints (LiteLLM, Ollama), ensure the server is running
 
 ### "Rate limit exceeded"
@@ -206,10 +237,29 @@ Wait a moment and try again. Consider upgrading your API plan for higher limits.
 Enable debug logging for troubleshooting:
 
 ```bash
-aiterm "your prompt" --debug
+ait "your prompt" --debug
 ```
 
-Logs are written to `~/.aiterm/debug.log`.
+Logs are written to `~/.ait/debug.log`.
+
+---
+
+## Deployment
+
+AIT uses a LiteLLM proxy deployed on HuggingFace Spaces to route requests to a fine-tuned Qwen3 model.
+
+### Deployed Infrastructure
+
+| Component | Platform | Description |
+|-----------|----------|-------------|
+| LiteLLM Proxy | HuggingFace Spaces | API gateway with auth, rate limiting |
+| HF Endpoint Proxy | Same Space (supervisord) | Translates OpenAI format to TGI native |
+| Model Endpoint | HF Dedicated Inference | Qwen3-0.6B Terminal Instruct |
+| Database | Supabase | Virtual keys, usage tracking |
+
+### Deploy Your Own
+
+See [`deploy/litellm/hf-spaces/README.md`](deploy/litellm/hf-spaces/README.md) for deployment instructions.
 
 ---
 
@@ -232,7 +282,7 @@ make dev            # Live reload with air
 ### Project Structure
 
 ```
-aiterm/
+ait/
 ├── main.go                    # Entry point
 ├── cmd/
 │   ├── root.go                # Root command & CLI logic
@@ -247,8 +297,19 @@ aiterm/
 │   └── config/
 │       ├── config.go          # Configuration management
 │       └── config_test.go     # Config tests
+├── deploy/
+│   └── litellm/
+│       └── hf-spaces/         # HuggingFace Spaces deployment
+│           ├── Dockerfile
+│           ├── config.yaml
+│           ├── supervisord.conf
+│           └── proxy/
+│               └── app.py     # HF endpoint proxy
+├── docs/
+│   ├── architecture.md        # System architecture
+│   ├── deployment-guide.md    # Deployment instructions
+│   └── security.md            # Security considerations
 ├── Makefile                   # Build targets
-├── .air.toml                  # Live reload config
 ├── go.mod
 ├── go.sum
 ├── LICENSE

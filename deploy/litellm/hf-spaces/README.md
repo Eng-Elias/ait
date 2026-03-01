@@ -14,7 +14,7 @@ This directory contains the configuration for deploying LiteLLM with an integrat
 ## Architecture
 
 ```
-aiterm CLI → LiteLLM (port 7860) → hf-proxy (port 8000) → HF Dedicated Endpoint
+ait CLI → LiteLLM (port 7860) → hf-proxy (port 8000) → HF Dedicated Endpoint
                   ↓                      ↓
            /v1/chat/completions    POST / (root path)
 ```
@@ -68,14 +68,14 @@ The Space will automatically build and deploy. Check the **Logs** tab for any er
 
 1. Open `https://your-space.hf.space/ui`
 2. Login with your master key
-3. Create a virtual key for aiterm
+3. Create a virtual key for ait
 
-### 6. Configure aiterm
+### 6. Configure ait
 
 ```bash
-aiterm config set api_endpoint https://your-space.hf.space/v1/chat/completions
-aiterm config set api_token sk-your-virtual-key
-aiterm config set model default
+ait config set api_endpoint https://your-space.hf.space/v1/chat/completions
+ait config set api_token sk-your-virtual-key
+ait config set model default
 ```
 
 ## Troubleshooting

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"aiterm/internal/config"
+	"ait/internal/config"
 )
 
 func TestGenerateCommand_Success(t *testing.T) {

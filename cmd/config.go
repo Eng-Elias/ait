@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"aiterm/internal/config"
+	"ait/internal/config"
 
 	"github.com/spf13/cobra"
 )

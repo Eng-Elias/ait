@@ -2,19 +2,19 @@
 
 ## Overview
 
-aiterm is a lightweight CLI tool that translates natural language into shell commands. It uses a layered architecture separating the client application from the AI backend, allowing flexible deployment and provider choice.
+AIT (AI Terminal) is a lightweight CLI tool that translates natural language into shell commands. It uses a layered architecture separating the client application from the AI backend, allowing flexible deployment and provider choice.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     User's Terminal                      │
 │                                                         │
-│  $ aiterm "find large log files" -t linux               │
+│  $ ait "find large log files" -t linux               │
 │                                                         │
 └──────────────────────┬──────────────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Layer 1: aiterm CLI (Go)                    │
+│              Layer 1: AIT CLI (Go)                    │
 │                                                         │
 │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐    │
 │  │ cmd/     │  │ ai/      │  │ config/            │    │
@@ -57,7 +57,7 @@ aiterm is a lightweight CLI tool that translates natural language into shell com
 
 ---
 
-## Layer 1: aiterm CLI
+## Layer 1: AIT CLI
 
 The Go binary that the user interacts with directly. It has no background processes, no daemon, no TUI — just a single command invocation.
 
@@ -76,9 +76,9 @@ The Go binary that the user interacts with directly. It has no background proces
 ### Request Flow
 
 ```
-1. User runs:  aiterm "find PDFs modified this week" -t linux
+1. User runs:  ait "find PDFs modified this week" -t linux
 2. cmd/root.go joins args into prompt, reads -t flag
-3. config.Load() reads ~/.aiterm/config.json
+3. config.Load() reads ~/.ait/config.json
 4. config.Validate() checks api_token, api_endpoint, model exist
 5. ai.ResolveTargetOS("linux") → ("Linux", "bash")
 6. ai.GenerateCommand() sends POST to API with system prompt + user prompt
@@ -101,7 +101,7 @@ The resolved OS and shell are injected into the system prompt so the AI generate
 
 ## Layer 2: LiteLLM Proxy (Optional)
 
-An optional middleware layer that adds enterprise features between aiterm and model endpoints. Deployed via Docker Compose or HuggingFace Spaces (see `deploy/litellm/`).
+An optional middleware layer that adds enterprise features between AIT and model endpoints. Deployed via Docker Compose or HuggingFace Spaces (see `deploy/litellm/`).
 
 ### Why LiteLLM?
 
@@ -134,7 +134,7 @@ An optional middleware layer that adds enterprise features between aiterm and mo
 
 ## Layer 3: Model Endpoints
 
-aiterm works with any OpenAI-compatible chat completions endpoint.
+AIT works with any OpenAI-compatible chat completions endpoint.
 
 | Provider | Model Example | Latency | Cost |
 |----------|--------------|---------|------|
@@ -147,7 +147,7 @@ aiterm works with any OpenAI-compatible chat completions endpoint.
 
 ## Configuration
 
-Stored at `~/.aiterm/config.json` (or `%USERPROFILE%\.aiterm\config.json` on Windows).
+Stored at `~/.ait/config.json` (or `%USERPROFILE%\.ait\config.json` on Windows).
 
 ```json
 {
@@ -167,7 +167,7 @@ Stored at `~/.aiterm/config.json` (or `%USERPROFILE%\.aiterm\config.json` on Win
 ## Data Flow Diagram
 
 ```
-User                aiterm CLI          LiteLLM Proxy       Model Endpoint
+User                AIT CLI             LiteLLM Proxy       Model Endpoint
  │                     │                     │                     │
  │  "find big files"   │                     │                     │
  │ ──────────────────► │                     │                     │
@@ -199,10 +199,10 @@ User                aiterm CLI          LiteLLM Proxy       Model Endpoint
 
 | Target | Command | Output |
 |--------|---------|--------|
-| Current platform | `make build` | `dist/aiterm` |
-| All platforms | `make build-all` | `dist/aiterm-{os}-{arch}` |
-| Linux AMD64 | `make linux-amd64` | `dist/aiterm-linux-amd64` |
-| macOS ARM64 | `make darwin-arm64` | `dist/aiterm-darwin-arm64` |
-| Windows AMD64 | `make windows-amd64` | `dist/aiterm-windows-amd64.exe` |
+| Current platform | `make build` | `dist/ait` |
+| All platforms | `make build-all` | `dist/ait-{os}-{arch}` |
+| Linux AMD64 | `make linux-amd64` | `dist/ait-linux-amd64` |
+| macOS ARM64 | `make darwin-arm64` | `dist/ait-darwin-arm64` |
+| Windows AMD64 | `make windows-amd64` | `dist/ait-windows-amd64.exe` |
 
-Version is embedded at build time via `-ldflags "-X aiterm/cmd.Version=X.Y.Z"`.
+Version is embedded at build time via `-ldflags "-X ait/cmd.Version=X.Y.Z"`.

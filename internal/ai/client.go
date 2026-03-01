@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"time"
 
-	"aiterm/internal/config"
+	"ait/internal/config"
 )
 
 // Client handles communication with an OpenAI-compatible API.
@@ -91,6 +92,7 @@ func systemPrompt(osName, shellType string) string {
 
 // GenerateCommand sends a natural language description to the AI API and
 // returns the generated shell command. targetOS can be "win", "linux", "mac", or "" for auto.
+// Includes retry logic for handling cold starts (503 errors).
 func (c *Client) GenerateCommand(ctx context.Context, description, targetOS string) (string, error) {
 	if err := c.cfg.Validate(); err != nil {
 		return "", err
@@ -111,9 +113,41 @@ func (c *Client) GenerateCommand(ctx context.Context, description, targetOS stri
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Retry configuration for cold starts
+	maxRetries := 3
+	retryDelays := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			waitTime := retryDelays[attempt-1]
+			fmt.Fprintf(os.Stderr, "\033[90mEndpoint waking up, retrying in %v (attempt %d/%d)...\033[0m\n", waitTime, attempt, maxRetries)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("request cancelled")
+			case <-time.After(waitTime):
+			}
+		}
+
+		result, err, shouldRetry := c.doRequest(ctx, bodyBytes)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !shouldRetry {
+			return "", err
+		}
+		// Continue to next retry
+	}
+
+	return "", fmt.Errorf("API unavailable after %d retries (endpoint may be waking up): %w", maxRetries, lastErr)
+}
+
+// doRequest performs a single API request and returns the result, error, and whether to retry.
+func (c *Client) doRequest(ctx context.Context, bodyBytes []byte) (string, error, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.APIEndpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return "", fmt.Errorf("failed to create request: %w", err), false
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -122,43 +156,51 @@ func (c *Client) GenerateCommand(ctx context.Context, description, targetOS stri
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("request timed out")
+			return "", fmt.Errorf("request timed out"), false
 		}
-		return "", fmt.Errorf("API request failed: %w", err)
+		return "", fmt.Errorf("API request failed: %w", err), true // Network errors are retryable
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return "", fmt.Errorf("failed to read response: %w", err), false
 	}
 
 	// Handle HTTP error codes
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
-		return "", fmt.Errorf("authentication failed — check your API token")
+		return "", fmt.Errorf("authentication failed — check your API token"), false
 	case http.StatusTooManyRequests:
-		return "", fmt.Errorf("rate limit exceeded — please try again later")
-	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
-		return "", fmt.Errorf("API server error (HTTP %d)", resp.StatusCode)
+		return "", fmt.Errorf("rate limit exceeded — please try again later"), false
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout:
+		// These are retryable - endpoint may be waking up
+		return "", fmt.Errorf("service unavailable (HTTP %d) — endpoint may be waking up", resp.StatusCode), true
+	case http.StatusInternalServerError:
+		return "", fmt.Errorf("API server error (HTTP %d)", resp.StatusCode), true
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API returned HTTP %d: %s", resp.StatusCode, string(respBytes))
+		return "", fmt.Errorf("API returned HTTP %d: %s", resp.StatusCode, string(respBytes)), false
 	}
 
 	var chatResp chatResponse
 	if err := json.Unmarshal(respBytes, &chatResp); err != nil {
-		return "", fmt.Errorf("failed to parse API response: %w", err)
+		return "", fmt.Errorf("failed to parse API response: %w", err), false
 	}
 
 	// Check for API-level error in response body
 	if chatResp.Error != nil {
-		return "", fmt.Errorf("API error: %s", chatResp.Error.Message)
+		// Check if error message indicates cold start
+		errMsg := strings.ToLower(chatResp.Error.Message)
+		if strings.Contains(errMsg, "service unavailable") || strings.Contains(errMsg, "503") {
+			return "", fmt.Errorf("API error: %s", chatResp.Error.Message), true
+		}
+		return "", fmt.Errorf("API error: %s", chatResp.Error.Message), false
 	}
 
 	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("API returned no choices")
+		return "", fmt.Errorf("API returned no choices"), false
 	}
 
 	command := strings.TrimSpace(chatResp.Choices[0].Message.Content)
@@ -166,7 +208,7 @@ func (c *Client) GenerateCommand(ctx context.Context, description, targetOS stri
 	// Strip markdown code fences if the model returned them anyway
 	command = stripCodeFences(command)
 
-	return command, nil
+	return command, nil, false
 }
 
 // TestConnection verifies that the API endpoint and token are working.

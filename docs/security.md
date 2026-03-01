@@ -2,7 +2,7 @@
 
 ## Overview
 
-aiterm implements layered security controls to protect API credentials, prevent dangerous command execution, and ensure safe interaction with AI-generated shell commands.
+AIT implements layered security controls to protect API credentials, prevent dangerous command execution, and ensure safe interaction with AI-generated shell commands.
 
 ---
 
@@ -11,8 +11,8 @@ aiterm implements layered security controls to protect API credentials, prevent 
 ### Storage
 
 Configuration is stored at:
-- **Unix**: `~/.aiterm/config.json` (file `0600`, directory `0700`)
-- **Windows**: `%USERPROFILE%\.aiterm\config.json`
+- **Unix**: `~/.ait/config.json` (file `0600`, directory `0700`)
+- **Windows**: `%USERPROFILE%\.ait\config.json`
 
 Only the file owner has read/write access. Permissions are enforced on creation.
 
@@ -25,7 +25,7 @@ API Token: ***********a1b2
 ```
 
 This applies to:
-- `aiterm config` output
+- `ait config` output
 - Error messages
 - Debug logs
 
@@ -80,7 +80,7 @@ curl -X POST http://localhost:4000/key/generate \
 
 ## Command Safety
 
-AI-generated commands are **always shown to the user before any action is taken**. aiterm never auto-executes commands.
+AI-generated commands are **always shown to the user before any action is taken**. AIT never auto-executes commands.
 
 ### User Workflow
 
@@ -106,7 +106,7 @@ Users should be aware of potentially dangerous commands. Common risky patterns:
 
 ### Design Principle
 
-aiterm intentionally **does not execute commands** — it only prints them. This is a deliberate security choice:
+AIT intentionally **does not execute commands** — it only prints them. This is a deliberate security choice:
 - The user's existing terminal handles execution
 - The user has full control and visibility
 - No privilege escalation through the tool
@@ -116,13 +116,13 @@ aiterm intentionally **does not execute commands** — it only prints them. This
 
 ## Data Privacy
 
-### What aiterm Sends to the API
+### What AIT Sends to the API
 
 Each request contains:
 - **System prompt**: OS type and shell type (e.g., "Linux", "bash")
 - **User prompt**: The natural language description provided by the user
 
-### What aiterm Does NOT Send
+### What AIT Does NOT Send
 
 - File contents
 - Environment variables
@@ -134,9 +134,9 @@ Each request contains:
 
 | Data | Stored Locally | Location |
 |------|---------------|----------|
-| Config (endpoint, model, shell) | Yes | `~/.aiterm/config.json` |
-| API token | Yes (in config) | `~/.aiterm/config.json` |
-| Debug logs (if enabled) | Yes | `~/.aiterm/debug.log` |
+| Config (endpoint, model, shell) | Yes | `~/.ait/config.json` |
+| API token | Yes (in config) | `~/.ait/config.json` |
+| Debug logs (if enabled) | Yes | `~/.ait/debug.log` |
 | Command history | No | — |
 | Prompts | No | — |
 | AI responses | No | — |
@@ -144,7 +144,7 @@ Each request contains:
 ### Debug Logging
 
 When `--debug` is enabled:
-- Logs are written to `~/.aiterm/debug.log`
+- Logs are written to `~/.ait/debug.log`
 - API tokens are masked in logs
 - Logs contain request metadata (not full prompts by default)
 - Users should **not** share debug logs publicly without review
@@ -199,7 +199,7 @@ Rate limiting prevents:
 1. **Disable** the key immediately via dashboard or API
 2. **Review** spend logs for unauthorized usage
 3. **Generate** a new key for the affected user
-4. **Update** aiterm config: `aiterm config set api_token sk-new-key`
+4. **Update** AIT config: `ait config set api_token sk-new-key`
 
 ### Compromised Master Key
 
@@ -216,12 +216,12 @@ Rate limiting prevents:
 ### HTTPS
 
 - Always use HTTPS endpoints in production
-- aiterm sends the `Authorization: Bearer` header — this must be encrypted in transit
+- AIT sends the `Authorization: Bearer` header — this must be encrypted in transit
 - Local development (localhost) may use HTTP
 
 ### Minimal Attack Surface
 
-- aiterm is a stateless CLI tool — no listening ports, no daemon
+- AIT is a stateless CLI tool — no listening ports, no daemon
 - Configuration is local files only
 - No telemetry, no analytics, no phone-home
 
@@ -231,9 +231,9 @@ Rate limiting prevents:
 
 ### GDPR / Data Protection
 
-- User prompts are processed but **not stored** by aiterm
+- User prompts are processed but **not stored** by AIT
 - LiteLLM can be configured with data retention policies
-- Users can delete their local config at any time: `rm -rf ~/.aiterm`
+- Users can delete their local config at any time: `rm -rf ~/.ait`
 
 ### Audit Trail (via LiteLLM)
 

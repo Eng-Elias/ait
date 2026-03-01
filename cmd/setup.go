@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"aiterm/internal/ai"
-	"aiterm/internal/config"
+	"ait/internal/ai"
+	"ait/internal/config"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -18,7 +18,7 @@ import (
 var setupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "Interactive setup wizard",
-	Long:  `Guides you through configuring aiterm with your API credentials and preferences.`,
+	Long:  `Guides you through configuring AIT with your API credentials and preferences.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runSetup()
 	},
@@ -34,7 +34,7 @@ func runSetup() error {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════╗")
-	fmt.Println("║       Welcome to aiterm Setup        ║")
+	fmt.Println("║        Welcome to AIT Setup          ║")
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Println()
 
@@ -87,7 +87,7 @@ func runSetup() error {
 
 		if err := client.TestConnection(ctx); err != nil {
 			fmt.Printf("✗ Failed: %v\n", err)
-			fmt.Println("Configuration will be saved anyway. You can update it later with 'aiterm config set'.")
+			fmt.Println("Configuration will be saved anyway. You can update it later with 'ait config set'.")
 		} else {
 			fmt.Println("✓ Connection successful!")
 		}
@@ -100,7 +100,7 @@ func runSetup() error {
 
 	path, _ := config.ConfigFilePath()
 	fmt.Printf("\nConfiguration saved to %s\n", path)
-	fmt.Println("Run 'aiterm' to start the AI terminal!")
+	fmt.Println("Run 'ait' to start the AI Terminal!")
 	fmt.Println()
 
 	return nil

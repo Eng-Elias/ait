@@ -1,4 +1,4 @@
-module aiterm
+module ait
 
 go 1.21
 

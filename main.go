@@ -1,6 +1,6 @@
 package main
 
-import "aiterm/cmd"
+import "ait/cmd"
 
 func main() {
 	cmd.Execute()

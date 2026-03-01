@@ -27,7 +27,7 @@ func DefaultConfig() *Config {
 	}
 }
 
-// ConfigDir returns the path to the aiterm configuration directory.
+// ConfigDir returns the path to the AIT configuration directory.
 func ConfigDir() (string, error) {
 	var home string
 	if runtime.GOOS == "windows" {
@@ -38,7 +38,7 @@ func ConfigDir() (string, error) {
 	if home == "" {
 		return "", fmt.Errorf("unable to determine home directory")
 	}
-	return filepath.Join(home, ".aiterm"), nil
+	return filepath.Join(home, ".ait"), nil
 }
 
 // ConfigFilePath returns the full path to config.json.
@@ -158,7 +158,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("api_endpoint is required")
 	}
 	if c.APIToken == "" {
-		return fmt.Errorf("api_token is required — run 'aiterm setup' to configure")
+		return fmt.Errorf("api_token is required — run 'ait setup' to configure")
 	}
 	if c.Model == "" {
 		return fmt.Errorf("model is required")

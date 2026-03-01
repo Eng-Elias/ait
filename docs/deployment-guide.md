@@ -1,11 +1,11 @@
 # Deployment Guide: LiteLLM on HF Spaces + Model on HF Inference API
 
-A step-by-step practical guide to deploy the full aiterm backend stack and test the app end-to-end.
+A step-by-step practical guide to deploy the full AIT backend stack and test the app end-to-end.
 
 **What you'll set up:**
 
 ```
-aiterm CLI  ──►  LiteLLM Proxy (HF Spaces)  ──►  Model (HF Inference API)
+AIT CLI  ──►  LiteLLM Proxy (HF Spaces)  ──►  HF Endpoint Proxy  ──►  Model (HF Dedicated Endpoint)
 ```
 
 **Time required:** ~15–20 minutes
@@ -17,7 +17,7 @@ aiterm CLI  ──►  LiteLLM Proxy (HF Spaces)  ──►  Model (HF Inference
 - A [HuggingFace account](https://huggingface.co/join) (free)
 - A HuggingFace API token with **write** access
 - A free [Supabase](https://supabase.com) account (for the LiteLLM database)
-- `aiterm` binary built and available (see main README)
+- `ait` binary built and available (see main README)
 
 ---
 
@@ -25,7 +25,7 @@ aiterm CLI  ──►  LiteLLM Proxy (HF Spaces)  ──►  Model (HF Inference
 
 1. Go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
 2. Click **New token**
-3. Name: `aiterm-deploy`
+3. Name: `ait-deploy`
 4. Type: **Write** (needed to create Spaces)
 5. Click **Generate**
 6. Copy the token — you'll need it in Steps 2 and 3
@@ -95,7 +95,7 @@ LiteLLM requires PostgreSQL for virtual keys, spend tracking, and user authentic
 
 1. Go to [supabase.com](https://supabase.com) and sign in (free account)
 2. Click **New Project**
-   - **Name**: `litellm-aiterm`
+   - **Name**: `litellm-ait`
    - **Database password**: choose a strong password — **save it, you'll need it below**
    - **Region**: choose the closest to you
 3. Wait ~1 minute for the project to be created
@@ -164,7 +164,7 @@ Double-check:
 
 1. Go to [huggingface.co/new-space](https://huggingface.co/new-space)
 2. Fill in:
-   - **Space name**: `aiterm-proxy`
+   - **Space name**: `ait-proxy`
    - **SDK**: **Docker**
    - **Visibility**: **Private** (recommended)
 3. Click **Create Space**
@@ -187,8 +187,8 @@ Go to your Space → **Settings** → **Repository secrets** and add these **4 s
 Clone the Space repo and add two files:
 
 ```bash
-git clone https://huggingface.co/spaces/YOUR_USERNAME/aiterm-proxy
-cd aiterm-proxy
+git clone https://huggingface.co/spaces/YOUR_USERNAME/ait-proxy
+cd ait-proxy
 ```
 
 **Create `config.yaml`:**
@@ -253,21 +253,21 @@ git push
 
 Your proxy URL is:
 ```
-https://YOUR_USERNAME-aiterm-proxy.hf.space
+https://YOUR_USERNAME-ait-proxy.hf.space
 ```
 
 ### 4.5 Verify the Proxy
 
 ```bash
 # Health check
-curl https://YOUR_USERNAME-aiterm-proxy.hf.space/health
+curl https://YOUR_USERNAME-ait-proxy.hf.space/health
 
 # Expected: {"status":"healthy"}
 ```
 
 Open the dashboard at:
 ```
-https://YOUR_USERNAME-aiterm-proxy.hf.space/ui
+https://YOUR_USERNAME-ait-proxy.hf.space/ui
 ```
 
 Log in with your `LITELLM_MASTER_KEY`.
@@ -281,7 +281,7 @@ Virtual keys let you control access without exposing your master key or HF token
 ### Via curl:
 
 ```bash
-curl -X POST https://YOUR_USERNAME-aiterm-proxy.hf.space/key/generate \
+curl -X POST https://YOUR_USERNAME-ait-proxy.hf.space/key/generate \
   -H "Authorization: Bearer YOUR_MASTER_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -300,11 +300,11 @@ curl -X POST https://YOUR_USERNAME-aiterm-proxy.hf.space/key/generate \
 }
 ```
 
-Save the `key` value — this is your API token for aiterm.
+Save the `key` value — this is your API token for ait.
 
 ### Via Dashboard:
 
-1. Open `https://YOUR_USERNAME-aiterm-proxy.hf.space/ui`
+1. Open `https://YOUR_USERNAME-ait-proxy.hf.space/ui`
 2. Log in with your `LITELLM_MASTER_KEY`
 3. Go to **Virtual Keys**
 4. Click **Generate Key**
@@ -313,26 +313,26 @@ Save the `key` value — this is your API token for aiterm.
 
 ---
 
-## Step 6: Configure aiterm
+## Step 6: Configure ait
 
-Now connect your aiterm CLI to the deployed proxy:
+Now connect your ait CLI to the deployed proxy:
 
 ```bash
 # Set the API endpoint to your LiteLLM proxy
-aiterm config set api_endpoint https://YOUR_USERNAME-aiterm-proxy.hf.space/v1/chat/completions
+ait config set api_endpoint https://YOUR_USERNAME-ait-proxy.hf.space/v1/chat/completions
 
 # Set your virtual key
-aiterm config set api_token sk-your-virtual-key-here
+ait config set api_token sk-your-virtual-key-here
 
 # Set the model name (must match model_name in config.yaml)
-aiterm config set model default
+ait config set model default
 ```
 
 Or run the setup wizard:
 
 ```bash
-aiterm setup
-# API Endpoint: https://YOUR_USERNAME-aiterm-proxy.hf.space/v1/chat/completions
+ait setup
+# API Endpoint: https://YOUR_USERNAME-ait-proxy.hf.space/v1/chat/completions
 # API Token: sk-your-virtual-key-here
 # Model: default
 ```
@@ -340,13 +340,13 @@ aiterm setup
 Verify the config:
 
 ```bash
-aiterm config
+ait config
 ```
 
 Expected output:
 
 ```
-api_endpoint: https://YOUR_USERNAME-aiterm-proxy.hf.space/v1/chat/completions
+api_endpoint: https://YOUR_USERNAME-ait-proxy.hf.space/v1/chat/completions
 api_token:    ***********xxxx
 model:        default
 shell:        auto
@@ -359,7 +359,7 @@ shell:        auto
 ### Basic Test
 
 ```bash
-aiterm "list all files in the current directory"
+ait "list all files in the current directory"
 ```
 
 Expected: prints a command like `ls -la` (Linux/macOS) or `Get-ChildItem` (Windows).
@@ -367,20 +367,20 @@ Expected: prints a command like `ls -la` (Linux/macOS) or `Get-ChildItem` (Windo
 ### Cross-Platform Test
 
 ```bash
-aiterm "find all log files larger than 10MB" -t linux
+ait "find all log files larger than 10MB" -t linux
 # Expected: find / -name "*.log" -size +10M
 
-aiterm "find all log files larger than 10MB" -t win
+ait "find all log files larger than 10MB" -t win
 # Expected: Get-ChildItem -Path C:\ -Recurse -Filter *.log | Where-Object {$_.Length -gt 10MB}
 
-aiterm "find all log files larger than 10MB" -t mac
+ait "find all log files larger than 10MB" -t mac
 # Expected: find / -name "*.log" -size +10M
 ```
 
 ### Headless / Pipe Test
 
 ```bash
-aiterm generate "show current date and time"
+ait generate "show current date and time"
 # Prints just the command to stdout, e.g.: date
 ```
 
@@ -388,12 +388,12 @@ aiterm generate "show current date and time"
 
 ```bash
 # Test with invalid token
-aiterm config set api_token sk-invalid-key
-aiterm "test"
+ait config set api_token sk-invalid-key
+ait "test"
 # Expected: error about authentication
 
 # Restore your key
-aiterm config set api_token sk-your-virtual-key-here
+ait config set api_token sk-your-virtual-key-here
 ```
 
 ---
@@ -402,9 +402,9 @@ aiterm config set api_token sk-your-virtual-key-here
 
 ### "Connection refused" or timeout
 
-- **Check the Space is running**: visit `https://YOUR_USERNAME-aiterm-proxy.hf.space`
+- **Check the Space is running**: visit `https://YOUR_USERNAME-ait-proxy.hf.space`
 - **HF Spaces may sleep** after inactivity — the first request wakes it up (~30s)
-- **Check health**: `curl https://YOUR_USERNAME-aiterm-proxy.hf.space/health`
+- **Check health**: `curl https://YOUR_USERNAME-ait-proxy.hf.space/health`
 
 ### "Authentication failed"
 
@@ -414,7 +414,7 @@ aiterm config set api_token sk-your-virtual-key-here
 
 ### "Model not found" or empty response
 
-- Check `config.yaml` — the `model_name` must match what you set in aiterm config
+- Check `config.yaml` — the `model_name` must match what you set in ait config
 - Verify the HF model is accessible: test it with curl (Step 2)
 - Check LiteLLM logs in the Space **Logs** tab
 
@@ -446,7 +446,7 @@ The `DATABASE_URL` secret is malformed or the database is unreachable. Common ca
 ```
 ┌──────────────────┐     HTTPS      ┌─────────────────────┐     HTTPS      ┌──────────────────┐
 │                  │  ──────────►   │                     │  ──────────►   │                  │
-│   aiterm CLI     │                │  LiteLLM Proxy      │                │  HF Inference    │
+│   ait CLI     │                │  LiteLLM Proxy      │                │  HF Inference    │
 │   (your machine) │  ◄──────────   │  (HF Spaces)        │  ◄──────────   │  API / Endpoint  │
 │                  │                │                     │                │                  │
 └──────────────────┘                │  • Virtual keys     │                └──────────────────┘

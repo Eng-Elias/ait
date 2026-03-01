@@ -1,6 +1,6 @@
-BINARY_NAME=aiterm
+BINARY_NAME=ait
 VERSION?=0.1.0
-LDFLAGS=-ldflags "-X aiterm/cmd.Version=$(VERSION)"
+LDFLAGS=-ldflags "-X ait/cmd.Version=$(VERSION)"
 DIST_DIR=dist
 
 .PHONY: build install dev build-all clean test lint \

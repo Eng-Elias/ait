@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"aiterm/internal/ai"
-	"aiterm/internal/config"
+	"ait/internal/ai"
+	"ait/internal/config"
 
 	"github.com/spf13/cobra"
 )
@@ -30,7 +30,7 @@ var generateCmd = &cobra.Command{
 		description := strings.Join(args, " ")
 		client := ai.NewClient(cfg)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		command, err := client.GenerateCommand(ctx, description, "")
