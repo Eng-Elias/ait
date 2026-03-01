@@ -141,7 +141,7 @@ AIT works with any OpenAI-compatible chat completions endpoint.
 | HuggingFace Inference API | Qwen2.5-Coder-0.5B | ~2-5s | Free tier available |
 | OpenAI | gpt-4o-mini | ~1-3s | Pay per token |
 | Ollama (local) | llama3, codellama | ~1-2s | Free (local GPU/CPU) |
-| HF Dedicated Endpoint | Custom fine-tuned | ~1-2s | Pay per hour |
+| HF Dedicated Endpoint | Custom fine-tuned (Nvidia T4 GPU) | ~0.5-1s | Pay per hour |
 
 ---
 

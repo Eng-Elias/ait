@@ -76,7 +76,7 @@ For production use with guaranteed availability and no rate limits:
 2. Click **New Endpoint**
 3. **Model**: `Qwen/Qwen2.5-Coder-0.5B-Instruct`
 4. **Cloud**: AWS or Azure
-5. **Instance**: CPU (cheapest) or GPU (faster)
+5. **Instance**: GPU (Nvidia T4, 16GB recommended for fast inference)
 6. **Scaling**: Enable **Scale to Zero** to save costs
 7. Click **Create Endpoint**
 8. Wait for status to show **Running**
@@ -468,4 +468,4 @@ The `DATABASE_URL` secret is malformed or the database is unreachable. Common ca
 | Supabase (free tier, 500 MB) | Free |
 | **Total** | **$0/month** |
 
-For higher throughput, consider a Dedicated Inference Endpoint (~$0.06/hr for CPU).
+For higher throughput, consider a Dedicated Inference Endpoint (~$0.50/hr for Nvidia T4 GPU).
