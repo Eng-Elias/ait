@@ -25,19 +25,23 @@ async def chat_completions(request: Request):
         data = await request.json()
         messages = data.get("messages", [])
         
-        # Extract user message
-        user_content = ""
+        # Build prompt from all messages (include system prompt for OS context)
+        prompt_parts = []
         for msg in messages:
-            if msg.get("role") == "user":
-                user_content = msg.get("content", "")
-                break
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                prompt_parts.append(f"System: {content}")
+            elif role == "user":
+                prompt_parts.append(f"User: {content}")
         
-        if not user_content:
-            raise HTTPException(status_code=400, detail="No user message found")
+        full_prompt = "\n".join(prompt_parts)
+        if not full_prompt:
+            raise HTTPException(status_code=400, detail="No message content found")
         
         # Build HF request
         hf_payload = {
-            "inputs": user_content,
+            "inputs": full_prompt,
             "parameters": {
                 "max_new_tokens": data.get("max_tokens", 100),
                 "temperature": data.get("temperature", 0.1),
@@ -82,10 +86,11 @@ async def chat_completions(request: Request):
                 },
                 "finish_reason": "stop"
             }],
+            # Token estimation: ~4 chars per token (enables LiteLLM budget tracking)
             "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
+                "prompt_tokens": len(full_prompt) // 4,
+                "completion_tokens": len(generated_text) // 4,
+                "total_tokens": (len(full_prompt) + len(generated_text)) // 4
             }
         }
     
