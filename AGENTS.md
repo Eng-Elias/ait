@@ -43,7 +43,29 @@ All three must pass before any push. CI runs the same three.
   - Planned (post-v1) features: spec `Spec PNN: <feature>`, tickets
     `PNN-T<k>: <title>`, branch `plan-NN-<slug>`, assigned to a
     `Release N` milestone. Do not implement a planned issue until asked to.
-- Branches: work branches → PR into `dev` (the default branch).
-  `main` only receives promotion PRs from `dev`. Never push directly to `dev`
-  or `main`; never force-push them.
+- Branch protection (repo ruleset `protected-branches`): `main`, `qa` and
+  `dev` are protected. Changes reach them only via pull request — never push
+  directly — and the ruleset rejects deletions and non-fast-forward pushes,
+  so never delete or force-push them. All merge methods (merge, squash,
+  rebase) are allowed; approvals are not required.
+- Branch flow: cut every work branch (rounds, tickets, fixes) from `dev` —
+  the default branch — and merge it back into `dev` via PR. On release,
+  promote `dev` to `main` with a PR; `main` only receives promotion PRs from
+  `dev`. `qa` is updated by PR only.
 - PRs into `dev` carry a `Closes #N` line for the spec issue and every ticket.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See
+`docs/agents/domain.md`.
