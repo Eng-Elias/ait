@@ -53,7 +53,7 @@ cloud dependency, no vendor lock-in.
 | Language | Rust (stable, edition 2021+) | Cargo workspace |
 | UI | `ratatui` + `crossterm` | TUI only in v1 |
 | PTY | `portable-pty` | Own the master side; spawn `$SHELL` |
-| VT emulation | **Proposed:** `alacritty_terminal` (grid + `vte` parser). Alternative: `vte` + our own grid | Decide in Round 1; do not hand-write a full emulator |
+| VT emulation | `alacritty_terminal` (grid + `vte` parser), exact-pinned | Do not hand-write a full emulator (ADR-0002) |
 | Async | `tokio` | PTY reader, agent loop, HTTP run concurrently |
 | HTTP / streaming | `reqwest` + `eventsource-stream` (SSE) | Streaming for every provider schema |
 | Config | `toml` + `serde` + `schemars` | `settings.toml` + emitted JSON Schema |
@@ -94,7 +94,7 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.1 Proposed crate layout
+### 3.1 Crate layout (Decided, ADR-0003)
 
 | Crate | Responsibility |
 |---|---|
@@ -105,7 +105,8 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction |
 | `ait` | TUI binary (frontend only — no business logic) |
 
-The layout is confirmed in Round 1 and may grow (e.g. `ait-store`, `ait-ssh`).
+The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-store`,
+`ait-ssh`).
 
 ---
 
