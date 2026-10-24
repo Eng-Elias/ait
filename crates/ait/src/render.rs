@@ -1,0 +1,348 @@
+//! `GridView` → ratatui `Buffer` painting (Spec R02 render seam).
+//!
+//! [`paint_session`] copies a session's visible grid into a ratatui buffer:
+//! text via `Row::text` (keeps zero-width/combining characters riding on
+//! their base cell, so ZWJ emoji render whole), then per-cell colors and
+//! style flags. Wide characters are handled by ratatui's own grapheme
+//! sizing; `CellKind::WideSpacer` columns are covered automatically.
+//!
+//! ratatui's `Modifier::UNDERLINED` is a single bit — it cannot carry *which*
+//! underline an application requested. Every non-`None` underline therefore
+//! sets that bit (so plain backends still underline) *and* records the real
+//! variant in the [`UnderlineOverlay`], which [`StyledBackend`](crate::backend::StyledBackend)
+//! reads when emitting SGR `4:x` attributes.
+
+use std::collections::HashMap;
+
+use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Style, Underline};
+use crossterm::cursor::SetCursorStyle;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color as RtColor, Modifier};
+
+/// Per-position map of the *exact* underline variant on the current frame.
+///
+/// Filled by [`paint_session`], consumed by
+/// [`StyledBackend::draw`](crate::backend::StyledBackend). Only cells whose
+/// underline differs from `None` appear — a missing key means "whatever
+/// `Modifier::UNDERLINED` on the buffer cell says".
+pub type UnderlineOverlay = HashMap<(u16, u16), Underline>;
+
+/// Paint the session's visible grid into `buf`, covering `area`.
+///
+/// `area` is the region the grid occupies (the whole frame for the
+/// single-session skeleton; a smaller rect once chrome lands). Cells past
+/// the grid's edge — e.g. a just-grown frame before the session's resize is
+/// processed — are reset to blank.
+pub fn paint_session(
+    buf: &mut Buffer,
+    area: Rect,
+    grid: &GridView<'_>,
+    overlay: &mut UnderlineOverlay,
+) {
+    for (row_index, row) in grid.visible_rows().enumerate() {
+        let y = area.y + row_index as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        // Text first: `set_stringn` sizes graphemes itself, so wide
+        // characters occupy two columns and zero-width characters stay
+        // attached to their base grapheme.
+        let width = usize::from(area.right() - area.x);
+        buf.set_stringn(
+            area.x,
+            y,
+            row.text(),
+            width,
+            ratatui::style::Style::default(),
+        );
+        // Then per-cell styling, column-aligned with the grid.
+        for (col, cell) in row.cells().enumerate() {
+            if col >= usize::from(area.right() - area.x) {
+                break;
+            }
+            if cell.kind == CellKind::WideSpacer {
+                // Covered by the wide grapheme's cell; skip it — the
+                // overlay and diff only care about the leading cell.
+                continue;
+            }
+            let x = area.x + col as u16;
+            let target = &mut buf[(x, y)];
+            target.fg = to_ratatui_color(cell.fg);
+            target.bg = to_ratatui_color(cell.bg);
+            target.modifier = to_modifier(cell.style);
+            if cell.style.underline != Underline::None {
+                overlay.insert((x, y), cell.style.underline);
+            }
+        }
+    }
+    // Clear any rows the grid doesn't cover (resize slack).
+    for y in (area.y + grid.lines() as u16)..area.bottom() {
+        for x in area.x..area.right() {
+            buf[(x, y)].reset();
+        }
+    }
+}
+
+/// `ait_term` color → ratatui color. Beware the naming trap: ratatui's
+/// `Red`/`Green`/… are the *normal* ANSI colors (SGR 3x) while
+/// `LightRed`/… are the bright variants (SGR 9x) — the same convention as
+/// `ratatui::backend::IntoCrossterm`.
+pub fn to_ratatui_color(color: Color) -> RtColor {
+    match color {
+        Color::Default => RtColor::Reset,
+        Color::Indexed(index) => RtColor::Indexed(index),
+        Color::Rgb(rgb) => RtColor::Rgb(rgb.r, rgb.g, rgb.b),
+        Color::Ansi(ansi) => match ansi {
+            AnsiColor::Black => RtColor::Black,
+            AnsiColor::Red => RtColor::Red,
+            AnsiColor::Green => RtColor::Green,
+            AnsiColor::Yellow => RtColor::Yellow,
+            AnsiColor::Blue => RtColor::Blue,
+            AnsiColor::Magenta => RtColor::Magenta,
+            AnsiColor::Cyan => RtColor::Cyan,
+            AnsiColor::White => RtColor::Gray,
+            AnsiColor::BrightBlack => RtColor::DarkGray,
+            AnsiColor::BrightRed => RtColor::LightRed,
+            AnsiColor::BrightGreen => RtColor::LightGreen,
+            AnsiColor::BrightYellow => RtColor::LightYellow,
+            AnsiColor::BrightBlue => RtColor::LightBlue,
+            AnsiColor::BrightMagenta => RtColor::LightMagenta,
+            AnsiColor::BrightCyan => RtColor::LightCyan,
+            AnsiColor::BrightWhite => RtColor::White,
+        },
+    }
+}
+
+/// `ait_term` style flags → ratatui modifier bits. Every underline variant
+/// sets `UNDERLINED`; the variant itself rides in the overlay.
+fn to_modifier(style: Style) -> Modifier {
+    let mut modifier = Modifier::empty();
+    if style.bold {
+        modifier |= Modifier::BOLD;
+    }
+    if style.dim {
+        modifier |= Modifier::DIM;
+    }
+    if style.italic {
+        modifier |= Modifier::ITALIC;
+    }
+    if style.underline != Underline::None {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if style.inverse {
+        modifier |= Modifier::REVERSED;
+    }
+    if style.hidden {
+        modifier |= Modifier::HIDDEN;
+    }
+    if style.strikeout {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    modifier
+}
+
+/// Application-requested cursor shape → crossterm `SetCursorStyle`.
+///
+/// DECSCUSR has no hollow block: [`CursorShape::HollowBlock`] maps to a
+/// steady block (a terminal never *requests* hollow — the emulator uses it
+/// for its own "unfocused" rendering). [`CursorShape::Hidden`] has no
+/// `SetCursorStyle` — the app hides the cursor instead.
+pub fn to_cursor_style(shape: CursorShape) -> Option<SetCursorStyle> {
+    match shape {
+        CursorShape::Block | CursorShape::HollowBlock => Some(SetCursorStyle::SteadyBlock),
+        CursorShape::Underline => Some(SetCursorStyle::SteadyUnderScore),
+        CursorShape::Beam => Some(SetCursorStyle::SteadyBar),
+        CursorShape::Hidden => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ait_term::{Session, SessionOptions, Size};
+
+    /// Byte-fed session fixture (the R01 seam): feed PTY output bytes, get a
+    /// grid to paint.
+    fn session(columns: usize, lines: usize) -> Session {
+        Session::new(SessionOptions {
+            size: Size::new(columns, lines),
+            ..Default::default()
+        })
+    }
+
+    fn paint(session: &Session, width: u16, height: u16) -> (Buffer, UnderlineOverlay) {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut overlay = UnderlineOverlay::new();
+        let area = buf.area;
+        paint_session(&mut buf, area, &session.grid(), &mut overlay);
+        (buf, overlay)
+    }
+
+    #[test]
+    fn text_lands_in_the_buffer() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"hi");
+        let (buf, _) = paint(&session, 80, 24);
+
+        assert_eq!(buf[(0, 0)].symbol(), "h");
+        assert_eq!(buf[(1, 0)].symbol(), "i");
+        assert_eq!(buf[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn named_ansi_colors_map() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"\x1b[31;104mX");
+        let (buf, _) = paint(&session, 80, 24);
+
+        assert_eq!(buf[(0, 0)].fg, RtColor::Red);
+        assert_eq!(buf[(0, 0)].bg, RtColor::LightBlue);
+        // ratatui naming: normal ANSI colors are Red/…, bright are Light*.
+        assert_eq!(
+            to_ratatui_color(Color::Ansi(AnsiColor::White)),
+            RtColor::Gray
+        );
+        assert_eq!(
+            to_ratatui_color(Color::Ansi(AnsiColor::BrightWhite)),
+            RtColor::White
+        );
+        assert_eq!(
+            to_ratatui_color(Color::Ansi(AnsiColor::BrightBlack)),
+            RtColor::DarkGray
+        );
+    }
+
+    #[test]
+    fn indexed_and_rgb_colors_map() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"\x1b[38;5;196mA\x1b[48;2;10;20;30mB");
+        let (buf, _) = paint(&session, 80, 24);
+
+        assert_eq!(buf[(0, 0)].fg, RtColor::Indexed(196));
+        assert_eq!(buf[(1, 0)].bg, RtColor::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn default_colors_are_reset() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"x");
+        let (buf, _) = paint(&session, 80, 24);
+
+        assert_eq!(buf[(0, 0)].fg, RtColor::Reset);
+        assert_eq!(buf[(0, 0)].bg, RtColor::Reset);
+    }
+
+    #[test]
+    fn style_flags_become_modifiers() {
+        let mut session = session(80, 24);
+        // bold, dim, italic, single underline, inverse, hidden, strikeout.
+        session.feed_bytes(b"\x1b[1mB\x1b[2mD\x1b[3mI\x1b[4mU\x1b[7mR\x1b[8mH\x1b[9mS\x1b[0mN");
+        let (buf, _) = paint(&session, 80, 24);
+
+        let at = |x: u16| buf[(x, 0)].modifier;
+        assert!(at(0).contains(Modifier::BOLD));
+        // DIM persists on following cells until reset — read each flag.
+        assert!(at(1).contains(Modifier::DIM));
+        assert!(at(2).contains(Modifier::ITALIC));
+        assert!(at(3).contains(Modifier::UNDERLINED));
+        assert!(at(4).contains(Modifier::REVERSED));
+        assert!(at(5).contains(Modifier::HIDDEN));
+        assert!(at(6).contains(Modifier::CROSSED_OUT));
+        assert_eq!(at(7), Modifier::empty());
+    }
+
+    /// SGR 58 sets an underline *color*; alacritty reports it via the cell's
+    /// fg/bg… actually it surfaces nowhere in ait-term's `Style` — the
+    /// overlay only carries the variant. Single underline lands as
+    /// `Modifier::UNDERLINED` + overlay `Single`.
+    #[test]
+    fn underline_variants_land_in_the_overlay() {
+        let mut session = session(80, 24);
+        // 4:0 none, 4:1 single, 4:2 double, 4:3 curly, 4:4 dotted, 4:5 dashed.
+        session.feed_bytes(b"\x1b[4:1mA\x1b[4:2mB\x1b[4:3mC\x1b[4:4mD\x1b[4:5mE\x1b[0mF");
+        let (buf, overlay) = paint(&session, 80, 24);
+
+        assert_eq!(overlay.get(&(0, 0)), Some(&Underline::Single), "single");
+        assert_eq!(overlay.get(&(1, 0)), Some(&Underline::Double));
+        assert_eq!(overlay.get(&(2, 0)), Some(&Underline::Curly));
+        assert_eq!(overlay.get(&(3, 0)), Some(&Underline::Dotted));
+        assert_eq!(overlay.get(&(4, 0)), Some(&Underline::Dashed));
+        assert_eq!(overlay.get(&(5, 0)), None);
+        // Every variant still sets the buffer's UNDERLINED bit so the cell
+        // style is truthful even without the overlay.
+        for x in 0..5 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::UNDERLINED),
+                "cell {x} should carry UNDERLINED"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_columns() {
+        let mut session = session(80, 24);
+        session.feed_bytes("コx".as_bytes());
+        let (buf, _) = paint(&session, 80, 24);
+
+        assert_eq!(buf[(0, 0)].symbol(), "コ");
+        // The spacer column belongs to the wide glyph; 'x' lands at col 2,
+        // matching the grid.
+        assert_eq!(buf[(2, 0)].symbol(), "x");
+    }
+
+    /// Emoji with zero-width riders (VS16 / ZWJ parts) render as one
+    /// grapheme, not as their base char alone.
+    #[test]
+    fn zero_width_riders_stay_attached() {
+        let mut session = session(80, 24);
+        session.feed_bytes("☑️x".as_bytes()); // ☑ + VS16 + x
+        let (buf, _) = paint(&session, 80, 24);
+
+        let symbol = buf[(0, 0)].symbol();
+        assert!(
+            symbol.starts_with('☑'),
+            "expected the grapheme on the buffer cell, got {symbol:?}"
+        );
+        assert!(
+            symbol.contains('\u{fe0f}'),
+            "variation selector must ride along, got {symbol:?}"
+        );
+    }
+
+    /// Rows the grid doesn't cover get blanked (fresh-frame slack).
+    #[test]
+    fn uncovered_rows_are_cleared() {
+        let mut session = session(10, 2);
+        session.feed_bytes(b"top");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        // Pre-fill a row the grid doesn't reach.
+        buf[(0, 4)].set_symbol("!");
+        let mut overlay = UnderlineOverlay::new();
+        let area = buf.area;
+        paint_session(&mut buf, area, &session.grid(), &mut overlay);
+
+        assert_eq!(buf[(0, 4)].symbol(), " ");
+    }
+
+    #[test]
+    fn cursor_shape_mapping() {
+        assert_eq!(
+            to_cursor_style(CursorShape::Block),
+            Some(SetCursorStyle::SteadyBlock)
+        );
+        assert_eq!(
+            to_cursor_style(CursorShape::HollowBlock),
+            Some(SetCursorStyle::SteadyBlock)
+        );
+        assert_eq!(
+            to_cursor_style(CursorShape::Underline),
+            Some(SetCursorStyle::SteadyUnderScore)
+        );
+        assert_eq!(
+            to_cursor_style(CursorShape::Beam),
+            Some(SetCursorStyle::SteadyBar)
+        );
+        assert_eq!(to_cursor_style(CursorShape::Hidden), None);
+    }
+}
