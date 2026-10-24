@@ -233,8 +233,14 @@ fn cursor_key(final_byte: u8, app_cursor: bool, mods: Modifiers) -> Vec<u8> {
         vec![ESC, introducer, final_byte]
     } else {
         // `CSI 1;{m}X`; modifiers never produce the SS3 form.
-        csi(&format!("1;{}", mods.xterm_param()), final_byte)
+        csi(&modifier_params(mods), final_byte)
     }
+}
+
+/// The `1;{m}` parameter pair for modified keys whose unmodified form is a
+/// plain `CSI X` (arrows, Home/End, F1–F4).
+fn modifier_params(mods: Modifiers) -> String {
+    format!("1;{}", mods.xterm_param())
 }
 
 /// `CSI {n}` or `CSI {n};{m}` terminated by `~` (Insert, Delete, PageUp,
@@ -257,7 +263,7 @@ fn function_key(n: u8, mods: Modifiers) -> Vec<u8> {
             if mods.is_empty() {
                 vec![ESC, b'O', final_byte]
             } else {
-                csi(&format!("1;{}", mods.xterm_param()), final_byte)
+                csi(&modifier_params(mods), final_byte)
             }
         }
         5..=12 => {

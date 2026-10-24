@@ -54,7 +54,7 @@ cloud dependency, no vendor lock-in.
 | UI | `ratatui` + `crossterm` | TUI only in v1 |
 | PTY | `portable-pty` | Own the master side; spawn `$SHELL` |
 | VT emulation | `alacritty_terminal` (grid + `vte` parser), exact-pinned | Do not hand-write a full emulator (ADR-0002) |
-| Async | `tokio` | PTY reader, agent loop, HTTP run concurrently |
+| Async | `tokio` | App runtime at the `ait` binary (agent loop, HTTP, SSE). The PTY reader runs on `std::thread` inside `ait-term`; the core stays synchronous (ADR-0004) |
 | HTTP / streaming | `reqwest` + `eventsource-stream` (SSE) | Streaming for every provider schema |
 | Config | `toml` + `serde` + `schemars` | `settings.toml` + emitted JSON Schema |
 | Secrets | env vars + `keyring` crate | Never in `settings.toml` |
