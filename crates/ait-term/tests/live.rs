@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ait_term::{
-    ExitStatus, Key, KeyEvent, LiveSession, LiveSessionOptions, Modifiers, SessionEvent,
+    ExitStatus, Key, KeyEvent, LiveEvent, LiveSession, LiveSessionOptions, Modifiers,
     SessionOptions, Size,
 };
 
@@ -34,7 +34,7 @@ fn spawn(program: &str, args: &[OsString], mut options: LiveSessionOptions) -> L
 }
 
 /// Drain events until `pred` accepts one, or the timeout kills the test.
-fn wait_for_event(session: &mut LiveSession, pred: impl Fn(&SessionEvent) -> bool) -> SessionEvent {
+fn wait_for_event(session: &mut LiveSession, pred: impl Fn(&LiveEvent) -> bool) -> LiveEvent {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         for event in session.drain_events() {
@@ -47,10 +47,10 @@ fn wait_for_event(session: &mut LiveSession, pred: impl Fn(&SessionEvent) -> boo
     }
 }
 
-/// Wait for `SessionEvent::Exited` and return its status.
+/// Wait for `LiveEvent::Exited` and return its status.
 fn wait_for_exit(session: &mut LiveSession) -> ExitStatus {
-    match wait_for_event(session, |event| matches!(event, SessionEvent::Exited(_))) {
-        SessionEvent::Exited(status) => status,
+    match wait_for_event(session, |event| matches!(event, LiveEvent::Exited(_))) {
+        LiveEvent::Exited(status) => status,
         other => panic!("expected Exited, got {other:?}"),
     }
 }
@@ -261,7 +261,7 @@ fn try_recv_event_surfaces_output_and_exit() {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         match session.try_recv_event() {
-            Some(SessionEvent::OutputReady) => break,
+            Some(LiveEvent::OutputReady) => break,
             Some(_) => panic!("no other event can precede OutputReady here"),
             None => {
                 assert!(
@@ -278,7 +278,7 @@ fn try_recv_event_surfaces_output_and_exit() {
     session.send_bytes(b"\n").expect("input should be accepted");
     let status = loop {
         match session.try_recv_event() {
-            Some(SessionEvent::Exited(status)) => break status,
+            Some(LiveEvent::Exited(status)) => break status,
             Some(_) => {}
             None => {
                 assert!(Instant::now() < deadline, "timed out waiting for Exited");
@@ -291,4 +291,31 @@ fn try_recv_event_surfaces_output_and_exit() {
     assert!(grid_text(&session).contains("done"));
     // After the exit event nothing further is pending.
     assert!(session.try_recv_event().is_none());
+}
+
+#[test]
+fn osc_events_flow_through_the_live_channel() {
+    // OSC 9 (notification) observed by the core while output is fed must
+    // surface on the live event stream, in order, before Exited.
+    let mut session = spawn_shell_script("printf '\\033]9;build done\\007'; printf tail; exit 0");
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut notification = None;
+    let status = 'outer: loop {
+        for event in session.drain_events() {
+            match event {
+                LiveEvent::Osc(ait_term::SessionEvent::Notification { message, .. }) => {
+                    notification = Some(message);
+                }
+                LiveEvent::Exited(status) => break 'outer status,
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for Exited");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    assert!(status.success());
+    assert_eq!(notification.as_deref(), Some("build done"));
+    assert!(grid_text(&session).contains("tail"));
 }

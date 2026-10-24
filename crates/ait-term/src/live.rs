@@ -36,8 +36,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use std::collections::VecDeque;
+
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::events::SessionEvent;
 use crate::grid::{Cursor, Damage, GridView};
 use crate::key::KeyEvent;
 use crate::session::{Session, SessionOptions, Size};
@@ -150,14 +153,17 @@ pub enum SessionState {
 }
 
 /// A session event surfaced through [`LiveSession::drain_events`] or
-/// [`LiveSession::try_recv_event`]. OSC-sequence events join this enum when
-/// the observer lands (Spec R01).
+/// [`LiveSession::try_recv_event`] — the live channel's unified stream:
+/// output-ready hints, the core's observed [`SessionEvent`]s, and exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SessionEvent {
+pub enum LiveEvent {
     /// PTY output was fed into the grid; check [`LiveSession::damage`] and
     /// repaint.
     OutputReady,
+    /// An event the core observed while feeding output — OSC 7/133/9/777
+    /// and friends ([`SessionEvent`]).
+    Osc(SessionEvent),
     /// The spawned program exited.
     ///
     /// `Exited` is withheld until the reader thread has delivered all
@@ -165,7 +171,7 @@ pub enum SessionEvent {
     /// time it surfaces the grid holds everything the program printed —
     /// unless a process that outlived the session leader is still holding
     /// the PTY open, in which case trailing output may arrive as further
-    /// `OutputReady` events after `Exited`.
+    /// `OutputReady`/`Osc` events after `Exited`.
     Exited(ExitStatus),
 }
 
@@ -188,6 +194,9 @@ pub struct LiveSession {
     reader: Option<JoinHandle<()>>,
     waiter: Option<JoinHandle<()>>,
     child_pid: Option<u32>,
+    /// Events produced but not yet surfaced to the caller: `drain_events`
+    /// empties this, `try_recv_event` pops one at a time.
+    pending: VecDeque<LiveEvent>,
     /// The output channel disconnected (the reader thread finished): every
     /// byte the PTY will ever produce has been fed.
     reader_done: bool,
@@ -278,6 +287,7 @@ impl LiveSession {
             reader: Some(reader),
             waiter: Some(waiter),
             child_pid,
+            pending: VecDeque::new(),
             reader_done: false,
             exit_emitted: false,
         })
@@ -358,47 +368,51 @@ impl LiveSession {
 
     /// Feed all pending PTY output into the grid and return what happened.
     ///
-    /// Returns `OutputReady` (once, coalesced) if any bytes were fed, then
-    /// `Exited` if the child has finished. Terminal replies the core
-    /// generates while feeding (device-status answers, …) are written back
-    /// to the PTY before this returns.
-    pub fn drain_events(&mut self) -> Vec<SessionEvent> {
-        let mut events = Vec::new();
-        if self.feed_pending() {
-            events.push(SessionEvent::OutputReady);
-        }
-        if let Some(status) = self.pending_exit() {
-            events.push(self.finish_exit(status));
-        }
-        events
+    /// Events come back in stream order: the [`LiveEvent::Osc`] events
+    /// observed while feeding, a coalesced [`LiveEvent::OutputReady`]
+    /// covering those bytes, then [`LiveEvent::Exited`] if the child has
+    /// finished. Terminal replies the core generates while feeding
+    /// (device-status answers, …) are written back to the PTY before this
+    /// returns.
+    pub fn drain_events(&mut self) -> Vec<LiveEvent> {
+        self.pull_events();
+        self.pending.drain(..).collect()
     }
 
-    /// Non-blocking single event: `Exited` is reported as soon as the
-    /// waiter observed it (never starved by an output flood); otherwise
-    /// pending output is fed and `OutputReady` returned; `None` when
-    /// nothing is pending.
-    pub fn try_recv_event(&mut self) -> Option<SessionEvent> {
-        if let Some(status) = self.pending_exit() {
-            return Some(self.finish_exit(status));
+    /// Non-blocking single event from the same stream
+    /// [`drain_events`](Self::drain_events) returns; `None` when nothing is
+    /// pending.
+    pub fn try_recv_event(&mut self) -> Option<LiveEvent> {
+        if self.pending.is_empty() {
+            self.pull_events();
         }
-        if self.feed_pending() {
-            return Some(SessionEvent::OutputReady);
-        }
-        None
+        self.pending.pop_front()
     }
 
-    /// Drain every output chunk the reader has queued into the core.
-    /// Returns `true` when at least one byte was fed.
-    fn feed_pending(&mut self) -> bool {
+    /// One drain round into `pending`: feed queued output, then check the
+    /// waiter for an exit report.
+    fn pull_events(&mut self) {
+        self.feed_pending();
+        if let Some(status) = self.pending_exit() {
+            self.finish_exit(status);
+        }
+    }
+
+    /// Drain every output chunk the reader has queued into the core,
+    /// queueing the events it produced ([`LiveEvent::Osc`]s in stream
+    /// order, then one coalesced [`LiveEvent::OutputReady`]).
+    fn feed_pending(&mut self) {
         let mut fed = false;
         {
             let Some(rx) = &self.output_rx else {
-                return false;
+                return;
             };
             loop {
                 match rx.try_recv() {
                     Ok(chunk) => {
-                        self.session.feed_bytes(&chunk);
+                        for event in self.session.feed_bytes(&chunk) {
+                            self.pending.push_back(LiveEvent::Osc(event));
+                        }
                         fed = true;
                     }
                     Err(TryRecvError::Empty) => break,
@@ -412,8 +426,16 @@ impl LiveSession {
         }
         if fed {
             self.flush_pty_responses();
+            self.note_output_ready();
         }
-        fed
+    }
+
+    /// Queue `OutputReady` unless one is already queued at the tail —
+    /// consecutive feeds coalesce into a single repaint hint.
+    fn note_output_ready(&mut self) {
+        if !matches!(self.pending.back(), Some(LiveEvent::OutputReady)) {
+            self.pending.push_back(LiveEvent::OutputReady);
+        }
     }
 
     /// Write terminal-generated replies (device-status answers etc.) back
@@ -436,10 +458,10 @@ impl LiveSession {
         self.exit_rx.try_recv().ok()
     }
 
-    /// Surface `Exited`: first wait (bounded by [`READER_EXIT_GRACE`]) for
-    /// the reader to deliver trailing output so the grid is complete when
-    /// the event fires.
-    fn finish_exit(&mut self, status: ExitStatus) -> SessionEvent {
+    /// Queue `Exited`: first wait (bounded by [`READER_EXIT_GRACE`]) for
+    /// the reader to deliver trailing output — those bytes' events land
+    /// ahead of the `Exited` so the grid is complete when it fires.
+    fn finish_exit(&mut self, status: ExitStatus) {
         self.exit_emitted = true;
         let deadline = Instant::now() + READER_EXIT_GRACE;
         loop {
@@ -452,7 +474,7 @@ impl LiveSession {
         if self.reader_done {
             self.join_reader();
         }
-        SessionEvent::Exited(status)
+        self.pending.push_back(LiveEvent::Exited(status));
     }
 
     /// Join the reader thread if it already finished.

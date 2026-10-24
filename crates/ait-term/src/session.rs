@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{self, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{self, ClipboardType, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as TermCursorShape, Processor};
+use alacritty_terminal::vte::Parser;
 
+use crate::events::{ClipboardSelection, OscObserver, SessionEvent};
 use crate::grid::{Cursor, CursorShape, Damage, DamageBounds, GridView};
 use crate::key::{self, EncodingModes, KeyEvent};
 
@@ -53,6 +55,12 @@ pub struct SessionOptions {
     pub size: Size,
     /// Maximum scrollback lines kept above the viewport.
     pub scrollback: usize,
+    /// Honor OSC 52 clipboard-write requests: emit
+    /// [`SessionEvent::ClipboardWrite`]. **Off by default** — remote or
+    /// malicious output must never silently overwrite the user's clipboard
+    /// (REQUIREMENTS.md §5.1). The flag also gates the emulator's own OSC 52
+    /// handling, so the sequence is fully inert when off.
+    pub osc52: bool,
 }
 
 impl Default for SessionOptions {
@@ -60,24 +68,41 @@ impl Default for SessionOptions {
         Self {
             size: Size::new(80, 24),
             scrollback: DEFAULT_SCROLLBACK,
+            osc52: false,
         }
     }
 }
 
 /// Terminal event sink. Replies the terminal generates for the PTY (device
 /// status answers, clipboard loads, …) are queued for a future live driver to
-/// write back; everything else is dropped.
+/// write back; OSC 52 clipboard writes become [`SessionEvent`]s; everything
+/// else is dropped.
 #[derive(Debug, Default)]
 struct SessionListener {
     pty_responses: Arc<Mutex<VecDeque<String>>>,
+    events: Arc<Mutex<VecDeque<SessionEvent>>>,
 }
 
 impl EventListener for SessionListener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            if let Ok(mut queue) = self.pty_responses.lock() {
-                queue.push_back(text);
+        match event {
+            Event::PtyWrite(text) => {
+                if let Ok(mut queue) = self.pty_responses.lock() {
+                    queue.push_back(text);
+                }
             }
+            Event::ClipboardStore(clipboard_type, contents) => {
+                if let Ok(mut queue) = self.events.lock() {
+                    queue.push_back(SessionEvent::ClipboardWrite {
+                        selection: match clipboard_type {
+                            ClipboardType::Clipboard => ClipboardSelection::Clipboard,
+                            ClipboardType::Selection => ClipboardSelection::Selection,
+                        },
+                        contents,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -92,28 +117,57 @@ impl EventListener for SessionListener {
 pub struct Session {
     term: Term<SessionListener>,
     processor: Processor,
+    osc_parser: Parser,
+    osc_observer: OscObserver,
     pty_responses: Arc<Mutex<VecDeque<String>>>,
+    pending_events: Arc<Mutex<VecDeque<SessionEvent>>>,
 }
 
 impl Session {
     pub fn new(options: SessionOptions) -> Self {
         let config = term::Config {
             scrolling_history: options.scrollback,
+            // The emulator decodes OSC 52 for us; `OnlyCopy` keeps paste
+            // requests (`clipboard_load`) denied even when opted in.
+            osc52: if options.osc52 {
+                Osc52::OnlyCopy
+            } else {
+                Osc52::Disabled
+            },
             ..Default::default()
         };
         let listener = SessionListener::default();
         let pty_responses = Arc::clone(&listener.pty_responses);
+        let pending_events = Arc::clone(&listener.events);
         let term = Term::new(config, &options.size, listener);
         Self {
             term,
             processor: Processor::new(),
+            osc_parser: Parser::new(),
+            osc_observer: OscObserver::default(),
             pty_responses,
+            pending_events,
         }
     }
 
     /// Feed raw PTY output bytes into the session.
-    pub fn feed_bytes(&mut self, bytes: &[u8]) {
+    ///
+    /// Returns the [`SessionEvent`]s observed on the stream (Spec R01 — the
+    /// OSC interception seam): a parallel `vte` parser watches the same
+    /// bytes, so nothing is stripped from what the emulator renders.
+    /// Emulator-side events (currently `OSC 52` clipboard writes) are drained
+    /// first, so ordering across the two pipelines within one feed is
+    /// approximate.
+    pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<SessionEvent> {
         self.processor.advance(&mut self.term, bytes);
+        self.osc_parser.advance(&mut self.osc_observer, bytes);
+
+        let mut events: Vec<SessionEvent> = match self.pending_events.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        events.append(&mut self.osc_observer.take_events());
+        events
     }
 
     /// Resize the grid, reflowing wrapped lines.
