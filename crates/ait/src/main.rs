@@ -11,6 +11,7 @@ mod keymap;
 mod keys;
 mod render;
 mod scroll;
+mod selection;
 mod terminal;
 
 use std::env;
