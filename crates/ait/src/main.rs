@@ -7,8 +7,10 @@
 
 mod app;
 mod backend;
+mod keymap;
 mod keys;
 mod render;
+mod scroll;
 mod terminal;
 
 use std::env;

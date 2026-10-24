@@ -1,17 +1,22 @@
 //! The Round-2 application loop: one full-screen [`LiveSession`] in the
-//! host terminal (Spec R02-T1).
+//! host terminal (Spec R02, tickets T1+T2).
 //!
 //! The loop is synchronous per the spec — no async runtime in Round 2:
 //!
 //! 1. `crossterm::event::poll` for input (a short timeout caps the frame
 //!    period); every queued input event is serviced first so output floods
-//!    can never starve the keyboard (REQUIREMENTS.md §6).
-//! 2. [`LiveSession::drain_events`] feeds pending PTY output into the grid.
-//! 3. A frame renders only when the session reports damage.
+//!    can never starve the keyboard (REQUIREMENTS.md §6). Keys resolve
+//!    against the app [`keymap`] **before** PTY input (standard 7): bound
+//!    keys run app actions, everything else snaps the view to the bottom
+//!    and encodes to the shell. The mouse wheel scrolls scrollback.
+//! 2. [`LiveSession::drain_events`] feeds pending PTY output into the
+//!    grid; a scrolled-up view stays pinned on its lines.
+//! 3. A frame renders when the session reports damage or the scroll
+//!    offset moved since the last frame.
 //!
-//! When the session's child exits, `ait` exits with the child's status —
-//! the [`TerminalGuard`](crate::terminal::TerminalGuard) restores the host
-//! terminal on the way out.
+//! `Alt+Q` quits, and when the session's child exits `ait` exits with the
+//! child's status — the [`TerminalGuard`](crate::terminal::TerminalGuard)
+//! restores the host terminal on every way out.
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -24,13 +29,15 @@ use ait_term::{
     Size,
 };
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, MouseEventKind};
 use crossterm::queue;
 use ratatui::Terminal;
 
 use crate::backend::StyledBackend;
+use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::render::{paint_session, to_cursor_style, UnderlineOverlay};
+use crate::scroll::{ScrollState, WHEEL_LINES};
 use crate::terminal::TerminalGuard;
 
 /// Upper bound on one loop iteration's wait for input: at 8 ms the loop
@@ -38,11 +45,29 @@ use crate::terminal::TerminalGuard;
 /// input latency stays under a frame.
 const INPUT_POLL: Duration = Duration::from_millis(8);
 
+/// Whether the loop keeps running after an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handled {
+    Continue,
+    /// `Alt+Q` (or enhanced `Ctrl+Shift+Q`) — exit cleanly.
+    Quit,
+}
+
 /// Run the TUI: spawn `$SHELL` in a full-screen session and drive it until
-/// the child exits. Returns the child's exit status mapped to an
-/// [`ExitCode`].
+/// the child exits or the user quits. Returns the child's exit status
+/// mapped to an [`ExitCode`], or `SUCCESS` for a user quit.
 pub fn run() -> io::Result<ExitCode> {
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::with_options(crate::terminal::TerminalOptions {
+        mouse_capture: true,
+    })?;
+    // Capability detection runs once, before the event loop: the query
+    // blocks up to ~2 s on hosts that don't answer (tmux) and must never
+    // race `event::poll`.
+    let tier = if crate::terminal::enable_keyboard_enhancement() {
+        CapabilityTier::Enhanced
+    } else {
+        CapabilityTier::Legacy
+    };
     let (columns, rows) = crossterm::terminal::size()?;
     let mut session = LiveSession::spawn(LiveSessionOptions {
         session: SessionOptions {
@@ -61,14 +86,23 @@ pub fn run() -> io::Result<ExitCode> {
     // blocks on stdin, and the just-entered alternate screen is already
     // clean — the first damage render repaints everything.
     let mut last_cursor_shape = None;
+    // Scroll state lives next to the session: `rendered_offset` is what
+    // the last painted frame showed, so a change alone triggers repaint.
+    let mut scroll = ScrollState::new();
+    let mut rendered_offset = 0;
 
     let mut exit_status = None;
-    while exit_status.is_none() {
+    'main: while exit_status.is_none() {
         // 1. Input first, completely — floods must not starve keystrokes.
         if event::poll(INPUT_POLL)? {
-            handle_event(event::read()?, &mut session);
+            if let Handled::Quit = handle_event(event::read()?, &mut session, &mut scroll, tier) {
+                break;
+            }
             while event::poll(Duration::ZERO)? {
-                handle_event(event::read()?, &mut session);
+                if let Handled::Quit = handle_event(event::read()?, &mut session, &mut scroll, tier)
+                {
+                    break 'main;
+                }
             }
         }
 
@@ -85,44 +119,104 @@ pub fn run() -> io::Result<ExitCode> {
             break;
         }
 
-        // 3. Render only when the grid reports damage.
+        // A scrolled-up view stays pinned on its lines while output grows
+        // the scrollback underneath it.
+        scroll.on_output(session.grid().scrollback());
+
+        // 3. Render when the grid reports damage or the view moved.
         let damaged = !matches!(session.damage(), Damage::Partial(bounds) if bounds.is_empty());
-        if damaged {
-            render_frame(&mut terminal, &session, &underlines, &mut last_cursor_shape)?;
+        if damaged || scroll.offset() != rendered_offset {
+            render_frame(
+                &mut terminal,
+                &session,
+                &underlines,
+                &mut last_cursor_shape,
+                scroll.offset(),
+            )?;
+            rendered_offset = scroll.offset();
         }
     }
 
     Ok(exit_code(exit_status.as_ref()))
 }
 
-/// Route one host event: keys translate and go to the PTY (the keymap seam
-/// slots in ahead of this in a later ticket — every key goes to the
-/// session in T1), resizes forward to the PTY, the rest are ignored.
+/// Route one host event. Keys hit the app keymap **before** PTY input
+/// (standard 7): a bound key runs its action and never reaches the PTY; an
+/// unbound key snaps the view to the bottom and encodes to the shell as
+/// before. The wheel moves the scroll offset; resizes forward to the PTY.
 ///
 /// Write/resize failures (e.g. a just-dead child) are tolerated — the
 /// session's `Exited` event ends the loop cleanly.
-fn handle_event(event: Event, session: &mut LiveSession) {
+fn handle_event(
+    event: Event,
+    session: &mut LiveSession,
+    scroll: &mut ScrollState,
+    tier: CapabilityTier,
+) -> Handled {
     match event {
-        Event::Key(key_event) => {
-            if let Some(key_event) = keys::translate(&key_event) {
-                let _ = session.send_key(key_event);
+        Event::Key(key_event) => match keymap::resolve(&key_event, tier) {
+            Resolution::Action(action) => match action {
+                AppAction::Quit => return Handled::Quit,
+                AppAction::ScrollPageUp => {
+                    let grid = session.grid();
+                    scroll.scroll_up(grid.lines(), grid.scrollback());
+                }
+                AppAction::ScrollPageDown => {
+                    let page = session.grid().lines();
+                    scroll.scroll_down(page);
+                }
+                AppAction::ScrollTop => {
+                    let scrollback = session.grid().scrollback();
+                    scroll.jump_to_top(scrollback);
+                }
+                AppAction::ScrollBottom => scroll.snap_to_bottom(),
+                // Paste (T3) and the tab actions (T4) are bound so the
+                // keymap already owns the full Spec R02 table; they
+                // consume the key and do nothing until their dispatch
+                // lands.
+                AppAction::Paste
+                | AppAction::NewTab
+                | AppAction::CloseTab
+                | AppAction::NextTab
+                | AppAction::PrevTab
+                | AppAction::JumpToTab(_) => {}
+            },
+            Resolution::PassThrough => {
+                // Typing snaps the view back to the live viewport, then
+                // reaches the PTY encoded exactly as before.
+                scroll.snap_to_bottom();
+                if let Some(key_event) = keys::translate(&key_event) {
+                    let _ = session.send_key(key_event);
+                }
             }
-        }
+        },
+        Event::Mouse(mouse_event) => match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                let scrollback = session.grid().scrollback();
+                scroll.scroll_up(WHEEL_LINES, scrollback);
+            }
+            MouseEventKind::ScrollDown => scroll.scroll_down(WHEEL_LINES),
+            // Clicks/drags are T3's selection; motion isn't captured.
+            _ => {}
+        },
         Event::Resize(columns, rows) => {
             let _ = session.resize(Size::new(usize::from(columns), usize::from(rows)));
         }
-        // Focus, paste and mouse events have no T1 handler.
+        // Focus and paste events have no Round-2 handler yet.
         _ => {}
     }
+    Handled::Continue
 }
 
-/// Draw one frame: repaint the grid, apply the application-requested
-/// cursor shape (only when it changed), and place the cursor.
+/// Draw one frame: repaint the grid at `scroll_offset`, apply the
+/// application-requested cursor shape (only when it changed), and place
+/// the cursor.
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     session: &LiveSession,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
+    scroll_offset: usize,
 ) -> io::Result<()> {
     let cursor = session.cursor();
     if let Some(style) = to_cursor_style(cursor.shape) {
@@ -139,14 +233,16 @@ fn render_frame(
         {
             let mut overlay = underlines.borrow_mut();
             overlay.clear();
-            paint_session(frame.buffer_mut(), area, &grid, &mut overlay);
+            paint_session(frame.buffer_mut(), area, &grid, &mut overlay, scroll_offset);
         }
-        if cursor.shape != CursorShape::Hidden {
+        // The cursor's live line renders at screen row `line + offset`;
+        // scrolled far enough up it leaves the frame and stays hidden.
+        let y = cursor.line.saturating_add(scroll_offset);
+        if cursor.shape != CursorShape::Hidden && y < usize::from(area.height) {
             let x = (cursor.column as u16).min(area.width.saturating_sub(1));
-            let y = (cursor.line as u16).min(area.height.saturating_sub(1));
-            frame.set_cursor_position((x, y));
+            frame.set_cursor_position((x, y as u16));
         }
-        // A hidden cursor gets no position → ratatui hides it this frame.
+        // No position set → ratatui hides the cursor this frame.
     })?;
     terminal.backend_mut().writer_mut().flush()?;
     Ok(())
