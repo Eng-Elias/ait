@@ -97,11 +97,6 @@ impl Selection {
         *self = Self::default();
     }
 
-    /// Whether a drag is in progress.
-    pub fn dragging(&self) -> bool {
-        self.dragging
-    }
-
     /// The current normalized range — during and after a drag.
     pub fn range(&self) -> Option<SelectionRange> {
         let anchor = self.anchor?;
@@ -431,13 +426,13 @@ mod tests {
 
         selection.begin(point(2, 5));
         selection.extend(point(0, 1));
-        assert!(selection.dragging());
 
         let finished = selection.finish().unwrap();
         assert_eq!(finished.start, point(0, 1));
         assert_eq!(finished.end, point(2, 5));
-        assert!(!selection.dragging());
-        // The range stays for the post-release highlight.
+        // The drag ended: extend is a no-op now, and the range stays for
+        // the post-release highlight.
+        selection.extend(point(9, 9));
         assert_eq!(selection.range(), Some(finished));
     }
 

@@ -38,19 +38,23 @@ impl ScrollState {
     }
 
     /// New output arrived: feed the grid's current
-    /// [`scrollback()`](ait_term::GridView::scrollback) depth.
+    /// [`scrollback()`](ait_term::GridView::scrollback) depth. Returns how
+    /// many lines scrolled into history this call — the shift every grid
+    /// line index underwent (mouse selections follow it the same way the
+    /// pinned view does).
     ///
     /// A scrolled-up view stays pinned on the same lines, so its offset
     /// follows scrollback growth; at the bottom nothing moves. When the
     /// history buffer is full its depth stops growing and the pinned view
     /// drifts slowly — `GridView` exposes no per-line identity, so drift
     /// at the scrollback cap is the accepted bound.
-    pub fn on_output(&mut self, scrollback: usize) {
+    pub fn on_output(&mut self, scrollback: usize) -> usize {
+        let grown = scrollback.saturating_sub(self.last_scrollback);
         if self.offset > 0 {
-            let grown = scrollback.saturating_sub(self.last_scrollback);
             self.offset = (self.offset + grown).min(scrollback);
         }
         self.last_scrollback = scrollback;
+        grown
     }
 
     /// Scroll `lines` further into history, clamped at the oldest line.
