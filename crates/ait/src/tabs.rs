@@ -20,21 +20,25 @@
 //! - an exited session KEEPS its tab: [`Tab::exit_status`] records the
 //!   status, the caller drops input to it, and `Alt+W` removes it
 //!   without confirmation;
+//! - every transition away from the active tab (spawn, cycle, jump)
+//!   drops its selection highlight — a range on an off-screen tab is
+//!   stale state — while its scroll offset persists;
 //! - every tab is drained and resized each pass — background grids stay
 //!   current and their exits/OSC events surface.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use ait_term::{
-    ExitStatus, LiveEvent, LiveSession, LiveSessionOptions, SessionEvent, Size, SpawnError,
+    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, SessionEvent, Size,
+    SpawnError,
 };
 
 use crate::scroll::ScrollState;
 use crate::selection::Selection;
 
-/// Title shown when the spawned program has no usable basename
-/// (`$SHELL` unset or empty) — mirrors `ait-term`'s `/bin/sh` fallback.
+/// Title shown when the resolved program has no usable basename — the
+/// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
+/// this only guards pathological paths (e.g. `/`).
 const FALLBACK_TITLE: &str = "sh";
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
@@ -69,6 +73,31 @@ impl Tab {
     /// The tab-bar title: the spawned program's basename.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Read-only view of the session's grid (viewport + scrollback) —
+    /// what painting, selection extraction and scroll math all read.
+    pub fn grid(&self) -> GridView<'_> {
+        self.session.grid()
+    }
+
+    /// The grid's current scrollback depth — what every scroll/jump
+    /// bound clamps against.
+    pub fn scrollback(&self) -> usize {
+        self.session.grid().scrollback()
+    }
+
+    /// The renderable cursor: viewport position and shape.
+    pub fn cursor(&self) -> Cursor {
+        self.session.cursor()
+    }
+
+    /// The `N:title` label for the tab at position `index` (0-based) —
+    /// the tab bar paints it, and toasts use it to attribute a
+    /// background tab's notification. The 1-based position is what
+    /// `Alt+N` jumps to.
+    pub fn label(&self, index: usize) -> String {
+        format!("{}:{}", index + 1, self.title())
     }
 }
 
@@ -139,6 +168,9 @@ impl TabManager {
     /// `options.session.size` is always overridden — every tab's PTY is
     /// the content area, not the window (Spec R02 layout decision).
     fn spawn_tab(&mut self, mut options: LiveSessionOptions) -> Result<(), SpawnError> {
+        // The outgoing tab's highlight ends when its tab loses focus —
+        // even on a failed spawn, the keypress already left the tab.
+        self.clear_active_selection();
         options.session.size = self.size;
         let cwd = options.cwd.take().unwrap_or_else(|| self.spawn_cwd());
         options.cwd = Some(cwd.clone());
@@ -185,14 +217,21 @@ impl TabManager {
     }
 
     /// `Ctrl+PageDown`: the next tab, wrapping past the last.
+    ///
+    /// Switching drops the outgoing tab's selection — a highlight on a
+    /// tab that is no longer on screen is stale state.
     pub fn activate_next(&mut self) {
+        self.clear_active_selection();
         if !self.tabs.is_empty() {
             self.active = (self.active + 1) % self.tabs.len();
         }
     }
 
     /// `Ctrl+PageUp`: the previous tab, wrapping before the first.
+    /// Drops the outgoing tab's selection like
+    /// [`activate_next`](Self::activate_next).
     pub fn activate_prev(&mut self) {
+        self.clear_active_selection();
         if !self.tabs.is_empty() {
             self.active = self.active.checked_sub(1).unwrap_or(self.tabs.len() - 1);
         }
@@ -200,8 +239,10 @@ impl TabManager {
 
     /// `Alt+1..9`: jump straight to tab `n` (1-based). Out-of-range
     /// jumps are inert — the set may hold fewer tabs than the keymap
-    /// offers digits.
+    /// offers digits — but the keypress still drops the outgoing tab's
+    /// selection like every switch.
     pub fn jump_to(&mut self, n: usize) {
+        self.clear_active_selection();
         if n >= 1 && n <= self.tabs.len() {
             self.active = n - 1;
         }
@@ -220,6 +261,15 @@ impl TabManager {
     /// Index of the active tab (meaningless on the empty set).
     pub fn active_index(&self) -> usize {
         self.active
+    }
+
+    /// Drop the active tab's selection highlight — every transition
+    /// away from a tab (spawn, cycle, jump) starts here. Inert on the
+    /// empty set.
+    fn clear_active_selection(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.selection.clear();
+        }
     }
 
     /// All tabs, in tab-bar order.
@@ -243,7 +293,7 @@ impl TabManager {
         self.tabs()
             .iter()
             .enumerate()
-            .map(|(index, tab)| format!("{}:{}", index + 1, tab.title()))
+            .map(|(index, tab)| tab.label(index))
             .collect()
     }
 
@@ -293,17 +343,14 @@ impl TabManager {
     }
 }
 
-/// The tab-bar title for a session spawned from `options`: the
-/// program's basename — `options.program` when explicit, else `$SHELL`
-/// like [`LiveSession::spawn`] resolves it — with `sh` as the fallback
-/// when neither yields a usable name.
+/// The tab-bar title for a session spawned from `options`: the resolved
+/// program's basename, with `sh` as the fallback when the path has no
+/// usable name. The program itself comes from
+/// [`LiveSessionOptions::resolved_program`] — the same resolution
+/// [`LiveSession::spawn`] applies — so the title can never drift from
+/// what actually spawned.
 fn title_for(options: &LiveSessionOptions) -> String {
-    let program = options
-        .program
-        .clone()
-        .or_else(|| std::env::var_os("SHELL"))
-        .unwrap_or_else(|| OsString::from(FALLBACK_TITLE));
-    Path::new(&program)
+    Path::new(&options.resolved_program())
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
@@ -313,6 +360,7 @@ fn title_for(options: &LiveSessionOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
     /// Generous bound for every wait below (mirrors ait-term's live
@@ -421,8 +469,10 @@ mod tests {
         );
     }
 
-    /// Per-tab viewport state: each tab keeps its own scroll offset and
-    /// selection, untouched by a switch.
+    /// Per-tab viewport state: each tab keeps its own scroll offset —
+    /// a switch leaves the background tab's view untouched. The
+    /// selection is the exception: a switch drops the outgoing tab's
+    /// highlight, since a range on an off-screen tab is stale state.
     #[test]
     fn viewport_state_is_per_tab() {
         let mut manager = manager(2, "/tmp");
@@ -441,7 +491,10 @@ mod tests {
         manager.activate_prev();
         let first = manager.active().unwrap();
         assert_eq!(first.scroll.offset(), 7, "first tab kept its offset");
-        assert!(first.selection.range().is_some());
+        assert!(
+            first.selection.range().is_none(),
+            "the switch dropped the outgoing highlight"
+        );
     }
 
     /// Cycling wraps at both ends; `jump_to` is 1-based and ignores

@@ -43,7 +43,7 @@ pub struct TerminalOptions {
 /// left, mouse released, cursor shape reset to the user's default and made
 /// visible, raw mode off.
 pub struct TerminalGuard {
-    // Private so construction only happens through `enter`/`with_options`.
+    // Private so construction only happens through `with_options`.
     _private: (),
 }
 
