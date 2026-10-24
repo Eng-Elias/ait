@@ -17,13 +17,16 @@
 //!    already exited is dropped.
 //! 2. [`TabManager::drain_events`] feeds pending PTY output into EVERY
 //!    tab's grid and surfaces lifecycle events — background sessions keep
-//!    up, `Exited` marks the tab rather than ending the loop, and OSC 7
-//!    reports track each tab's cwd for `Alt+T` to inherit.
+//!    up, `Exited` marks the tab rather than ending the loop, OSC 7
+//!    reports track each tab's cwd for `Alt+T` to inherit, and OSC 9/777
+//!    `Notification`s become a ~3 s toast on the status line.
 //! 3. A frame renders when the active session reports damage or what the
 //!    last frame showed changed (view offset, selection, active tab, tab
-//!    count). Chrome — the tab bar on top and the status-line row T5 owns
-//!    at the bottom — lives outside the session grid; the PTY winsize is
-//!    the content area only.
+//!    count, status-line text). The status text is part of that snapshot,
+//!    so a session exiting or a toast appearing/expiring repaints even
+//!    with no grid damage. Chrome — the tab bar on top and the status
+//!    line at the bottom — lives outside the session grid; the PTY
+//!    winsize is the content area only.
 //!
 //! `Alt+Q` quits everything, and closing the LAST tab exits `ait` cleanly
 //! — the empty tab set is guarded before any indexing (standard 6). The
@@ -35,7 +38,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ait_term::{CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
 use crossterm::clipboard::CopyToClipboard;
@@ -54,6 +57,7 @@ use crate::render::{
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
+use crate::status::{notification_text, status_text, Toast};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
 
@@ -71,10 +75,29 @@ enum Handled {
     Quit,
 }
 
+/// App-global mutable state the loop owns and `handle_event` mutates:
+/// the bits that don't belong to any one tab.
+struct AppState {
+    /// The current window rect (updated on resize).
+    screen: Rect,
+    /// The last copied selection — whichever tab it came from;
+    /// `Shift+Insert` pastes it into the active tab.
+    copied_text: Option<String>,
+    /// The exit status of the last closed tab, captured when closing
+    /// empties the set — it becomes ait's exit code then.
+    last_exit: Option<ExitStatus>,
+    /// The live status-line toast, if any — a notification or error
+    /// message that replaces the summary until its deadline (~3 s),
+    /// expiring on the loop's 8 ms tick, not on a thread.
+    toast: Option<Toast>,
+}
+
 /// What the last painted frame showed: a change in any field alone
 /// triggers a repaint even when the grid reports no damage (a tab switch
 /// repaints an unchanged-but-background grid; a close repaints the tab
-/// bar).
+/// bar; a session exit, cwd change, or a toast appearing/expiring
+/// repaints the status line — including an `Exited` on a grid that
+/// reports no further damage).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rendered {
     /// Which tab was painted.
@@ -85,6 +108,10 @@ struct Rendered {
     offset: usize,
     /// The painted selection range.
     selection: Option<SelectionRange>,
+    /// The status line's text this frame (toast or session summary).
+    status: String,
+    /// Whether `status` was a live toast (painted reversed).
+    toast: bool,
 }
 
 /// Run the TUI: spawn `$SHELL` in a tab and drive the tab set until the
@@ -104,11 +131,16 @@ pub fn run() -> io::Result<ExitCode> {
         CapabilityTier::Legacy
     };
     let (columns, rows) = crossterm::terminal::size()?;
-    let mut screen = Rect::new(0, 0, columns, rows);
+    let mut state = AppState {
+        screen: Rect::new(0, 0, columns, rows),
+        copied_text: None,
+        last_exit: None,
+        toast: None,
+    };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
-    let mut tabs =
-        TabManager::spawn(content_size(screen)).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut tabs = TabManager::spawn(content_size(state.screen))
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let backend = StyledBackend::new(io::stdout());
     let underlines = backend.underline_overlay();
@@ -117,13 +149,7 @@ pub fn run() -> io::Result<ExitCode> {
     // blocks on stdin, and the just-entered alternate screen is already
     // clean — the first damage render repaints everything.
     let mut last_cursor_shape = None;
-    // `copied_text` is app-global — the last copy wins, whichever tab it
-    // came from; `Shift+Insert` pastes it into the active tab.
-    let mut copied_text: Option<String> = None;
     let mut rendered: Option<Rendered> = None;
-    // The exit status of the last closed tab, captured only when closing
-    // empties the set — it becomes ait's exit code then.
-    let mut last_exit: Option<ExitStatus> = None;
 
     'main: loop {
         // 1. Input first, completely — floods must not starve keystrokes.
@@ -131,9 +157,7 @@ pub fn run() -> io::Result<ExitCode> {
             if let Handled::Quit = handle_event(
                 event::read()?,
                 &mut tabs,
-                &mut copied_text,
-                &mut screen,
-                &mut last_exit,
+                &mut state,
                 terminal.backend_mut().writer_mut(),
                 tier,
             ) {
@@ -143,9 +167,7 @@ pub fn run() -> io::Result<ExitCode> {
                 if let Handled::Quit = handle_event(
                     event::read()?,
                     &mut tabs,
-                    &mut copied_text,
-                    &mut screen,
-                    &mut last_exit,
+                    &mut state,
                     terminal.backend_mut().writer_mut(),
                     tier,
                 ) {
@@ -156,16 +178,35 @@ pub fn run() -> io::Result<ExitCode> {
 
         // 2. Drain EVERY tab: feeds queued PTY bytes into the grids and
         //    surfaces lifecycle events. `CwdChanged`/`Exited` are applied
-        //    inside the manager; the returned stream is where T5 picks up
-        //    `Notification`s for its toast.
+        //    inside the manager; `Notification`s become the status-line
+        //    toast here.
         for tab_event in tabs.drain_events() {
-            // Child-app OSC 52 stays off (`SessionOptions::osc52`
-            // default), so this event can't fire — when Round 3's
-            // config flips the option, honor the request by copying
-            // `contents` to the host clipboard exactly like our own
-            // selection copies. `Notification`s surface to T5's toast
-            // from this same stream.
-            if let LiveEvent::Osc(SessionEvent::ClipboardWrite { .. }) = tab_event.event {}
+            match tab_event.event {
+                // OSC 9/777: the child asked for a notification. A
+                // background tab's toast is prefixed with its tab-bar
+                // label (`N:title`) so it surfaces with attribution
+                // (Spec R02 user story 16).
+                LiveEvent::Osc(SessionEvent::Notification { title, message }) => {
+                    let source = if tab_event.tab == tabs.active_index() {
+                        None
+                    } else {
+                        tabs.tabs()
+                            .get(tab_event.tab)
+                            .map(|tab| format!("{}:{}", tab_event.tab + 1, tab.title()))
+                    };
+                    state.toast = Some(Toast::new(
+                        notification_text(source.as_deref(), title.as_deref(), &message),
+                        Instant::now(),
+                    ));
+                }
+                // Child-app OSC 52 stays off (`SessionOptions::osc52`
+                // default), so this event can't fire — when Round 3's
+                // config flips the option, honor the request by copying
+                // `contents` to the host clipboard exactly like our own
+                // selection copies.
+                LiveEvent::Osc(SessionEvent::ClipboardWrite { .. }) => {}
+                _ => {}
+            }
         }
 
         // Standard 6: the last close already exits via `Handled::Quit`;
@@ -178,21 +219,38 @@ pub fn run() -> io::Result<ExitCode> {
         };
 
         // 3. Render when the grid reports damage or the painted view
-        //    changed.
+        //    changed. The status text rides the snapshot, so `Exited`
+        //    and toast expiry repaint without grid damage.
         let damaged = !matches!(tab.session.damage(), Damage::Partial(bounds) if bounds.is_empty());
+        let now = Instant::now();
         let view = Rendered {
             active,
             count,
             offset: tab.scroll.offset(),
             selection: tab.selection.range(),
+            status: status_text(
+                tab.cwd(),
+                tab.title(),
+                tab.exit_status(),
+                state.toast.as_ref(),
+                now,
+            ),
+            toast: state.toast.as_ref().is_some_and(|t| t.is_live(now)),
         };
         if damaged || rendered.as_ref() != Some(&view) {
-            render_frame(&mut terminal, &tabs, &underlines, &mut last_cursor_shape)?;
+            render_frame(
+                &mut terminal,
+                &tabs,
+                &view.status,
+                view.toast,
+                &underlines,
+                &mut last_cursor_shape,
+            )?;
             rendered = Some(view);
         }
     }
 
-    Ok(exit_code(last_exit.as_ref()))
+    Ok(exit_code(state.last_exit.as_ref()))
 }
 
 /// Route one host event. Keys hit the app keymap **before** PTY input
@@ -204,16 +262,16 @@ pub fn run() -> io::Result<ExitCode> {
 /// also clears the selection highlight. The wheel moves the scroll
 /// offset; a left-button drag selects cells and its release copies the
 /// text to the host clipboard via OSC 52 — a silent no-op where the host
-/// denies it (Spec R02). Resizes forward to EVERY tab's PTY.
+/// denies it (Spec R02). Resizes forward to EVERY tab's PTY. A failed
+/// `Alt+T` spawn surfaces as a status-line toast instead of being
+/// swallowed.
 ///
 /// Write/resize failures (e.g. a just-dead child) are tolerated — the
 /// session's `Exited` event marks the tab cleanly.
 fn handle_event<W: Write>(
     event: Event,
     tabs: &mut TabManager,
-    copied_text: &mut Option<String>,
-    screen: &mut Rect,
-    last_exit: &mut Option<ExitStatus>,
+    state: &mut AppState,
     host: &mut W,
     tier: CapabilityTier,
 ) -> Handled {
@@ -227,15 +285,20 @@ fn handle_event<W: Write>(
                     tab.selection.clear();
                 }
                 // A spawn failure (e.g. the tracked cwd was deleted)
-                // leaves the set untouched — T5's toast is the surface
-                // for the error.
-                let _ = tabs.new_tab();
+                // leaves the set untouched — toast it instead of
+                // swallowing it.
+                if let Err(error) = tabs.new_tab() {
+                    state.toast = Some(Toast::new(
+                        format!("new tab failed: {error}"),
+                        Instant::now(),
+                    ));
+                }
             }
             Resolution::Action(AppAction::CloseTab) => {
                 // Closing the last tab exits ait; capture its status for
                 // the process exit code before it is removed.
                 if tabs.len() == 1 {
-                    *last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
+                    state.last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
                 }
                 // `false` = the set is now empty: quit rather than ever
                 // indexing it (standard 6).
@@ -289,7 +352,7 @@ fn handle_event<W: Write>(
                         // Exited sessions drop input like keys do.
                         tab.scroll.snap_to_bottom();
                         if tab.exit_status().is_none() {
-                            if let Some(text) = copied_text.as_deref() {
+                            if let Some(text) = state.copied_text.as_deref() {
                                 let bytes = encode_paste(text, tab.session.bracketed_paste());
                                 let _ = tab.session.send_bytes(&bytes);
                             }
@@ -317,7 +380,7 @@ fn handle_event<W: Write>(
             }
         },
         Event::Mouse(mouse_event) => {
-            let content = chrome_areas(*screen).content;
+            let content = chrome_areas(state.screen).content;
             let Some(tab) = tabs.active_mut() else {
                 return Handled::Continue;
             };
@@ -353,7 +416,7 @@ fn handle_event<W: Write>(
                     if let Some(range) = tab.selection.finish() {
                         let text = extract(&tab.session.grid(), range);
                         if !text.is_empty() {
-                            *copied_text = Some(text.clone());
+                            state.copied_text = Some(text.clone());
                             // OSC 52 silently no-ops where the host
                             // denies it — never an error (Spec R02).
                             let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
@@ -366,11 +429,11 @@ fn handle_event<W: Write>(
             }
         }
         Event::Resize(columns, rows) => {
-            *screen = Rect::new(0, 0, columns, rows);
+            state.screen = Rect::new(0, 0, columns, rows);
             // EVERY tab's PTY gets the new content-area winsize, not just
             // the visible one (Spec R02 user story 17); selections are
             // cleared inside — reflow invalidates their coordinates.
-            tabs.resize_all(content_size(*screen));
+            tabs.resize_all(content_size(state.screen));
         }
         // Focus and paste events have no Round-2 handler yet.
         _ => {}
@@ -391,11 +454,14 @@ fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPo
 
 /// Draw one frame: the tab bar on top, the active tab's grid in the
 /// content band (shifted `scroll_offset` lines into scrollback, selected
-/// cells inverted), the reserved status row at the bottom, then the
-/// application-requested cursor shape and position.
+/// cells inverted), the status line at the bottom (`status`, reversed
+/// while it's a live toast), then the application-requested cursor
+/// shape and position.
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     tabs: &TabManager,
+    status: &str,
+    toast: bool,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
 ) -> io::Result<()> {
@@ -437,7 +503,7 @@ fn render_frame(
             }
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
-        paint_status_line(buf, areas.status);
+        paint_status_line(buf, areas.status, status, toast);
         // The cursor's live line renders at `content.y + line + offset`;
         // scrolled far enough up it leaves the band and stays hidden.
         let y = usize::from(areas.content.y) + cursor.line + tab.scroll.offset();
@@ -480,9 +546,7 @@ mod tests {
 
     struct Harness {
         tabs: TabManager,
-        screen: Rect,
-        copied: Option<String>,
-        last_exit: Option<ExitStatus>,
+        state: AppState,
         sink: Vec<u8>,
     }
 
@@ -490,9 +554,12 @@ mod tests {
         fn new(tabs: TabManager) -> Self {
             Self {
                 tabs,
-                screen: Rect::new(0, 0, 80, 24),
-                copied: None,
-                last_exit: None,
+                state: AppState {
+                    screen: Rect::new(0, 0, 80, 24),
+                    copied_text: None,
+                    last_exit: None,
+                    toast: None,
+                },
                 sink: Vec::new(),
             }
         }
@@ -501,9 +568,7 @@ mod tests {
             handle_event(
                 event,
                 &mut self.tabs,
-                &mut self.copied,
-                &mut self.screen,
-                &mut self.last_exit,
+                &mut self.state,
                 &mut self.sink,
                 CapabilityTier::Legacy,
             )
@@ -618,6 +683,21 @@ mod tests {
             harness.tabs.tabs()[1].scroll.offset(),
             3,
             "the background tab kept its offset"
+        );
+    }
+
+    /// A successful `Alt+T` shows no toast — the status line keeps its
+    /// `cwd · shell · model · state` summary.
+    #[test]
+    fn successful_new_tab_shows_no_toast() {
+        let mut harness = Harness::new(manager());
+
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+
+        assert_eq!(harness.tabs.len(), 2);
+        assert!(
+            harness.state.toast.is_none(),
+            "a successful spawn is silent"
         );
     }
 }

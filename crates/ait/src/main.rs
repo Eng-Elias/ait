@@ -12,6 +12,7 @@ mod keys;
 mod render;
 mod scroll;
 mod selection;
+mod status;
 mod tabs;
 mod terminal;
 
