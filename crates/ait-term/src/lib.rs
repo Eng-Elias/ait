@@ -11,6 +11,7 @@
 
 mod events;
 mod grid;
+mod key;
 mod session;
 
 pub use events::{ClipboardSelection, PromptMarkKind, SessionEvent};
@@ -18,4 +19,5 @@ pub use grid::{
     AnsiColor, Cell, CellKind, Color, Cursor, CursorShape, Damage, DamageBounds, GridView, Rgb,
     Row, Style, Underline,
 };
+pub use key::{Key, KeyEvent, Keypad, Modifiers};
 pub use session::{Session, SessionOptions, Size, DEFAULT_SCROLLBACK};
