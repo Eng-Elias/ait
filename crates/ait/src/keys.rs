@@ -6,9 +6,10 @@
 //! Encoding to PTY bytes — including application cursor/keypad modes — is
 //! `ait_term`'s job ([`LiveSession::send_key`](ait_term::LiveSession::send_key)).
 //!
-//! Round 2 has no app keymap yet (Spec R02-T1): every translated event is
-//! written straight to the PTY. The keymap seam from the spec slots in as a
-//! lookup *before* this translation runs.
+//! The app keymap ([`crate::keymap`]) resolves each key event **before** this
+//! translation runs: only events it resolves
+//! [`PassThrough`](crate::keymap::Resolution::PassThrough) ever reach
+//! [`translate`] — bound actions never see the PTY.
 
 use ait_term::{Key, KeyEvent, Keypad, Modifiers};
 use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};

@@ -30,13 +30,26 @@ use ratatui::style::{Color as RtColor, Modifier};
 /// `Modifier::UNDERLINED` on the buffer cell says".
 pub type UnderlineOverlay = HashMap<(u16, u16), Underline>;
 
+/// The one screen→grid rule, shared by painting and mouse hit-testing:
+/// the content-band screen row `row` displays
+/// `grid.line(row - content.y - scroll_offset)` — line `0` is the
+/// viewport's first line, negatives reach into scrollback. The reverse
+/// direction (grid line → screen row, used to place the live cursor) is
+/// `content.y + line + scroll_offset`.
+///
+/// A `scroll_offset` past `i32::MAX` clamps the same way the painters do.
+pub fn grid_line(row: u16, content: Rect, scroll_offset: usize) -> i32 {
+    let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
+    i32::from(row) - i32::from(content.y) - offset
+}
+
 /// Paint the session's grid into `buf`, covering `area`, shifted
 /// `scroll_offset` lines into scrollback (`0` = live viewport).
 ///
 /// Screen row `i` displays `grid.line(i - scroll_offset)` — a positive
 /// offset pulls history lines in from the top. `area` is the region the
-/// grid occupies (the whole frame for the single-session skeleton; a
-/// smaller rect once chrome lands). Cells past the grid's edge — e.g. a
+/// grid occupies — the content band [`chrome_areas`] carves between the
+/// tab bar and the status line. Cells past the grid's edge — e.g. a
 /// just-grown frame before the session's resize is processed — are reset
 /// to blank.
 pub fn paint_session(
@@ -46,13 +59,10 @@ pub fn paint_session(
     overlay: &mut UnderlineOverlay,
     scroll_offset: usize,
 ) {
-    // `offset` can't exceed i32 (scrollback depth is small), but guard the
-    // cast anyway — a pathological offset just paints blanks.
-    let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
     let viewport_rows = grid.lines().min(usize::from(area.height));
     for row_index in 0..viewport_rows {
         let y = area.y + row_index as u16;
-        let line_index = row_index as i32 - offset;
+        let line_index = grid_line(y, area, scroll_offset);
         let Some(row) = grid.line(line_index) else {
             // Above the oldest scrollback line (offset deeper than the
             // history, e.g. right after a shrink) — paint blank.
@@ -116,11 +126,10 @@ pub fn apply_selection(
     range: SelectionRange,
     scroll_offset: usize,
 ) {
-    let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
     let viewport_rows = grid.lines().min(usize::from(area.height));
     for row_index in 0..viewport_rows {
-        let line = row_index as i32 - offset;
         let y = area.y + row_index as u16;
+        let line = grid_line(y, area, scroll_offset);
         for col in 0..usize::from(area.right() - area.x) {
             if !range.contains(line, col) {
                 continue;
