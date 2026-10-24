@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{self, Term, TermDamage};
+use alacritty_terminal::term::{self, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape as TermCursorShape, Processor};
 
 use crate::grid::{Cursor, CursorShape, Damage, DamageBounds, GridView};
+use crate::key::{self, EncodingModes, KeyEvent};
 
 /// Default scrollback capacity, in lines (REQUIREMENTS.md §5.1).
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -166,6 +167,22 @@ impl Session {
         };
         self.term.reset_damage();
         damage
+    }
+
+    /// Encode a [`KeyEvent`] into the bytes to write to the PTY.
+    ///
+    /// The encoding honors the modes the application set through its own
+    /// output: application cursor keys (DECCKM) switch unmodified
+    /// arrows/Home/End to their SS3 forms, and application keypad (DECKPAM)
+    /// switches numpad keys. Frontends hand over `KeyEvent`s only — escape
+    /// sequences are owned by the core.
+    pub fn encode_key(&self, event: KeyEvent) -> Vec<u8> {
+        let mode = self.term.mode();
+        let modes = EncodingModes {
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            app_keypad: mode.contains(TermMode::APP_KEYPAD),
+        };
+        key::encode(&event, modes)
     }
 
     /// Responses the terminal generated for the PTY (e.g. device-status
