@@ -8,7 +8,9 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   numbers (§5.3 …) in specs, tickets and PRs.
 - Decisions made since live in `docs/adr/`; an ADR wins over `REQUIREMENTS.md`.
   Update `REQUIREMENTS.md` in the same PR that adds a conflicting ADR.
-- Work only inside this repository. Do not read files outside it.
+- Work only inside this repository — except the sibling `ait-notes-*/`
+  and `ait-worktrees/` directories used by runbook rounds for research
+  notes and ticket worktrees.
 - Write our own prompts, tool descriptions and assets.
 
 ## Navigation
@@ -72,3 +74,8 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`,
 
 Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See
 `docs/agents/domain.md`.
+
+### Subagents
+
+Worktree, research-notes and skill conventions for runbook rounds:
+`docs/agents/subagents.md`.
