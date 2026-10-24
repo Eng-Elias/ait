@@ -13,6 +13,7 @@
 //! reads when emitting SGR `4:x` attributes.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
@@ -29,6 +30,14 @@ use ratatui::style::{Color as RtColor, Modifier};
 /// underline differs from `None` appear — a missing key means "whatever
 /// `Modifier::UNDERLINED` on the buffer cell says".
 pub type UnderlineOverlay = HashMap<(u16, u16), Underline>;
+
+/// Blank `xs` columns on row `y` — the reset every painter uses for
+/// uncovered tails and stale cells.
+fn reset_span(buf: &mut Buffer, y: u16, xs: Range<u16>) {
+    for x in xs {
+        buf[(x, y)].reset();
+    }
+}
 
 /// The one screen→grid rule, shared by painting and mouse hit-testing:
 /// the content-band screen row `row` displays
@@ -66,9 +75,7 @@ pub fn paint_session(
         let Some(row) = grid.line(line_index) else {
             // Above the oldest scrollback line (offset deeper than the
             // history, e.g. right after a shrink) — paint blank.
-            for x in area.x..area.right() {
-                buf[(x, y)].reset();
-            }
+            reset_span(buf, y, area.x..area.right());
             continue;
         };
         // Text first: `set_stringn` sizes graphemes itself, so wide
@@ -104,9 +111,7 @@ pub fn paint_session(
     }
     // Clear any rows the grid doesn't cover (resize slack).
     for y in (area.y + viewport_rows as u16)..area.bottom() {
-        for x in area.x..area.right() {
-            buf[(x, y)].reset();
-        }
+        reset_span(buf, y, area.x..area.right());
     }
 }
 
@@ -222,10 +227,7 @@ pub fn paint_tab_bar(buf: &mut Buffer, area: Rect, titles: &[String], active: us
     }
     // Clear whatever the bar doesn't cover (a stale longer bar, the
     // unused tail).
-    while x < area.right() {
-        buf[(x, y)].reset();
-        x += 1;
-    }
+    reset_span(buf, y, x..area.right());
 }
 
 /// Paint the status-line row: `text` clipped at the row's right edge,
@@ -240,9 +242,7 @@ pub fn paint_status_line(buf: &mut Buffer, area: Rect, text: &str, highlighted: 
     let y = area.y;
     // Reset first: `set_stringn` patches symbols but doesn't clear a
     // stale REVERSED left by an expired toast.
-    for x in area.x..area.right() {
-        buf[(x, y)].reset();
-    }
+    reset_span(buf, y, area.x..area.right());
     // `set_stringn` sizes graphemes itself, so a wide char in a cwd
     // occupies two columns like it does in the grid.
     let width = usize::from(area.right() - area.x);

@@ -34,7 +34,7 @@ use ait_term::{
 };
 
 use crate::scroll::ScrollState;
-use crate::selection::Selection;
+use crate::selection::{GridPoint, Selection, SelectionRange};
 
 /// Title shown when the resolved program has no usable basename — the
 /// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
@@ -42,13 +42,22 @@ use crate::selection::Selection;
 const FALLBACK_TITLE: &str = "sh";
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
+///
+/// The session is public — the frontend legitimately drives its whole
+/// API (keys, bytes, damage) — but the scroll offset and selection are
+/// owned data: callers go through the methods so the grid-math they
+/// need (`scrollback` bounds, page size) can't drift out of sync.
 pub struct Tab {
     /// The live PTY session this tab drives.
     pub session: LiveSession,
     /// How far above the live viewport this tab's view sits.
-    pub scroll: ScrollState,
-    /// This tab's mouse-selection state.
-    pub selection: Selection,
+    /// `pub(crate)`: tests reach the raw state to stage offsets the
+    /// clamping methods can't produce; production callers use the
+    /// `scroll_*`/`page_*`/`snap_to_bottom` methods.
+    pub(crate) scroll: ScrollState,
+    /// This tab's mouse-selection state — same `pub(crate)` test seam;
+    /// production callers use the `*_selection` methods.
+    pub(crate) selection: Selection,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
     cwd: PathBuf,
@@ -98,6 +107,76 @@ impl Tab {
     /// `Alt+N` jumps to.
     pub fn label(&self, index: usize) -> String {
         format!("{}:{}", index + 1, self.title())
+    }
+
+    /// Distance the view sits above the live viewport (`0` = bottom).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll.offset()
+    }
+
+    /// Scroll `lines` into history, clamped at the oldest line.
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll.scroll_up(lines, self.scrollback());
+    }
+
+    /// Scroll `lines` toward the live viewport, clamped at the bottom.
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll.scroll_down(lines);
+    }
+
+    /// Scroll one page (a viewport's height) into history.
+    pub fn page_up(&mut self) {
+        self.scroll_up(self.grid().lines());
+    }
+
+    /// Scroll one page toward the live viewport.
+    pub fn page_down(&mut self) {
+        let page = self.grid().lines();
+        self.scroll.scroll_down(page);
+    }
+
+    /// Jump to the oldest scrollback line.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll.jump_to_top(self.scrollback());
+    }
+
+    /// Snap back to the live viewport — what a keypress does.
+    pub fn snap_to_bottom(&mut self) {
+        self.scroll.snap_to_bottom();
+    }
+
+    /// Begin a mouse-drag selection at `point` (grid coordinates).
+    pub fn begin_selection(&mut self, point: GridPoint) {
+        self.selection.begin(point);
+    }
+
+    /// Extend the in-flight selection to `point`; a no-op outside a
+    /// drag.
+    pub fn extend_selection(&mut self, point: GridPoint) {
+        self.selection.extend(point);
+    }
+
+    /// Finish the drag and return the selected range, if any.
+    pub fn finish_selection(&mut self) -> Option<SelectionRange> {
+        self.selection.finish()
+    }
+
+    /// Drop the highlight — typing, scrolling or switching away does
+    /// this; stale state never lingers.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    /// The currently highlighted range, if any.
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        self.selection.range()
+    }
+
+    /// Follow new output: a pinned view rides scrollback growth, and a
+    /// held selection shifts with it. Called once per drained batch.
+    fn on_output(&mut self) {
+        let grown = self.scroll.on_output(self.session.grid().scrollback());
+        self.selection.on_output(grown);
     }
 }
 
@@ -268,7 +347,7 @@ impl TabManager {
     /// empty set.
     fn clear_active_selection(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.selection.clear();
+            tab.clear_selection();
         }
     }
 
@@ -306,7 +385,7 @@ impl TabManager {
     pub fn resize_all(&mut self, size: Size) {
         self.size = size;
         for tab in &mut self.tabs {
-            tab.selection.clear();
+            tab.clear_selection();
             let _ = tab.session.resize(size);
         }
     }
@@ -336,8 +415,7 @@ impl TabManager {
                 }
                 events.push(TabEvent { tab: index, event });
             }
-            let grown = tab.scroll.on_output(tab.session.grid().scrollback());
-            tab.selection.on_output(grown);
+            tab.on_output();
         }
         events
     }
@@ -478,21 +556,21 @@ mod tests {
         let mut manager = manager(2, "/tmp");
         manager.jump_to(1);
         let first = manager.active_mut().unwrap();
+        // Field access fixes a nonzero offset the public methods would
+        // clamp against this tiny session's real scrollback.
         first.scroll.jump_to_top(7);
-        first
-            .selection
-            .begin(crate::selection::GridPoint::new(0, 0));
+        first.begin_selection(crate::selection::GridPoint::new(0, 0));
 
         manager.activate_next();
         let second = manager.active().unwrap();
-        assert_eq!(second.scroll.offset(), 0, "new tab starts at bottom");
-        assert_eq!(second.selection.range(), None);
+        assert_eq!(second.scroll_offset(), 0, "new tab starts at bottom");
+        assert_eq!(second.selection_range(), None);
 
         manager.activate_prev();
         let first = manager.active().unwrap();
-        assert_eq!(first.scroll.offset(), 7, "first tab kept its offset");
+        assert_eq!(first.scroll_offset(), 7, "first tab kept its offset");
         assert!(
-            first.selection.range().is_none(),
+            first.selection_range().is_none(),
             "the switch dropped the outgoing highlight"
         );
     }

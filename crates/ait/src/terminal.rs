@@ -57,7 +57,7 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         let result = (|| -> io::Result<()> {
             enable_raw_mode()?;
-            queue_commands(&mut stdout, options)?;
+            execute_commands(&mut stdout, options)?;
             Ok(())
         })();
         if result.is_err() {
@@ -93,8 +93,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Emit the enter-side commands for `options`.
-fn queue_commands(stdout: &mut impl Write, options: TerminalOptions) -> io::Result<()> {
+/// Emit the enter-side commands for `options` (`execute!` writes AND
+/// flushes — the alt screen must be live before the kitty probe runs).
+fn execute_commands(stdout: &mut impl Write, options: TerminalOptions) -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     if options.mouse_capture {
         // Deliberately NOT crossterm's `EnableMouseCapture`: that also

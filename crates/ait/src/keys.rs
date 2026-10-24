@@ -62,8 +62,8 @@ pub fn translate(event: &crossterm::event::KeyEvent) -> Option<KeyEvent> {
 }
 
 /// crossterm modifier bits → ait-term [`Modifiers`]. `HYPER`/`META` have no
-/// ait-term equivalent and are dropped (they only arrive when the kitty
-/// enhancement is pushed, which a later ticket owns).
+/// ait-term equivalent and are dropped (they can only arrive in the
+/// enhanced tier — the kitty flags push in `terminal.rs` enables them).
 fn translate_modifiers(modifiers: KeyModifiers) -> Modifiers {
     let mut out = Modifiers::NONE;
     if modifiers.contains(KeyModifiers::SHIFT) {

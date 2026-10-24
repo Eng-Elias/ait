@@ -13,7 +13,6 @@ ait-term = { path = "../ait-term" }
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm",
     "crossterm_0_29",
-    "underline-color",
 ] }
 # `osc52` gives `crossterm::clipboard::CopyToClipboard` — our own host
 # clipboard writes (R02-T3). It does NOT touch child-app OSC 52, which

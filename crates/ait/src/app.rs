@@ -1,5 +1,5 @@
 //! The Round-2 application loop: shell sessions in tabs inside the host
-//! terminal (Spec R02, tickets T1–T4).
+//! terminal (Spec R02, tickets T1–T6).
 //!
 //! The loop is synchronous per the spec — no async runtime in Round 2:
 //!
@@ -76,6 +76,12 @@ const INPUT_POLL: Duration = Duration::from_millis(8);
 /// that permanent failure — the spec's stdin-EOF exit path — from a
 /// transient one.
 const INPUT_ERROR_LIMIT: u32 = 125;
+/// Events serviced per [`service_input`] call before control returns
+/// to the loop — bounds the zero-time drain so a sustained input
+/// flood can't starve session drains and repaints (§6's starvation
+/// rule cuts both ways). What's left is serviced next tick: 8 ms
+/// later, invisible to the user.
+const INPUT_DRAIN_LIMIT: u32 = 256;
 
 /// Watchdog bound on the startup capability probe: comfortably past
 /// crossterm's own ~2 s query timeout, so only a genuinely wedged probe
@@ -284,8 +290,8 @@ pub fn run() -> io::Result<ExitCode> {
         let view = Rendered {
             active,
             count,
-            offset: tab.scroll.offset(),
-            selection: tab.selection.range(),
+            offset: tab.scroll_offset(),
+            selection: tab.selection_range(),
             status: status_text(
                 tab.cwd(),
                 tab.title(),
@@ -396,28 +402,19 @@ fn handle_event<W: Write>(
                     let Some(tab) = tabs.active_mut() else {
                         return Handled::Continue;
                     };
-                    tab.selection.clear();
+                    tab.clear_selection();
                     match action {
-                        AppAction::ScrollPageUp => {
-                            let (lines, scrollback) = (tab.grid().lines(), tab.scrollback());
-                            tab.scroll.scroll_up(lines, scrollback);
-                        }
-                        AppAction::ScrollPageDown => {
-                            let page = tab.grid().lines();
-                            tab.scroll.scroll_down(page);
-                        }
-                        AppAction::ScrollTop => {
-                            let scrollback = tab.scrollback();
-                            tab.scroll.jump_to_top(scrollback);
-                        }
-                        AppAction::ScrollBottom => tab.scroll.snap_to_bottom(),
+                        AppAction::ScrollPageUp => tab.page_up(),
+                        AppAction::ScrollPageDown => tab.page_down(),
+                        AppAction::ScrollTop => tab.scroll_to_top(),
+                        AppAction::ScrollBottom => tab.snap_to_bottom(),
                         AppAction::Paste => {
                             // Paste ait's own copied selection (there is no
                             // host-clipboard read), bracketed iff the child
                             // enabled mode 2004. The user pastes to type, so
                             // the view snaps to the live viewport first.
                             // Exited sessions drop input like keys do.
-                            tab.scroll.snap_to_bottom();
+                            tab.snap_to_bottom();
                             if tab.exit_status().is_none() {
                                 if let Some(text) = state.copied_text.as_deref() {
                                     let bytes = encode_paste(text, tab.session.bracketed_paste());
@@ -446,10 +443,10 @@ fn handle_event<W: Write>(
                         return Handled::Continue;
                     };
                     // Any keypress drops the highlight — never stale state.
-                    tab.selection.clear();
+                    tab.clear_selection();
                     // Typing snaps the view back to the live viewport, then
                     // reaches the PTY encoded exactly as before.
-                    tab.scroll.snap_to_bottom();
+                    tab.snap_to_bottom();
                     if tab.exit_status().is_none() {
                         if let Some(key_event) = keys::translate(&key_event) {
                             let _ = tab.session.send_key(key_event);
@@ -465,31 +462,26 @@ fn handle_event<W: Write>(
             };
             match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    tab.selection.clear();
-                    let scrollback = tab.scrollback();
-                    tab.scroll.scroll_up(WHEEL_LINES, scrollback);
+                    tab.clear_selection();
+                    tab.scroll_up(WHEEL_LINES);
                 }
                 MouseEventKind::ScrollDown => {
-                    tab.selection.clear();
-                    tab.scroll.scroll_down(WHEEL_LINES);
+                    tab.clear_selection();
+                    tab.scroll_down(WHEEL_LINES);
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Only a drag starting inside the session area
                     // selects; the chrome rows (tab bar, status line)
                     // are inert.
                     if content.contains(Position::new(mouse_event.column, mouse_event.row)) {
-                        let offset = tab.scroll.offset();
-                        tab.selection
-                            .begin(grid_point(&mouse_event, content, offset));
+                        tab.begin_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     // An in-flight drag follows the pointer anywhere —
                     // past the top it selects into scrollback, the way
                     // the view would scroll.
-                    let offset = tab.scroll.offset();
-                    tab.selection
-                        .extend(grid_point(&mouse_event, content, offset));
+                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
                     // Fold the release point into the range before
@@ -497,10 +489,8 @@ fn handle_event<W: Write>(
                     // last `Drag` can lag the cell the button released
                     // on — a fast flick would otherwise copy short.
                     // Outside a drag `extend` is a no-op.
-                    let offset = tab.scroll.offset();
-                    tab.selection
-                        .extend(grid_point(&mouse_event, content, offset));
-                    if let Some(range) = tab.selection.finish() {
+                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    if let Some(range) = tab.finish_selection() {
                         let text = extract(&tab.grid(), range);
                         if !text.is_empty() {
                             state.copied_text = Some(text.clone());
@@ -529,8 +519,9 @@ fn handle_event<W: Write>(
 }
 
 /// Service the host input queue once: wait up to [`INPUT_POLL`] for the
-/// first event, then drain everything queued behind it before
-/// returning, so an output flood can never starve the keyboard.
+/// first event, then drain what follows before returning — bounded by
+/// [`INPUT_DRAIN_LIMIT`] so an *input* flood can't starve the output
+/// drains and repaints the input-first order exists to protect.
 ///
 /// `poll`/`read` are crossterm's calls in production; tests inject
 /// fakes to exercise the failure path without a TTY (the same seam
@@ -550,7 +541,7 @@ fn service_input<W: Write>(
         Ok(false) => return InputOutcome::Continue,
         Err(_) => return InputOutcome::Failed,
     }
-    loop {
+    for _ in 0..INPUT_DRAIN_LIMIT {
         match read() {
             Ok(event) => {
                 if let Handled::Quit = handle_event(event, tabs, state, host, tier) {
@@ -565,6 +556,10 @@ fn service_input<W: Write>(
             Err(_) => return InputOutcome::Failed,
         }
     }
+    // The cap hit with (presumably) more input queued — yield to the
+    // loop so PTY output drains and the frame renders; the rest of
+    // the queue is serviced next tick.
+    InputOutcome::Continue
 }
 
 /// Screen mouse position → grid coordinates: the line by
@@ -615,17 +610,17 @@ fn render_frame(
                 areas.content,
                 &tab.grid(),
                 &mut overlay,
-                tab.scroll.offset(),
+                tab.scroll_offset(),
             );
-            if let Some(range) = tab.selection.range() {
-                apply_selection(buf, areas.content, &tab.grid(), range, tab.scroll.offset());
+            if let Some(range) = tab.selection_range() {
+                apply_selection(buf, areas.content, &tab.grid(), range, tab.scroll_offset());
             }
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
         paint_status_line(buf, areas.status, status, toast);
         // The cursor's live line renders at `content.y + line + offset`;
         // scrolled far enough up it leaves the band and stays hidden.
-        let y = usize::from(areas.content.y) + cursor.line + tab.scroll.offset();
+        let y = usize::from(areas.content.y) + cursor.line + tab.scroll_offset();
         if cursor.shape != CursorShape::Hidden && y < usize::from(areas.content.bottom()) {
             let x = (areas.content.x + cursor.column as u16)
                 .min(areas.content.right().saturating_sub(1));
@@ -839,6 +834,8 @@ mod tests {
         // Scroll tab 2 up, switch back to tab 1, type there.
         {
             let tab = harness.tabs.active_mut().unwrap();
+            // `pub(crate)` seam: stage an offset the fresh session's
+            // empty scrollback couldn't produce via `scroll_up`.
             tab.scroll.scroll_up(3, 10);
         }
         harness.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL));
@@ -846,12 +843,12 @@ mod tests {
         harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
 
         assert_eq!(
-            harness.tabs.tabs()[0].scroll.offset(),
+            harness.tabs.tabs()[0].scroll_offset(),
             0,
             "typed tab snapped"
         );
         assert_eq!(
-            harness.tabs.tabs()[1].scroll.offset(),
+            harness.tabs.tabs()[1].scroll_offset(),
             3,
             "the background tab kept its offset"
         );
@@ -949,7 +946,7 @@ mod tests {
         {
             let tab = harness.tabs.active_mut().unwrap();
             tab.scroll.scroll_up(3, 10);
-            tab.selection.begin(GridPoint::new(0, 0));
+            tab.begin_selection(GridPoint::new(0, 0));
         }
         let release = Event::Key(CtKeyEvent::new_with_kind_and_state(
             KeyCode::Char('x'),
@@ -961,9 +958,9 @@ mod tests {
         assert_eq!(harness.handle(release), Handled::Continue);
 
         let tab = harness.tabs.active().unwrap();
-        assert_eq!(tab.scroll.offset(), 3, "a release never snaps the view");
+        assert_eq!(tab.scroll_offset(), 3, "a release never snaps the view");
         assert!(
-            tab.selection.range().is_some(),
+            tab.selection_range().is_some(),
             "a release never drops the highlight"
         );
     }
@@ -1036,5 +1033,31 @@ mod tests {
             &mut || Ok(events.borrow_mut().pop_front().unwrap()),
         );
         assert_eq!(outcome, InputOutcome::Quit);
+    }
+
+    /// A flood past [`INPUT_DRAIN_LIMIT`] yields the call instead of
+    /// draining forever — the loop gets its turn to drain sessions and
+    /// repaint, and the leftover events are serviced next tick.
+    #[test]
+    fn input_flood_yields_at_the_drain_limit() {
+        let mut harness = Harness::new(manager());
+        let events = RefCell::new(VecDeque::from_iter(
+            std::iter::repeat_with(|| key(KeyCode::Char('x'), KeyModifiers::NONE))
+                .take(INPUT_DRAIN_LIMIT as usize + 10),
+        ));
+        let outcome = service_input(
+            &mut harness.tabs,
+            &mut harness.state,
+            &mut harness.sink,
+            CapabilityTier::Legacy,
+            &mut |_| Ok(!events.borrow().is_empty()),
+            &mut || Ok(events.borrow_mut().pop_front().unwrap()),
+        );
+        assert_eq!(outcome, InputOutcome::Continue);
+        assert_eq!(
+            events.borrow().len(),
+            10,
+            "the cap released control with the tail still queued"
+        );
     }
 }

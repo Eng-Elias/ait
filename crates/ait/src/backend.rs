@@ -23,7 +23,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::queue;
 use crossterm::style::{
     Attribute, Color as CtColor, Colors as CtColors, Print, SetAttribute, SetBackgroundColor,
-    SetColors, SetForegroundColor, SetUnderlineColor,
+    SetColors, SetForegroundColor,
 };
 use crossterm::terminal::{self, Clear};
 use ratatui::backend::{Backend, ClearType, WindowSize};
@@ -48,7 +48,6 @@ pub struct StyledBackend<W> {
     /// the end of every `draw`).
     fg: CtColor,
     bg: CtColor,
-    underline_color: CtColor,
     /// Tracked modifier bits *excluding* `UNDERLINED` — underline variants
     /// are tracked separately in `underline`.
     modifier: Modifier,
@@ -64,7 +63,6 @@ impl<W: Write> StyledBackend<W> {
             underlines: Rc::new(RefCell::new(UnderlineOverlay::new())),
             fg: CtColor::Reset,
             bg: CtColor::Reset,
-            underline_color: CtColor::Reset,
             modifier: Modifier::empty(),
             underline: Underline::None,
             last_pos: None,
@@ -231,11 +229,6 @@ impl<W: Write> Backend for StyledBackend<W> {
                 self.fg = fg;
                 self.bg = bg;
             }
-            let underline_color = to_crossterm_color(cell.underline_color);
-            if underline_color != self.underline_color {
-                queue!(self.writer, SetUnderlineColor(underline_color))?;
-                self.underline_color = underline_color;
-            }
 
             queue!(self.writer, Print(cell.symbol()))?;
         }
@@ -246,12 +239,10 @@ impl<W: Write> Backend for StyledBackend<W> {
             self.writer,
             SetForegroundColor(CtColor::Reset),
             SetBackgroundColor(CtColor::Reset),
-            SetUnderlineColor(CtColor::Reset),
             SetAttribute(Attribute::Reset),
         )?;
         self.fg = CtColor::Reset;
         self.bg = CtColor::Reset;
-        self.underline_color = CtColor::Reset;
         self.modifier = Modifier::empty();
         self.underline = Underline::None;
         self.last_pos = None;

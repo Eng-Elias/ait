@@ -33,8 +33,7 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 AIT_BIN=${AIT_BIN:-"$REPO/target/debug/ait"}
 OUT=${1:-"$REPO/../ait-notes-r02/demo"}
-TMUX=${TMUX:-/tmp/tmux-local/bin/tmux}
-command -v "$TMUX" >/dev/null 2>&1 || TMUX=tmux
+TMUX=${TMUX:-tmux}
 ROWS=30
 COLS=100
 mkdir -p "$OUT"

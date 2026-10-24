@@ -129,12 +129,16 @@ impl Selection {
 /// cells between the range's column bounds (full width on interior
 /// lines). Rows joined by a hard line break get `'\n'`; a soft-wrapped
 /// row flows into the next without one. Trailing blanks on each line are
-/// dropped; the result never ends with `'\n'`. Cells beyond the grid
-/// (scrolled out of history) extract as nothing.
+/// dropped; the result never ends with `'\n'`. A line that scrolled out
+/// of history contributes no cells but still counts as a hard break —
+/// its neighbors must not silently concatenate into one line.
 pub fn extract(grid: &GridView<'_>, range: SelectionRange) -> String {
     let mut text = String::new();
     for line in range.start.line..=range.end.line {
         let Some(row) = grid.line(line) else {
+            if line != range.end.line {
+                text.push('\n');
+            }
             continue;
         };
         let first = if line == range.start.line {
@@ -302,6 +306,21 @@ mod tests {
         let grid = session.grid();
 
         assert_eq!(extract(&grid, range(0, 0, 1, 1)), "ab\ncd");
+    }
+
+    /// A line scrolled out of history contributes nothing but still
+    /// breaks the output — its neighbors never concatenate into one
+    /// line that was never on screen.
+    #[test]
+    fn extract_breaks_on_lines_outside_the_grid() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"ab\r\ncd");
+        let grid = session.grid();
+
+        // Lines -5..-1 are above all scrollback — each is a break, so
+        // the selection spanning them still reads as separate lines
+        // rather than "ab" gluing straight onto nothing.
+        assert_eq!(extract(&grid, range(-5, 0, 1, 1)), "\n\n\n\n\nab\ncd");
     }
 
     /// A soft-wrapped row joins the next WITHOUT a newline — the spec's
