@@ -92,6 +92,17 @@ pub struct LiveSessionOptions {
     pub env: Vec<(OsString, OsString)>,
 }
 
+impl LiveSessionOptions {
+    /// The program [`LiveSession::spawn`] will launch for these options:
+    /// `program` when explicit, else `$SHELL`, else `/bin/sh` (an empty
+    /// `$SHELL` counts as unset). Frontends derive display names — a tab
+    /// title is the basename — from the same source of truth the spawn
+    /// uses, instead of re-resolving `$SHELL` themselves.
+    pub fn resolved_program(&self) -> OsString {
+        resolve_shell(self.program.clone(), std::env::var_os("SHELL"))
+    }
+}
+
 /// Why [`LiveSession::spawn`] failed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -221,7 +232,7 @@ impl LiveSession {
             .openpty(pty_size(options.session.size))
             .map_err(|e| SpawnError::OpenPty(e.to_string()))?;
 
-        let program = resolve_shell(options.program, std::env::var_os("SHELL"));
+        let program = options.resolved_program();
         let mut cmd = CommandBuilder::new(&program);
         cmd.args(&options.args);
         cmd.env("TERM", DEFAULT_TERM);
@@ -313,6 +324,12 @@ impl LiveSession {
     /// drained so far.
     pub fn grid(&self) -> GridView<'_> {
         self.session.grid()
+    }
+
+    /// Whether the application enabled bracketed-paste mode (`DECSET`
+    /// 2004) — see [`Session::bracketed_paste`].
+    pub fn bracketed_paste(&self) -> bool {
+        self.session.bracketed_paste()
     }
 
     /// The renderable cursor: viewport position and shape.
@@ -667,6 +684,17 @@ mod tests {
             resolve_shell(None, Some(OsString::new())),
             OsString::from("/bin/sh")
         );
+    }
+
+    /// `resolved_program` is the options-side view of `resolve_shell` —
+    /// the same value `spawn` launches, so a frontend can title from it.
+    #[test]
+    fn resolved_program_is_what_spawn_would_launch() {
+        let options = LiveSessionOptions {
+            program: Some(OsString::from("/bin/zsh")),
+            ..Default::default()
+        };
+        assert_eq!(options.resolved_program(), OsString::from("/bin/zsh"));
     }
 
     #[test]
