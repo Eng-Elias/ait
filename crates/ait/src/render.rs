@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
+
+use crate::selection::SelectionRange;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RtColor, Modifier};
@@ -98,6 +100,46 @@ pub fn paint_session(
     }
 }
 
+/// Highlight a mouse-selection range by reversing the covered buffer
+/// cells — the frontend-only drag highlight (Spec R02).
+///
+/// Same coordinate rule as [`paint_session`]: screen row `i` shows grid
+/// line `i - scroll_offset`. The range lives in grid coordinates, so a
+/// selection spanning scrollback highlights exactly where its rows
+/// appear. A selected [`CellKind::WideSpacer`] reverses its leading cell
+/// instead — the buffer cell under a wide grapheme's trailing column has
+/// no symbol of its own, and the lead is what the host inverts.
+pub fn apply_selection(
+    buf: &mut Buffer,
+    area: Rect,
+    grid: &GridView<'_>,
+    range: SelectionRange,
+    scroll_offset: usize,
+) {
+    let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
+    let viewport_rows = grid.lines().min(usize::from(area.height));
+    for row_index in 0..viewport_rows {
+        let line = row_index as i32 - offset;
+        let y = area.y + row_index as u16;
+        for col in 0..usize::from(area.right() - area.x) {
+            if !range.contains(line, col) {
+                continue;
+            }
+            let x = area.x + col as u16;
+            buf[(x, y)].modifier |= Modifier::REVERSED;
+            // The spacer half of a wide char renders nothing itself;
+            // carry the highlight onto the grapheme's leading cell.
+            if grid
+                .cell(line, col)
+                .is_some_and(|cell| cell.kind == CellKind::WideSpacer)
+                && x > area.x
+            {
+                buf[(x - 1, y)].modifier |= Modifier::REVERSED;
+            }
+        }
+    }
+}
+
 /// `ait_term` color → ratatui color. Beware the naming trap: ratatui's
 /// `Red`/`Green`/… are the *normal* ANSI colors (SGR 3x) while
 /// `LightRed`/… are the bright variants (SGR 9x) — the same convention as
@@ -174,6 +216,7 @@ pub fn to_cursor_style(shape: CursorShape) -> Option<SetCursorStyle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::{GridPoint, SelectionRange};
     use ait_term::{Session, SessionOptions, Size};
 
     /// Byte-fed session fixture (the R01 seam): feed PTY output bytes, get a
@@ -402,6 +445,78 @@ mod tests {
 
         let (buf, _) = paint_scrolled(&session, 80, 2, depth + 100);
         assert_eq!(buf[(0, 0)].symbol(), " ", "beyond depth paints blank");
+    }
+
+    /// Selected cells render inverted, edge columns bounded by the
+    /// range — the cell-accurate highlight.
+    #[test]
+    fn selection_reverses_covered_cells() {
+        let mut session = session(80, 24);
+        session.feed_bytes(b"ab\r\ncd\r\nef");
+        let (mut buf, _) = paint(&session, 80, 24);
+
+        let range = SelectionRange {
+            start: GridPoint::new(0, 1),
+            end: GridPoint::new(1, 0),
+        };
+        let area = buf.area;
+        apply_selection(&mut buf, area, &session.grid(), range, 0);
+
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(2, 0)].modifier.contains(Modifier::REVERSED));
+        // Line 1 is inside only through its first column; line 2 is out.
+        assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(1, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 2)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// The highlight respects the scroll offset: a selection reaching
+    /// into scrollback paints the scrollback rows where they appear.
+    #[test]
+    fn selection_paints_scrollback_rows() {
+        let mut session = session(80, 2);
+        session.feed_bytes(b"one\r\ntwo\r\nthree");
+        let (mut buf, _) = paint_scrolled(&session, 80, 2, 1);
+        // Screen row i shows grid line (i - 1): row 0 is scrollback "one".
+        let range = SelectionRange {
+            start: GridPoint::new(-1, 0),
+            end: GridPoint::new(-1, 2),
+        };
+        let area = buf.area;
+        apply_selection(&mut buf, area, &session.grid(), range, 1);
+
+        for x in 0..3 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "scrollback row cell {x} highlighted"
+            );
+            assert!(!buf[(x, 1)].modifier.contains(Modifier::REVERSED));
+        }
+    }
+
+    /// A wide char's spacer cell highlights through its leading cell —
+    /// the grapheme occupies both columns visually.
+    #[test]
+    fn selection_on_wide_char_covers_both_columns() {
+        let mut session = session(80, 24);
+        session.feed_bytes("コx".as_bytes());
+        let (mut buf, _) = paint(&session, 80, 24);
+
+        // Select only the spacer cell (col 1): its lead cell renders the
+        // grapheme, so the lead carries the highlight.
+        let range = SelectionRange {
+            start: GridPoint::new(0, 1),
+            end: GridPoint::new(0, 1),
+        };
+        let area = buf.area;
+        apply_selection(&mut buf, area, &session.grid(), range, 0);
+
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::REVERSED),
+            "spacer selection highlights the wide glyph's lead cell"
+        );
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

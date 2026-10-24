@@ -315,6 +315,12 @@ impl LiveSession {
         self.session.grid()
     }
 
+    /// Whether the application enabled bracketed-paste mode (`DECSET`
+    /// 2004) — see [`Session::bracketed_paste`].
+    pub fn bracketed_paste(&self) -> bool {
+        self.session.bracketed_paste()
+    }
+
     /// The renderable cursor: viewport position and shape.
     pub fn cursor(&self) -> Cursor {
         self.session.cursor()
