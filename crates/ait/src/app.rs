@@ -66,6 +66,12 @@ use crate::terminal::TerminalGuard;
 /// input latency stays under a frame.
 const INPUT_POLL: Duration = Duration::from_millis(8);
 
+/// Watchdog bound on the startup capability probe: comfortably past
+/// crossterm's own ~2 s query timeout, so only a genuinely wedged probe
+/// (kitty flags answered, primary-DA never) trips it — never a merely
+/// slow-to-answer legacy host.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Whether the loop keeps running after an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handled {
@@ -124,11 +130,22 @@ pub fn run() -> io::Result<ExitCode> {
     })?;
     // Capability detection runs once, before the event loop: the query
     // blocks up to ~2 s on hosts that don't answer (tmux) and must never
-    // race `event::poll`.
-    let tier = if crate::terminal::enable_keyboard_enhancement() {
-        CapabilityTier::Enhanced
-    } else {
-        CapabilityTier::Legacy
+    // race `event::poll`. It runs under a watchdog — a host that answers
+    // the kitty flags query but never answers the trailing primary-DA
+    // query wedges crossterm's event reader *forever*, and the wedged
+    // lock would starve every later `event::poll`. There is no recovery:
+    // exit cleanly (the guard restores the host) rather than start an
+    // input-dead TUI that can't even quit.
+    let tier = match crate::terminal::detect_tier(DETECT_TIMEOUT) {
+        crate::terminal::TierDetection::Enhanced => CapabilityTier::Enhanced,
+        crate::terminal::TierDetection::Legacy => CapabilityTier::Legacy,
+        crate::terminal::TierDetection::Hung => {
+            return Err(io::Error::other(
+                "host terminal never finished the keyboard-capability probe \
+                 (answered the kitty flags query but not primary-DA) — \
+                 refusing to start with a dead input path",
+            ));
+        }
     };
     let (columns, rows) = crossterm::terminal::size()?;
     let mut state = AppState {
@@ -413,6 +430,14 @@ fn handle_event<W: Write>(
                         .extend(grid_point(&mouse_event, content, offset));
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    // Fold the release point into the range before
+                    // finishing: hosts coalesce motion reports, so the
+                    // last `Drag` can lag the cell the button released
+                    // on — a fast flick would otherwise copy short.
+                    // Outside a drag `extend` is a no-op.
+                    let offset = tab.scroll.offset();
+                    tab.selection
+                        .extend(grid_point(&mouse_event, content, offset));
                     if let Some(range) = tab.selection.finish() {
                         let text = extract(&tab.session.grid(), range);
                         if !text.is_empty() {
@@ -698,6 +723,73 @@ mod tests {
         assert!(
             harness.state.toast.is_none(),
             "a successful spawn is silent"
+        );
+    }
+
+    /// The release point belongs to the selection: hosts coalesce
+    /// motion reports, so the last `Drag` can lag the cell the button
+    /// was released on — a quick flick released past the last reported
+    /// drag must still copy through the release cell.
+    #[test]
+    fn release_extends_the_selection_to_the_release_cell() {
+        use crossterm::event::MouseEvent;
+        use std::time::Instant;
+
+        let mut harness = Harness::new(manager());
+        // A marker the whole grid knows: the sh output `HELLOWORLD` on
+        // its own line. Wait for it, then find its grid line.
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"printf 'HELLOWORLD\\n'\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let line = loop {
+            let tab = harness.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            let found = (0..grid.lines()).find(|&line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().starts_with("HELLOWORLD"))
+            });
+            if let Some(line) = found {
+                break line;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the marker"
+            );
+            harness.tabs.drain_events();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Grid line `l` paints at screen row `l + content.y` (the tab
+        // bar sits at row 0).
+        let row = (line + 1) as u16;
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        // Down on 'H', a drag report at 'O' (col 4), released on the
+        // final 'D' (col 9): the copy must reach the release cell.
+        harness.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        harness.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        harness.handle(mouse(MouseEventKind::Up(MouseButton::Left), 9));
+
+        assert_eq!(
+            harness.state.copied_text.as_deref(),
+            Some("HELLOWORLD"),
+            "the release point extends the copied range"
+        );
+        // …and the copy went out to the host clipboard via OSC 52.
+        assert!(
+            harness.sink.windows(5).any(|w| w == b"\x1b]52;"),
+            "OSC 52 should reach the host stream"
         );
     }
 }

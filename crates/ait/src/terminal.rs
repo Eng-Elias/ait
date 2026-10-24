@@ -15,6 +15,7 @@
 use std::io::{self, Write};
 use std::panic;
 use std::sync::Once;
+use std::time::Duration;
 
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
@@ -152,4 +153,105 @@ fn install_panic_hook() {
             previous(info);
         }));
     });
+}
+
+/// How the startup keyboard-capability probe resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierDetection {
+    /// Enhancement confirmed — the caller pushes the flags and uses the
+    /// enhanced keymap.
+    Enhanced,
+    /// The host declined or never answered inside crossterm's probe
+    /// window — the legacy keymap.
+    Legacy,
+    /// The probe never returned: crossterm's
+    /// `supports_keyboard_enhancement` ends with an *unbounded* wait for
+    /// the host's primary-DA reply whenever the kitty flags query matched
+    /// — a host that answers `CSI ? u` but swallows `CSI c` wedges the
+    /// probe forever, and the wedged internal reader lock would starve
+    /// every later `event::poll` (input dead; the user couldn't even
+    /// quit). There is no recovery path — the caller must exit.
+    Hung,
+}
+
+/// Run the startup capability probe under a watchdog.
+///
+/// [`enable_keyboard_enhancement`] normally returns within crossterm's
+/// ~2 s window, but on a host that answers the flags query without ever
+/// answering primary-DA it never returns (see [`TierDetection::Hung`]),
+/// so it runs on a worker thread and the caller bounds the wait. A hung
+/// worker keeps the event reader's lock for the rest of the process — it
+/// is abandoned here, never re-queried, and `Hung` callers exit instead
+/// of entering an input-dead loop.
+pub fn detect_tier(timeout: Duration) -> TierDetection {
+    detect_tier_with(enable_keyboard_enhancement, timeout)
+}
+
+/// The seam for [`detect_tier`]: `query` stands in for
+/// [`enable_keyboard_enhancement`] so tests exercise the watchdog without
+/// a TTY.
+fn detect_tier_with(
+    query: impl FnOnce() -> bool + Send + 'static,
+    timeout: Duration,
+) -> TierDetection {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(query());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(true) => TierDetection::Enhanced,
+        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => TierDetection::Legacy,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => TierDetection::Hung,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A probe that answers promptly maps to its tier in bounded time.
+    #[test]
+    fn answered_probe_maps_to_its_tier() {
+        assert_eq!(
+            detect_tier_with(|| true, Duration::from_secs(1)),
+            TierDetection::Enhanced
+        );
+        assert_eq!(
+            detect_tier_with(|| false, Duration::from_secs(1)),
+            TierDetection::Legacy
+        );
+    }
+
+    /// A probe that never answers — the DA-flush hang — must not block
+    /// the caller forever: `recv_timeout` bounds the wait and reports
+    /// `Hung` so `run` can exit instead of entering an input-dead loop.
+    #[test]
+    fn hung_probe_reports_hung_in_bounded_time() {
+        let started = Instant::now();
+        let detection = detect_tier_with(
+            || {
+                std::thread::sleep(Duration::from_secs(60));
+                true
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(detection, TierDetection::Hung);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the watchdog must return promptly, not wait out the probe"
+        );
+    }
+
+    /// A probe thread that dies without sending (a panic inside the
+    /// query — its own panic hook restores first) degrades to the legacy
+    /// tier rather than hanging: a dead thread cannot hold the reader
+    /// lock, so input stays usable.
+    #[test]
+    fn dead_probe_degrades_to_legacy() {
+        assert_eq!(
+            detect_tier_with(|| panic!("probe died"), Duration::from_secs(1)),
+            TierDetection::Legacy
+        );
+    }
 }
