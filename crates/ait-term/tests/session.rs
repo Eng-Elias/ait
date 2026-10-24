@@ -127,6 +127,7 @@ fn scrollback_is_capped_by_the_configured_limit() {
     let mut session = Session::new(SessionOptions {
         size: Size::new(80, 2),
         scrollback: 5,
+        ..Default::default()
     });
     for i in 0..10 {
         session.feed_bytes(format!("line{i}\r\n").as_bytes());
