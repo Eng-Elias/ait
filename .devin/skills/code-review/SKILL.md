@@ -59,6 +59,8 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 
 Issue both sub-agent calls together, in the foreground, and aggregate the reports they return.
 
+Both sub-agents need **shell access**: each must run the diff command itself, and the Spec agent fetches the spec per the issue-tracker doc. Spawn them with an exec-capable profile (e.g. `subagent_general`), not a read-only one. If only read-only agents are available, write the diff (`git diff <fixed-point>...HEAD`) and the spec text to files under `.scratch/` first and pass the paths instead of the commands.
+
 **Standards sub-agent prompt** should include:
 
 - The full diff command and commit list.
