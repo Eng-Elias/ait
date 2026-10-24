@@ -204,6 +204,13 @@ impl Session {
         GridView::new(self.term.grid())
     }
 
+    /// Whether the application enabled bracketed-paste mode (`DECSET`
+    /// 2004). Frontends consult this when sending paste text: wrap in
+    /// `\x1b[200~` … `\x1b[201~` iff `true` (REQUIREMENTS.md §5.2).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Damage accumulated since the last `damage` call; clears the tracker.
     /// Starts as [`Damage::Full`] on a fresh session.
     ///

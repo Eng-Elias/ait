@@ -298,3 +298,17 @@ fn terminal_queries_produce_pty_responses_for_a_driver() {
     assert_eq!(session.take_pty_responses(), vec!["\x1b[0n"]);
     assert!(session.take_pty_responses().is_empty());
 }
+
+#[test]
+fn bracketed_paste_mode_reports_what_the_application_set() {
+    let mut session = session(80, 24);
+    assert!(!session.bracketed_paste(), "off on a fresh session");
+
+    // Application enables bracketed paste: `CSI ? 2004 h`.
+    session.feed_bytes(b"\x1b[?2004h");
+    assert!(session.bracketed_paste());
+
+    // And disables it again: `CSI ? 2004 l`.
+    session.feed_bytes(b"\x1b[?2004l");
+    assert!(!session.bracketed_paste());
+}
