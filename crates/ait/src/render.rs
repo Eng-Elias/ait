@@ -14,12 +14,12 @@
 
 use std::collections::HashMap;
 
-use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Style, Underline};
+use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
 
 use crate::selection::SelectionRange;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RtColor, Modifier};
 
 /// Per-position map of the *exact* underline variant on the current frame.
@@ -136,6 +136,96 @@ pub fn apply_selection(
             {
                 buf[(x - 1, y)].modifier |= Modifier::REVERSED;
             }
+        }
+    }
+}
+
+/// The three chrome bands of a frame (Spec R02 layout decision): the tab
+/// bar on top, the status line T5 paints at the bottom, and the session
+/// content between them. Chrome is drawn OUTSIDE the session grid — the
+/// PTY's winsize is the content area only, so resize math starts from
+/// [`content_size`], never the raw window.
+pub struct ChromeAreas {
+    /// Row 0: the always-visible tab bar.
+    pub tab_bar: Rect,
+    /// The session grid's region.
+    pub content: Rect,
+    /// The last row: T5's status line (`cwd · shell · model · state` +
+    /// toasts). T4 already reserves it so the status line lands without
+    /// reshuffling the layout.
+    pub status: Rect,
+}
+
+/// Split `area` into the three chrome bands. On a degenerate frame
+/// (`height < 3`) the content band can be empty — painting handles a
+/// zero-height rect, and the PTY still gets a 1-line grid via
+/// [`content_size`]'s clamp.
+pub fn chrome_areas(area: Rect) -> ChromeAreas {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    ChromeAreas {
+        tab_bar: rows[0],
+        content: rows[1],
+        status: rows[2],
+    }
+}
+
+/// The grid/PTY size for a frame of `area`: the content band's
+/// dimensions. A terminal can never have zero lines (`Size` itself
+/// clamps), so a starved content band still maps to a 1-line grid.
+pub fn content_size(area: Rect) -> Size {
+    let content = chrome_areas(area).content;
+    Size::new(
+        usize::from(content.width).max(1),
+        usize::from(content.height).max(1),
+    )
+}
+
+/// Paint the always-visible tab bar: `" 1:bash "` chunks in order, the
+/// active tab reversed. Titles beyond the row's width are clipped —
+/// jumping (`Alt+N`) still reaches them; T5's status line owns any
+/// richer state display.
+pub fn paint_tab_bar(buf: &mut Buffer, area: Rect, titles: &[String], active: usize) {
+    if area.height == 0 {
+        return;
+    }
+    let y = area.y;
+    let mut x = area.x;
+    'titles: for (index, title) in titles.iter().enumerate() {
+        for c in format!(" {title} ").chars() {
+            if x >= area.right() {
+                break 'titles;
+            }
+            let cell = &mut buf[(x, y)];
+            cell.reset();
+            cell.set_char(c);
+            if index == active {
+                cell.modifier |= Modifier::REVERSED;
+            }
+            x += 1;
+        }
+    }
+    // Clear whatever the bar doesn't cover (a stale longer bar, the
+    // unused tail).
+    while x < area.right() {
+        buf[(x, y)].reset();
+        x += 1;
+    }
+}
+
+/// Paint the status-line row. T5 owns its content (`cwd · shell · model
+/// · state`, notification toasts); T4 only reserves and clears it so a
+/// frame never leaves stale cells behind.
+pub fn paint_status_line(buf: &mut Buffer, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            buf[(x, y)].reset();
         }
     }
 }
@@ -538,5 +628,93 @@ mod tests {
             Some(SetCursorStyle::SteadyBar)
         );
         assert_eq!(to_cursor_style(CursorShape::Hidden), None);
+    }
+
+    // --- chrome: tab bar, content split, status-line row ---
+
+    /// The layout: tab bar on top, status line at the bottom, the
+    /// session content between — and `content_size` (the PTY winsize)
+    /// is the content band only.
+    #[test]
+    fn chrome_splits_off_two_rows() {
+        let areas = chrome_areas(Rect::new(0, 0, 80, 24));
+        assert_eq!(areas.tab_bar, Rect::new(0, 0, 80, 1));
+        assert_eq!(areas.content, Rect::new(0, 1, 80, 22));
+        assert_eq!(areas.status, Rect::new(0, 23, 80, 1));
+        assert_eq!(content_size(Rect::new(0, 0, 80, 24)), Size::new(80, 22));
+    }
+
+    /// A degenerate frame still yields a usable PTY size — never zero.
+    #[test]
+    fn content_size_never_has_zero_lines() {
+        assert_eq!(content_size(Rect::new(0, 0, 80, 2)), Size::new(80, 1));
+        assert_eq!(content_size(Rect::new(0, 0, 80, 0)), Size::new(80, 1));
+    }
+
+    /// Every tab renders `" N:title "`, the active one inverted; the
+    /// row tail is cleared, not left stale.
+    #[test]
+    fn tab_bar_paints_titles_and_marks_active() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
+        // Pre-fill the tail so the clear is observable.
+        buf[(30, 0)].set_symbol("!");
+        let titles = vec!["1:bash".to_string(), "2:sh".to_string()];
+        paint_tab_bar(&mut buf, Rect::new(0, 0, 40, 1), &titles, 1);
+
+        // " 1:bash " occupies cols 0..8, plain.
+        let label1: String = (0..8).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(label1, " 1:bash ");
+        assert!(!buf[(1, 0)].modifier.contains(Modifier::REVERSED));
+
+        // " 2:sh " occupies cols 8..14, every cell reversed.
+        let label2: String = (8..14).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(label2, " 2:sh ");
+        for x in 8..14 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "active tab cell {x} reversed"
+            );
+        }
+
+        // The tail was cleared; other rows untouched.
+        assert_eq!(buf[(30, 0)].symbol(), " ");
+        assert_eq!(buf[(0, 1)].symbol(), " ");
+    }
+
+    /// Titles past the row's width clip instead of overflowing; the
+    /// active marker can sit anywhere, including on a hidden tab.
+    #[test]
+    fn tab_bar_clips_overflow() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let titles = vec![
+            "1:averylongshellname".to_string(),
+            "2:sh".to_string(),
+            "3:bash".to_string(),
+        ];
+        let area = buf.area;
+        paint_tab_bar(&mut buf, area, &titles, 2);
+        let row: String = (0..10).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, " 1:averylo", "clipped at the row's edge");
+    }
+
+    /// An empty tab set paints a clean blank bar — the guarded state
+    /// the app exits on must still be safe to render a frame for.
+    #[test]
+    fn tab_bar_on_empty_set_is_blank() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+        buf[(0, 0)].set_symbol("x");
+        let area = buf.area;
+        paint_tab_bar(&mut buf, area, &[], 0);
+        assert_eq!(buf[(0, 0)].symbol(), " ");
+    }
+
+    /// The reserved status row is cleared so T5 starts from blank.
+    #[test]
+    fn status_line_row_is_cleared() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+        buf[(3, 0)].set_symbol("x");
+        let area = buf.area;
+        paint_status_line(&mut buf, area);
+        assert_eq!(buf[(3, 0)].symbol(), " ");
     }
 }

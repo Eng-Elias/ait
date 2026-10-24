@@ -27,8 +27,8 @@ pub enum CapabilityTier {
 
 /// What a bound key does.
 ///
-/// The table models the whole Spec R02 keymap now; the tab and paste
-/// actions are bound but have no dispatch until T3 (paste) and T4 (tabs).
+/// The table models the whole Spec R02 keymap; every action has dispatch
+/// in `app` — paste in T3, tabs in T4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
     /// Exit `ait`, restoring the host terminal (`Alt+Q`; enhanced alias
@@ -42,17 +42,17 @@ pub enum AppAction {
     ScrollTop,
     /// Jump back to the live viewport (`Shift+End`).
     ScrollBottom,
-    /// Paste ait's own copied selection (`Shift+Insert`) — T3.
+    /// Paste ait's own copied selection (`Shift+Insert`).
     Paste,
-    /// New tab (`Alt+T`; enhanced alias `Ctrl+Shift+T`) — T4.
+    /// New tab (`Alt+T`; enhanced alias `Ctrl+Shift+T`).
     NewTab,
-    /// Close tab (`Alt+W`; enhanced alias `Ctrl+Shift+W`) — T4.
+    /// Close tab (`Alt+W`; enhanced alias `Ctrl+Shift+W`).
     CloseTab,
-    /// Previous tab (`Ctrl+PageUp`) — T4.
+    /// Previous tab (`Ctrl+PageUp`).
     PrevTab,
-    /// Next tab (`Ctrl+PageDown`) — T4.
+    /// Next tab (`Ctrl+PageDown`).
     NextTab,
-    /// Jump to tab N (`Alt+1..=9`, 1-based) — T4.
+    /// Jump to tab N (`Alt+1..=9`, 1-based).
     JumpToTab(usize),
 }
 
@@ -109,7 +109,7 @@ const BINDINGS: &[Binding] = &[
         enhanced_only: false,
         action: AppAction::ScrollBottom,
     },
-    // Tabs — both tiers; dispatch lands in T4.
+    // Tabs — both tiers.
     Binding {
         code: KeyCode::PageUp,
         modifiers: CONTROL,
@@ -306,8 +306,7 @@ mod tests {
         }
     }
 
-    /// The tab/paste bindings are declared in the table (their dispatch
-    /// lands in T3/T4).
+    /// The tab/paste bindings exist in the table.
     #[test]
     fn tab_and_paste_bindings_resolve() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {

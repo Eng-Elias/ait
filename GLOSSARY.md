@@ -4,6 +4,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 (Seeded from REQUIREMENTS.md §9.)
 
 - **Session** — one PTY + shell process + its grid and blocks.
+- **Tab** — one session plus its viewport, scroll offset and selection
+  state.
 - **Grid** — the styled cell matrix plus scrollback for a session.
 - **Block** — one command, its output and exit code, delimited by shell hooks.
 - **Shell integration / rc snippet** — the script injected into a shell that
