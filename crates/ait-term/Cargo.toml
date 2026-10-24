@@ -1,0 +1,19 @@
+[package]
+name = "ait-term"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Frontend-agnostic terminal core: byte-fed VT emulation into a styled cell grid."
+
+[dependencies]
+# Exact pin per ADR-0002 supply-chain rule (release must be >=7 days old).
+alacritty_terminal = "=0.26.0"
+# Exact pin per the same supply-chain rule (0.9.0 released 2025-02-11).
+portable-pty = "=0.9.0"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# Already in the tree via `portable-pty`/`nix` — used by the live tests for
+# the portable `kill(pid, 0)` process-existence probe (no `/proc`).
+libc = "0.2"
