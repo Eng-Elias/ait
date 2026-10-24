@@ -1,5 +1,5 @@
-//! The Round-2 application loop: one full-screen [`LiveSession`] in the
-//! host terminal (Spec R02, tickets T1+T2).
+//! The Round-2 application loop: shell sessions in tabs inside the host
+//! terminal (Spec R02, tickets T1–T4).
 //!
 //! The loop is synchronous per the spec — no async runtime in Round 2:
 //!
@@ -7,20 +7,29 @@
 //!    period); every queued input event is serviced first so output floods
 //!    can never starve the keyboard (REQUIREMENTS.md §6). Keys resolve
 //!    against the app [`keymap`] **before** PTY input (standard 7): bound
-//!    keys run app actions, everything else snaps the view to the bottom
-//!    and encodes to the shell. The mouse wheel scrolls scrollback; a
-//!    left-button drag highlights cells and its release copies the text
-//!    to the host clipboard via OSC 52 (`Shift+Insert` pastes ait's own
-//!    copy back, bracketed-paste-wrapped when the child enabled mode
-//!    2004).
-//! 2. [`LiveSession::drain_events`] feeds pending PTY output into the
-//!    grid; a scrolled-up view stays pinned on its lines.
-//! 3. A frame renders when the session reports damage or the scroll
-//!    offset moved since the last frame.
+//!    keys run app actions — tab spawn/close/switch land on the
+//!    [`TabManager`], scroll/paste act on the active tab — everything else
+//!    snaps the view to the bottom and encodes to the shell. The mouse
+//!    wheel scrolls scrollback; a left-button drag highlights cells and
+//!    its release copies the text to the host clipboard via OSC 52
+//!    (`Shift+Insert` pastes ait's own copy back, bracketed-paste-wrapped
+//!    when the child enabled mode 2004). Input to a tab whose session
+//!    already exited is dropped.
+//! 2. [`TabManager::drain_events`] feeds pending PTY output into EVERY
+//!    tab's grid and surfaces lifecycle events — background sessions keep
+//!    up, `Exited` marks the tab rather than ending the loop, and OSC 7
+//!    reports track each tab's cwd for `Alt+T` to inherit.
+//! 3. A frame renders when the active session reports damage or what the
+//!    last frame showed changed (view offset, selection, active tab, tab
+//!    count). Chrome — the tab bar on top and the status-line row T5 owns
+//!    at the bottom — lives outside the session grid; the PTY winsize is
+//!    the content area only.
 //!
-//! `Alt+Q` quits, and when the session's child exits `ait` exits with the
-//! child's status — the [`TerminalGuard`](crate::terminal::TerminalGuard)
-//! restores the host terminal on every way out.
+//! `Alt+Q` quits everything, and closing the LAST tab exits `ait` cleanly
+//! — the empty tab set is guarded before any indexing (standard 6). The
+//! [`TerminalGuard`](crate::terminal::TerminalGuard) restores the host
+//! terminal on every way out; dropping the manager drops every
+//! `LiveSession`, which kills the children (SIGHUP → SIGKILL).
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -28,22 +37,24 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ait_term::{
-    CursorShape, Damage, ExitStatus, LiveEvent, LiveSession, LiveSessionOptions, SessionEvent,
-    SessionOptions, Size,
-};
+use ait_term::{CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::queue;
+use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
 use crate::backend::StyledBackend;
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
-use crate::render::{apply_selection, paint_session, to_cursor_style, UnderlineOverlay};
-use crate::scroll::{ScrollState, WHEEL_LINES};
-use crate::selection::{encode_paste, extract, GridPoint, Selection, SelectionRange};
+use crate::render::{
+    apply_selection, chrome_areas, content_size, paint_session, paint_status_line, paint_tab_bar,
+    to_cursor_style, UnderlineOverlay,
+};
+use crate::scroll::WHEEL_LINES;
+use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
+use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
 
 /// Upper bound on one loop iteration's wait for input: at 8 ms the loop
@@ -55,13 +66,31 @@ const INPUT_POLL: Duration = Duration::from_millis(8);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handled {
     Continue,
-    /// `Alt+Q` (or enhanced `Ctrl+Shift+Q`) — exit cleanly.
+    /// `Alt+Q` (or enhanced `Ctrl+Shift+Q`), or the last tab closed —
+    /// exit cleanly.
     Quit,
 }
 
-/// Run the TUI: spawn `$SHELL` in a full-screen session and drive it until
-/// the child exits or the user quits. Returns the child's exit status
-/// mapped to an [`ExitCode`], or `SUCCESS` for a user quit.
+/// What the last painted frame showed: a change in any field alone
+/// triggers a repaint even when the grid reports no damage (a tab switch
+/// repaints an unchanged-but-background grid; a close repaints the tab
+/// bar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rendered {
+    /// Which tab was painted.
+    active: usize,
+    /// How many tabs the bar showed.
+    count: usize,
+    /// The painted tab's scroll offset.
+    offset: usize,
+    /// The painted selection range.
+    selection: Option<SelectionRange>,
+}
+
+/// Run the TUI: spawn `$SHELL` in a tab and drive the tab set until the
+/// last tab closes or the user quits. The last closed tab's exit status
+/// (if it had exited) becomes the process exit code, like the single
+/// session's status did in T1; a user quit maps to `SUCCESS`.
 pub fn run() -> io::Result<ExitCode> {
     let _guard = TerminalGuard::with_options(crate::terminal::TerminalOptions {
         mouse_capture: true,
@@ -75,15 +104,11 @@ pub fn run() -> io::Result<ExitCode> {
         CapabilityTier::Legacy
     };
     let (columns, rows) = crossterm::terminal::size()?;
-    let mut session = LiveSession::spawn(LiveSessionOptions {
-        session: SessionOptions {
-            size: Size::new(usize::from(columns), usize::from(rows)),
-            ..Default::default()
-        },
-        // `program: None` resolves $SHELL, falling back to /bin/sh.
-        ..Default::default()
-    })
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut screen = Rect::new(0, 0, columns, rows);
+    // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
+    // status-line row are chrome outside the session grid (Spec R02).
+    let mut tabs =
+        TabManager::spawn(content_size(screen)).map_err(|e| io::Error::other(e.to_string()))?;
 
     let backend = StyledBackend::new(io::stdout());
     let underlines = backend.underline_overlay();
@@ -92,26 +117,23 @@ pub fn run() -> io::Result<ExitCode> {
     // blocks on stdin, and the just-entered alternate screen is already
     // clean — the first damage render repaints everything.
     let mut last_cursor_shape = None;
-    // Scroll state lives next to the session: `rendered_offset` is what
-    // the last painted frame showed, so a change alone triggers repaint.
-    // The same goes for the mouse selection and ait's own copied text —
-    // per-tab viewport state once T4's tab manager lands.
-    let mut scroll = ScrollState::new();
-    let mut rendered_offset = 0;
-    let mut selection = Selection::default();
-    let mut rendered_selection: Option<SelectionRange> = None;
+    // `copied_text` is app-global — the last copy wins, whichever tab it
+    // came from; `Shift+Insert` pastes it into the active tab.
     let mut copied_text: Option<String> = None;
+    let mut rendered: Option<Rendered> = None;
+    // The exit status of the last closed tab, captured only when closing
+    // empties the set — it becomes ait's exit code then.
+    let mut last_exit: Option<ExitStatus> = None;
 
-    let mut exit_status = None;
-    'main: while exit_status.is_none() {
+    'main: loop {
         // 1. Input first, completely — floods must not starve keystrokes.
         if event::poll(INPUT_POLL)? {
             if let Handled::Quit = handle_event(
                 event::read()?,
-                &mut session,
-                &mut scroll,
-                &mut selection,
+                &mut tabs,
                 &mut copied_text,
+                &mut screen,
+                &mut last_exit,
                 terminal.backend_mut().writer_mut(),
                 tier,
             ) {
@@ -120,10 +142,10 @@ pub fn run() -> io::Result<ExitCode> {
             while event::poll(Duration::ZERO)? {
                 if let Handled::Quit = handle_event(
                     event::read()?,
-                    &mut session,
-                    &mut scroll,
-                    &mut selection,
+                    &mut tabs,
                     &mut copied_text,
+                    &mut screen,
+                    &mut last_exit,
                     terminal.backend_mut().writer_mut(),
                     tier,
                 ) {
@@ -132,157 +154,223 @@ pub fn run() -> io::Result<ExitCode> {
             }
         }
 
-        // 2. Drain the session: feeds queued PTY bytes into the grid and
-        //    surfaces lifecycle events.
-        for live_event in session.drain_events() {
-            match live_event {
-                LiveEvent::Exited(status) => exit_status = Some(status),
-                // Child-app OSC 52 stays off (`SessionOptions::osc52`
-                // default), so this event can't fire — when Round 3's
-                // config flips the option, honor the request by copying
-                // `contents` to the host clipboard exactly like our own
-                // selection copies.
-                LiveEvent::Osc(SessionEvent::ClipboardWrite { .. }) => {}
-                // OSC 7/9/133/… are consumed by later tickets (status
-                // line, toasts).
-                _ => {}
-            }
+        // 2. Drain EVERY tab: feeds queued PTY bytes into the grids and
+        //    surfaces lifecycle events. `CwdChanged`/`Exited` are applied
+        //    inside the manager; the returned stream is where T5 picks up
+        //    `Notification`s for its toast.
+        for tab_event in tabs.drain_events() {
+            // Child-app OSC 52 stays off (`SessionOptions::osc52`
+            // default), so this event can't fire — when Round 3's
+            // config flips the option, honor the request by copying
+            // `contents` to the host clipboard exactly like our own
+            // selection copies. `Notification`s surface to T5's toast
+            // from this same stream.
+            if let LiveEvent::Osc(SessionEvent::ClipboardWrite { .. }) = tab_event.event {}
         }
-        if exit_status.is_some() {
+
+        // Standard 6: the last close already exits via `Handled::Quit`;
+        // this guard is the belt for any path that could empty the set —
+        // never index an empty tab list.
+        let active = tabs.active_index();
+        let count = tabs.len();
+        let Some(tab) = tabs.active_mut() else {
             break;
-        }
+        };
 
-        // A scrolled-up view stays pinned on its lines while output grows
-        // the scrollback underneath it; an in-flight selection follows
-        // the same shift to stay on its text.
-        let grown = scroll.on_output(session.grid().scrollback());
-        selection.on_output(grown);
-
-        // 3. Render when the grid reports damage, the view moved, or the
-        //    selection changed.
-        let damaged = !matches!(session.damage(), Damage::Partial(bounds) if bounds.is_empty());
-        let selection_range = selection.range();
-        if damaged || scroll.offset() != rendered_offset || selection_range != rendered_selection {
-            render_frame(
-                &mut terminal,
-                &session,
-                &underlines,
-                &mut last_cursor_shape,
-                scroll.offset(),
-                selection_range,
-            )?;
-            rendered_offset = scroll.offset();
-            rendered_selection = selection_range;
+        // 3. Render when the grid reports damage or the painted view
+        //    changed.
+        let damaged = !matches!(tab.session.damage(), Damage::Partial(bounds) if bounds.is_empty());
+        let view = Rendered {
+            active,
+            count,
+            offset: tab.scroll.offset(),
+            selection: tab.selection.range(),
+        };
+        if damaged || rendered.as_ref() != Some(&view) {
+            render_frame(&mut terminal, &tabs, &underlines, &mut last_cursor_shape)?;
+            rendered = Some(view);
         }
     }
 
-    Ok(exit_code(exit_status.as_ref()))
+    Ok(exit_code(last_exit.as_ref()))
 }
 
 /// Route one host event. Keys hit the app keymap **before** PTY input
-/// (standard 7): a bound key runs its action and never reaches the PTY; an
-/// unbound key snaps the view to the bottom and encodes to the shell as
-/// before. Any keypress also clears the selection highlight. The wheel
-/// moves the scroll offset; a left-button drag selects cells and its
-/// release copies the text to the host clipboard via OSC 52 — a silent
-/// no-op where the host denies it (Spec R02). Resizes forward to the PTY.
+/// (standard 7): a bound key runs its action and never reaches the PTY —
+/// tab actions mutate the [`TabManager`], scroll/paste actions act on the
+/// active tab. An unbound key snaps the view to the bottom and encodes to
+/// the shell, unless the tab's session already exited — input to exited
+/// tabs is dropped (the tab stays readable until `Alt+W`). Any keypress
+/// also clears the selection highlight. The wheel moves the scroll
+/// offset; a left-button drag selects cells and its release copies the
+/// text to the host clipboard via OSC 52 — a silent no-op where the host
+/// denies it (Spec R02). Resizes forward to EVERY tab's PTY.
 ///
 /// Write/resize failures (e.g. a just-dead child) are tolerated — the
-/// session's `Exited` event ends the loop cleanly.
+/// session's `Exited` event marks the tab cleanly.
 fn handle_event<W: Write>(
     event: Event,
-    session: &mut LiveSession,
-    scroll: &mut ScrollState,
-    selection: &mut Selection,
+    tabs: &mut TabManager,
     copied_text: &mut Option<String>,
+    screen: &mut Rect,
+    last_exit: &mut Option<ExitStatus>,
     host: &mut W,
     tier: CapabilityTier,
 ) -> Handled {
     match event {
-        Event::Key(key_event) => {
-            // Any keypress drops the highlight — never stale state.
-            selection.clear();
-            match keymap::resolve(&key_event, tier) {
-                Resolution::Action(action) => match action {
-                    AppAction::Quit => return Handled::Quit,
+        Event::Key(key_event) => match keymap::resolve(&key_event, tier) {
+            Resolution::Action(AppAction::Quit) => return Handled::Quit,
+            Resolution::Action(AppAction::NewTab) => {
+                // The outgoing tab's highlight ends with the keypress;
+                // the spawned tab becomes active.
+                if let Some(tab) = tabs.active_mut() {
+                    tab.selection.clear();
+                }
+                // A spawn failure (e.g. the tracked cwd was deleted)
+                // leaves the set untouched — T5's toast is the surface
+                // for the error.
+                let _ = tabs.new_tab();
+            }
+            Resolution::Action(AppAction::CloseTab) => {
+                // Closing the last tab exits ait; capture its status for
+                // the process exit code before it is removed.
+                if tabs.len() == 1 {
+                    *last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
+                }
+                // `false` = the set is now empty: quit rather than ever
+                // indexing it (standard 6).
+                if !tabs.close_active() {
+                    return Handled::Quit;
+                }
+            }
+            Resolution::Action(AppAction::NextTab) => {
+                if let Some(tab) = tabs.active_mut() {
+                    tab.selection.clear();
+                }
+                tabs.activate_next();
+            }
+            Resolution::Action(AppAction::PrevTab) => {
+                if let Some(tab) = tabs.active_mut() {
+                    tab.selection.clear();
+                }
+                tabs.activate_prev();
+            }
+            Resolution::Action(AppAction::JumpToTab(n)) => {
+                if let Some(tab) = tabs.active_mut() {
+                    tab.selection.clear();
+                }
+                tabs.jump_to(n);
+            }
+            // Per-active-tab viewport actions: scrollback + paste.
+            Resolution::Action(action) => {
+                let Some(tab) = tabs.active_mut() else {
+                    return Handled::Continue;
+                };
+                tab.selection.clear();
+                match action {
                     AppAction::ScrollPageUp => {
-                        let grid = session.grid();
-                        scroll.scroll_up(grid.lines(), grid.scrollback());
+                        let grid = tab.session.grid();
+                        tab.scroll.scroll_up(grid.lines(), grid.scrollback());
                     }
                     AppAction::ScrollPageDown => {
-                        let page = session.grid().lines();
-                        scroll.scroll_down(page);
+                        let page = tab.session.grid().lines();
+                        tab.scroll.scroll_down(page);
                     }
                     AppAction::ScrollTop => {
-                        let scrollback = session.grid().scrollback();
-                        scroll.jump_to_top(scrollback);
+                        let scrollback = tab.session.grid().scrollback();
+                        tab.scroll.jump_to_top(scrollback);
                     }
-                    AppAction::ScrollBottom => scroll.snap_to_bottom(),
+                    AppAction::ScrollBottom => tab.scroll.snap_to_bottom(),
                     AppAction::Paste => {
                         // Paste ait's own copied selection (there is no
                         // host-clipboard read), bracketed iff the child
                         // enabled mode 2004. The user pastes to type, so
                         // the view snaps to the live viewport first.
-                        scroll.snap_to_bottom();
-                        if let Some(text) = copied_text.as_deref() {
-                            let bytes = encode_paste(text, session.bracketed_paste());
-                            let _ = session.send_bytes(&bytes);
+                        // Exited sessions drop input like keys do.
+                        tab.scroll.snap_to_bottom();
+                        if tab.exit_status().is_none() {
+                            if let Some(text) = copied_text.as_deref() {
+                                let bytes = encode_paste(text, tab.session.bracketed_paste());
+                                let _ = tab.session.send_bytes(&bytes);
+                            }
                         }
                     }
-                    // The tab actions are bound so the keymap already
-                    // owns the full Spec R02 table; they consume the key
-                    // and do nothing until T4's dispatch lands.
-                    AppAction::NewTab
-                    | AppAction::CloseTab
-                    | AppAction::NextTab
-                    | AppAction::PrevTab
-                    | AppAction::JumpToTab(_) => {}
-                },
-                Resolution::PassThrough => {
-                    // Typing snaps the view back to the live viewport,
-                    // then reaches the PTY encoded exactly as before.
-                    scroll.snap_to_bottom();
+                    other => unreachable!(
+                        "keymap actions handled above: {other:?} is not a viewport action"
+                    ),
+                }
+            }
+            Resolution::PassThrough => {
+                let Some(tab) = tabs.active_mut() else {
+                    return Handled::Continue;
+                };
+                // Any keypress drops the highlight — never stale state.
+                tab.selection.clear();
+                // Typing snaps the view back to the live viewport, then
+                // reaches the PTY encoded exactly as before.
+                tab.scroll.snap_to_bottom();
+                if tab.exit_status().is_none() {
                     if let Some(key_event) = keys::translate(&key_event) {
-                        let _ = session.send_key(key_event);
+                        let _ = tab.session.send_key(key_event);
                     }
                 }
+            }
+        },
+        Event::Mouse(mouse_event) => {
+            let content = chrome_areas(*screen).content;
+            let Some(tab) = tabs.active_mut() else {
+                return Handled::Continue;
+            };
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => {
+                    tab.selection.clear();
+                    let scrollback = tab.session.grid().scrollback();
+                    tab.scroll.scroll_up(WHEEL_LINES, scrollback);
+                }
+                MouseEventKind::ScrollDown => {
+                    tab.selection.clear();
+                    tab.scroll.scroll_down(WHEEL_LINES);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Only a drag starting inside the session area
+                    // selects; the chrome rows (tab bar, status line)
+                    // are inert.
+                    if content.contains(Position::new(mouse_event.column, mouse_event.row)) {
+                        let offset = tab.scroll.offset();
+                        tab.selection
+                            .begin(grid_point(&mouse_event, content, offset));
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    // An in-flight drag follows the pointer anywhere —
+                    // past the top it selects into scrollback, the way
+                    // the view would scroll.
+                    let offset = tab.scroll.offset();
+                    tab.selection
+                        .extend(grid_point(&mouse_event, content, offset));
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(range) = tab.selection.finish() {
+                        let text = extract(&tab.session.grid(), range);
+                        if !text.is_empty() {
+                            *copied_text = Some(text.clone());
+                            // OSC 52 silently no-ops where the host
+                            // denies it — never an error (Spec R02).
+                            let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
+                            let _ = host.flush();
+                        }
+                    }
+                }
+                // Other buttons and motion aren't captured/used.
+                _ => {}
             }
         }
-        Event::Mouse(mouse_event) => match mouse_event.kind {
-            MouseEventKind::ScrollUp => {
-                selection.clear();
-                let scrollback = session.grid().scrollback();
-                scroll.scroll_up(WHEEL_LINES, scrollback);
-            }
-            MouseEventKind::ScrollDown => {
-                selection.clear();
-                scroll.scroll_down(WHEEL_LINES);
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                selection.begin(grid_point(&mouse_event, scroll.offset()));
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                selection.extend(grid_point(&mouse_event, scroll.offset()));
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(range) = selection.finish() {
-                    let text = extract(&session.grid(), range);
-                    if !text.is_empty() {
-                        *copied_text = Some(text.clone());
-                        // OSC 52 silently no-ops where the host denies
-                        // it — never an error (Spec R02).
-                        let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
-                        let _ = host.flush();
-                    }
-                }
-            }
-            // Other buttons and motion aren't captured/used.
-            _ => {}
-        },
         Event::Resize(columns, rows) => {
-            // Reflow invalidates grid coordinates the range points at.
-            selection.clear();
-            let _ = session.resize(Size::new(usize::from(columns), usize::from(rows)));
+            *screen = Rect::new(0, 0, columns, rows);
+            // EVERY tab's PTY gets the new content-area winsize, not just
+            // the visible one (Spec R02 user story 17); selections are
+            // cleared inside — reflow invalidates their coordinates.
+            tabs.resize_all(content_size(*screen));
         }
         // Focus and paste events have no Round-2 handler yet.
         _ => {}
@@ -290,25 +378,31 @@ fn handle_event<W: Write>(
     Handled::Continue
 }
 
-/// Screen mouse position → grid coordinates: `line = row - scroll_offset`
-/// (the same rule the painter uses).
-fn grid_point(mouse: &MouseEvent, scroll_offset: usize) -> GridPoint {
+/// Screen mouse position → grid coordinates: `line = row - content.y -
+/// scroll_offset` (the same rule the painter uses), `column = column -
+/// content.x`.
+fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPoint {
     let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
-    GridPoint::new(i32::from(mouse.row) - offset, usize::from(mouse.column))
+    GridPoint::new(
+        i32::from(mouse.row) - i32::from(content.y) - offset,
+        usize::from(mouse.column.saturating_sub(content.x)),
+    )
 }
 
-/// Draw one frame: repaint the grid at `scroll_offset`, invert the
-/// selected cells if a range is active, apply the application-requested
-/// cursor shape (only when it changed), and place the cursor.
+/// Draw one frame: the tab bar on top, the active tab's grid in the
+/// content band (shifted `scroll_offset` lines into scrollback, selected
+/// cells inverted), the reserved status row at the bottom, then the
+/// application-requested cursor shape and position.
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
-    session: &LiveSession,
+    tabs: &TabManager,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
-    scroll_offset: usize,
-    selection: Option<SelectionRange>,
 ) -> io::Result<()> {
-    let cursor = session.cursor();
+    let Some(tab) = tabs.active() else {
+        return Ok(());
+    };
+    let cursor = tab.session.cursor();
     if let Some(style) = to_cursor_style(cursor.shape) {
         if *last_cursor_shape != Some(style) {
             // Queued on the backend's writer; flushes with this draw.
@@ -317,22 +411,39 @@ fn render_frame(
         }
     }
 
+    let titles = tabs.titles();
+    let active = tabs.active_index();
     terminal.draw(|frame| {
-        let area = frame.area();
-        let grid = session.grid();
+        let areas = chrome_areas(frame.area());
+        let buf = frame.buffer_mut();
         {
             let mut overlay = underlines.borrow_mut();
             overlay.clear();
-            paint_session(frame.buffer_mut(), area, &grid, &mut overlay, scroll_offset);
-            if let Some(range) = selection {
-                apply_selection(frame.buffer_mut(), area, &grid, range, scroll_offset);
+            paint_session(
+                buf,
+                areas.content,
+                &tab.session.grid(),
+                &mut overlay,
+                tab.scroll.offset(),
+            );
+            if let Some(range) = tab.selection.range() {
+                apply_selection(
+                    buf,
+                    areas.content,
+                    &tab.session.grid(),
+                    range,
+                    tab.scroll.offset(),
+                );
             }
         }
-        // The cursor's live line renders at screen row `line + offset`;
-        // scrolled far enough up it leaves the frame and stays hidden.
-        let y = cursor.line.saturating_add(scroll_offset);
-        if cursor.shape != CursorShape::Hidden && y < usize::from(area.height) {
-            let x = (cursor.column as u16).min(area.width.saturating_sub(1));
+        paint_tab_bar(buf, areas.tab_bar, &titles, active);
+        paint_status_line(buf, areas.status);
+        // The cursor's live line renders at `content.y + line + offset`;
+        // scrolled far enough up it leaves the band and stays hidden.
+        let y = usize::from(areas.content.y) + cursor.line + tab.scroll.offset();
+        if cursor.shape != CursorShape::Hidden && y < usize::from(areas.content.bottom()) {
+            let x = (areas.content.x + cursor.column as u16)
+                .min(areas.content.right().saturating_sub(1));
             frame.set_cursor_position((x, y as u16));
         }
         // No position set → ratatui hides the cursor this frame.
@@ -341,10 +452,172 @@ fn render_frame(
     Ok(())
 }
 
-/// The child's exit status as the process exit code.
+/// The last closed tab's exit status as the process exit code.
 fn exit_code(status: Option<&ExitStatus>) -> ExitCode {
     match status {
         Some(status) => ExitCode::from(u8::try_from(status.code).unwrap_or(u8::MAX)),
         None => ExitCode::SUCCESS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Dispatch tests: `handle_event` is where the keymap's tab actions
+    //! meet the [`TabManager`]. Real `/bin/sh`-class sessions keep the
+    //! wiring honest — spawning tiny PTYs needs no host TTY.
+
+    use super::*;
+    use ait_term::Size;
+    use crossterm::event::{KeyCode, KeyEvent as CtKeyEvent, KeyModifiers};
+
+    fn manager() -> TabManager {
+        TabManager::spawn(Size::new(40, 10)).unwrap()
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(CtKeyEvent::new(code, modifiers))
+    }
+
+    struct Harness {
+        tabs: TabManager,
+        screen: Rect,
+        copied: Option<String>,
+        last_exit: Option<ExitStatus>,
+        sink: Vec<u8>,
+    }
+
+    impl Harness {
+        fn new(tabs: TabManager) -> Self {
+            Self {
+                tabs,
+                screen: Rect::new(0, 0, 80, 24),
+                copied: None,
+                last_exit: None,
+                sink: Vec::new(),
+            }
+        }
+
+        fn handle(&mut self, event: Event) -> Handled {
+            handle_event(
+                event,
+                &mut self.tabs,
+                &mut self.copied,
+                &mut self.screen,
+                &mut self.last_exit,
+                &mut self.sink,
+                CapabilityTier::Legacy,
+            )
+        }
+    }
+
+    /// `Alt+T` spawns a second tab and activates it.
+    #[test]
+    fn alt_t_spawns_and_activates() {
+        let mut harness = Harness::new(manager());
+
+        let handled = harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+
+        assert_eq!(handled, Handled::Continue);
+        assert_eq!(harness.tabs.len(), 2);
+        assert_eq!(harness.tabs.active_index(), 1);
+    }
+
+    /// `Alt+W` closes the active tab; on the last one it reports `Quit`
+    /// — and leaves the empty set for the loop's guard, never indexed.
+    #[test]
+    fn alt_w_closes_and_quits_on_the_last_tab() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Handled::Continue,
+            "one tab remains"
+        );
+        assert_eq!(harness.tabs.len(), 1);
+        assert_eq!(
+            harness.handle(key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Handled::Quit,
+            "closing the last tab exits ait"
+        );
+        assert!(harness.tabs.is_empty());
+    }
+
+    /// `Ctrl+PageDown`/`Ctrl+PageUp` cycle with wraparound; `Alt+N`
+    /// jumps; `Alt+Q` quits regardless of the tab count.
+    #[test]
+    fn switch_jump_and_quit_dispatch() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(harness.tabs.len(), 3);
+
+        harness.handle(key(KeyCode::PageDown, KeyModifiers::CONTROL));
+        assert_eq!(harness.tabs.active_index(), 0, "wrapped");
+        harness.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        assert_eq!(harness.tabs.active_index(), 2);
+        harness.handle(key(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(harness.tabs.active_index(), 1);
+        harness.handle(key(KeyCode::Char('9'), KeyModifiers::ALT));
+        assert_eq!(harness.tabs.active_index(), 1, "inert out-of-range jump");
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Char('q'), KeyModifiers::ALT)),
+            Handled::Quit
+        );
+        // Quit leaves the set alone — the manager's Drop kills the
+        // children.
+        assert_eq!(harness.tabs.len(), 3);
+    }
+
+    /// A resize event reaches every tab's PTY — and it is the CONTENT
+    /// size (window minus the two chrome rows), never the full window.
+    #[test]
+    fn resize_event_resizes_every_tab_to_the_content_area() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+
+        harness.handle(Event::Resize(100, 30));
+
+        for tab in harness.tabs.tabs() {
+            assert_eq!(
+                tab.session.size(),
+                Size::new(100, 28),
+                "window minus tab bar + status row"
+            );
+        }
+        // New tabs spawned after the resize get the content size too.
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(100, 28)
+        );
+    }
+
+    /// A press that resolves `PassThrough` snaps the active tab's view
+    /// to the bottom — per-tab scroll state survives the switch.
+    #[test]
+    fn typing_snaps_only_the_active_tab() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        // Scroll tab 2 up, switch back to tab 1, type there.
+        {
+            let tab = harness.tabs.active_mut().unwrap();
+            tab.scroll.scroll_up(3, 10);
+        }
+        harness.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        assert_eq!(harness.tabs.active_index(), 0);
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(
+            harness.tabs.tabs()[0].scroll.offset(),
+            0,
+            "typed tab snapped"
+        );
+        assert_eq!(
+            harness.tabs.tabs()[1].scroll.offset(),
+            3,
+            "the background tab kept its offset"
+        );
     }
 }
