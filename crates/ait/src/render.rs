@@ -28,23 +28,37 @@ use ratatui::style::{Color as RtColor, Modifier};
 /// `Modifier::UNDERLINED` on the buffer cell says".
 pub type UnderlineOverlay = HashMap<(u16, u16), Underline>;
 
-/// Paint the session's visible grid into `buf`, covering `area`.
+/// Paint the session's grid into `buf`, covering `area`, shifted
+/// `scroll_offset` lines into scrollback (`0` = live viewport).
 ///
-/// `area` is the region the grid occupies (the whole frame for the
-/// single-session skeleton; a smaller rect once chrome lands). Cells past
-/// the grid's edge — e.g. a just-grown frame before the session's resize is
-/// processed — are reset to blank.
+/// Screen row `i` displays `grid.line(i - scroll_offset)` — a positive
+/// offset pulls history lines in from the top. `area` is the region the
+/// grid occupies (the whole frame for the single-session skeleton; a
+/// smaller rect once chrome lands). Cells past the grid's edge — e.g. a
+/// just-grown frame before the session's resize is processed — are reset
+/// to blank.
 pub fn paint_session(
     buf: &mut Buffer,
     area: Rect,
     grid: &GridView<'_>,
     overlay: &mut UnderlineOverlay,
+    scroll_offset: usize,
 ) {
-    for (row_index, row) in grid.visible_rows().enumerate() {
+    // `offset` can't exceed i32 (scrollback depth is small), but guard the
+    // cast anyway — a pathological offset just paints blanks.
+    let offset = i32::try_from(scroll_offset).unwrap_or(i32::MAX);
+    let viewport_rows = grid.lines().min(usize::from(area.height));
+    for row_index in 0..viewport_rows {
         let y = area.y + row_index as u16;
-        if y >= area.bottom() {
-            break;
-        }
+        let line_index = row_index as i32 - offset;
+        let Some(row) = grid.line(line_index) else {
+            // Above the oldest scrollback line (offset deeper than the
+            // history, e.g. right after a shrink) — paint blank.
+            for x in area.x..area.right() {
+                buf[(x, y)].reset();
+            }
+            continue;
+        };
         // Text first: `set_stringn` sizes graphemes itself, so wide
         // characters occupy two columns and zero-width characters stay
         // attached to their base grapheme.
@@ -77,7 +91,7 @@ pub fn paint_session(
         }
     }
     // Clear any rows the grid doesn't cover (resize slack).
-    for y in (area.y + grid.lines() as u16)..area.bottom() {
+    for y in (area.y + viewport_rows as u16)..area.bottom() {
         for x in area.x..area.right() {
             buf[(x, y)].reset();
         }
@@ -172,10 +186,19 @@ mod tests {
     }
 
     fn paint(session: &Session, width: u16, height: u16) -> (Buffer, UnderlineOverlay) {
+        paint_scrolled(session, width, height, 0)
+    }
+
+    fn paint_scrolled(
+        session: &Session,
+        width: u16,
+        height: u16,
+        scroll_offset: usize,
+    ) -> (Buffer, UnderlineOverlay) {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         let mut overlay = UnderlineOverlay::new();
         let area = buf.area;
-        paint_session(&mut buf, area, &session.grid(), &mut overlay);
+        paint_session(&mut buf, area, &session.grid(), &mut overlay, scroll_offset);
         (buf, overlay)
     }
 
@@ -320,9 +343,65 @@ mod tests {
         buf[(0, 4)].set_symbol("!");
         let mut overlay = UnderlineOverlay::new();
         let area = buf.area;
-        paint_session(&mut buf, area, &session.grid(), &mut overlay);
+        paint_session(&mut buf, area, &session.grid(), &mut overlay, 0);
 
         assert_eq!(buf[(0, 4)].symbol(), " ");
+    }
+
+    /// A scrolled-up view pulls scrollback rows in from the top: screen row
+    /// `i` shows `grid.line(i - offset)` — styled cells included.
+    #[test]
+    fn scroll_offset_paints_scrollback_rows() {
+        let mut session = session(80, 4);
+        // Seven numbered lines on a 4-line viewport: each trailing CRLF
+        // scrolls once at the bottom, so line0..line3 end in scrollback
+        // and line4..line6 fill the live viewport.
+        for n in 0..7 {
+            session.feed_bytes(format!("line{n}\r\n").as_bytes());
+        }
+        assert_eq!(session.grid().scrollback(), 4);
+
+        let (buf, _) = paint_scrolled(&session, 80, 4, 2);
+        // Screen rows 0-1 show the last two scrollback lines; the rest of
+        // the viewport shifted down.
+        let row0: String = (0..5).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        let row1: String = (0..5).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        let row2: String = (0..5).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        assert_eq!(row0, "line2");
+        assert_eq!(row1, "line3");
+        assert_eq!(row2, "line4");
+    }
+
+    /// Scrollback cells keep their colors and styles, not just their text.
+    #[test]
+    fn scroll_offset_keeps_scrollback_styles() {
+        let mut session = session(80, 2);
+        session.feed_bytes(b"\x1b[31mRED\r\nplain\r\n");
+        assert!(session.grid().scrollback() >= 1);
+
+        let (buf, _) = paint_scrolled(&session, 80, 2, 1);
+        assert_eq!(buf[(0, 0)].symbol(), "R");
+        assert_eq!(buf[(0, 0)].fg, RtColor::Red);
+        assert_eq!(buf[(0, 1)].symbol(), "p");
+    }
+
+    /// Scrolled to the top of history, the oldest scrollback line leads;
+    /// an offset beyond the depth paints blanks rather than panicking.
+    #[test]
+    fn scroll_offset_at_top_and_beyond() {
+        let mut session = session(80, 2);
+        for n in 0..5 {
+            session.feed_bytes(format!("row{n}\r\n").as_bytes());
+        }
+        let depth = session.grid().scrollback();
+        assert!(depth >= 3);
+
+        let (buf, _) = paint_scrolled(&session, 80, 2, depth);
+        let row0: String = (0..4).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row0, "row0", "deepest offset shows the oldest line");
+
+        let (buf, _) = paint_scrolled(&session, 80, 2, depth + 100);
+        assert_eq!(buf[(0, 0)].symbol(), " ", "beyond depth paints blank");
     }
 
     #[test]
