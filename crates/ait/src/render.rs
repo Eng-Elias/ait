@@ -219,13 +219,28 @@ pub fn paint_tab_bar(buf: &mut Buffer, area: Rect, titles: &[String], active: us
     }
 }
 
-/// Paint the status-line row. T5 owns its content (`cwd · shell · model
-/// · state`, notification toasts); T4 only reserves and clears it so a
-/// frame never leaves stale cells behind.
-pub fn paint_status_line(buf: &mut Buffer, area: Rect) {
-    for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            buf[(x, y)].reset();
+/// Paint the status-line row: `text` clipped at the row's right edge,
+/// the tail cleared so a shrinking line never leaves stale cells (the
+/// same contract as [`paint_tab_bar`]). `highlighted` reverses the
+/// text's cells — the toast's "get my attention" look vs. the plain
+/// session summary.
+pub fn paint_status_line(buf: &mut Buffer, area: Rect, text: &str, highlighted: bool) {
+    if area.height == 0 {
+        return;
+    }
+    let y = area.y;
+    // Reset first: `set_stringn` patches symbols but doesn't clear a
+    // stale REVERSED left by an expired toast.
+    for x in area.x..area.right() {
+        buf[(x, y)].reset();
+    }
+    // `set_stringn` sizes graphemes itself, so a wide char in a cwd
+    // occupies two columns like it does in the grid.
+    let width = usize::from(area.right() - area.x);
+    let (end_x, _) = buf.set_stringn(area.x, y, text, width, ratatui::style::Style::default());
+    if highlighted {
+        for x in area.x..end_x.min(area.right()) {
+            buf[(x, y)].modifier |= Modifier::REVERSED;
         }
     }
 }
@@ -708,13 +723,68 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), " ");
     }
 
-    /// The reserved status row is cleared so T5 starts from blank.
+    /// The status line paints its text left-aligned, plain when it is
+    /// the session summary, and clears the tail so a shrinking line
+    /// leaves nothing stale behind.
     #[test]
-    fn status_line_row_is_cleared() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
-        buf[(3, 0)].set_symbol("x");
+    fn status_line_paints_text_and_clears_the_tail() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 1));
+        // Pre-fill the tail so the clear is observable.
+        buf[(25, 0)].set_symbol("!");
+        buf[(25, 0)].modifier |= Modifier::REVERSED;
         let area = buf.area;
-        paint_status_line(&mut buf, area);
-        assert_eq!(buf[(3, 0)].symbol(), " ");
+        paint_status_line(&mut buf, area, "/tmp · sh · — · running", false);
+
+        let row: String = (0..23).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "/tmp · sh · — · running");
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        // The tail cell's symbol AND its stale highlight are gone.
+        assert_eq!(buf[(25, 0)].symbol(), " ");
+        assert!(!buf[(25, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// A live toast paints its text reversed — the attention marker —
+    /// over the whole of its cells.
+    #[test]
+    fn status_line_toast_is_highlighted() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let area = buf.area;
+        paint_status_line(&mut buf, area, "build finished", true);
+
+        let row: String = (0..14).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "build finished");
+        for x in 0..14 {
+            assert!(
+                buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "toast cell {x} reversed"
+            );
+        }
+        // Untouched tail: reset but not part of the highlight.
+        assert!(!buf[(15, 0)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Text past the row's width clips instead of overflowing (a deep
+    /// cwd on a narrow window).
+    #[test]
+    fn status_line_clips_overflow() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let area = buf.area;
+        paint_status_line(&mut buf, area, "/very/deep/cwd · bash", false);
+        let row: String = (0..10).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "/very/deep", "clipped at the row's edge");
+    }
+
+    /// A wide char in the cwd occupies two columns, matching how the
+    /// grid itself paints it.
+    #[test]
+    fn status_line_wide_chars_take_two_columns() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        let area = buf.area;
+        paint_status_line(&mut buf, area, "/日本語 · sh", false);
+
+        assert_eq!(buf[(0, 0)].symbol(), "/");
+        assert_eq!(buf[(1, 0)].symbol(), "日");
+        // '本' lands two columns over — the spacer belongs to '日'.
+        assert_eq!(buf[(3, 0)].symbol(), "本");
     }
 }

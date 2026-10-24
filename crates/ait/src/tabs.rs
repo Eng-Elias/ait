@@ -78,11 +78,8 @@ impl Tab {
 /// removals shift positions.
 #[derive(Debug)]
 pub struct TabEvent {
-    /// Position in the tab list when the event was drained.
-    #[expect(
-        dead_code,
-        reason = "tab attribution — T5's toast tags notifications to their tab"
-    )]
+    /// Position in the tab list when the event was drained — the toast
+    /// uses it to attribute a notification to a background tab.
     pub tab: usize,
     /// What the session surfaced.
     pub event: LiveEvent,
@@ -162,8 +159,8 @@ impl TabManager {
     /// `Alt+T`: a fresh `$SHELL` tab in the active tab's cwd.
     ///
     /// A spawn failure (e.g. the tracked cwd was deleted) leaves the tab
-    /// set untouched and propagates — the caller ignores it this round;
-    /// T5's toast is the right surface for the error.
+    /// set untouched and propagates — the caller surfaces it as a
+    /// status-line toast.
     pub fn new_tab(&mut self) -> Result<(), SpawnError> {
         self.spawn_tab(LiveSessionOptions::default())
     }
@@ -270,8 +267,8 @@ impl TabManager {
     ///
     /// Per-tab bookkeeping is applied here (`CwdChanged` updates the
     /// tab's tracked cwd, `Exited` records the status); the events are
-    /// also returned for whatever else the caller renders — `T5` toasts
-    /// `Notification`s from this stream.
+    /// also returned for whatever else the caller renders — `app`
+    /// toasts `Notification`s from this stream.
     ///
     /// After draining, each tab's pinned scroll view and selection are
     /// shifted by how much scrollback grew, so they stay on their lines
@@ -542,6 +539,22 @@ mod tests {
         // state.
         assert!(!manager.close_active());
         assert!(manager.is_empty());
+    }
+
+    /// A failed spawn — a nonexistent program here — propagates a real
+    /// `SpawnError` and leaves the tab set untouched; `app` toasts that
+    /// error on `Alt+T`.
+    #[test]
+    fn failed_spawn_propagates_and_changes_nothing() {
+        let mut manager = manager(1, "/tmp");
+        let result = manager.spawn_tab(LiveSessionOptions {
+            program: Some(OsString::from("/ait-definitely-nonexistent-program")),
+            ..Default::default()
+        });
+
+        assert!(result.is_err(), "the spawn reports its failure");
+        assert_eq!(manager.len(), 1, "no half-spawned tab was kept");
+        assert_eq!(manager.active_index(), 0, "the active tab is unmoved");
     }
 
     /// Background tabs drain too: output lands in their grids and their
