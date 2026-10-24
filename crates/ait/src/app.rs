@@ -40,7 +40,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use ait_term::{CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
+use ait_term::{Cell, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, MouseButton, MouseEvent, MouseEventKind};
@@ -65,6 +65,12 @@ use crate::terminal::TerminalGuard;
 /// idles at ~125 iterations/sec — well above the §6 floor of 30 fps — and
 /// input latency stays under a frame.
 const INPUT_POLL: Duration = Duration::from_millis(8);
+
+/// Watchdog bound on the startup capability probe: comfortably past
+/// crossterm's own ~2 s query timeout, so only a genuinely wedged probe
+/// (kitty flags answered, primary-DA never) trips it — never a merely
+/// slow-to-answer legacy host.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Whether the loop keeps running after an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +118,13 @@ struct Rendered {
     status: String,
     /// Whether `status` was a live toast (painted reversed).
     toast: bool,
+    /// The cursor's position and shape — a pure cursor move repaints.
+    cursor: Cursor,
+    /// The cursor cell's contents last frame. alacritty's `damage()`
+    /// always marks the cursor cell, so when that is the only mark the
+    /// snapshot must carry enough to notice the cell changing under a
+    /// stationary cursor (a spinner redrawing in place).
+    cursor_cell: Option<Cell>,
 }
 
 /// Run the TUI: spawn `$SHELL` in a tab and drive the tab set until the
@@ -124,11 +137,22 @@ pub fn run() -> io::Result<ExitCode> {
     })?;
     // Capability detection runs once, before the event loop: the query
     // blocks up to ~2 s on hosts that don't answer (tmux) and must never
-    // race `event::poll`.
-    let tier = if crate::terminal::enable_keyboard_enhancement() {
-        CapabilityTier::Enhanced
-    } else {
-        CapabilityTier::Legacy
+    // race `event::poll`. It runs under a watchdog — a host that answers
+    // the kitty flags query but never answers the trailing primary-DA
+    // query wedges crossterm's event reader *forever*, and the wedged
+    // lock would starve every later `event::poll`. There is no recovery:
+    // exit cleanly (the guard restores the host) rather than start an
+    // input-dead TUI that can't even quit.
+    let tier = match crate::terminal::detect_tier(DETECT_TIMEOUT) {
+        crate::terminal::TierDetection::Enhanced => CapabilityTier::Enhanced,
+        crate::terminal::TierDetection::Legacy => CapabilityTier::Legacy,
+        crate::terminal::TierDetection::Hung => {
+            return Err(io::Error::other(
+                "host terminal never finished the keyboard-capability probe \
+                 (answered the kitty flags query but not primary-DA) — \
+                 refusing to start with a dead input path",
+            ));
+        }
     };
     let (columns, rows) = crossterm::terminal::size()?;
     let mut state = AppState {
@@ -221,7 +245,14 @@ pub fn run() -> io::Result<ExitCode> {
         // 3. Render when the grid reports damage or the painted view
         //    changed. The status text rides the snapshot, so `Exited`
         //    and toast expiry repaint without grid damage.
-        let damaged = !matches!(tab.session.damage(), Damage::Partial(bounds) if bounds.is_empty());
+        let cursor = tab.session.cursor();
+        // alacritty's `damage()` ALWAYS marks the cursor's own cell —
+        // trusting it alone repaints every 8 ms tick (~125 fps idle,
+        // emitting empty ratatui diffs). A cursor-only report carries no
+        // new pixels: a cursor move marks the old AND new cells, and a
+        // cell rewritten under a stationary cursor shows up in
+        // `view.cursor_cell` — both still repaint via the snapshot.
+        let damaged = damaged_beyond_cursor(&tab.session.damage(), cursor);
         let now = Instant::now();
         let view = Rendered {
             active,
@@ -236,6 +267,11 @@ pub fn run() -> io::Result<ExitCode> {
                 now,
             ),
             toast: state.toast.as_ref().is_some_and(|t| t.is_live(now)),
+            cursor,
+            cursor_cell: tab.session.grid().cell(
+                i32::try_from(cursor.line).unwrap_or(i32::MAX),
+                cursor.column,
+            ),
         };
         if damaged || rendered.as_ref() != Some(&view) {
             render_frame(
@@ -413,6 +449,14 @@ fn handle_event<W: Write>(
                         .extend(grid_point(&mouse_event, content, offset));
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
+                    // Fold the release point into the range before
+                    // finishing: hosts coalesce motion reports, so the
+                    // last `Drag` can lag the cell the button released
+                    // on — a fast flick would otherwise copy short.
+                    // Outside a drag `extend` is a no-op.
+                    let offset = tab.scroll.offset();
+                    tab.selection
+                        .extend(grid_point(&mouse_event, content, offset));
                     if let Some(range) = tab.selection.finish() {
                         let text = extract(&tab.session.grid(), range);
                         if !text.is_empty() {
@@ -518,6 +562,23 @@ fn render_frame(
     Ok(())
 }
 
+/// Whether a damage report marks any cell besides the cursor's own.
+///
+/// alacritty's `Term::damage` unconditionally damages the cursor cell —
+/// under an 8 ms input tick that alone would repaint ~125 frames/sec on
+/// an idle session (each an empty ratatui diff). The cases that DO need
+/// a repaint stay covered: a cursor move damages the old and new cells,
+/// and a cell rewritten in place shows up as a `Rendered::cursor_cell`
+/// change — so filtering cursor-only bounds never stalls a real update.
+fn damaged_beyond_cursor(damage: &Damage, cursor: Cursor) -> bool {
+    match damage {
+        Damage::Full => true,
+        Damage::Partial(bounds) => bounds.iter().any(|b| {
+            !(b.line == cursor.line && b.left == cursor.column && b.right == cursor.column)
+        }),
+    }
+}
+
 /// The last closed tab's exit status as the process exit code.
 fn exit_code(status: Option<&ExitStatus>) -> ExitCode {
     match status {
@@ -542,6 +603,38 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(CtKeyEvent::new(code, modifiers))
+    }
+
+    /// The idle-repaint guard: alacritty always damages the cursor's own
+    /// cell, so a naive `is_empty` check redraws every loop tick. Only
+    /// damage beyond that exact cell counts — a cursor move (old + new
+    /// cells) or any real content change still renders.
+    #[test]
+    fn cursor_only_damage_is_not_a_repaint() {
+        use ait_term::DamageBounds;
+        let cursor = Cursor {
+            line: 5,
+            column: 10,
+            shape: CursorShape::Block,
+        };
+        let bound = |line, left, right| DamageBounds { line, left, right };
+
+        assert!(!damaged_beyond_cursor(&Damage::Partial(vec![]), cursor));
+        assert!(!damaged_beyond_cursor(
+            &Damage::Partial(vec![bound(5, 10, 10)]),
+            cursor
+        ));
+        // A second damaged cell (the cursor's old spot, or real content).
+        assert!(damaged_beyond_cursor(
+            &Damage::Partial(vec![bound(5, 10, 10), bound(3, 0, 0)]),
+            cursor
+        ));
+        // A range covering the cursor plus neighbors is real damage.
+        assert!(damaged_beyond_cursor(
+            &Damage::Partial(vec![bound(5, 8, 12)]),
+            cursor
+        ));
+        assert!(damaged_beyond_cursor(&Damage::Full, cursor));
     }
 
     struct Harness {
@@ -698,6 +791,73 @@ mod tests {
         assert!(
             harness.state.toast.is_none(),
             "a successful spawn is silent"
+        );
+    }
+
+    /// The release point belongs to the selection: hosts coalesce
+    /// motion reports, so the last `Drag` can lag the cell the button
+    /// was released on — a quick flick released past the last reported
+    /// drag must still copy through the release cell.
+    #[test]
+    fn release_extends_the_selection_to_the_release_cell() {
+        use crossterm::event::MouseEvent;
+        use std::time::Instant;
+
+        let mut harness = Harness::new(manager());
+        // A marker the whole grid knows: the sh output `HELLOWORLD` on
+        // its own line. Wait for it, then find its grid line.
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"printf 'HELLOWORLD\\n'\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let line = loop {
+            let tab = harness.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            let found = (0..grid.lines()).find(|&line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().starts_with("HELLOWORLD"))
+            });
+            if let Some(line) = found {
+                break line;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the marker"
+            );
+            harness.tabs.drain_events();
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Grid line `l` paints at screen row `l + content.y` (the tab
+        // bar sits at row 0).
+        let row = (line + 1) as u16;
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        // Down on 'H', a drag report at 'O' (col 4), released on the
+        // final 'D' (col 9): the copy must reach the release cell.
+        harness.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        harness.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        harness.handle(mouse(MouseEventKind::Up(MouseButton::Left), 9));
+
+        assert_eq!(
+            harness.state.copied_text.as_deref(),
+            Some("HELLOWORLD"),
+            "the release point extends the copied range"
+        );
+        // …and the copy went out to the host clipboard via OSC 52.
+        assert!(
+            harness.sink.windows(5).any(|w| w == b"\x1b]52;"),
+            "OSC 52 should reach the host stream"
         );
     }
 }
