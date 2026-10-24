@@ -329,7 +329,9 @@ pub fn run() -> io::Result<ExitCode> {
 /// view, `Paste` snaps (the user pastes to type), the tab actions
 /// change which tab is on screen — each tab keeps its own offset by
 /// design — and `Quit` exits. A key release is not a keypress: it does
-/// none of this. The wheel moves the scroll
+/// none of this.
+///
+/// The wheel moves the scroll
 /// offset; a left-button drag selects cells and its release copies the
 /// text to the host clipboard via OSC 52 — a silent no-op where the host
 /// denies it (Spec R02). Resizes forward to EVERY tab's PTY. A failed
