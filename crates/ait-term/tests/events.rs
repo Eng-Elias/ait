@@ -104,6 +104,39 @@ fn osc777_notify_produces_a_notification_with_a_title() {
 }
 
 #[test]
+fn osc777_notify_with_only_a_message_reports_no_title() {
+    let mut session = session();
+    // `OSC 777 ; notify ; <message>` — no body param. The `notify` verb is
+    // part of the protocol, not the payload: it must never leak into the
+    // message.
+    let events = session.feed_bytes(b"\x1b]777;notify;Build finished\x07");
+
+    assert_eq!(
+        events,
+        vec![SessionEvent::Notification {
+            title: None,
+            message: "Build finished".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn osc777_bare_notify_is_malformed_and_surfaces_as_private() {
+    let mut session = session();
+    // `OSC 777 ; notify` with no payload at all: nothing to toast, so the
+    // sequence is a recognized-but-malformed one — raw params preserved.
+    let events = session.feed_bytes(b"\x1b]777;notify\x07");
+
+    assert_eq!(
+        events,
+        vec![SessionEvent::Private {
+            code: b"777".to_vec(),
+            params: vec![b"notify".to_vec()],
+        }]
+    );
+}
+
+#[test]
 fn osc52_is_silent_until_the_session_opts_in() {
     let mut session = session();
     // `aGk=` is base64 "hi". With the default options this must emit nothing.

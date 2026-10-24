@@ -139,14 +139,16 @@ impl ExitStatus {
     }
 }
 
-/// Lifecycle of a [`LiveSession`] (Spec R01): `Starting` inside
-/// [`LiveSession::spawn`] before the child is launched, `Running` once it
-/// is, `Exited` once the waiter thread observes its death.
+/// Lifecycle of a [`LiveSession`] (Spec R01): `Running` once the child is
+/// launched, `Exited` once the session's event path surfaces its death.
+/// `Starting` is the transient phase inside [`LiveSession::spawn`] — a
+/// returned session never reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
-    /// The PTY is open and the child is being spawned.
+    /// The PTY is open and the child is being spawned — transient inside
+    /// [`LiveSession::spawn`].
     Starting,
-    /// The child is (as far as the waiter knows) alive.
+    /// The child is (as far as the event stream knows) alive.
     Running,
     /// The child exited.
     Exited(ExitStatus),
@@ -190,10 +192,12 @@ pub struct LiveSession {
     output_rx: Option<Receiver<Vec<u8>>>,
     exit_rx: Receiver<ExitStatus>,
     kill_requested: Arc<AtomicBool>,
-    exit_state: Arc<Mutex<Option<ExitStatus>>>,
     reader: Option<JoinHandle<()>>,
     waiter: Option<JoinHandle<()>>,
     child_pid: Option<u32>,
+    /// Lifecycle state as seen by the event path: `Running` until
+    /// `finish_exit` queues the `Exited` event, `Exited` from then on.
+    state: SessionState,
     /// Events produced but not yet surfaced to the caller: `drain_events`
     /// empties this, `try_recv_event` pops one at a time.
     pending: VecDeque<LiveEvent>,
@@ -254,15 +258,13 @@ impl LiveSession {
         let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_BOUND);
         let (exit_tx, exit_rx) = mpsc::channel();
         let kill_requested = Arc::new(AtomicBool::new(false));
-        let exit_state = Arc::new(Mutex::new(None));
 
         // The waiter owns the child; spawn it first so that a reader-spawn
         // failure can still request a kill and reap the child.
         let waiter = spawn_thread("ait-term waiter", {
             let kill_requested = Arc::clone(&kill_requested);
-            let exit_state = Arc::clone(&exit_state);
             move || {
-                wait_loop(child, kill_requested, exit_state, exit_tx);
+                wait_loop(child, kill_requested, exit_tx);
             }
         })?;
         let reader = match spawn_thread("ait-term reader", move || {
@@ -283,7 +285,7 @@ impl LiveSession {
             output_rx: Some(output_rx),
             exit_rx,
             kill_requested,
-            exit_state,
+            state: SessionState::Running,
             reader: Some(reader),
             waiter: Some(waiter),
             child_pid,
@@ -293,17 +295,13 @@ impl LiveSession {
         })
     }
 
-    /// Current session lifecycle state. `Exited` is reported here as soon
-    /// as the waiter thread reaps the child, even before the event is
-    /// drained.
+    /// Current session lifecycle state, as seen by the event path:
+    /// `Exited` once [`drain_events`](Self::drain_events) (or
+    /// [`try_recv_event`](Self::try_recv_event)) has produced the
+    /// [`LiveEvent::Exited`] event — even if the caller has not popped it
+    /// yet — `Running` until then.
     pub fn state(&self) -> SessionState {
-        match self.exit_state.lock() {
-            Ok(guard) => match &*guard {
-                Some(status) => SessionState::Exited(status.clone()),
-                None => SessionState::Running,
-            },
-            Err(_) => SessionState::Running,
-        }
+        self.state.clone()
     }
 
     /// The spawned child's process id, if the platform reports one.
@@ -368,12 +366,15 @@ impl LiveSession {
 
     /// Feed all pending PTY output into the grid and return what happened.
     ///
-    /// Events come back in stream order: the [`LiveEvent::Osc`] events
-    /// observed while feeding, a coalesced [`LiveEvent::OutputReady`]
-    /// covering those bytes, then [`LiveEvent::Exited`] if the child has
-    /// finished. Terminal replies the core generates while feeding
-    /// (device-status answers, …) are written back to the PTY before this
-    /// returns.
+    /// Ordering guarantee: within one drain the events are grouped by
+    /// source — the [`LiveEvent::Osc`] events observed while feeding (in
+    /// stream order, with the caveat documented on
+    /// [`Session::feed_bytes`]), then one coalesced
+    /// [`LiveEvent::OutputReady`] covering those bytes, then
+    /// [`LiveEvent::Exited`] if the child has finished. Across drains,
+    /// events are chronological. Terminal replies the core generates while
+    /// feeding (device-status answers, …) are written back to the PTY
+    /// before this returns.
     pub fn drain_events(&mut self) -> Vec<LiveEvent> {
         self.pull_events();
         self.pending.drain(..).collect()
@@ -474,6 +475,9 @@ impl LiveSession {
         if self.reader_done {
             self.join_reader();
         }
+        // `state()` mirrors the event stream: flip it as the event is
+        // queued so a dead child can never report `Running`.
+        self.state = SessionState::Exited(status.clone());
         self.pending.push_back(LiveEvent::Exited(status));
     }
 
@@ -556,7 +560,6 @@ fn read_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::SyncSender<Vec<u8>>) {
 fn wait_loop(
     mut child: Box<dyn Child + Send + Sync>,
     kill_requested: Arc<AtomicBool>,
-    exit_state: Arc<Mutex<Option<ExitStatus>>>,
     exit_tx: mpsc::Sender<ExitStatus>,
 ) {
     let status = loop {
@@ -581,9 +584,6 @@ fn wait_loop(
         }
         std::thread::sleep(POLL);
     };
-    if let Ok(mut guard) = exit_state.lock() {
-        *guard = Some(status.clone());
-    }
     // Unbounded channel: never blocks, so the waiter always exits.
     let _ = exit_tx.send(status);
 }

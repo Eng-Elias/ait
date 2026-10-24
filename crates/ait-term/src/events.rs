@@ -139,15 +139,9 @@ fn prompt_mark(args: &[&[u8]]) -> Option<SessionEvent> {
         b"D" => PromptMarkKind::CommandEnd,
         _ => return None,
     };
-    let payload = match args.get(1..) {
-        Some(rest) if !rest.is_empty() => Some(
-            rest.iter()
-                .map(|param| String::from_utf8_lossy(param))
-                .collect::<Vec<_>>()
-                .join(";"),
-        ),
-        _ => None,
-    };
+    // `args.first()?` above guarantees `args[1..]` exists (possibly empty);
+    // `join_params` maps an empty rest to `None`.
+    let payload = join_params(&args[1..]);
     Some(SessionEvent::PromptMark { kind, payload })
 }
 
@@ -165,14 +159,24 @@ fn join_params(args: &[&[u8]]) -> Option<String> {
 }
 
 /// Parse an `OSC 777` payload. The common form is
-/// `777;notify;<title>;<body>` (rxvt-unicode convention); anything else is
-/// still a notification, just without a title.
+/// `777;notify;<title>;<body>` (rxvt-unicode convention); a lone payload
+/// after the verb is a title-less message. The `notify` verb itself is
+/// never part of the payload. Anything else is still a notification, just
+/// without a title.
 fn rxvt_notification(args: &[&[u8]]) -> Option<SessionEvent> {
     match args {
+        // `777;notify;<title>;<body>` — the rxvt-unicode convention.
         [b"notify", title, body @ ..] if !body.is_empty() => Some(SessionEvent::Notification {
             title: Some(String::from_utf8_lossy(title).into_owned()),
             message: join_params(body).unwrap_or_default(),
         }),
+        // `777;notify;<message>` — a bare message with no title.
+        [b"notify", message] => Some(SessionEvent::Notification {
+            title: None,
+            message: String::from_utf8_lossy(message).into_owned(),
+        }),
+        // `777;notify` with no payload: nothing to toast — malformed.
+        [b"notify"] => None,
         _ => join_params(args).map(|message| SessionEvent::Notification {
             title: None,
             message,

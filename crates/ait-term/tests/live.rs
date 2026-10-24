@@ -55,6 +55,23 @@ fn wait_for_exit(session: &mut LiveSession) -> ExitStatus {
     }
 }
 
+/// Assert the child process is fully gone — no zombie, no orphan.
+/// `kill(pid, 0)` is the portable existence probe (an `ESRCH` errno means
+/// gone, `EPERM` would still mean it exists); unlike `/proc` it works on
+/// every unix, and §6 lists macOS as supported.
+#[cfg(unix)]
+fn assert_child_gone(pid: Option<u32>, context: &str) {
+    let pid = pid.expect("spawned child has a pid");
+    let gone = unsafe { libc::kill(pid as i32, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    assert!(gone, "child {pid} {context}");
+}
+
+/// No portable existence probe exists in our dep tree outside unix; the
+/// waiter-join contract is still covered by the event assertions above.
+#[cfg(not(unix))]
+fn assert_child_gone(_pid: Option<u32>, _context: &str) {}
+
 /// All text in the grid: scrollback then viewport, rows trimmed and joined.
 fn grid_text(session: &LiveSession) -> String {
     let grid = session.grid();
@@ -82,11 +99,7 @@ fn spawned_program_output_lands_in_grid_and_exit_is_reported() {
 
     // The waiter thread reaped the child before surfacing Exited: the
     // process must be fully gone — no zombie, no orphan.
-    let pid = session.child_pid().expect("spawned child has a pid");
-    assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "child {pid} still exists after Exited"
-    );
+    assert_child_gone(session.child_pid(), "still exists after Exited");
 }
 
 #[test]
@@ -222,10 +235,7 @@ fn teardown_under_flood_kills_the_child_and_joins_threads() {
 
     // The waiter reaped the killed child before drop returned: no orphan,
     // no zombie.
-    assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "child {pid} survived teardown"
-    );
+    assert_child_gone(Some(pid), "survived teardown");
 }
 
 #[test]

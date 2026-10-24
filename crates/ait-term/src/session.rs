@@ -155,9 +155,12 @@ impl Session {
     /// Returns the [`SessionEvent`]s observed on the stream (Spec R01 — the
     /// OSC interception seam): a parallel `vte` parser watches the same
     /// bytes, so nothing is stripped from what the emulator renders.
-    /// Emulator-side events (currently `OSC 52` clipboard writes) are drained
-    /// first, so ordering across the two pipelines within one feed is
-    /// approximate.
+    ///
+    /// Ordering guarantee: within one feed the events are grouped by
+    /// source — emulator-side events (currently `OSC 52` clipboard
+    /// writes) first, then the observer's events in stream order —
+    /// because the two pipelines don't share a position index. Across
+    /// feeds, events are chronological.
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<SessionEvent> {
         self.processor.advance(&mut self.term, bytes);
         self.osc_parser.advance(&mut self.osc_observer, bytes);
