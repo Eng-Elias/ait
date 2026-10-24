@@ -1,0 +1,180 @@
+//! The pure, byte-fed [`Session`] core.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::{self, Term, TermDamage};
+use alacritty_terminal::vte::ansi::{CursorShape as TermCursorShape, Processor};
+
+use crate::grid::{Cursor, CursorShape, Damage, DamageBounds, GridView};
+
+/// Default scrollback capacity, in lines (REQUIREMENTS.md §5.1).
+pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+/// Grid dimensions in character cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub columns: usize,
+    pub lines: usize,
+}
+
+impl Size {
+    pub fn new(columns: usize, lines: usize) -> Self {
+        Self { columns, lines }
+    }
+}
+
+impl Dimensions for Size {
+    fn total_lines(&self) -> usize {
+        // A zero-sized terminal is meaningless; clamp so the emulator never
+        // sees a dimension of 0.
+        self.lines.max(1)
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.lines.max(1)
+    }
+
+    fn columns(&self) -> usize {
+        self.columns.max(1)
+    }
+}
+
+/// Constructor options for [`Session`].
+///
+/// Configuration via `settings.toml` arrives in Round 3 (REQUIREMENTS.md §4);
+/// for now sessions are configured here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionOptions {
+    /// Initial grid size (the live driver resizes from the real window).
+    pub size: Size,
+    /// Maximum scrollback lines kept above the viewport.
+    pub scrollback: usize,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            size: Size::new(80, 24),
+            scrollback: DEFAULT_SCROLLBACK,
+        }
+    }
+}
+
+/// Terminal event sink. Replies the terminal generates for the PTY (device
+/// status answers, clipboard loads, …) are queued for a future live driver to
+/// write back; everything else is dropped.
+#[derive(Debug, Default)]
+struct SessionListener {
+    pty_responses: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl EventListener for SessionListener {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            if let Ok(mut queue) = self.pty_responses.lock() {
+                queue.push_back(text);
+            }
+        }
+    }
+}
+
+/// One terminal session: PTY output bytes in, styled grid out.
+///
+/// This is the pure core (Spec R01): no PTY, no TTY, no threads. Feed bytes
+/// with [`feed_bytes`](Self::feed_bytes), read the styled
+/// [`GridView`] with [`grid`](Self::grid), forward window changes with
+/// [`resize`](Self::resize). A live PTY driver wraps this type in a later
+/// ticket.
+pub struct Session {
+    term: Term<SessionListener>,
+    processor: Processor,
+    pty_responses: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Session {
+    pub fn new(options: SessionOptions) -> Self {
+        let config = term::Config {
+            scrolling_history: options.scrollback,
+            ..Default::default()
+        };
+        let listener = SessionListener::default();
+        let pty_responses = Arc::clone(&listener.pty_responses);
+        let term = Term::new(config, &options.size, listener);
+        Self {
+            term,
+            processor: Processor::new(),
+            pty_responses,
+        }
+    }
+
+    /// Feed raw PTY output bytes into the session.
+    pub fn feed_bytes(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Resize the grid, reflowing wrapped lines.
+    pub fn resize(&mut self, size: Size) {
+        self.term.resize(size);
+    }
+
+    /// Current grid size.
+    pub fn size(&self) -> Size {
+        Size::new(self.term.columns(), self.term.screen_lines())
+    }
+
+    /// The renderable cursor: viewport position and shape.
+    pub fn cursor(&self) -> Cursor {
+        let cursor = self.term.renderable_content().cursor;
+        Cursor {
+            line: cursor.point.line.0.max(0) as usize,
+            column: cursor.point.column.0,
+            shape: match cursor.shape {
+                TermCursorShape::Block => CursorShape::Block,
+                TermCursorShape::HollowBlock => CursorShape::HollowBlock,
+                TermCursorShape::Underline => CursorShape::Underline,
+                TermCursorShape::Beam => CursorShape::Beam,
+                TermCursorShape::Hidden => CursorShape::Hidden,
+            },
+        }
+    }
+
+    /// Read-only view of the grid (viewport + scrollback).
+    pub fn grid(&self) -> GridView<'_> {
+        GridView::new(self.term.grid())
+    }
+
+    /// Damage accumulated since the last `damage` call; clears the tracker.
+    /// Starts as [`Damage::Full`] on a fresh session.
+    ///
+    /// The cursor's cell is always included in partial damage, so a renderer
+    /// can repaint the cursor without special-casing it.
+    pub fn damage(&mut self) -> Damage {
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(lines) => Damage::Partial(
+                lines
+                    .map(|line| DamageBounds {
+                        line: line.line,
+                        left: line.left,
+                        right: line.right,
+                    })
+                    .collect(),
+            ),
+        };
+        self.term.reset_damage();
+        damage
+    }
+
+    /// Responses the terminal generated for the PTY (e.g. device-status
+    /// replies), drained from the queue. A live driver writes these back to
+    /// the PTY master; byte-fed tests can assert on them.
+    pub fn take_pty_responses(&mut self) -> Vec<String> {
+        match self.pty_responses.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
