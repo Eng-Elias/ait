@@ -10,7 +10,7 @@
 //! polls like `ait-term`'s live tests — never a fixed sleep.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ait_term::{
@@ -18,8 +18,11 @@ use ait_term::{
     SpawnError,
 };
 
+use crate::agent::{self, Agent};
 use crate::chord::parse_chord;
+use crate::driver::{Authored, Driver};
 use crate::mouse::{self, MouseEvent};
+use crate::screen::ScreenState;
 use crate::tempdir::TempDir;
 
 /// Bound on every wait the harness performs: the live-test tier's
@@ -74,6 +77,24 @@ pub struct E2e {
     /// Hook point for the raw-PTY-output tail ticket E01-T5 wires
     /// `LiveSession` into; until then the buffer honestly stays empty.
     tail: Vec<u8>,
+    /// The spawned program's name, kept for recording provenance.
+    pub(crate) program: String,
+    /// The backing that resolves `agent` steps at record time —
+    /// [`Authored`] (replay-only) until [`set_driver`](Self::set_driver)
+    /// injects another.
+    pub(crate) driver: Box<dyn Driver>,
+    /// Recordings-root override from
+    /// [`set_recordings_dir`](Self::set_recordings_dir); `None` resolves
+    /// the `AIT_E2E_RECORDINGS`/`<crate>/tests/recordings` convention.
+    pub(crate) recordings_dir: Option<PathBuf>,
+    /// Record mode (`AIT_E2E_RECORD` at spawn, or
+    /// [`set_record_mode`](Self::set_record_mode)): agent steps resolve
+    /// through `driver` and rewrite their recordings instead of
+    /// replaying.
+    pub(crate) record: bool,
+    /// The agent-step counter — each `agent().act`/`assert` consumes one
+    /// index → its `<step>.jsonl`.
+    pub(crate) agent_step: usize,
 }
 
 impl E2e {
@@ -83,6 +104,7 @@ impl E2e {
     /// ticket's clipboard assertions see the app's copies as events.
     pub fn spawn(config: SpawnConfig) -> Result<Self, SpawnError> {
         let cwd = TempDir::fresh().map_err(|e| SpawnError::Io(e.to_string()))?;
+        let program = config.program.to_string_lossy().into_owned();
         let session = LiveSession::spawn(LiveSessionOptions {
             session: SessionOptions {
                 size: config.size,
@@ -102,7 +124,54 @@ impl E2e {
             cwd,
             exited: None,
             tail: Vec::new(),
+            program,
+            driver: Box::new(Authored),
+            recordings_dir: None,
+            record: agent::record_flag(),
+            agent_step: 0,
         })
+    }
+
+    /// The `agent.*` primitive (Spec E01): [`Agent::act`] /
+    /// [`Agent::assert`] steps resolved through the active [`Driver`] at
+    /// record time and replayed byte-deterministically from committed
+    /// `*.jsonl` recordings otherwise. The default driver is
+    /// [`Authored`] — replay-only, zero configuration.
+    pub fn agent(&mut self) -> Agent<'_> {
+        Agent::new(self)
+    }
+
+    /// Inject the [`Driver`] agent steps resolve through at record time
+    /// — self-tests plug in a stub here; E01-T3's `AIT_E2E_DRIVER`
+    /// `Command` backing plugs in the same way. Never consulted on the
+    /// replay path.
+    pub fn set_driver(&mut self, driver: impl Driver + 'static) {
+        self.driver = Box::new(driver);
+    }
+
+    /// Point recordings at `dir` instead of the
+    /// `AIT_E2E_RECORDINGS`/`<crate>/tests/recordings` convention — how
+    /// self-tests give each case its own writable tree.
+    pub fn set_recordings_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.recordings_dir = Some(dir.into());
+    }
+
+    /// Override record mode explicitly (the default is
+    /// `AIT_E2E_RECORD` at spawn) — keeps tests free of environment
+    /// races.
+    pub fn set_record_mode(&mut self, record: bool) {
+        self.record = record;
+    }
+
+    /// Whether agent steps re-resolve and rewrite recordings.
+    pub fn record_mode(&self) -> bool {
+        self.record
+    }
+
+    /// The current screen as a serializable [`ScreenState`] — what a
+    /// [`Driver`] is handed and what the recording guard hashes.
+    pub fn screen_state(&self) -> ScreenState {
+        ScreenState::capture(self)
     }
 
     /// Press a named chord (`"Alt+T"`, `"Ctrl+PageDown"`, `"F5"`, …),
@@ -211,7 +280,7 @@ impl E2e {
 
     /// One drain round: feed queued PTY output into the grid and record
     /// the exit status when `Exited` surfaces.
-    fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) {
         for event in self.session.drain_events() {
             if let LiveEvent::Exited(status) = event {
                 self.exited = Some(status);
