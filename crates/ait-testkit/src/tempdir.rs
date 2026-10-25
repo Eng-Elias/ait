@@ -9,11 +9,11 @@ use std::{fs, io, process};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// A uniquely-named directory under the system temp dir.
-pub struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
     /// Create a fresh `ait-e2e-<pid>-<n>` directory.
-    pub fn fresh() -> io::Result<Self> {
+    pub(crate) fn fresh() -> io::Result<Self> {
         for _ in 0..100 {
             let path = std::env::temp_dir().join(format!(
                 "ait-e2e-{}-{}",
@@ -33,7 +33,7 @@ impl TempDir {
     }
 
     /// The directory's path — the spawned program's cwd.
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }

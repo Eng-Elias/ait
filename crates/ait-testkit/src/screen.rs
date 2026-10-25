@@ -98,10 +98,14 @@ impl ScreenState {
 }
 
 /// FNV-1a 64 — tiny, stable, dependency-free; a drift guard wants a
-/// fingerprint, not a cryptographic hash.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// fingerprint, not a cryptographic hash. The offset basis and the
+/// folding step live here so every hash the crate computes
+/// ([`ScreenState::hash`], `recording::text_hash`) shares one
+/// implementation.
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Fold `bytes` into FNV-1a state `h` (start `h` at [`FNV_OFFSET`]).
 pub(crate) fn fnv(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
         *h ^= u64::from(b);

@@ -91,24 +91,24 @@ pub struct E2e {
     /// `RefCell` because input verbs take `&self`.
     log: RefCell<Vec<ActionEntry>>,
     /// The spawned program's name, kept for recording provenance.
-    pub(crate) program: String,
+    program: String,
     /// The backing that resolves `agent` steps at record time —
     /// `AIT_E2E_DRIVER`'s [`Command`] when the variable is set at
     /// spawn, else the replay-only [`Authored`], until
     /// [`set_driver`](Self::set_driver) injects another.
-    pub(crate) driver: Box<dyn Driver>,
+    driver: Box<dyn Driver>,
     /// Recordings-root override from
     /// [`set_recordings_dir`](Self::set_recordings_dir); `None` resolves
     /// the `AIT_E2E_RECORDINGS`/`<crate>/tests/recordings` convention.
-    pub(crate) recordings_dir: Option<PathBuf>,
+    recordings_dir: Option<PathBuf>,
     /// Record mode (`AIT_E2E_RECORD` at spawn, or
     /// [`set_record_mode`](Self::set_record_mode)): agent steps resolve
     /// through `driver` and rewrite their recordings instead of
     /// replaying.
-    pub(crate) record: bool,
+    record: bool,
     /// The agent-step counter — each `agent().act`/`assert` consumes one
     /// index → its `<step>.jsonl`.
-    pub(crate) agent_step: usize,
+    agent_step: usize,
     /// Every `ClipboardWrite` the program has emitted so far, in order —
     /// harness sessions opt into `SessionOptions::osc52` so a spawned
     /// app's selection-copy surfaces here (Spec E01, ticket E01-T4's
@@ -167,13 +167,15 @@ impl E2e {
     }
 
     /// Append `action` to the ordered action log, stamped with the time
-    /// since spawn and the current screen-state hash (the evidence a
-    /// failure dump prints).
-    fn record(&self, action: String) {
+    /// since spawn and the current [`ScreenState::hash`] — the same hash
+    /// a recording's `screen_hash` field stores, so the dump's log can be
+    /// compared against recorded steps (the evidence a failure dump
+    /// prints).
+    fn log_action(&self, action: String) {
         self.log.borrow_mut().push(ActionEntry {
             at: self.started.elapsed(),
             action,
-            screen_hash: evidence::screen_hash(&self.screen_text()),
+            screen_hash: self.screen_state().hash(),
         });
     }
 
@@ -213,6 +215,34 @@ impl E2e {
         self.record
     }
 
+    /// The next agent-step index — each `agent().act`/`assert` consumes
+    /// one → its `<step>.jsonl` (crate-internal; [`Agent`] owns the
+    /// sequence).
+    pub(crate) fn next_agent_step(&mut self) -> usize {
+        let step = self.agent_step;
+        self.agent_step += 1;
+        step
+    }
+
+    /// The [`Driver`] agent steps resolve through at record time
+    /// (crate-internal — replay never consults it).
+    pub(crate) fn driver(&mut self) -> &mut dyn Driver {
+        &mut *self.driver
+    }
+
+    /// The recordings-root override
+    /// [`set_recordings_dir`](Self::set_recordings_dir) installed, if any
+    /// (crate-internal).
+    pub(crate) fn recordings_dir(&self) -> Option<&Path> {
+        self.recordings_dir.as_deref()
+    }
+
+    /// The spawned program's name — recording provenance
+    /// (crate-internal).
+    pub(crate) fn program(&self) -> &str {
+        &self.program
+    }
+
     /// The current screen as a serializable [`ScreenState`] — what a
     /// [`Driver`] is handed and what the recording guard hashes.
     pub fn screen_state(&self) -> ScreenState {
@@ -226,7 +256,7 @@ impl E2e {
     /// # Panics
     /// On an unparseable chord or a failed PTY write.
     pub fn press(&self, chord: &str) {
-        self.record(format!("press({chord:?})"));
+        self.log_action(format!("press({chord:?})"));
         let event = parse_chord(chord).unwrap_or_else(|e| panic!("press({chord:?}): {e}"));
         self.session
             .send_key(event)
@@ -240,7 +270,7 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn type_text(&self, text: &str) {
-        self.record(format!("type_text({text:?})"));
+        self.log_action(format!("type_text({text:?})"));
         self.write(text.as_bytes());
     }
 
@@ -250,7 +280,7 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn send_bytes(&self, bytes: &[u8]) {
-        self.record(evidence::describe_bytes(bytes));
+        self.log_action(evidence::describe_bytes(bytes));
         self.write(bytes);
     }
 
@@ -268,7 +298,7 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn send_mouse(&self, event: MouseEvent, column: u16, row: u16) {
-        self.record(format!("send_mouse({event:?} @{column},{row})"));
+        self.log_action(format!("send_mouse({event:?} @{column},{row})"));
         self.write(&mouse::encode(event, column, row));
     }
 
@@ -277,7 +307,7 @@ impl E2e {
     /// # Panics
     /// On a failed winsize write (a just-dead child).
     pub fn resize(&mut self, size: Size) {
-        self.record(format!("resize({}x{})", size.columns, size.lines));
+        self.log_action(format!("resize({}x{})", size.columns, size.lines));
         self.session.resize(size).expect("resize: PTY write failed");
     }
 
@@ -289,7 +319,7 @@ impl E2e {
     /// On timeout (with the final screen text), or early when the
     /// program exits while the predicate still fails.
     pub fn wait_for_screen(&mut self, description: &str, mut pred: impl FnMut(&Self) -> bool) {
-        self.record(format!("wait_for_screen({description:?})"));
+        self.log_action(format!("wait_for_screen({description:?})"));
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             self.pump();
@@ -319,7 +349,7 @@ impl E2e {
     /// # Panics
     /// On timeout (with the final screen text).
     pub fn wait_for_exit(&mut self) -> ExitStatus {
-        self.record("wait_for_exit".to_string());
+        self.log_action("wait_for_exit".to_string());
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             self.pump();
@@ -361,8 +391,7 @@ impl E2e {
     }
 
     /// The visible screen as text: every viewport row, trimmed,
-    /// `\n`-joined — scrollback excluded. What `insta` snapshots assert
-    /// on.
+    /// `\n`-joined — scrollback excluded.
     pub fn screen_text(&self) -> String {
         self.session
             .grid()
@@ -370,6 +399,15 @@ impl E2e {
             .map(|row| row.text().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The screen text ready for an `insta` text snapshot (Spec E01's
+    /// `snapshot` verb): [`screen_text`](Self::screen_text) with the
+    /// spawn's fresh temp cwd redacted to `[cwd]` — the same redaction
+    /// [`ScreenState::capture`] applies, so snapshots stay
+    /// machine-independent without each test redacting by hand.
+    pub fn snapshot(&self) -> String {
+        self.screen_state().rows.join("\n")
     }
 
     /// One visible row, trimmed; `""` when out of range.

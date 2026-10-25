@@ -45,12 +45,12 @@ use crate::screen::ScreenState;
 
 /// The environment variable that selects this backing, read once at
 /// [`E2e::spawn`](crate::E2e::spawn).
-pub const DRIVER_ENV: &str = "AIT_E2E_DRIVER";
+pub(crate) const DRIVER_ENV: &str = "AIT_E2E_DRIVER";
 
 /// The wire-protocol version, carried in `v` on both the request and
 /// the response. Bump on any incompatible change — a mismatch fails the
 /// step loudly rather than silently misbehaving.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
 /// Bound on one subprocess's lifetime — generous next to a model round
 /// trip; a stuck wrapper is killed and the step fails.
@@ -108,7 +108,7 @@ impl Command {
     /// The driver `AIT_E2E_DRIVER` names at spawn, or `None` when the
     /// variable is unset or blank (a blank value is a configuration
     /// no-op, not a command).
-    pub fn from_env() -> Option<Self> {
+    pub(crate) fn from_env() -> Option<Self> {
         let value = std::env::var(DRIVER_ENV).ok()?;
         let command = value.trim();
         if command.is_empty() {
@@ -122,7 +122,7 @@ impl Command {
     /// its stdin, and read both pipes to EOF within `self.timeout`.
     /// Returns `(stdout, stderr)` on a clean exit; every deviation is a
     /// step failure with stderr in the message.
-    fn exchange(&self, kind: &str, text: &str, body: &[u8]) -> (Vec<u8>, String) {
+    fn exchange(&self, call: &Call, body: &[u8]) -> (Vec<u8>, String) {
         let mut child = match process::Command::new("sh")
             .arg("-c")
             .arg(&self.command)
@@ -132,7 +132,7 @@ impl Command {
             .spawn()
         {
             Ok(child) => child,
-            Err(e) => self.fail(kind, text, &format!("could not spawn `sh -c`: {e}"), ""),
+            Err(e) => self.fail(call, &format!("could not spawn `sh -c`: {e}"), ""),
         };
 
         // The request, then EOF — the protocol's framing. A write error
@@ -151,15 +151,14 @@ impl Command {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
-                Err(e) => self.fail(kind, text, &format!("cannot poll the subprocess: {e}"), ""),
+                Err(e) => self.fail(call, &format!("cannot poll the subprocess: {e}"), ""),
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 let stderr = String::from_utf8_lossy(&collect(&stderr)).into_owned();
                 self.fail(
-                    kind,
-                    text,
+                    call,
                     &format!(
                         "timed out after {:?} — the subprocess was killed",
                         self.timeout
@@ -174,8 +173,7 @@ impl Command {
         let stderr = String::from_utf8_lossy(&collect(&stderr)).into_owned();
         if !status.success() {
             self.fail(
-                kind,
-                text,
+                call,
                 &format!("the subprocess exited with {status}"),
                 &stderr,
             );
@@ -186,11 +184,10 @@ impl Command {
     /// The `v` gate: parse the envelope first so a wrapper speaking a
     /// newer protocol — or printing something that isn't protocol JSON
     /// at all — fails clearly instead of misparsing.
-    fn check_protocol(&self, kind: &str, text: &str, stdout: &[u8], stderr: &str) {
+    fn check_protocol(&self, call: &Call, stdout: &[u8], stderr: &str) {
         let envelope: Envelope = serde_json::from_slice(stdout).unwrap_or_else(|e| {
             self.fail(
-                kind,
-                text,
+                call,
                 &format!(
                     "the response is not valid protocol JSON: {e}\n\
                      --- stdout ---\n{}",
@@ -201,8 +198,7 @@ impl Command {
         });
         if envelope.v != PROTOCOL_VERSION {
             self.fail(
-                kind,
-                text,
+                call,
                 &format!(
                     "the response speaks protocol v{}, this ait-testkit reads v{PROTOCOL_VERSION}",
                     envelope.v
@@ -215,17 +211,21 @@ impl Command {
     /// The step-failure shape (Spec E01: failure modes surface as test
     /// failures, stderr captured in evidence). Diverging — every call
     /// site is a panic path.
-    fn fail(&self, kind: &str, text: &str, problem: &str, stderr: &str) -> ! {
+    fn fail(&self, call: &Call, problem: &str, stderr: &str) -> ! {
         panic!(
-            "the Command driver {:?} failed to resolve the {kind} step {text:?}: \
+            "the Command driver {:?} failed to resolve the {} step {:?}: \
              {problem}\n--- stderr ---\n{stderr}",
-            self.command
+            self.command, call.kind, call.text,
         )
     }
 }
 
 impl Driver for Command {
     fn act(&mut self, goal: &str, screen: &ScreenState) -> Vec<Input> {
+        let call = Call {
+            kind: "act",
+            text: goal,
+        };
         let body = serde_json::to_vec(&Request {
             v: PROTOCOL_VERSION,
             kind: "act",
@@ -234,13 +234,12 @@ impl Driver for Command {
             screen,
         })
         .expect("the request serializes");
-        let (stdout, stderr) = self.exchange("act", goal, &body);
-        self.check_protocol("act", goal, &stdout, &stderr);
+        let (stdout, stderr) = self.exchange(&call, &body);
+        self.check_protocol(&call, &stdout, &stderr);
         serde_json::from_slice::<ActResponse>(&stdout)
             .unwrap_or_else(|e| {
                 self.fail(
-                    "act",
-                    goal,
+                    &call,
                     &format!("the act response doesn't match the v1 schema: {e}"),
                     &stderr,
                 )
@@ -249,6 +248,10 @@ impl Driver for Command {
     }
 
     fn assert(&mut self, claim: &str, screen: &ScreenState) -> Verdict {
+        let call = Call {
+            kind: "assert",
+            text: claim,
+        };
         let body = serde_json::to_vec(&Request {
             v: PROTOCOL_VERSION,
             kind: "assert",
@@ -257,19 +260,27 @@ impl Driver for Command {
             screen,
         })
         .expect("the request serializes");
-        let (stdout, stderr) = self.exchange("assert", claim, &body);
-        self.check_protocol("assert", claim, &stdout, &stderr);
+        let (stdout, stderr) = self.exchange(&call, &body);
+        self.check_protocol(&call, &stdout, &stderr);
         serde_json::from_slice::<AssertResponse>(&stdout)
             .unwrap_or_else(|e| {
                 self.fail(
-                    "assert",
-                    claim,
+                    &call,
                     &format!("the assert response doesn't match the v1 schema: {e}"),
                     &stderr,
                 )
             })
             .verdict
     }
+}
+
+/// The step identity threaded through `exchange`/`check_protocol`/`fail`
+/// — the failure messages name *which* call failed.
+struct Call<'a> {
+    /// `"act"` or `"assert"`.
+    kind: &'a str,
+    /// The goal or claim text.
+    text: &'a str,
 }
 
 /// The request a step pipes to the subprocess's stdin — one JSON

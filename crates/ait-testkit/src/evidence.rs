@@ -9,6 +9,7 @@
 //! `E2e`'s `Drop`), naming the dir after the panicking test's thread;
 //! scenario runners call `E2e::dump_evidence` with an explicit name.
 
+use std::any::Any;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -44,7 +45,7 @@ pub fn dump_root() -> PathBuf {
 /// current thread's name — under `cargo test` that is the test's own
 /// name — sanitized for the filesystem. Unnamed threads dump under
 /// `unnamed`.
-pub fn current_test_name() -> String {
+pub(crate) fn current_test_name() -> String {
     let thread = std::thread::current();
     sanitize(thread.name().unwrap_or("unnamed"))
 }
@@ -70,19 +71,12 @@ pub(crate) struct ActionEntry {
     pub at: Duration,
     /// What happened, e.g. `press("Alt+T")` or `wait_for_screen("…")`.
     pub action: String,
-    /// [`screen_hash`] of the screen text at log time.
+    /// [`ScreenState::hash`](crate::ScreenState::hash) of the screen at
+    /// log time — the same hash a recording's `screen_hash` field
+    /// stores, so the log's `screen=` values compare directly to
+    /// recorded steps (drift visibility for humans, not a
+    /// cryptographic guard).
     pub screen_hash: u64,
-}
-
-/// A screen-state hash for the action log (FNV-1a — drift visibility
-/// for humans, not a cryptographic guard).
-pub(crate) fn screen_hash(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in text.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// Write the three dump files under `dump_root()/<test_name>/`,
@@ -121,6 +115,19 @@ fn render_actions(actions: &[ActionEntry]) -> String {
     log
 }
 
+/// The message inside a caught panic payload — for callers that
+/// `catch_unwind` or join a thread and re-raise the text with context,
+/// so the original evidence (screens, drift diffs) survives.
+pub fn panic_text(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        text.to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "(non-string panic)".to_string()
+    }
+}
+
 /// Render a byte run for the action log: ASCII-escaped and truncated,
 /// so raw input stays readable without flooding the log.
 pub(crate) fn describe_bytes(bytes: &[u8]) -> String {
@@ -147,12 +154,6 @@ mod tests {
         assert_eq!(sanitize("e2e::tabs::opens"), "e2e__tabs__opens");
         assert_eq!(sanitize("plain-name_1.2"), "plain-name_1.2");
         assert_eq!(sanitize("a/b c"), "a_b_c");
-    }
-
-    #[test]
-    fn screen_hash_distinguishes_screens() {
-        assert_ne!(screen_hash("screen a"), screen_hash("screen b"));
-        assert_eq!(screen_hash("same"), screen_hash("same"));
     }
 
     #[test]

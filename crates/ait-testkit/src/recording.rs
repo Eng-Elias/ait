@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::driver::{Input, Verdict};
-use crate::screen::{fnv, ScreenState};
+use crate::screen::{fnv, ScreenState, FNV_OFFSET};
 
 /// Recording format version, bumped on any incompatible change.
 pub(crate) const FORMAT_VERSION: u32 = 1;
@@ -43,7 +43,7 @@ pub enum Op {
 
 impl Op {
     /// Lowercase verb name for messages.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Act => "act",
             Self::Assert => "assert",
@@ -53,7 +53,7 @@ impl Op {
 
 /// Line 1 of a recording: everything about the step except its inputs.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Header {
+pub(crate) struct Header {
     /// [`FORMAT_VERSION`].
     pub v: u32,
     /// The step's index within its test.
@@ -80,7 +80,7 @@ pub struct Header {
 }
 
 /// A whole recording: header plus the semantic inputs to re-send.
-pub struct Recording {
+pub(crate) struct Recording {
     /// Line 1.
     pub header: Header,
     /// Lines 2.. — sent in order on replay.
@@ -91,7 +91,7 @@ pub struct Recording {
 /// `act("x")` and `assert("x")` hash differently and any edit
 /// invalidates the file.
 pub fn text_hash(op: Op, text: &str) -> String {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = FNV_OFFSET;
     fnv(&mut h, op.as_str().as_bytes());
     fnv(&mut h, b"\0");
     fnv(&mut h, text.as_bytes());
@@ -102,7 +102,7 @@ pub fn text_hash(op: Op, text: &str) -> String {
 /// `root` — `root/<test_name>/<step>.jsonl`, where `<test_name>` is the
 /// test thread's name with `::` mapped to `/` (cargo names test threads
 /// after the test path, so module structure is preserved).
-pub fn step_path(root: &Path, step: usize) -> PathBuf {
+pub(crate) fn step_path(root: &Path, step: usize) -> PathBuf {
     root.join(test_dir()).join(format!("{step:02}.jsonl"))
 }
 
@@ -111,7 +111,7 @@ pub fn step_path(root: &Path, step: usize) -> PathBuf {
 /// else `<consuming crate>/tests/recordings` via the `CARGO_MANIFEST_DIR`
 /// cargo exports to test processes at run time — so a consuming crate's
 /// recordings land in *its* test tree, not ait-testkit's.
-pub fn recordings_root(override_dir: Option<&Path>) -> PathBuf {
+pub(crate) fn recordings_root(override_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir.to_path_buf();
     }
@@ -137,7 +137,7 @@ impl Recording {
     /// Load `path`; `None` when no file exists. A file that exists but
     /// doesn't parse panics with context — a corrupt recording is a test
     /// bug, not a missing one.
-    pub fn load(path: &Path) -> Option<Self> {
+    pub(crate) fn load(path: &Path) -> Option<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -167,7 +167,7 @@ impl Recording {
 
     /// Write the recording (header line + one input per line), creating
     /// the `<test_name>` directory as needed.
-    pub fn save(&self, path: &Path) {
+    pub(crate) fn save(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).unwrap_or_else(|e| {
                 panic!("could not create recording dir {}: {e}", dir.display())

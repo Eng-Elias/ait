@@ -135,11 +135,28 @@ impl Driver for Authored {
     }
 }
 
-/// Lowercase hex for [`Input::Bytes`]' jsonl form.
+/// The lowercase-hex `bytes` spelling [`Input::Bytes`]' jsonl and the
+/// scenario `bytes` verb share: even-length hex pairs, whitespace
+/// ignored (`od -tx1` style).
+pub(crate) fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    let hex: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{text:?} is not an even number of hex digits"));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("{text:?}: {e}")))
+        .collect()
+}
+
+/// Lowercase hex for [`Input::Bytes`]' jsonl form — the serde face of
+/// [`decode_hex`].
 mod hex {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    use super::decode_hex;
+
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         let mut out = String::with_capacity(bytes.len() * 2);
         for b in bytes {
             out.push_str(&format!("{b:02x}"));
@@ -147,16 +164,8 @@ mod hex {
         s.serialize_str(&out)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let text = String::deserialize(d)?;
-        if text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(serde::de::Error::custom(format!(
-                "{text:?} is not an even number of hex digits"
-            )));
-        }
-        (0..text.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(serde::de::Error::custom))
-            .collect()
+        decode_hex(&text).map_err(serde::de::Error::custom)
     }
 }

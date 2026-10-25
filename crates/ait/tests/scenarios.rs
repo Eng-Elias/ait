@@ -6,12 +6,11 @@
 //! agent-step recordings resolve under `tests/recordings/<scenario>/`
 //! — the same conventions a `#[test]` thread name produces.
 
-use std::any::Any;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ait_testkit::{ait_bin, E2e, Scenario};
+use ait_testkit::{ait_bin, panic_text, E2e, Scenario};
 
 /// The committed scenario set, sorted for deterministic order.
 fn scenario_files() -> Vec<PathBuf> {
@@ -68,15 +67,4 @@ fn scenarios() {
         failures.len(),
         failures.join("\n---\n")
     );
-}
-
-/// The message inside a caught panic payload.
-fn panic_text(payload: &(dyn Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&'static str>() {
-        text.to_string()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "(non-string panic)".to_string()
-    }
 }

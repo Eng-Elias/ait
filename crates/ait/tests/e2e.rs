@@ -96,15 +96,14 @@ fn pr_evidence_transcript() {
 }
 
 /// One text snapshot of the initial screen (Spec E01: plain-text diffs
-/// for visual regressions). The pinned dash prompt is `$ `; the temp cwd
-/// is redacted so the snapshot is machine-independent.
+/// for visual regressions). The pinned dash prompt is `$ `;
+/// [`E2e::snapshot`] redacts the temp cwd so the snapshot is
+/// machine-independent.
 #[test]
 fn initial_screen_snapshot() {
     let mut app = spawn_ait();
     wait_for_chrome(&mut app);
     app.wait_for_screen("the shell prompt", |app| app.line(1) == "$");
 
-    let cwd = app.cwd().to_string_lossy().into_owned();
-    let screen = app.screen_text().replace(&cwd, "[cwd]");
-    insta::assert_snapshot!(screen);
+    insta::assert_snapshot!(app.snapshot());
 }

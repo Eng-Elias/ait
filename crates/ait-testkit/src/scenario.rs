@@ -50,7 +50,6 @@
 //! step; a failing step fails its [`run`](Scenario::run) naming the
 //! scenario and step — never a bare panic.
 
-use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
@@ -59,6 +58,8 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::chord::parse_chord;
+use crate::driver::decode_hex;
+use crate::evidence::panic_text;
 use crate::harness::{E2e, SpawnConfig};
 use crate::mouse::{MouseButton, MouseEvent};
 use ait_term::Size;
@@ -528,32 +529,6 @@ fn parse_mouse_event(mouse: &RawMouse) -> Result<MouseEvent, String> {
             "mouse.event must be \"down\"|\"drag\"|\"up\"|\"wheel_up\"|\"wheel_down\", \
              got {other:?}"
         )),
-    }
-}
-
-/// `bytes`' lowercase-hex form: even-length hex pairs, whitespace
-/// ignored — the same spelling [`Input::Bytes`](crate::Input)'s jsonl
-/// uses (`od -tx1` style).
-fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
-    let hex: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{text:?} is not an even number of hex digits"));
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("{text:?}: {e}")))
-        .collect()
-}
-
-/// The message inside a caught panic — re-raised with scenario/step
-/// context, so the original evidence (screens, drift diffs) survives.
-fn panic_text(payload: &(dyn Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&'static str>() {
-        text.to_string()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "(non-string panic)".to_string()
     }
 }
 

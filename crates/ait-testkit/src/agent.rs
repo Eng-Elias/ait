@@ -19,7 +19,7 @@
 //! with [`E2e::set_record_mode`], which keeps self-tests free of
 //! environment races.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::driver::{Input, Verdict};
@@ -86,27 +86,31 @@ impl<'e> Agent<'e> {
 
     /// Dispatch one numbered step to the record or replay path.
     fn step(&mut self, op: Op, text: &str) {
-        let step = self.e2e.agent_step;
-        self.e2e.agent_step += 1;
-        let path = recording::step_path(
-            &recording::recordings_root(self.e2e.recordings_dir.as_deref()),
-            step,
-        );
-        if self.e2e.record {
-            self.record(step, op, text, &path);
+        let number = self.e2e.next_agent_step();
+        let ctx = StepCtx {
+            path: recording::step_path(
+                &recording::recordings_root(self.e2e.recordings_dir()),
+                number,
+            ),
+            number,
+            op,
+            text,
+        };
+        if self.e2e.record_mode() {
+            self.record(&ctx);
         } else {
-            self.replay(step, op, text, &path);
+            self.replay(&ctx);
         }
     }
 
     /// Record path (`AIT_E2E_RECORD`): resolve through the active
     /// driver, send the inputs, then write the settled screen and its
     /// hash as the step's new recording.
-    fn record(&mut self, step: usize, op: Op, text: &str, path: &Path) {
+    fn record(&mut self, ctx: &StepCtx) {
         let screen = settle(self.e2e);
-        let (inputs, verdict, screen) = match op {
+        let (inputs, verdict, screen) = match ctx.op {
             Op::Act => {
-                let inputs = self.e2e.driver.act(text, &screen);
+                let inputs = self.e2e.driver().act(ctx.text, &screen);
                 for input in &inputs {
                     send_input(self.e2e, input);
                 }
@@ -114,13 +118,15 @@ impl<'e> Agent<'e> {
                 // what replay waits for after re-sending the inputs.
                 (inputs, None, settle(self.e2e))
             }
-            Op::Assert => match self.e2e.driver.assert(text, &screen) {
+            Op::Assert => match self.e2e.driver().assert(ctx.text, &screen) {
                 // Record exactly the screen that was judged, so the
                 // hash guard re-asserts what the verdict saw.
                 Verdict::Pass => (Vec::new(), Some(Verdict::Pass), screen),
                 Verdict::Fail { reason } => panic!(
-                    "agent step {step} (assert {text:?}) failed: {reason}\n\
+                    "agent step {} (assert {:?}) failed: {reason}\n\
                      --- screen ---\n{}",
+                    ctx.number,
+                    ctx.text,
                     screen.rows.join("\n")
                 ),
             },
@@ -128,53 +134,58 @@ impl<'e> Agent<'e> {
         let recording = Recording {
             header: Header {
                 v: recording::FORMAT_VERSION,
-                step,
-                op,
-                text: text.to_string(),
-                text_hash: recording::text_hash(op, text),
-                program: self.e2e.program.clone(),
+                step: ctx.number,
+                op: ctx.op,
+                text: ctx.text.to_string(),
+                text_hash: recording::text_hash(ctx.op, ctx.text),
+                program: self.e2e.program().to_string(),
                 screen_hash: screen.hash_hex(),
                 screen,
                 verdict,
             },
             inputs,
         };
-        recording.save(path);
+        recording.save(&ctx.path);
     }
 
     /// Replay path: re-send the recorded inputs, then assert the
     /// recorded screen-state hash. Every failure here is first-class.
-    fn replay(&mut self, step: usize, op: Op, text: &str, path: &Path) {
-        let Some(recording) = Recording::load(path) else {
+    fn replay(&mut self, ctx: &StepCtx) {
+        let Some(recording) = Recording::load(&ctx.path) else {
             panic!(
-                "agent step {step} ({} {text:?}) has no recording at {}\n\
+                "agent step {} ({} {:?}) has no recording at {}\n\
                  Recordings are committed authored assets (Spec E01): write the \
                  .jsonl by hand, or run the test once with `AIT_E2E_RECORD=1` and a \
                  resolving driver (`E2e::set_driver`, or `AIT_E2E_DRIVER`'s \
                  Command backing).",
-                op.as_str(),
-                path.display()
+                ctx.number,
+                ctx.op.as_str(),
+                ctx.text,
+                ctx.path.display()
             )
         };
         let header = &recording.header;
         assert!(
-            header.op == op && header.text_hash == recording::text_hash(op, text),
-            "agent step {step} at {} was recorded as {} {:?} but the test now \
-             says {} {text:?} — editing a step's text invalidates its recording; \
+            header.op == ctx.op && header.text_hash == recording::text_hash(ctx.op, ctx.text),
+            "agent step {} at {} was recorded as {} {:?} but the test now \
+             says {} {:?} — editing a step's text invalidates its recording; \
              re-record with `AIT_E2E_RECORD=1`",
-            path.display(),
+            ctx.number,
+            ctx.path.display(),
             header.op.as_str(),
             header.text,
-            op.as_str(),
+            ctx.op.as_str(),
+            ctx.text,
         );
         for input in &recording.inputs {
             send_input(self.e2e, input);
         }
-        self.await_recorded(step, op, text, path, &recording);
+        self.await_recorded(ctx, &recording);
         if let Some(Verdict::Fail { reason }) = &header.verdict {
             panic!(
-                "agent step {step} (assert {text:?}) replays a recording whose \
-                 verdict is fail: {reason} — re-record with `AIT_E2E_RECORD=1`"
+                "agent step {} (assert {:?}) replays a recording whose \
+                 verdict is fail: {reason} — re-record with `AIT_E2E_RECORD=1`",
+                ctx.number, ctx.text
             );
         }
     }
@@ -182,16 +193,12 @@ impl<'e> Agent<'e> {
     /// Wait — bounded by [`AWAIT_TIMEOUT`] — for the live screen to match
     /// the recording's screen-state hash. Exits early on the states that
     /// can never heal: a different grid size, a dead child, or a screen
-    /// stable for [`DRIFT_STABLE`] while still different. Any miss is
-    /// drift: a first-class failure carrying the screen diff.
-    fn await_recorded(
-        &mut self,
-        step: usize,
-        op: Op,
-        text: &str,
-        path: &Path,
-        recording: &Recording,
-    ) {
+    /// stable for [`DRIFT_STABLE`] while still different. The deadline is
+    /// checked before the churn tracking, so a screen that never stops
+    /// changing still fails at [`AWAIT_TIMEOUT`] instead of resetting the
+    /// stability clock forever (Spec E01: bounded waits only). Any miss
+    /// is drift: a first-class failure carrying the screen diff.
+    fn await_recorded(&mut self, ctx: &StepCtx, recording: &Recording) {
         let recorded = &recording.header.screen;
         let start = Instant::now();
         let mut last = ScreenState::capture(self.e2e);
@@ -205,6 +212,10 @@ impl<'e> Agent<'e> {
                 Some("the grid size differs and cannot heal".to_string())
             } else if self.e2e.exited().is_some() {
                 Some("the program exited before the screen matched".to_string())
+            } else if start.elapsed() >= AWAIT_TIMEOUT {
+                Some(format!(
+                    "timed out after {AWAIT_TIMEOUT:?} waiting for the recorded screen"
+                ))
             } else if screen != last {
                 last = screen;
                 last_change = Instant::now();
@@ -213,24 +224,22 @@ impl<'e> Agent<'e> {
                 Some(format!(
                     "the screen has been stable for {DRIFT_STABLE:?} without matching"
                 ))
-            } else if start.elapsed() >= AWAIT_TIMEOUT {
-                Some(format!(
-                    "timed out after {AWAIT_TIMEOUT:?} waiting for the recorded screen"
-                ))
             } else {
                 None
             };
             if let Some(reason) = reason {
                 let actual = ScreenState::capture(self.e2e);
                 panic!(
-                    "agent step {step} ({} {text:?}) DRIFTED: {reason}.\n\
+                    "agent step {} ({} {:?}) DRIFTED: {reason}.\n\
                      The live screen no longer matches the recording at {}.\n\
                      --- recorded screen ---\n{}\n\
                      --- actual screen ---\n{}\n\
                      --- diff (- recorded, + actual) ---\n{}\
                      If this change is intended, re-record with `AIT_E2E_RECORD=1`.",
-                    op.as_str(),
-                    path.display(),
+                    ctx.number,
+                    ctx.op.as_str(),
+                    ctx.text,
+                    ctx.path.display(),
                     recorded.rows.join("\n"),
                     actual.rows.join("\n"),
                     screen::diff(recorded, &actual),
@@ -240,6 +249,20 @@ impl<'e> Agent<'e> {
             self.e2e.pump();
         }
     }
+}
+
+/// Everything one numbered step needs on both the record and replay
+/// paths — bundled so `record`/`replay`/`await_recorded` don't pass the
+/// same four values around as loose parameters.
+struct StepCtx<'a> {
+    /// The step's index within its test → its `<step>.jsonl` name.
+    number: usize,
+    /// `act` or `assert`.
+    op: Op,
+    /// The goal/claim text the recording's `text_hash` guards.
+    text: &'a str,
+    /// The step's recording path under the recordings root.
+    path: PathBuf,
 }
 
 /// Send one semantic [`Input`] through the harness's real encoding
