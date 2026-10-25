@@ -13,6 +13,8 @@
 //!                                # pinned SHELL/PS1 (and so override them)
 //! headed = true                  # optional — mirror PTY output to the
 //!                                # controlling terminal while running
+//! slowmo = 400                   # optional — ms delay after each
+//!                                # input step (watch pacing)
 //!
 //! [[steps]]                      # exactly one verb per step
 //! wait_text = "· sh · — · running"
@@ -108,6 +110,10 @@ pub struct Scenario {
     /// controlling terminal while the scenario runs — see
     /// [`SpawnConfig::headed`].
     pub headed: bool,
+    /// Watch pacing in milliseconds (`slowmo = 400`): a fixed delay
+    /// after each input step so a headed run stays readable — see
+    /// [`SpawnConfig::slowmo_ms`].
+    pub slowmo_ms: u64,
     /// The ordered steps.
     pub steps: Vec<Step>,
     /// The scenario's name — its file stem, used in failure messages
@@ -293,6 +299,8 @@ struct RawScenario {
     #[serde(default)]
     headed: bool,
     #[serde(default)]
+    slowmo: u64,
+    #[serde(default)]
     steps: Vec<toml::Table>,
 }
 
@@ -352,6 +360,7 @@ impl Scenario {
             args: raw.args.iter().map(OsString::from).collect(),
             env,
             headed: raw.headed,
+            slowmo_ms: raw.slowmo,
             steps,
             name,
             source: source.to_string(),
@@ -365,6 +374,7 @@ impl Scenario {
         config.args = self.args.iter().map(OsString::from).collect();
         config.env = self.env.clone();
         config.headed = self.headed;
+        config.slowmo_ms = self.slowmo_ms;
         config
     }
 

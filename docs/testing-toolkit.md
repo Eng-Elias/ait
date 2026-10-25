@@ -225,6 +225,7 @@ target/e2e-failures/<test>/
 | `AIT_E2E_RECORDINGS` | override the recordings root (else `<crate>/tests/recordings`) |
 | `AIT_E2E_DUMP_DIR` | override the failure-dump root (else `<workspace>/target/e2e-failures`) |
 | `AIT_E2E_HEADED` | headed mode: mirror raw PTY output to the controlling terminal while tests run |
+| `AIT_E2E_SLOWMO` | watch pacing in ms: fixed delay after each input verb (overrides `SpawnConfig::slowmo_ms`) |
 
 ## Watching tests run (headed mode)
 
@@ -238,15 +239,26 @@ user sees, alt-screen and all.
 
 ```bash
 cargo build -p ait
-AIT_E2E_HEADED=1 cargo test -p ait --test e2e -- --test-threads=1
+# watch at human speed: 400ms after every input
+AIT_E2E_HEADED=1 AIT_E2E_SLOWMO=400 cargo test -p ait --test scenarios -- --test-threads=1
 ```
 
 `--test-threads=1` matters: parallel tests would interleave their
-mirrors on the one terminal. Mirroring is a tap, not part of the
-pipeline — a failing mirror write detaches silently and changes nothing
-about drains, backpressure or events. To poke at a session by hand
-instead of watching a test, `cargo run -p ait-testkit --example drive`
-drives the grid interactively from your keyboard.
+mirrors on the one terminal. `AIT_E2E_SLOWMO=<ms>` (or a scenario's
+`slowmo = <ms>`) paces inputs so the run stays readable — it delays
+input verbs only, never a wait, so it can't change outcomes.
+
+Mirroring is a tap, not part of the pipeline — a failing mirror write
+detaches silently and changes nothing about drains, backpressure or
+events. When an `E2e` that ran headed drops, the harness restores the
+host terminal's modes (alt-screen, mouse reporting, bracketed paste,
+kitty flags) — a child that dies without its own cleanup would
+otherwise leave the terminal echoing escape codes on every scroll.
+If a terminal ever *does* get stuck that way, `reset` fixes it.
+
+To poke at a session by hand instead of watching a test,
+`cargo run -p ait-testkit --example drive` drives the grid
+interactively from your keyboard.
 
 ## CI
 

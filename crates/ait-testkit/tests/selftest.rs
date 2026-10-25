@@ -230,3 +230,22 @@ fn headed_mode_does_not_disturb_the_session() {
         app.screen_text().contains("headed-ok")
     });
 }
+
+/// `SpawnConfig.slowmo_ms` adds a fixed delay after each input verb —
+/// watch pacing only, never a wait.
+#[test]
+fn slowmo_delays_input_verbs() {
+    let mut config = SpawnConfig::new("/bin/sh", &["-c", "read x"], SIZE);
+    config.slowmo_ms = 250;
+    let app = E2e::spawn(config).expect("spawn /bin/sh");
+
+    let start = std::time::Instant::now();
+    app.type_text("a");
+    app.type_text("b");
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(500),
+        "two paced verbs should take >=500ms, took {elapsed:?}"
+    );
+}

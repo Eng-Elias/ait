@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,12 @@ pub struct SpawnConfig {
     /// `--test-threads=1`: parallel tests would interleave on the one
     /// terminal.
     pub headed: bool,
+    /// Watch pacing: a fixed delay after every *input* verb, so a
+    /// headed run stays readable to a human eye. `AIT_E2E_SLOWMO=<ms>`
+    /// sets it at [`E2e::spawn`], overriding this field. It delays
+    /// inputs only — waits stay predicate-based and bounded, so it can
+    /// never make a test pass or fail differently.
+    pub slowmo_ms: u64,
 }
 
 impl SpawnConfig {
@@ -77,6 +83,7 @@ impl SpawnConfig {
             size,
             env: Vec::new(),
             headed: false,
+            slowmo_ms: 0,
         }
     }
 }
@@ -123,6 +130,12 @@ pub struct E2e {
     /// app's selection-copy surfaces here (Spec E01, ticket E01-T4's
     /// `expect_clipboard` verb).
     clipboard: Vec<String>,
+    /// Headed mode is on — PTY output mirrors to the controlling
+    /// terminal, and [`Drop`] restores that terminal's modes.
+    headed: bool,
+    /// Watch pacing — the fixed delay applied after each input verb
+    /// (`SpawnConfig::slowmo_ms` / `AIT_E2E_SLOWMO`).
+    slowmo: Duration,
 }
 
 impl E2e {
@@ -156,7 +169,8 @@ impl E2e {
         // mirror raw PTY output to the controlling terminal as it's
         // read — the app takes over the host terminal's alternate
         // screen while the test drives it.
-        if config.headed || env_flag("AIT_E2E_HEADED") {
+        let headed = config.headed || env_flag("AIT_E2E_HEADED");
+        if headed {
             session.set_output_mirror(Some(headed_writer()));
         }
         // `AIT_E2E_DRIVER` selects the resolving driver for record mode
@@ -179,6 +193,8 @@ impl E2e {
             record: agent::record_flag(),
             agent_step: 0,
             clipboard: Vec::new(),
+            headed,
+            slowmo: slowmo(config.slowmo_ms),
         })
     }
 
@@ -277,6 +293,7 @@ impl E2e {
         self.session
             .send_key(event)
             .unwrap_or_else(|e| panic!("press({chord:?}): PTY write failed: {e}"));
+        self.pace();
     }
 
     /// Type literal text: its UTF-8 bytes to the program's stdin,
@@ -307,6 +324,16 @@ impl E2e {
         self.session
             .send_bytes(bytes)
             .unwrap_or_else(|e| panic!("{verb}: PTY write failed: {e}"));
+        self.pace();
+    }
+
+    /// Watch pacing: the fixed post-input delay when `slowmo` is set —
+    /// presentation only; waits stay predicate-based (a slowmo run
+    /// observes exactly the same sequence, just slower).
+    fn pace(&self) {
+        if !self.slowmo.is_zero() {
+            std::thread::sleep(self.slowmo);
+        }
     }
 
     /// Send one SGR (1006) mouse event at the 1-based screen cell
@@ -326,6 +353,7 @@ impl E2e {
     pub fn resize(&mut self, size: Size) {
         self.log_action(format!("resize({}x{})", size.columns, size.lines));
         self.session.resize(size).expect("resize: PTY write failed");
+        self.pace();
     }
 
     /// Wait — bounded by [`WAIT_TIMEOUT`] — until `pred` accepts the
@@ -503,6 +531,14 @@ impl Drop for E2e {
                 let _ = self.dump_evidence(&name);
             }));
         }
+        // A headed run left the program's mode-enables on the host
+        // terminal — leave-alt-screen, mouse reporting, bracketed
+        // paste, kitty flags — unless the child shut down cleanly and
+        // emitted its own reset. Restore it: a stuck ?1002/?2004 makes
+        // scrolls and selections echo escape codes in the shell.
+        if self.headed {
+            restore_tty();
+        }
     }
 }
 
@@ -522,5 +558,29 @@ fn headed_writer() -> Box<dyn io::Write + Send> {
     match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(tty) => Box::new(tty),
         Err(_) => Box::new(io::stderr()),
+    }
+}
+
+/// The watch pacing for a spawn: `AIT_E2E_SLOWMO=<ms>` overrides
+/// `SpawnConfig::slowmo_ms` (it's the runtime knob a watcher turns).
+fn slowmo(config_ms: u64) -> Duration {
+    match std::env::var("AIT_E2E_SLOWMO") {
+        Ok(value) => Duration::from_millis(value.parse().unwrap_or(0)),
+        Err(_) => Duration::from_millis(config_ms),
+    }
+}
+
+/// Best-effort restore of the host terminal's modes after a headed
+/// run: the mirrored bytes enabled alt-screen, mouse reporting
+/// (1002/1003/1006), bracketed paste and kitty-keyboard flags on
+/// `/dev/tty`, and a child that didn't shut down cleanly leaves them
+/// set — after which every scroll/selection echoes escape codes into
+/// the shell. Written to a fresh `/dev/tty` handle so it can't depend
+/// on a mirror still being attached.
+fn restore_tty() {
+    const RESTORE: &[u8] = b"\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[?1049l\x1b[0m";
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(RESTORE);
+        let _ = tty.flush();
     }
 }
