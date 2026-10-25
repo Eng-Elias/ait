@@ -22,6 +22,7 @@ use ait_term::{
 
 use crate::agent::{self, Agent};
 use crate::chord::parse_chord;
+use crate::command::Command;
 use crate::driver::{Authored, Driver};
 use crate::evidence::{self, ActionEntry};
 use crate::mouse::{self, MouseEvent};
@@ -92,8 +93,9 @@ pub struct E2e {
     /// The spawned program's name, kept for recording provenance.
     pub(crate) program: String,
     /// The backing that resolves `agent` steps at record time —
-    /// [`Authored`] (replay-only) until [`set_driver`](Self::set_driver)
-    /// injects another.
+    /// `AIT_E2E_DRIVER`'s [`Command`] when the variable is set at
+    /// spawn, else the replay-only [`Authored`], until
+    /// [`set_driver`](Self::set_driver) injects another.
     pub(crate) driver: Box<dyn Driver>,
     /// Recordings-root override from
     /// [`set_recordings_dir`](Self::set_recordings_dir); `None` resolves
@@ -141,6 +143,14 @@ impl E2e {
             cwd: Some(cwd.path().to_path_buf()),
             env,
         })?;
+        // `AIT_E2E_DRIVER` selects the resolving driver for record mode
+        // (Spec E01, ticket E01-T3); unset or blank keeps `Authored`.
+        // Replay never consults the driver, so an env-selected `Command`
+        // is inert outside `AIT_E2E_RECORD` runs.
+        let driver: Box<dyn Driver> = match Command::from_env() {
+            Some(command) => Box::new(command),
+            None => Box::new(Authored),
+        };
         Ok(Self {
             session,
             cwd,
@@ -148,7 +158,7 @@ impl E2e {
             started: Instant::now(),
             log: RefCell::new(Vec::new()),
             program,
-            driver: Box::new(Authored),
+            driver,
             recordings_dir: None,
             record: agent::record_flag(),
             agent_step: 0,
@@ -177,9 +187,9 @@ impl E2e {
     }
 
     /// Inject the [`Driver`] agent steps resolve through at record time
-    /// — self-tests plug in a stub here; E01-T3's `AIT_E2E_DRIVER`
-    /// `Command` backing plugs in the same way. Never consulted on the
-    /// replay path.
+    /// — self-tests plug in a stub here; `AIT_E2E_DRIVER`'s [`Command`]
+    /// backing is already installed at spawn, so this replaces it.
+    /// Never consulted on the replay path.
     pub fn set_driver(&mut self, driver: impl Driver + 'static) {
         self.driver = Box::new(driver);
     }

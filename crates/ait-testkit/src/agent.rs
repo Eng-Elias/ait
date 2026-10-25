@@ -150,8 +150,8 @@ impl<'e> Agent<'e> {
                 "agent step {step} ({} {text:?}) has no recording at {}\n\
                  Recordings are committed authored assets (Spec E01): write the \
                  .jsonl by hand, or run the test once with `AIT_E2E_RECORD=1` and a \
-                 resolving driver (`E2e::set_driver`, or `AIT_E2E_DRIVER` once the \
-                 Command backing lands).",
+                 resolving driver (`E2e::set_driver`, or `AIT_E2E_DRIVER`'s \
+                 Command backing).",
                 op.as_str(),
                 path.display()
             )

@@ -13,7 +13,11 @@
 //! committed `tests/recordings/<test>/<step>.jsonl` files replay them
 //! byte-deterministically otherwise — with the step-text and
 //! screen-state hashes guarding against stale steps and observable
-//! drift.
+//! drift. The default [`Authored`] driver is replay-only; setting
+//! `AIT_E2E_DRIVER` at spawn installs the [`Command`] backing, which
+//! resolves each step through a subprocess speaking a versioned JSON
+//! protocol (`docs/e2e-driver-protocol.md`) — secrets reach it through
+//! the inherited environment only.
 //!
 //! The scenario layer (ticket E01-T4) makes acceptance criteria
 //! declarative: a [`Scenario`] is a TOML file — `feature` tag, `size`,
@@ -23,6 +27,7 @@
 
 mod agent;
 mod chord;
+mod command;
 mod driver;
 mod evidence;
 mod harness;
@@ -35,6 +40,7 @@ mod tempdir;
 pub use agent::Agent;
 pub use ait_term::{Cursor, ExitStatus, GridView, Size};
 pub use chord::{parse_chord, ChordError};
+pub use command::Command;
 pub use driver::{Authored, Driver, Input, Verdict};
 pub use evidence::dump_root;
 pub use harness::{E2e, SpawnConfig};
