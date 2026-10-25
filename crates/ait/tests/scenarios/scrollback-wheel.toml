@@ -1,0 +1,41 @@
+# Spec R02 story 12: the mouse wheel scrolls the viewport 3 lines per
+# tick (WHEEL_LINES) from anywhere over the window. With `seq 1 100`
+# the live view ends at `100`; each wheel-up tick reveals numbers three
+# lower.
+feature = "scrollback"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "seq 1 100\n"
+
+# Same gate as scrollback-keys: `100` as a whole output line, so the
+# scrollback is complete before the wheel moves the view.
+[[steps]]
+expect_regex = "(?m)^100$"
+
+# One tick up: `77` enters the top of the view (was `80`).
+[[steps]]
+mouse = { event = "wheel_up", col = 9, row = 9 }
+
+[[steps]]
+expect_regex = "(?m)^77$"
+
+# A second tick: `74`.
+[[steps]]
+mouse = { event = "wheel_up", col = 9, row = 9 }
+
+[[steps]]
+expect_regex = "(?m)^74$"
+
+# Two ticks back down to live: `100` and the prompt again.
+[[steps]]
+mouse = { event = "wheel_down", col = 9, row = 9 }
+
+[[steps]]
+mouse = { event = "wheel_down", col = 9, row = 9 }
+
+[[steps]]
+expect_regex = "(?m)^100$"

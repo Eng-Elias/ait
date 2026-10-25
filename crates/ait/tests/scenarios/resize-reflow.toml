@@ -1,0 +1,22 @@
+# Spec R02 story 17: resizing the window reflows chrome and resizes
+# every inner PTY to `W x (H-2)` — `stty size` inside the shell reads
+# `13 50` after a resize to 50x15. The resize runs right after spawn so
+# the two chrome waits give ait event-loop iterations to apply the new
+# winsize before anything types.
+feature = "resize"
+size = [80, 24]
+
+[[steps]]
+resize = [50, 15]
+
+[[steps]]
+wait_text = "1:sh"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "stty size\n"
+
+[[steps]]
+expect_text = "13 50"

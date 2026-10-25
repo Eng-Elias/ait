@@ -1,0 +1,15 @@
+# Spec R02 stories 1, 10: spawning `ait` renders the chrome a user sees
+# first — the `1:sh` tab in the bar (row 0) and the
+# `cwd · sh · — · running` status line (last row), then the inner
+# shell's prompt in the content band.
+feature = "chrome"
+size = [80, 24]
+
+[[steps]]
+wait_text = "1:sh"
+
+[[steps]]
+wait_text = "· sh · — · running"
+
+[[steps]]
+expect_text = "$"

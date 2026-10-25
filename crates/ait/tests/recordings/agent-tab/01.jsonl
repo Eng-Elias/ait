@@ -1,0 +1,1 @@
+{"v":1,"step":1,"op":"assert","text":"the tab bar shows two tabs","text_hash":"de07769e5fcc34d2","program":"ait","screen":{"columns":80,"lines":24,"rows":[" 1:sh  2:sh","$","","","","","","","","","","","","","","","","","","","","","","[cwd] · sh · — · running"],"cursor":{"line":1,"column":2,"shape":"Block"}},"screen_hash":"b4416fad66c15235","verdict":"pass"}

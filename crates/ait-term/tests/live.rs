@@ -304,6 +304,44 @@ fn try_recv_event_surfaces_output_and_exit() {
 }
 
 #[test]
+fn output_tail_holds_the_raw_bytes_fed_into_the_grid() {
+    let mut session = spawn_shell_script("printf tail-marker; read x");
+
+    // The tail reports output the session has *consumed* (fed into the
+    // grid), not output the reader has merely produced: bytes the child
+    // already wrote but nobody drained yet are not in it.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.output_tail().is_empty());
+
+    wait_for_event(&mut session, |event| {
+        matches!(event, LiveEvent::OutputReady)
+    });
+    let tail = session.output_tail();
+    assert!(
+        String::from_utf8_lossy(tail).contains("tail-marker"),
+        "tail should hold the raw output: {}",
+        String::from_utf8_lossy(tail)
+    );
+}
+
+#[test]
+fn output_tail_is_bounded_to_the_last_64_kib() {
+    // ~700 KB of output — far past the documented 64 KiB bound.
+    let mut session = spawn_shell_script("seq 1 100000");
+
+    let status = wait_for_exit(&mut session);
+    assert!(status.success());
+
+    let tail = session.output_tail();
+    assert_eq!(tail.len(), 64 * 1024, "the tail is capped at 64 KiB");
+    // It is a *tail*: the last bytes the program emitted.
+    assert!(
+        String::from_utf8_lossy(tail).trim_end().ends_with("100000"),
+        "the tail should end with the program's last output"
+    );
+}
+
+#[test]
 fn osc_events_flow_through_the_live_channel() {
     // OSC 9 (notification) observed by the core while output is fed must
     // surface on the live event stream, in order, before Exited.
@@ -328,4 +366,74 @@ fn osc_events_flow_through_the_live_channel() {
     assert!(status.success());
     assert_eq!(notification.as_deref(), Some("build done"));
     assert!(grid_text(&session).contains("tail"));
+}
+
+/// A `Write` shared with the test so the mirrored bytes can be
+/// inspected: the mirror is consumed as `Box<dyn Write + Send>`, so a
+/// plain buffer behind a Mutex is the simplest stand-in for a terminal.
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_output_mirror_receives_bytes_as_the_reader_reads_them() {
+    let mut session = spawn_shell_script("printf early-mark; read x; printf late-mark; read x");
+    let mirror = SharedBuf::default();
+    session.set_output_mirror(Some(Box::new(mirror.clone())));
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        session.drain_events();
+        if grid_text(&session).contains("early-mark") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for early-mark"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        mirror
+            .0
+            .lock()
+            .unwrap()
+            .windows(b"early-mark".len())
+            .any(|w| w == b"early-mark"),
+        "the mirror missed the child's first output"
+    );
+
+    // Detaching stops the tap: the second print reaches the grid but
+    // never the mirror.
+    session.set_output_mirror(None);
+    session.send_bytes(b"\n").expect("input should be accepted");
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        session.drain_events();
+        if grid_text(&session).contains("late-mark") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for late-mark");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !mirror
+            .0
+            .lock()
+            .unwrap()
+            .windows(b"late-mark".len())
+            .any(|w| w == b"late-mark"),
+        "the detached mirror still received output"
+    );
 }

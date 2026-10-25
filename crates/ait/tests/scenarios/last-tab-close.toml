@@ -1,0 +1,20 @@
+# Spec R02 story 20: closing the last tab exits ait — and when that
+# tab's session had itself exited, ait's exit code carries the child's
+# (`exit 3` in the shell -> ait exits 3).
+feature = "lifecycle"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "exit 3\n"
+
+[[steps]]
+wait_text = "exited 3"
+
+[[steps]]
+keys = ["Alt+W"]
+
+[[steps]]
+expect_exit = 3
