@@ -30,7 +30,7 @@
 //! | `keys` | `["Alt+T", …]` | press each chord in order |
 //! | `text` | `"…"` | literal text to the program's stdin (`\n` stays `\n` — use `keys = ["Enter"]` for the `\r` terminals send) |
 //! | `bytes` | `"1b5b…"` | raw bytes, lowercase hex pairs — the same spelling [`Input::Bytes`](crate::Input) uses (`od -tx1` style); whitespace ignored |
-//! | `mouse` | `{event = "…", x = 10, y = 5}` | one SGR mouse event at the 1-based *screen* cell `(x, y)` — `event`: `"down"`/`"drag"`/`"up"`/`"wheel_up"`/`"wheel_down"`, plus optional `button`: `"left"` (default)/`"middle"`/`"right"` |
+//! | `mouse` | `{event = "…", col = 9, row = 4}` | one SGR mouse event at the 0-based screen cell `(col, row)` — the same convention `expect_cursor` uses; the SGR encoding adds the 1 the wire requires — `event`: `"down"`/`"drag"`/`"up"`/`"wheel_up"`/`"wheel_down"`, plus optional `button`: `"left"` (default)/`"middle"`/`"right"` |
 //! | `resize` | `[w, h]` | resize the PTY and grid |
 //! | `wait_text` | `"…"` | bounded wait until the screen contains it |
 //! | `expect_text` | `"…"` | assert the screen shows it (bounded wait — assertions on a live screen must tolerate render latency) |
@@ -120,13 +120,15 @@ pub enum Step {
     Text(String),
     /// `bytes` — raw bytes (decoded from hex at load).
     Bytes(Vec<u8>),
-    /// `mouse` — one SGR event at the 1-based screen cell.
+    /// `mouse` — one SGR event at the 0-based screen cell (the same
+    /// convention `expect_cursor` uses; the SGR wire encoding adds the
+    /// 1 the protocol requires).
     Mouse {
         /// The event to send.
         event: MouseEvent,
-        /// 1-based screen column.
+        /// 0-based screen column (`col` in the file).
         column: u16,
-        /// 1-based screen row.
+        /// 0-based screen row (`row` in the file).
         row: u16,
     },
     /// `resize` — new PTY size.
@@ -189,7 +191,11 @@ impl Step {
             }
             Self::Text(text) => e2e.type_text(text),
             Self::Bytes(bytes) => e2e.send_bytes(bytes),
-            Self::Mouse { event, column, row } => e2e.send_mouse(*event, *column, *row),
+            // Scenario cells are 0-based like the grid view and
+            // `expect_cursor`; the wire (`send_mouse`) wants 1-based.
+            Self::Mouse { event, column, row } => {
+                e2e.send_mouse(*event, column.saturating_add(1), row.saturating_add(1))
+            }
             Self::Resize(size) => e2e.resize(*size),
             Self::WaitText(text) => {
                 e2e.wait_for_screen(&format!("wait_text {text:?}"), |e2e| {
@@ -282,12 +288,13 @@ struct RawScenario {
     steps: Vec<toml::Table>,
 }
 
-/// The `mouse = { … }` inline table.
+/// The `mouse = { … }` inline table — `col`/`row` are the 0-based
+/// screen cell, matching `expect_cursor`'s convention.
 #[derive(Deserialize)]
 struct RawMouse {
     event: String,
-    x: u16,
-    y: u16,
+    col: u16,
+    row: u16,
     #[serde(default)]
     button: Option<String>,
 }
@@ -453,14 +460,14 @@ fn parse_step(source: &str, index: usize, table: &toml::Table) -> Result<Step, S
                 value,
                 verb,
                 "a table like \
-                 `{ event = \"wheel_up\", x = 10, y = 5 }`",
+                 `{ event = \"wheel_up\", col = 9, row = 4 }`",
             )
             .map_err(&fail)?;
             let event = parse_mouse_event(&mouse).map_err(&fail)?;
             Ok(Step::Mouse {
                 event,
-                column: mouse.x,
-                row: mouse.y,
+                column: mouse.col,
+                row: mouse.row,
             })
         }
         "resize" => {
@@ -582,9 +589,9 @@ text = "hi\n"
 [[steps]]
 bytes = "1b 5b"
 [[steps]]
-mouse = { event = "drag", x = 3, y = 4 }
+mouse = { event = "drag", col = 3, row = 4 }
 [[steps]]
-mouse = { event = "up", x = 3, y = 4, button = "middle" }
+mouse = { event = "up", col = 3, row = 4, button = "middle" }
 [[steps]]
 resize = [50, 15]
 [[steps]]
@@ -651,7 +658,7 @@ assert = "the thing happened"
             ("keys = [\"Bogus\"]", "invalid chord"),
             ("bytes = \"1b5\"", "not an even number of hex digits"),
             (
-                "mouse = { event = \"sideways\", x = 1, y = 1 }",
+                "mouse = { event = \"sideways\", col = 1, row = 1 }",
                 "mouse.event",
             ),
             ("resize = [80]", "`resize` must be"),

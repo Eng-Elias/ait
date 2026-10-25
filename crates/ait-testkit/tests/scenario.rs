@@ -5,36 +5,22 @@
 //! verb included. Agent-step scenarios are exercised end to end in
 //! `crates/ait/tests/scenarios.rs`.
 
-use std::fs;
-use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod common;
 
 use ait_testkit::{E2e, Scenario, Size};
+use common::TestDir;
 
 const SIZE: Size = Size {
     columns: 80,
     lines: 24,
 };
 
-/// A scenario file under a unique temp dir, returning its path — the
-/// file-on-disk shape the runner consumes (load errors name it).
-fn scenario_file(toml: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ait-e2e-scenarios-{}-{}",
-        process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&dir).expect("create scenario dir");
-    let file = dir.join("case.toml");
-    fs::write(&file, toml).expect("write scenario file");
-    file
-}
-
-/// Interactive `/bin/sh` with `toml`'s scenario run against it.
+/// Interactive `/bin/sh` with `toml`'s scenario run against it — the
+/// file-on-disk shape the runner consumes (load errors name it), kept
+/// inside a [`TestDir`] so it is read eagerly and removed on drop.
 fn run(toml: &str) -> E2e {
-    let file = scenario_file(toml);
+    let dir = TestDir::fresh();
+    let file = dir.write("case.toml", toml);
     let scenario = Scenario::load(&file).expect("scenario parses");
     let mut app = E2e::spawn(scenario.spawn_config("/bin/sh")).expect("spawn /bin/sh");
     scenario.run(&mut app);
@@ -122,8 +108,9 @@ expect_text = "saw:hello"
 }
 
 /// `mouse` writes the SGR bytes the wire spells: a wheel-up tick at
-/// (10,5) is `ESC [ < 6 4 ; 1 0 ; 5 M` — eleven bytes, hex-dumped by
-/// `od`.
+/// the 0-based cell (9,4) — `col`/`row`, the same convention as
+/// `expect_cursor` — encodes to the wire's 1-based (10,5):
+/// `ESC [ < 6 4 ; 1 0 ; 5 M` — eleven bytes, hex-dumped by `od`.
 #[test]
 fn mouse_verb_writes_sgr_sequences() {
     run(r#"
@@ -136,7 +123,7 @@ text = "stty -icanon -echo; printf READY; dd bs=1 count=11 2>/dev/null | od -An 
 wait_text = "READY"
 
 [[steps]]
-mouse = { event = "wheel_up", x = 10, y = 5 }
+mouse = { event = "wheel_up", col = 9, row = 4 }
 
 [[steps]]
 expect_text = "1b 5b 3c 36 34 3b 31 30 3b 35 4d"
@@ -193,7 +180,9 @@ expect_text = "SCENARIO>"
 /// parsed value; `size` defaults to the standard 80x24.
 #[test]
 fn feature_tag_and_default_size_parse() {
-    let file = scenario_file(
+    let dir = TestDir::fresh();
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "scrollback"
 
@@ -210,8 +199,10 @@ wait_text = "x"
 /// a bare toml panic.
 #[test]
 fn malformed_scenarios_name_file_and_step() {
+    let dir = TestDir::fresh();
     // Step 1 has no verb at all.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "bad"
 
@@ -229,7 +220,8 @@ bogus_verb = 3
     assert!(message.contains("bogus_verb"), "names the verb: {message}");
 
     // Two verbs in one step is ambiguous.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "bad"
 
@@ -242,7 +234,8 @@ text = "x"
     assert!(err.to_string().contains("step 0"), "{}", err);
 
     // A bad chord is caught at load, not mid-run.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "bad"
 
@@ -254,7 +247,8 @@ keys = ["Ctrl+Bogus"]
     assert!(err.to_string().contains("step 0"), "{}", err);
 
     // Bad hex in `bytes`.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "bad"
 
@@ -266,7 +260,8 @@ bytes = "zz"
     assert!(err.to_string().contains("step 0"), "{}", err);
 
     // Bad regex.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "bad"
 
@@ -278,7 +273,8 @@ expect_regex = "(["
     assert!(err.to_string().contains("step 0"), "{}", err);
 
     // A missing feature tag is a load error, not a panic.
-    let file = scenario_file(
+    let file = dir.write(
+        "case.toml",
         r#"
 [[steps]]
 wait_text = "x"
@@ -293,7 +289,9 @@ wait_text = "x"
 #[test]
 #[should_panic(expected = "case step 1")]
 fn a_failing_step_reports_its_index() {
-    let file = scenario_file(
+    let dir = TestDir::fresh();
+    let file = dir.write(
+        "case.toml",
         r#"
 feature = "selftest"
 

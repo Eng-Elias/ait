@@ -50,12 +50,15 @@ pub(crate) fn current_test_name() -> String {
     sanitize(thread.name().unwrap_or("unnamed"))
 }
 
-/// A filesystem-safe test/scenario name: anything outside
-/// `[A-Za-z0-9._-]` (e.g. the `::` in `mod::test`) becomes `_`.
+/// A filesystem-safe test/scenario name: `::` becomes `/` — the same
+/// module-nesting convention `recording::test_dir` uses, so a test's
+/// dump dir and its recordings dir are spelled alike — and anything
+/// else outside `[A-Za-z0-9._-]` becomes `_`.
 fn sanitize(name: &str) -> String {
-    name.chars()
+    name.replace("::", "/")
+        .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/') {
                 c
             } else {
                 '_'
@@ -151,9 +154,9 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_path_unsafe_characters() {
-        assert_eq!(sanitize("e2e::tabs::opens"), "e2e__tabs__opens");
+        assert_eq!(sanitize("e2e::tabs::opens"), "e2e/tabs/opens");
         assert_eq!(sanitize("plain-name_1.2"), "plain-name_1.2");
-        assert_eq!(sanitize("a/b c"), "a_b_c");
+        assert_eq!(sanitize("a b:c"), "a_b_c");
     }
 
     #[test]

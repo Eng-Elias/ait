@@ -5,13 +5,14 @@
 //! version, timeout) fails the step with the child's stderr in the
 //! message. No model anywhere.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ait_testkit::{Command, E2e, Size, SpawnConfig};
+use common::{step_file, TestDir};
 
 const SIZE: Size = Size {
     columns: 80,
@@ -28,39 +29,12 @@ fn wait_for_prompt(app: &mut E2e) {
     app.wait_for_screen("the shell prompt", |app| app.screen_text().contains('$'));
 }
 
-/// A recordings root unique to this test run.
-fn fresh_dir() -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ait-e2e-command-recordings-{}-{}",
-        process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&dir).expect("create fresh recordings dir");
-    dir
-}
-
-/// The `<step>.jsonl` path the convention produces for this test.
-fn step_file(dir: &Path, step: usize) -> PathBuf {
-    let test = std::thread::current()
-        .name()
-        .expect("test threads are named")
-        .replace("::", "/");
-    dir.join(test).join(format!("{step:02}.jsonl"))
-}
-
-/// Write `body` to a fresh temp file and return its path. Tests invoke
-/// it as `sh '<path>'` — no exec bit needed — while the env-selection
-/// test quotes the raw path to prove a plain program path works.
-fn write_script(body: &str) -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "ait-e2e-driver-{}-{}.sh",
-        process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&path, body).expect("write stub driver script");
-    path
+/// Write the stub driver `body` into `dir` and return its path. Tests
+/// invoke it as `sh '<path>'` — no exec bit needed — while the
+/// env-selection test quotes the raw path to prove a plain program
+/// path works.
+fn write_script(dir: &TestDir, body: &str) -> PathBuf {
+    dir.write("driver.sh", body)
 }
 
 /// The canned-answer stub: `assert` requests get a `pass` verdict, `act`
@@ -84,11 +58,11 @@ esac
 /// normal recording lands on disk.
 #[test]
 fn act_resolves_through_the_stub_script() {
-    let script = write_script(STUB_DRIVER);
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, STUB_DRIVER);
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
@@ -99,7 +73,8 @@ fn act_resolves_through_the_stub_script() {
         "the subprocess's inputs were sent:\n{}",
         app.screen_text()
     );
-    let recording = fs::read_to_string(step_file(&dir, 0)).expect("a normal recording was written");
+    let recording =
+        fs::read_to_string(step_file(dir.path(), 0)).expect("a normal recording was written");
     assert!(recording.contains(r#""op":"act""#), "header: {recording}");
     assert!(
         recording.contains(r#"{"text":"echo AGENT-MARK"}"#),
@@ -111,18 +86,18 @@ fn act_resolves_through_the_stub_script() {
 /// recorded the same way any driver's is.
 #[test]
 fn assert_resolves_through_the_stub_script() {
-    let script = write_script(STUB_DRIVER);
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, STUB_DRIVER);
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
     app.agent().assert("the mark is on screen");
 
     let recording =
-        fs::read_to_string(step_file(&dir, 0)).expect("the assert recording was written");
+        fs::read_to_string(step_file(dir.path(), 0)).expect("the assert recording was written");
     assert!(
         recording.contains(r#""op":"assert""#),
         "header: {recording}"
@@ -138,8 +113,8 @@ fn assert_resolves_through_the_stub_script() {
 /// normal recording, which a later driverless spawn then replays.
 #[test]
 fn ait_e2e_driver_env_selects_the_command_backing() {
-    let script = write_script(STUB_DRIVER);
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, STUB_DRIVER);
     // The env var is read once at spawn; remove it promptly so the
     // brief set window can't leak into a concurrently-running test's
     // spawn (which would be benign anyway — replay never consults the
@@ -148,12 +123,12 @@ fn ait_e2e_driver_env_selects_the_command_backing() {
     let mut app = sh();
     std::env::remove_var("AIT_E2E_DRIVER");
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
 
     app.agent().act("show the agent mark");
 
-    let recording = fs::read_to_string(step_file(&dir, 0))
+    let recording = fs::read_to_string(step_file(dir.path(), 0))
         .expect("the env-selected driver produced a normal recording");
     assert!(recording.contains(r#""op":"act""#), "header: {recording}");
     drop(app);
@@ -161,7 +136,7 @@ fn ait_e2e_driver_env_selects_the_command_backing() {
     // Round trip: the recording replays with zero driver involvement.
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(false);
 
     app.agent().act("show the agent mark");
@@ -178,13 +153,14 @@ fn ait_e2e_driver_env_selects_the_command_backing() {
 #[test]
 #[should_panic(expected = "no such thing on the screen")]
 fn a_fail_verdict_surfaces_the_drivers_reason() {
+    let dir = TestDir::fresh();
     let script = write_script(
+        &dir,
         "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"v\":1,\"verdict\":{\"fail\":{\"reason\":\"no such thing on the screen\"}}}'\n",
     );
-    let dir = fresh_dir();
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
@@ -196,11 +172,11 @@ fn a_fail_verdict_surfaces_the_drivers_reason() {
 #[test]
 #[should_panic(expected = "endpoint refused")]
 fn nonzero_exit_fails_the_step_with_stderr() {
-    let script = write_script("#!/bin/sh\necho 'endpoint refused' >&2\nexit 3\n");
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, "#!/bin/sh\necho 'endpoint refused' >&2\nexit 3\n");
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
@@ -212,11 +188,11 @@ fn nonzero_exit_fails_the_step_with_stderr() {
 #[test]
 #[should_panic(expected = "not valid protocol JSON")]
 fn malformed_json_fails_the_step() {
-    let script = write_script("#!/bin/sh\nprintf 'this is not json'\n");
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, "#!/bin/sh\nprintf 'this is not json'\n");
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
@@ -228,11 +204,14 @@ fn malformed_json_fails_the_step() {
 #[test]
 #[should_panic(expected = "protocol v2")]
 fn wrong_protocol_version_fails_the_step() {
-    let script = write_script("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"v\":2,\"inputs\":[]}'\n");
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(
+        &dir,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"v\":2,\"inputs\":[]}'\n",
+    );
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::new(format!("sh '{}'", script.display())));
 
@@ -245,11 +224,11 @@ fn wrong_protocol_version_fails_the_step() {
 #[test]
 #[should_panic(expected = "timed out")]
 fn a_hung_driver_is_killed_at_the_timeout() {
-    let script = write_script("#!/bin/sh\nsleep 30\n");
-    let dir = fresh_dir();
+    let dir = TestDir::fresh();
+    let script = write_script(&dir, "#!/bin/sh\nsleep 30\n");
     let mut app = sh();
     wait_for_prompt(&mut app);
-    app.set_recordings_dir(&dir);
+    app.set_recordings_dir(dir.path());
     app.set_record_mode(true);
     app.set_driver(Command::with_timeout(
         format!("sh '{}'", script.display()),

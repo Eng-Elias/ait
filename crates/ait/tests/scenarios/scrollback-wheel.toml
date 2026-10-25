@@ -18,24 +18,24 @@ expect_regex = "(?m)^100$"
 
 # One tick up: `77` enters the top of the view (was `80`).
 [[steps]]
-mouse = { event = "wheel_up", x = 10, y = 10 }
+mouse = { event = "wheel_up", col = 9, row = 9 }
 
 [[steps]]
 expect_regex = "(?m)^77$"
 
 # A second tick: `74`.
 [[steps]]
-mouse = { event = "wheel_up", x = 10, y = 10 }
+mouse = { event = "wheel_up", col = 9, row = 9 }
 
 [[steps]]
 expect_regex = "(?m)^74$"
 
 # Two ticks back down to live: `100` and the prompt again.
 [[steps]]
-mouse = { event = "wheel_down", x = 10, y = 10 }
+mouse = { event = "wheel_down", col = 9, row = 9 }
 
 [[steps]]
-mouse = { event = "wheel_down", x = 10, y = 10 }
+mouse = { event = "wheel_down", col = 9, row = 9 }
 
 [[steps]]
 expect_regex = "(?m)^100$"

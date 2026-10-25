@@ -38,7 +38,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::driver::{Driver, Input, Verdict};
 use crate::screen::ScreenState;
@@ -181,6 +181,26 @@ impl Command {
         (stdout, stderr)
     }
 
+    /// The shared spine of `act`/`assert`: serialize the step's
+    /// request, run the subprocess [`exchange`](Self::exchange), gate
+    /// on `v`, then deserialize the response body — every deviation a
+    /// step failure.
+    fn exchange_step<Res: DeserializeOwned>(&self, call: &Call, request: &Request<'_>) -> Res {
+        let body = serde_json::to_vec(request).expect("the request serializes");
+        let (stdout, stderr) = self.exchange(call, &body);
+        self.check_protocol(call, &stdout, &stderr);
+        serde_json::from_slice::<Res>(&stdout).unwrap_or_else(|e| {
+            self.fail(
+                call,
+                &format!(
+                    "the {} response doesn't match the v1 schema: {e}",
+                    call.kind
+                ),
+                &stderr,
+            )
+        })
+    }
+
     /// The `v` gate: parse the envelope first so a wrapper speaking a
     /// newer protocol — or printing something that isn't protocol JSON
     /// at all — fails clearly instead of misparsing.
@@ -226,25 +246,17 @@ impl Driver for Command {
             kind: "act",
             text: goal,
         };
-        let body = serde_json::to_vec(&Request {
-            v: PROTOCOL_VERSION,
-            kind: "act",
-            goal: Some(goal),
-            claim: None,
-            screen,
-        })
-        .expect("the request serializes");
-        let (stdout, stderr) = self.exchange(&call, &body);
-        self.check_protocol(&call, &stdout, &stderr);
-        serde_json::from_slice::<ActResponse>(&stdout)
-            .unwrap_or_else(|e| {
-                self.fail(
-                    &call,
-                    &format!("the act response doesn't match the v1 schema: {e}"),
-                    &stderr,
-                )
-            })
-            .inputs
+        self.exchange_step::<ActResponse>(
+            &call,
+            &Request {
+                v: PROTOCOL_VERSION,
+                kind: "act",
+                goal: Some(goal),
+                claim: None,
+                screen,
+            },
+        )
+        .inputs
     }
 
     fn assert(&mut self, claim: &str, screen: &ScreenState) -> Verdict {
@@ -252,25 +264,17 @@ impl Driver for Command {
             kind: "assert",
             text: claim,
         };
-        let body = serde_json::to_vec(&Request {
-            v: PROTOCOL_VERSION,
-            kind: "assert",
-            goal: None,
-            claim: Some(claim),
-            screen,
-        })
-        .expect("the request serializes");
-        let (stdout, stderr) = self.exchange(&call, &body);
-        self.check_protocol(&call, &stdout, &stderr);
-        serde_json::from_slice::<AssertResponse>(&stdout)
-            .unwrap_or_else(|e| {
-                self.fail(
-                    &call,
-                    &format!("the assert response doesn't match the v1 schema: {e}"),
-                    &stderr,
-                )
-            })
-            .verdict
+        self.exchange_step::<AssertResponse>(
+            &call,
+            &Request {
+                v: PROTOCOL_VERSION,
+                kind: "assert",
+                goal: None,
+                claim: Some(claim),
+                screen,
+            },
+        )
+        .verdict
     }
 }
 

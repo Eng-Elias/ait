@@ -278,7 +278,11 @@ fn send_input(e2e: &E2e, input: &Input) {
 
 /// Pump until the screen is unchanged for [`SETTLE_STABLE`] (or
 /// [`SETTLE_BUDGET`] elapses) and return the captured state — the
-/// "after the step" screen a recording hashes.
+/// "after the step" screen a recording hashes. The deadline is checked
+/// before the churn tracking (as in [`Agent::await_recorded`]), so a
+/// screen that changes on every poll still exits at the budget instead
+/// of resetting the stability clock forever (Spec E01: bounded waits
+/// only).
 fn settle(e2e: &mut E2e) -> ScreenState {
     let start = Instant::now();
     let mut last = ScreenState::capture(e2e);
@@ -286,10 +290,13 @@ fn settle(e2e: &mut E2e) -> ScreenState {
     loop {
         e2e.pump();
         let screen = ScreenState::capture(e2e);
+        if start.elapsed() >= SETTLE_BUDGET {
+            return screen;
+        }
         if screen != last {
             last = screen;
             last_change = Instant::now();
-        } else if last_change.elapsed() >= SETTLE_STABLE || start.elapsed() >= SETTLE_BUDGET {
+        } else if last_change.elapsed() >= SETTLE_STABLE {
             return screen;
         }
         std::thread::sleep(POLL);

@@ -1,6 +1,6 @@
 ---
 source: crates/ait/tests/e2e.rs
-expression: screen
+expression: app.snapshot()
 ---
  1:sh
 $

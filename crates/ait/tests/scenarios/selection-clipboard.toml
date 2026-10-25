@@ -3,10 +3,10 @@
 # `ClipboardWrite` event (the session opted into `osc52`) — and
 # `Shift+Insert` pastes the copied text into the inner shell.
 #
-# Screen coords below are 1-based: after `echo HELLOWORLD` at the first
-# prompt, row 3 holds `HELLOWORLD` starting at column 1 — the drag
-# covers columns 1..10, and the release extends the copy through its
-# cell.
+# Screen coords below are 0-based (the scenario `col`/`row`
+# convention): after `echo HELLOWORLD` at the first prompt, row 2 holds
+# `HELLOWORLD` starting at column 0 — the drag covers columns 0..9,
+# and the release extends the copy through its cell.
 feature = "selection"
 size = [80, 24]
 
@@ -23,13 +23,13 @@ text = "echo HELLOWORLD\n"
 expect_regex = "(?m)^HELLOWORLD$"
 
 [[steps]]
-mouse = { event = "down", x = 1, y = 3 }
+mouse = { event = "down", col = 0, row = 2 }
 
 [[steps]]
-mouse = { event = "drag", x = 10, y = 3 }
+mouse = { event = "drag", col = 9, row = 2 }
 
 [[steps]]
-mouse = { event = "up", x = 10, y = 3 }
+mouse = { event = "up", col = 9, row = 2 }
 
 [[steps]]
 expect_clipboard = "HELLOWORLD"

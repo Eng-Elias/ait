@@ -271,7 +271,7 @@ impl E2e {
     /// On a failed PTY write.
     pub fn type_text(&self, text: &str) {
         self.log_action(format!("type_text({text:?})"));
-        self.write(text.as_bytes());
+        self.write("type_text", text.as_bytes());
     }
 
     /// The raw-bytes escape hatch — anything [`press`](Self::press)
@@ -281,15 +281,16 @@ impl E2e {
     /// On a failed PTY write.
     pub fn send_bytes(&self, bytes: &[u8]) {
         self.log_action(evidence::describe_bytes(bytes));
-        self.write(bytes);
+        self.write("send_bytes", bytes);
     }
 
     /// The PTY write behind every input verb (each verb logs its own
-    /// action first, so the write itself is shared).
-    fn write(&self, bytes: &[u8]) {
+    /// action first, so the write itself is shared); `verb` names the
+    /// caller so a write failure names the actual verb.
+    fn write(&self, verb: &str, bytes: &[u8]) {
         self.session
             .send_bytes(bytes)
-            .expect("send_bytes: PTY write failed");
+            .unwrap_or_else(|e| panic!("{verb}: PTY write failed: {e}"));
     }
 
     /// Send one SGR (1006) mouse event at the 1-based screen cell
@@ -299,7 +300,7 @@ impl E2e {
     /// On a failed PTY write.
     pub fn send_mouse(&self, event: MouseEvent, column: u16, row: u16) {
         self.log_action(format!("send_mouse({event:?} @{column},{row})"));
-        self.write(&mouse::encode(event, column, row));
+        self.write("send_mouse", &mouse::encode(event, column, row));
     }
 
     /// Resize the PTY winsize and the grid.
