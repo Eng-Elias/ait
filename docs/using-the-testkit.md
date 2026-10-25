@@ -54,14 +54,37 @@ cargo run -p ait-testkit --example drive   # interactive manual driving
 
 ## For AI agents
 
-Paste this into the agent's prompt:
+Two ready prompts — paste either into an agent session that has the
+`e2e` skill (or point it at `.devin/skills/e2e/SKILL.md`).
 
-> This repo has `ait-testkit` for e2e testing: it spawns the real `ait`
-> binary in a PTY and asserts on the rendered screen. Read
-> `.devin/skills/e2e/SKILL.md` for the workflow and
-> `docs/testing-toolkit.md` for reference. To cover my feature: write a
-> TOML scenario in `crates/ait/tests/scenarios/` (see the existing ones
-> and the verb table in `crates/ait-testkit/src/scenario.rs`), or a
-> code-first test in `crates/ait/tests/e2e.rs`. Run with
-> `cargo test -p ait -p ait-testkit`. Commit the scenario/test plus any
-> `tests/recordings/*.jsonl` and `tests/snapshots/*.snap` it produces.
+**Cover a feature** — fill in `<FEATURE>` (e.g. "tab close",
+"session-exit status"):
+
+```prompt
+Add e2e coverage for <FEATURE> with ait-testkit. Read .devin/skills/e2e/SKILL.md
+and docs/testing-toolkit.md. (1) Find the feature's user-visible surface by
+reading its source: exact screen text, emitted events, exit paths — assert on
+those, not approximations. (2) Write one TOML scenario per acceptance criterion
+in crates/ait/tests/scenarios/ (feature tag "<FEATURE>"), or a code-first test
+in crates/ait/tests/e2e.rs where TOML can't express the flow. (3) Run
+cargo build -p ait && cargo test -p ait -p ait-testkit until green — on failure
+inspect target/e2e-failures/<test>/ first; fix the scenario or the product code,
+never weaken an assertion to hide a real bug. (4) Commit scenarios/tests plus
+any tests/recordings/*.jsonl and tests/snapshots/*.snap produced.
+```
+
+**Audit coverage + repair after a change:**
+
+```prompt
+Audit e2e coverage project-wide and fix broken tests. Read
+.devin/skills/e2e/SKILL.md and docs/testing-toolkit.md. (1) List user-visible
+features (REQUIREMENTS.md §5.2 stories, the keymap bindings, rendered screens)
+and map each to scenarios/tests under crates/ait/tests/ — report the gaps
+before writing anything. (2) Write TOML scenarios for the missing ones. (3) Run
+cargo build -p ait && cargo test -p ait -p ait-testkit; for every failure,
+diagnose via target/e2e-failures/<test>/: if the behavior change was intended,
+update the test or re-record (AIT_E2E_RECORD=1 AIT_E2E_DRIVER=<cmd>); if not,
+fix the product code. Never weaken an assertion to silence drift. (4) Keep
+running until green and commit.
+```
+
