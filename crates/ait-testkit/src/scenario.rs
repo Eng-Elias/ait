@@ -441,16 +441,15 @@ fn parse_step(source: &str, index: usize, table: &toml::Table) -> Result<Step, S
 
     match verb {
         "keys" => {
-            let chords: Vec<String> =
-                want(value, verb, "a list of chord strings").map_err(&fail)?;
+            let chords: Vec<String> = want(value, verb, "a list of chord strings").map_err(fail)?;
             for chord in &chords {
                 parse_chord(chord).map_err(|e| fail(format!("`keys` entry {chord:?}: {e}")))?;
             }
             Ok(Step::Keys(chords))
         }
-        "text" => Ok(Step::Text(want(value, verb, "a string").map_err(&fail)?)),
+        "text" => Ok(Step::Text(want(value, verb, "a string").map_err(fail)?)),
         "bytes" => {
-            let hex: String = want(value, verb, "a hex string").map_err(&fail)?;
+            let hex: String = want(value, verb, "a hex string").map_err(fail)?;
             Ok(Step::Bytes(
                 decode_hex(&hex).map_err(|e| fail(format!("`bytes`: {e}")))?,
             ))
@@ -462,8 +461,8 @@ fn parse_step(source: &str, index: usize, table: &toml::Table) -> Result<Step, S
                 "a table like \
                  `{ event = \"wheel_up\", col = 9, row = 4 }`",
             )
-            .map_err(&fail)?;
-            let event = parse_mouse_event(&mouse).map_err(&fail)?;
+            .map_err(fail)?;
+            let event = parse_mouse_event(&mouse).map_err(fail)?;
             Ok(Step::Mouse {
                 event,
                 column: mouse.col,
@@ -472,28 +471,26 @@ fn parse_step(source: &str, index: usize, table: &toml::Table) -> Result<Step, S
         }
         "resize" => {
             let [columns, lines]: [usize; 2] =
-                want(value, verb, "a `[columns, lines]` pair").map_err(&fail)?;
+                want(value, verb, "a `[columns, lines]` pair").map_err(fail)?;
             Ok(Step::Resize(Size::new(columns, lines)))
         }
-        "wait_text" => Ok(Step::WaitText(
-            want(value, verb, "a string").map_err(&fail)?,
-        )),
+        "wait_text" => Ok(Step::WaitText(want(value, verb, "a string").map_err(fail)?)),
         "expect_text" => Ok(Step::ExpectText(
-            want(value, verb, "a string").map_err(&fail)?,
+            want(value, verb, "a string").map_err(fail)?,
         )),
         "expect_regex" => {
-            let pattern: String = want(value, verb, "a regex string").map_err(&fail)?;
+            let pattern: String = want(value, verb, "a regex string").map_err(fail)?;
             let regex = Regex::new(&pattern)
                 .map_err(|e| fail(format!("`expect_regex` pattern {pattern:?}: {e}")))?;
             Ok(Step::ExpectRegex { pattern, regex })
         }
         "expect_cursor" => {
             let [line, column]: [usize; 2] =
-                want(value, verb, "a `[line, column]` pair").map_err(&fail)?;
+                want(value, verb, "a `[line, column]` pair").map_err(fail)?;
             Ok(Step::ExpectCursor { line, column })
         }
         "expect_exit" => {
-            let code: i64 = want(value, verb, "an exit code").map_err(&fail)?;
+            let code: i64 = want(value, verb, "an exit code").map_err(fail)?;
             let code = u32::try_from(code).map_err(|_| {
                 fail(format!(
                     "`expect_exit` must be a non-negative code, got {code}"
@@ -502,13 +499,11 @@ fn parse_step(source: &str, index: usize, table: &toml::Table) -> Result<Step, S
             Ok(Step::ExpectExit(code))
         }
         "expect_clipboard" => Ok(Step::ExpectClipboard(
-            want(value, verb, "a string").map_err(&fail)?,
+            want(value, verb, "a string").map_err(fail)?,
         )),
-        "act" => Ok(Step::Act(
-            want(value, verb, "a goal string").map_err(&fail)?,
-        )),
+        "act" => Ok(Step::Act(want(value, verb, "a goal string").map_err(fail)?)),
         "assert" => Ok(Step::Assert(
-            want(value, verb, "a claim string").map_err(&fail)?,
+            want(value, verb, "a claim string").map_err(fail)?,
         )),
         other => unreachable!("{other} passed the verb check"),
     }
