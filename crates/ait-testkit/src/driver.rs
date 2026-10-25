@@ -4,9 +4,10 @@
 //!
 //! Backings in delivery order: [`Authored`] (replay-only default — the
 //! committed `*.jsonl` recordings are the authored answer, zero infra),
-//! `Command` (E01-T3, `AIT_E2E_DRIVER` env points at a subprocess taking
-//! `{goal|claim, screen}` JSON on stdin), and a deferred `ait-llm`
-//! backing. Inject one with [`E2e::set_driver`](crate::E2e::set_driver).
+//! [`Command`](crate::Command) (E01-T3 — `AIT_E2E_DRIVER` env points at
+//! a subprocess taking the step as versioned JSON on stdin), and a
+//! deferred `ait-llm` backing. Inject one with
+//! [`E2e::set_driver`](crate::E2e::set_driver).
 
 use serde::{Deserialize, Serialize};
 
