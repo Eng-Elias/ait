@@ -6,16 +6,32 @@
 //! `LiveSession`: named chords, text, raw bytes, SGR mouse events and
 //! resizes in; the rendered grid, cursor and exit status out — the same
 //! observables a user has (bounded waits only, never fixed sleeps).
+//!
+//! The `agent` layer (ticket E01-T2) adds `agent().act("…")` /
+//! `agent().assert("…")` steps: a [`Driver`] resolves them against a
+//! serializable [`ScreenState`] at record time (`AIT_E2E_RECORD`), and
+//! committed `tests/recordings/<test>/<step>.jsonl` files replay them
+//! byte-deterministically otherwise — with the step-text and
+//! screen-state hashes guarding against stale steps and observable
+//! drift.
 
+mod agent;
 mod chord;
+mod driver;
 mod harness;
 mod mouse;
+mod recording;
+mod screen;
 mod tempdir;
 
+pub use agent::Agent;
 pub use ait_term::{Cursor, ExitStatus, GridView, Size};
 pub use chord::{parse_chord, ChordError};
+pub use driver::{Authored, Driver, Input, Verdict};
 pub use harness::{E2e, SpawnConfig};
 pub use mouse::{MouseButton, MouseEvent};
+pub use recording::{text_hash, Op};
+pub use screen::{CursorState, ScreenState};
 
 /// Resolve the `ait` binary under test (Spec E01): the `AIT_E2E_BIN`
 /// environment override first, else the `CARGO_BIN_EXE_ait` cargo exports
