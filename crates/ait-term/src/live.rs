@@ -74,6 +74,12 @@ const READER_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// Bound on the reader-thread join inside `Drop`.
 const READER_JOIN_GRACE: Duration = Duration::from_millis(500);
 
+/// Bound on [`LiveSession::output_tail`]: the most recent raw PTY output
+/// retained for failure dumps (Spec E01 — the round's only product-code
+/// change). 64 KiB covers several full screens of even escape-dense
+/// output while staying trivially cheap to keep.
+const OUTPUT_TAIL_BOUND: usize = 64 * 1024;
+
 /// Constructor options for [`LiveSession`].
 #[derive(Debug, Clone, Default)]
 pub struct LiveSessionOptions {
@@ -217,6 +223,13 @@ pub struct LiveSession {
     reader_done: bool,
     /// `Exited` was already surfaced.
     exit_emitted: bool,
+    /// The raw-output tail backing [`output_tail`](Self::output_tail):
+    /// `tail[tail_start..]` is the retained window (≤
+    /// [`OUTPUT_TAIL_BOUND`]); `tail_start` only advances, and dead
+    /// bytes before it are compacted away once they outgrow the bound
+    /// themselves, so appends stay amortized-cheap under floods.
+    tail: Vec<u8>,
+    tail_start: usize,
 }
 
 impl LiveSession {
@@ -303,6 +316,8 @@ impl LiveSession {
             pending: VecDeque::new(),
             reader_done: false,
             exit_emitted: false,
+            tail: Vec::new(),
+            tail_start: 0,
         })
     }
 
@@ -371,6 +386,21 @@ impl LiveSession {
         self.send_bytes(&self.session.encode_key(event))
     }
 
+    /// The tail of the raw PTY output this session has consumed: the
+    /// most recent bytes — up to [`OUTPUT_TAIL_BOUND`] (64 KiB) — that
+    /// [`drain_events`](Self::drain_events) / [`try_recv_event`](Self::try_recv_event)
+    /// fed into the grid, exactly as read from the PTY (escape sequences
+    /// included, nothing parsed or stripped).
+    ///
+    /// "Consumed" is literal: output sitting in the reader channel is
+    /// not in the tail until a drain feeds it, so a session that is
+    /// never drained reports an empty tail no matter how much the child
+    /// wrote. Intended for failure dumps (Spec E01): it answers "what
+    /// did the program emit last", not "everything it ever wrote".
+    pub fn output_tail(&self) -> &[u8] {
+        &self.tail[self.tail_start..]
+    }
+
     /// Write raw bytes to the program's stdin.
     pub fn send_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         let mut writer = self
@@ -428,6 +458,7 @@ impl LiveSession {
             loop {
                 match rx.try_recv() {
                     Ok(chunk) => {
+                        push_tail(&mut self.tail, &mut self.tail_start, &chunk);
                         for event in self.session.feed_bytes(&chunk) {
                             self.pending.push_back(LiveEvent::Osc(event));
                         }
@@ -542,6 +573,23 @@ impl Drop for LiveSession {
             std::thread::sleep(Duration::from_millis(5));
         }
         self.join_reader();
+    }
+}
+
+/// Append a consumed chunk to the output tail, keeping only the last
+/// [`OUTPUT_TAIL_BOUND`] bytes. `tail[start..]` is the live window; the
+/// dead prefix is compacted away once it alone exceeds the bound, so a
+/// flood pays one occasional `drain` instead of a memmove per chunk.
+/// (Free function, not a method: `feed_pending` calls it while holding
+/// a borrow of `output_rx`.)
+fn push_tail(tail: &mut Vec<u8>, start: &mut usize, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() - *start > OUTPUT_TAIL_BOUND {
+        *start = tail.len() - OUTPUT_TAIL_BOUND;
+    }
+    if *start >= OUTPUT_TAIL_BOUND {
+        tail.drain(..*start);
+        *start = 0;
     }
 }
 

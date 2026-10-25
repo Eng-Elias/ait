@@ -18,6 +18,7 @@
 mod agent;
 mod chord;
 mod driver;
+mod evidence;
 mod harness;
 mod mouse;
 mod recording;
@@ -28,6 +29,7 @@ pub use agent::Agent;
 pub use ait_term::{Cursor, ExitStatus, GridView, Size};
 pub use chord::{parse_chord, ChordError};
 pub use driver::{Authored, Driver, Input, Verdict};
+pub use evidence::dump_root;
 pub use harness::{E2e, SpawnConfig};
 pub use mouse::{MouseButton, MouseEvent};
 pub use recording::{text_hash, Op};
