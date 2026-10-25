@@ -1,5 +1,8 @@
 # Testing toolkit (`ait-testkit`)
 
+Quickstart: [using-the-testkit.md](using-the-testkit.md). Agent skill:
+`.devin/skills/e2e/SKILL.md`.
+
 AIT's agentic end-to-end testing toolkit (Spec E01, GitHub issue #19).
 A test-only crate — dev-dependency only, no product crate may depend on
 it — that spawns the **real `ait` binary in a real PTY** and asserts on
