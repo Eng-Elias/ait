@@ -42,15 +42,11 @@ fn bin() -> String {
 
 fn show(app: &E2e) {
     let size = app.size();
-    println!("+{}+", "-".repeat(usize::from(size.columns)));
+    println!("+{}+", "-".repeat(size.columns));
     for row in 0..size.lines {
-        println!(
-            "|{:<width$}|",
-            app.line(row),
-            width = usize::from(size.columns)
-        );
+        println!("|{:<width$}|", app.line(row), width = size.columns);
     }
-    println!("+{}+", "-".repeat(usize::from(size.columns)));
+    println!("+{}+", "-".repeat(size.columns));
     let cursor = app.cursor();
     println!("cursor: ({}, {})", cursor.line, cursor.column);
     if let Some(status) = app.exited() {
