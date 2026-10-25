@@ -1,0 +1,46 @@
+# Spec R02 story 9: `Alt+N` jumps straight to tab N; an out-of-range
+# digit is inert.
+feature = "tabs"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "echo TAB-ONE-MARK\n"
+
+[[steps]]
+wait_text = "TAB-ONE-MARK"
+
+[[steps]]
+keys = ["Alt+T"]
+
+[[steps]]
+wait_text = "2:sh"
+
+[[steps]]
+text = "echo TAB-TWO-MARK\n"
+
+[[steps]]
+wait_text = "TAB-TWO-MARK"
+
+# Jump back to tab 1.
+[[steps]]
+keys = ["Alt+1"]
+
+[[steps]]
+expect_text = "TAB-ONE-MARK"
+
+# `Alt+9` with two tabs is inert — still tab 1.
+[[steps]]
+keys = ["Alt+9"]
+
+[[steps]]
+expect_text = "TAB-ONE-MARK"
+
+# And forward to tab 2.
+[[steps]]
+keys = ["Alt+2"]
+
+[[steps]]
+expect_text = "TAB-TWO-MARK"

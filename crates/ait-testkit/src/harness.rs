@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ait_term::{
-    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, SessionOptions, Size,
-    SpawnError,
+    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, SessionEvent,
+    SessionOptions, Size, SpawnError,
 };
 
 use crate::agent::{self, Agent};
@@ -53,6 +53,11 @@ pub struct SpawnConfig {
     pub args: Vec<OsString>,
     /// The PTY's initial size in cells.
     pub size: Size,
+    /// Extra environment pairs, applied *after* the pinned `SHELL`/`PS1`
+    /// so they can override them — the escape hatch a scenario uses to
+    /// pin a different prompt (or a different inner shell) than the
+    /// defaults.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl SpawnConfig {
@@ -62,6 +67,7 @@ impl SpawnConfig {
             program: program.into(),
             args: args.iter().map(OsString::from).collect(),
             size,
+            env: Vec::new(),
         }
     }
 }
@@ -103,16 +109,29 @@ pub struct E2e {
     /// The agent-step counter — each `agent().act`/`assert` consumes one
     /// index → its `<step>.jsonl`.
     pub(crate) agent_step: usize,
+    /// Every `ClipboardWrite` the program has emitted so far, in order —
+    /// harness sessions opt into `SessionOptions::osc52` so a spawned
+    /// app's selection-copy surfaces here (Spec E01, ticket E01-T4's
+    /// `expect_clipboard` verb).
+    clipboard: Vec<String>,
 }
 
 impl E2e {
     /// Spawn `config`'s program in a PTY with the pinned environment:
     /// `SHELL`/`PS1` overridden, `cwd` a fresh temp dir, `TERM` the
-    /// driver's `xterm-256color` default. OSC 52 is opted in so a later
-    /// ticket's clipboard assertions see the app's copies as events.
+    /// driver's `xterm-256color` default. OSC 52 is opted in so a
+    /// spawned app's copies surface as events
+    /// ([`clipboard_writes`](Self::clipboard_writes)).
+    /// [`SpawnConfig::env`] pairs apply after the pinned `SHELL`/`PS1`,
+    /// so they override them.
     pub fn spawn(config: SpawnConfig) -> Result<Self, SpawnError> {
         let cwd = TempDir::fresh().map_err(|e| SpawnError::Io(e.to_string()))?;
         let program = config.program.to_string_lossy().into_owned();
+        let mut env = vec![
+            (OsString::from("SHELL"), OsString::from(PINNED_SHELL)),
+            (OsString::from("PS1"), OsString::from(PINNED_PS1)),
+        ];
+        env.extend(config.env);
         let session = LiveSession::spawn(LiveSessionOptions {
             session: SessionOptions {
                 size: config.size,
@@ -122,10 +141,7 @@ impl E2e {
             program: Some(config.program),
             args: config.args,
             cwd: Some(cwd.path().to_path_buf()),
-            env: vec![
-                (OsString::from("SHELL"), OsString::from(PINNED_SHELL)),
-                (OsString::from("PS1"), OsString::from(PINNED_PS1)),
-            ],
+            env,
         })?;
         // `AIT_E2E_DRIVER` selects the resolving driver for record mode
         // (Spec E01, ticket E01-T3); unset or blank keeps `Authored`.
@@ -146,6 +162,7 @@ impl E2e {
             recordings_dir: None,
             record: agent::record_flag(),
             agent_step: 0,
+            clipboard: Vec::new(),
         })
     }
 
@@ -319,14 +336,28 @@ impl E2e {
         }
     }
 
-    /// One drain round: feed queued PTY output into the grid and record
-    /// the exit status when `Exited` surfaces.
+    /// One drain round: feed queued PTY output into the grid, record
+    /// the exit status when `Exited` surfaces and collect OSC 52
+    /// clipboard writes as they arrive.
     pub(crate) fn pump(&mut self) {
         for event in self.session.drain_events() {
-            if let LiveEvent::Exited(status) = event {
-                self.exited = Some(status);
+            match event {
+                LiveEvent::Exited(status) => self.exited = Some(status),
+                LiveEvent::Osc(SessionEvent::ClipboardWrite { contents, .. }) => {
+                    self.clipboard.push(contents)
+                }
+                _ => {}
             }
         }
+    }
+
+    /// Every `SessionEvent::ClipboardWrite` the program has emitted so
+    /// far (decoded contents), oldest first — what the scenario
+    /// `expect_clipboard` verb and code-first clipboard assertions
+    /// read. The harness's session opts into `SessionOptions::osc52`,
+    /// which is what makes a spawned app's own OSC 52 copy arrive here.
+    pub fn clipboard_writes(&self) -> &[String] {
+        &self.clipboard
     }
 
     /// The visible screen as text: every viewport row, trimmed,
