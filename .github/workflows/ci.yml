@@ -12,9 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # Toolchain comes from rust-toolchain.toml (exact pin — local and
+      # CI can never disagree on the clippy/fmt version).
+      - uses: dtolnay/rust-toolchain@master
 
       - name: Format
         run: cargo fmt --all --check
@@ -34,7 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Same rust-toolchain.toml pin as the check job.
+      - uses: dtolnay/rust-toolchain@master
 
       - name: Build
         run: cargo build -p ait
