@@ -23,7 +23,8 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
 - Crate map (ADR-0003): `crates/ait-term` — exists (Round 1: pure byte-fed
   terminal core); `crates/ait` — exists (scaffold stub binary; TUI lands in
   Round 2); `crates/ait-testkit` — exists (Round E01: e2e testing toolkit;
-  dev-dependency only, no product crate may depend on it);
+  dev-dependency only, no product crate may depend on it; see
+  `docs/testing-toolkit.md`);
   `crates/ait-config`, `crates/ait-llm`, `crates/ait-shell`,
   `crates/ait-agent` — planned (Rounds 3/3/5/6).
 

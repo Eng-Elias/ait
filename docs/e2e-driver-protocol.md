@@ -1,6 +1,7 @@
 # E2E driver protocol (v1)
 
-Spec E01, ticket E01-T3. `ait-testkit`'s `agent().act("…")` /
+Part of [the testing toolkit](testing-toolkit.md). Spec E01, ticket
+E01-T3. `ait-testkit`'s `agent().act("…")` /
 `agent().assert("…")` steps are resolved by a **driver**. The default
 `Authored` driver is replay-only — committed `*.jsonl` recordings are
 the authored answer. To *resolve* steps at record time
