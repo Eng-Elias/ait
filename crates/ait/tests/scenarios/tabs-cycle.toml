@@ -1,0 +1,46 @@
+# Spec R02 story 9: `Ctrl+PageDown`/`Ctrl+PageUp` cycle tabs and wrap
+# around. Each tab's own marker proves which one is active.
+feature = "tabs"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "echo TAB-ONE-MARK\n"
+
+[[steps]]
+wait_text = "TAB-ONE-MARK"
+
+[[steps]]
+keys = ["Alt+T"]
+
+[[steps]]
+wait_text = "2:sh"
+
+[[steps]]
+text = "echo TAB-TWO-MARK\n"
+
+[[steps]]
+wait_text = "TAB-TWO-MARK"
+
+# To tab 1.
+[[steps]]
+keys = ["Ctrl+PageUp"]
+
+[[steps]]
+expect_text = "TAB-ONE-MARK"
+
+# Back to tab 2.
+[[steps]]
+keys = ["Ctrl+PageDown"]
+
+[[steps]]
+expect_text = "TAB-TWO-MARK"
+
+# `Ctrl+PageDown` wraps: tab 2 -> tab 1.
+[[steps]]
+keys = ["Ctrl+PageDown"]
+
+[[steps]]
+expect_text = "TAB-ONE-MARK"

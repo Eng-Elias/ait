@@ -14,6 +14,12 @@
 //! byte-deterministically otherwise — with the step-text and
 //! screen-state hashes guarding against stale steps and observable
 //! drift.
+//!
+//! The scenario layer (ticket E01-T4) makes acceptance criteria
+//! declarative: a [`Scenario`] is a TOML file — `feature` tag, `size`,
+//! ordered `[[steps]]` of deterministic verbs plus `act`/`assert` —
+//! run through `E2e`, so tests ship as data agents can write straight
+//! from ticket text.
 
 mod agent;
 mod chord;
@@ -22,6 +28,7 @@ mod evidence;
 mod harness;
 mod mouse;
 mod recording;
+mod scenario;
 mod screen;
 mod tempdir;
 
@@ -33,6 +40,7 @@ pub use evidence::dump_root;
 pub use harness::{E2e, SpawnConfig};
 pub use mouse::{MouseButton, MouseEvent};
 pub use recording::{text_hash, Op};
+pub use scenario::{Scenario, ScenarioError, Step};
 pub use screen::{CursorState, ScreenState};
 
 /// Resolve the `ait` binary under test (Spec E01): the `AIT_E2E_BIN`

@@ -1,0 +1,16 @@
+# Spec E01 stories 11-13: `act`/`assert` steps resolve through the
+# record/replay machinery — in CI they replay byte-deterministically
+# from the committed recordings under
+# `tests/recordings/agent-tab/` (authored assets, standard 10); a
+# screen that stops matching fails as drift.
+feature = "tabs"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+act = "open a new tab"
+
+[[steps]]
+assert = "the tab bar shows two tabs"

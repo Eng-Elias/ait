@@ -1,0 +1,16 @@
+# Spec R02 stories 8-9: `Alt+T` opens a second tab and the bar shows
+# both chunks.
+feature = "tabs"
+size = [80, 24]
+
+[[steps]]
+wait_text = "· sh · — · running"
+
+[[steps]]
+keys = ["Alt+T"]
+
+[[steps]]
+wait_text = "2:sh"
+
+[[steps]]
+expect_text = " 1:sh  2:sh"

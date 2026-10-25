@@ -1,0 +1,28 @@
+# Spec R02 stories 9, 20: `Alt+W` closes the active tab and the bar
+# drops its chunk; closing the last (still-running) tab exits ait
+# cleanly.
+feature = "tabs"
+size = [80, 24]
+
+[[steps]]
+wait_text = "· sh · — · running"
+
+[[steps]]
+keys = ["Alt+T"]
+
+[[steps]]
+wait_text = "2:sh"
+
+# Tab 2 closes; the bar is back to only ` 1:sh`.
+[[steps]]
+keys = ["Alt+W"]
+
+[[steps]]
+expect_regex = "(?m)^ 1:sh$"
+
+# Closing the last tab quits with code 0 (the shell was running).
+[[steps]]
+keys = ["Alt+W"]
+
+[[steps]]
+expect_exit = 0

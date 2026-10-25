@@ -32,3 +32,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 - **Remote bootstrap** — injecting shell integration into a remote shell over
   SSH.
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **Scenario** — a declarative TOML test of user-visible behavior.
+- **Recording** — the committed concrete inputs an agent step resolved to.
+- **Driver** — the backing that resolves agent steps.
+- **Replay** — re-sending recorded inputs with no model calls.
+- **Drift** — a screen-state hash mismatch between recording and replay.

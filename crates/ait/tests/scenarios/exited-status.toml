@@ -1,0 +1,28 @@
+# Spec R02 story 11: a dead session keeps its tab but the status
+# line's state slot shows `exited <code>` — or `exited <code>
+# (<signal>)` when a signal ended it. The signal text is platform
+# strsignal (`Hangup` for SIGHUP on glibc), so regex, not literal text.
+feature = "status"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "exit 3\n"
+
+[[steps]]
+expect_regex = "exited 3"
+
+# A signaled exit appends the signal name.
+[[steps]]
+keys = ["Alt+T"]
+
+[[steps]]
+wait_text = "2:sh"
+
+[[steps]]
+text = "kill -HUP $$\n"
+
+[[steps]]
+expect_regex = "exited 1 \\(Hangup\\)"

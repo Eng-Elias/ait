@@ -1,0 +1,22 @@
+# Spec R02 story 16: an inner-shell OSC 9 notification surfaces as a
+# status-line toast, and OSC 777's `notify;title;body` form prefixes
+# the title. `\040` is printf's octal escape for a space — the emitted
+# toast says "build done" while the command's own echo shows the escape
+# spelling, so the match can only be the toast.
+feature = "notify"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "printf '\\033]9;build\\040done\\007'\n"
+
+[[steps]]
+expect_text = "build done"
+
+[[steps]]
+text = "printf '\\033]777;notify;JOB;build\\040done\\007'\n"
+
+[[steps]]
+expect_text = "JOB: build done"
