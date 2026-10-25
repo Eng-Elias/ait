@@ -305,8 +305,5 @@ fn settle(e2e: &mut E2e) -> ScreenState {
 
 /// Read once at spawn: is `AIT_E2E_RECORD` set to a truthy value?
 pub(crate) fn record_flag() -> bool {
-    match std::env::var("AIT_E2E_RECORD") {
-        Ok(value) => !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
+    crate::harness::env_flag("AIT_E2E_RECORD")
 }

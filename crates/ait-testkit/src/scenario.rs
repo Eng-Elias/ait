@@ -11,6 +11,8 @@
 //! args = ["--version"]           # optional argv for the spawned program
 //! env = { PS1 = "E2E> " }        # optional pairs, applied after the
 //!                                # pinned SHELL/PS1 (and so override them)
+//! headed = true                  # optional — mirror PTY output to the
+//!                                # controlling terminal while running
 //!
 //! [[steps]]                      # exactly one verb per step
 //! wait_text = "· sh · — · running"
@@ -102,6 +104,10 @@ pub struct Scenario {
     /// Environment pairs applied after the pinned `SHELL`/`PS1`
     /// (`env = { … }`).
     pub env: Vec<(OsString, OsString)>,
+    /// Headed mode (`headed = true`): mirror raw PTY output to the
+    /// controlling terminal while the scenario runs — see
+    /// [`SpawnConfig::headed`].
+    pub headed: bool,
     /// The ordered steps.
     pub steps: Vec<Step>,
     /// The scenario's name — its file stem, used in failure messages
@@ -285,6 +291,8 @@ struct RawScenario {
     #[serde(default)]
     env: toml::Table,
     #[serde(default)]
+    headed: bool,
+    #[serde(default)]
     steps: Vec<toml::Table>,
 }
 
@@ -343,6 +351,7 @@ impl Scenario {
                 .unwrap_or(DEFAULT_SIZE),
             args: raw.args.iter().map(OsString::from).collect(),
             env,
+            headed: raw.headed,
             steps,
             name,
             source: source.to_string(),
@@ -355,6 +364,7 @@ impl Scenario {
         let mut config = SpawnConfig::new(program, &[], self.size);
         config.args = self.args.iter().map(OsString::from).collect();
         config.env = self.env.clone();
+        config.headed = self.headed;
         config
     }
 

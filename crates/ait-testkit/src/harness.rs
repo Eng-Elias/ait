@@ -58,6 +58,14 @@ pub struct SpawnConfig {
     /// pin a different prompt (or a different inner shell) than the
     /// defaults.
     pub env: Vec<(OsString, OsString)>,
+    /// Headed mode: mirror the spawned program's raw PTY output to the
+    /// controlling terminal as it's read, so the app renders live while
+    /// tests drive it (escape sequences land untouched — the app takes
+    /// over the host terminal's alternate screen). `AIT_E2E_HEADED`
+    /// sets the same flag globally at [`E2e::spawn`]. Run with
+    /// `--test-threads=1`: parallel tests would interleave on the one
+    /// terminal.
+    pub headed: bool,
 }
 
 impl SpawnConfig {
@@ -68,6 +76,7 @@ impl SpawnConfig {
             args: args.iter().map(OsString::from).collect(),
             size,
             env: Vec::new(),
+            headed: false,
         }
     }
 }
@@ -143,6 +152,13 @@ impl E2e {
             cwd: Some(cwd.path().to_path_buf()),
             env,
         })?;
+        // Headed mode (`SpawnConfig::headed` or `AIT_E2E_HEADED`):
+        // mirror raw PTY output to the controlling terminal as it's
+        // read — the app takes over the host terminal's alternate
+        // screen while the test drives it.
+        if config.headed || env_flag("AIT_E2E_HEADED") {
+            session.set_output_mirror(Some(headed_writer()));
+        }
         // `AIT_E2E_DRIVER` selects the resolving driver for record mode
         // (Spec E01, ticket E01-T3); unset or blank keeps `Authored`.
         // Replay never consults the driver, so an env-selected `Command`
@@ -487,5 +503,24 @@ impl Drop for E2e {
                 let _ = self.dump_evidence(&name);
             }));
         }
+    }
+}
+
+/// Truthy `AIT_E2E_*` env-var convention shared by the harness's flags:
+/// unset, empty, `0` or `false` (any case) is off; anything else is on.
+pub(crate) fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+/// The headed-mode mirror target: the controlling terminal (`/dev/tty`)
+/// when one is available — so watching works even with `cargo test`'s
+/// captured output — falling back to stderr otherwise.
+fn headed_writer() -> Box<dyn io::Write + Send> {
+    match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        Ok(tty) => Box::new(tty),
+        Err(_) => Box::new(io::stderr()),
     }
 }

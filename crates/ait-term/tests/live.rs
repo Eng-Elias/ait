@@ -367,3 +367,73 @@ fn osc_events_flow_through_the_live_channel() {
     assert_eq!(notification.as_deref(), Some("build done"));
     assert!(grid_text(&session).contains("tail"));
 }
+
+/// A `Write` shared with the test so the mirrored bytes can be
+/// inspected: the mirror is consumed as `Box<dyn Write + Send>`, so a
+/// plain buffer behind a Mutex is the simplest stand-in for a terminal.
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_output_mirror_receives_bytes_as_the_reader_reads_them() {
+    let mut session = spawn_shell_script("printf early-mark; read x; printf late-mark; read x");
+    let mirror = SharedBuf::default();
+    session.set_output_mirror(Some(Box::new(mirror.clone())));
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        session.drain_events();
+        if grid_text(&session).contains("early-mark") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for early-mark"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        mirror
+            .0
+            .lock()
+            .unwrap()
+            .windows(b"early-mark".len())
+            .any(|w| w == b"early-mark"),
+        "the mirror missed the child's first output"
+    );
+
+    // Detaching stops the tap: the second print reaches the grid but
+    // never the mirror.
+    session.set_output_mirror(None);
+    session.send_bytes(b"\n").expect("input should be accepted");
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        session.drain_events();
+        if grid_text(&session).contains("late-mark") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for late-mark");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !mirror
+            .0
+            .lock()
+            .unwrap()
+            .windows(b"late-mark".len())
+            .any(|w| w == b"late-mark"),
+        "the detached mirror still received output"
+    );
+}

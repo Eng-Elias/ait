@@ -216,3 +216,17 @@ fn dump_evidence_writes_the_dump_under_an_explicit_name() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `SpawnConfig.headed` attaches a live output mirror (`/dev/tty` when
+/// present, stderr otherwise) — either way the session must keep
+/// working normally: the tap is observability, not data path.
+#[test]
+fn headed_mode_does_not_disturb_the_session() {
+    let mut config = SpawnConfig::new("/bin/sh", &["-c", "printf headed-ok"], SIZE);
+    config.headed = true;
+    let mut app = E2e::spawn(config).expect("spawn /bin/sh");
+
+    app.wait_for_screen("the marker text", |app| {
+        app.screen_text().contains("headed-ok")
+    });
+}

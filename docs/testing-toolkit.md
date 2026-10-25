@@ -224,6 +224,29 @@ target/e2e-failures/<test>/
 | `AIT_E2E_DRIVER` | `Command` backing — subprocess command resolving steps (record mode only) |
 | `AIT_E2E_RECORDINGS` | override the recordings root (else `<crate>/tests/recordings`) |
 | `AIT_E2E_DUMP_DIR` | override the failure-dump root (else `<workspace>/target/e2e-failures`) |
+| `AIT_E2E_HEADED` | headed mode: mirror raw PTY output to the controlling terminal while tests run |
+
+## Watching tests run (headed mode)
+
+Tests are headless by default — the spawned program renders into the
+harness's in-memory grid, invisible to you. `AIT_E2E_HEADED=1` (or
+`SpawnConfig.headed` / a scenario's `headed = true`) attaches
+`LiveSession::set_output_mirror`: raw PTY bytes are mirrored to
+`/dev/tty` (falling back to stderr) *as the reader reads them*, so the
+program's escape sequences paint your terminal live — the same TUI a
+user sees, alt-screen and all.
+
+```bash
+cargo build -p ait
+AIT_E2E_HEADED=1 cargo test -p ait --test e2e -- --test-threads=1
+```
+
+`--test-threads=1` matters: parallel tests would interleave their
+mirrors on the one terminal. Mirroring is a tap, not part of the
+pipeline — a failing mirror write detaches silently and changes nothing
+about drains, backpressure or events. To poke at a session by hand
+instead of watching a test, `cargo run -p ait-testkit --example drive`
+drives the grid interactively from your keyboard.
 
 ## CI
 

@@ -230,6 +230,11 @@ pub struct LiveSession {
     /// themselves, so appends stay amortized-cheap under floods.
     tail: Vec<u8>,
     tail_start: usize,
+    /// Optional mirror receiving raw PTY bytes as the reader thread
+    /// reads them — see [`set_output_mirror`](Self::set_output_mirror).
+    /// Shared with the reader thread; `None` when detached (or after a
+    /// failed mirror write).
+    output_mirror: OutputMirror,
 }
 
 impl LiveSession {
@@ -282,6 +287,7 @@ impl LiveSession {
         let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_BOUND);
         let (exit_tx, exit_rx) = mpsc::channel();
         let kill_requested = Arc::new(AtomicBool::new(false));
+        let output_mirror: OutputMirror = Arc::new(Mutex::new(None));
 
         // The waiter owns the child; spawn it first so that a reader-spawn
         // failure can still request a kill and reap the child.
@@ -291,8 +297,11 @@ impl LiveSession {
                 wait_loop(child, kill_requested, exit_tx);
             }
         })?;
-        let reader = match spawn_thread("ait-term reader", move || {
-            read_loop(reader, output_tx);
+        let reader = match spawn_thread("ait-term reader", {
+            let output_mirror = Arc::clone(&output_mirror);
+            move || {
+                read_loop(reader, output_tx, output_mirror);
+            }
         }) {
             Ok(reader) => reader,
             Err(e) => {
@@ -318,6 +327,7 @@ impl LiveSession {
             exit_emitted: false,
             tail: Vec::new(),
             tail_start: 0,
+            output_mirror,
         })
     }
 
@@ -399,6 +409,23 @@ impl LiveSession {
     /// did the program emit last", not "everything it ever wrote".
     pub fn output_tail(&self) -> &[u8] {
         &self.tail[self.tail_start..]
+    }
+
+    /// Mirror the raw PTY output to `writer` as the reader thread reads
+    /// it — *before* the grid consumes it, so the mirror tracks the
+    /// program live (unlike [`output_tail`](Self::output_tail), which
+    /// only covers bytes already drained). Escape sequences pass
+    /// through untouched: attach a terminal (e.g. `/dev/tty`) to watch
+    /// the session render in real time. `None` detaches the mirror.
+    ///
+    /// The mirror is a tap, not part of the pipeline: a failing write
+    /// detaches it silently rather than disturbing the session, and it
+    /// changes nothing about [`drain_events`](Self::drain_events),
+    /// backpressure or the event model.
+    pub fn set_output_mirror(&self, writer: Option<Box<dyn Write + Send>>) {
+        if let Ok(mut mirror) = self.output_mirror.lock() {
+            *mirror = writer;
+        }
     }
 
     /// Write raw bytes to the program's stdin.
@@ -593,15 +620,43 @@ fn push_tail(tail: &mut Vec<u8>, start: &mut usize, chunk: &[u8]) {
     }
 }
 
+/// The optional live output tap attached with
+/// [`LiveSession::set_output_mirror`]: shared with the reader thread,
+/// `None` until a writer is set (and reset to `None` if a mirrored
+/// write fails).
+type OutputMirror = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// Mirror one freshly-read chunk to the output mirror, if attached. A
+/// failing write detaches the mirror rather than disturbing the
+/// pipeline (mirroring is observability, not data path); a poisoned
+/// lock skips the chunk.
+fn mirror_write(mirror: &OutputMirror, chunk: &[u8]) {
+    let Ok(mut mirror) = mirror.lock() else {
+        return;
+    };
+    if let Some(writer) = mirror.as_mut() {
+        if writer.write_all(chunk).is_err() || writer.flush().is_err() {
+            *mirror = None;
+        }
+    }
+}
+
 /// The reader thread's loop: push PTY output into the bounded channel.
 /// Blocks on `read` (no output) or on `send` (consumer behind); exits on
 /// EOF/EIO (child's slave closed) or when the receiver is gone (teardown).
-fn read_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::SyncSender<Vec<u8>>) {
+fn read_loop(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::SyncSender<Vec<u8>>,
+    mirror: OutputMirror,
+) {
     let mut buf = [0u8; READ_BUF];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                // Mirror before send: the tap stays live even when
+                // backpressure has the reader blocked on a full channel.
+                mirror_write(&mirror, &buf[..n]);
                 if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
