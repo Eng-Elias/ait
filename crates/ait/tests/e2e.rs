@@ -62,6 +62,39 @@ fn alt_q_quits_with_exit_code_zero() {
     assert!(status.success(), "expected a clean exit, got {status:?}");
 }
 
+/// Manual PR-evidence generator (Spec E01, ticket E01-T5: "the PR
+/// description includes a transcript of an e2e run"). Excluded from the
+/// suite — run it on demand:
+///
+/// ```text
+/// cargo test -p ait --test e2e pr_evidence_transcript -- --ignored --nocapture
+/// ```
+///
+/// It prints a spawn → keystroke → screen assertion → exit transcript
+/// and leaves the full evidence dump under
+/// `target/e2e-failures/pr-evidence/`.
+#[test]
+#[ignore = "manual evidence generator for PR bodies"]
+fn pr_evidence_transcript() {
+    let mut app = spawn_ait();
+    wait_for_chrome(&mut app);
+    println!("--- screen after spawn ---\n{}", app.screen_text());
+
+    app.press("Alt+T");
+    app.wait_for_screen("a second tab in the bar", |app| {
+        app.line(0).contains("2:sh")
+    });
+    println!("--- tab bar after Alt+T ---\n{}", app.line(0));
+
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+    println!("--- exited: {status:?} ---");
+
+    let dir = app.dump_evidence("pr-evidence").expect("evidence dump");
+    println!("--- evidence dump: {} ---", dir.display());
+}
+
 /// One text snapshot of the initial screen (Spec E01: plain-text diffs
 /// for visual regressions). The pinned dash prompt is `$ `; the temp cwd
 /// is redacted so the snapshot is machine-independent.

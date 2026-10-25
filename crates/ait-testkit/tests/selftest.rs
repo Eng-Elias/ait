@@ -3,7 +3,9 @@
 //! bytes, resize, bounded screen waits and exit status are all proven here
 //! without `ait` involved, so harness bugs can't hide behind the app.
 
-use ait_testkit::{E2e, MouseButton, MouseEvent, Size, SpawnConfig};
+use std::fs;
+
+use ait_testkit::{dump_root, E2e, MouseButton, MouseEvent, Size, SpawnConfig};
 
 const SIZE: Size = Size {
     columns: 80,
@@ -137,12 +139,80 @@ fn screen_accessors_read_the_grid() {
     assert_eq!(app.size(), SIZE);
 }
 
-/// `pty_tail()` is the hook ticket E01-T5 fills with `LiveSession`'s raw
-/// output tail — the accessor exists today and reports the (empty)
-/// buffer honestly.
+/// `pty_tail()` reports `LiveSession`'s raw output tail: the bytes the
+/// session fed into the grid, escapes and all (Spec E01, ticket E01-T5).
 #[test]
-fn pty_tail_is_the_t5_hook_point() {
-    let app = sh("printf x; read y");
+fn pty_tail_reports_the_raw_output_the_session_consumed() {
+    let mut app = sh("printf tail-marker; read y");
+    app.wait_for_screen("the marker", |app| {
+        app.screen_text().contains("tail-marker")
+    });
 
-    assert!(app.pty_tail().is_empty());
+    let tail = app.pty_tail();
+    assert!(
+        String::from_utf8_lossy(tail).contains("tail-marker"),
+        "the tail should hold the raw output: {}",
+        String::from_utf8_lossy(tail)
+    );
+}
+
+/// Spec E01's failure evidence: a failed step dumps the final screen,
+/// the raw PTY tail and the ordered action log under
+/// `target/e2e-failures/<test>/` *before* the panic propagates —
+/// verified by catching the panic and reading the dump back, so the
+/// suite itself stays green. The dump dir is named after the panicking
+/// test's thread (this test's own name).
+#[test]
+fn a_failed_step_leaves_a_failure_dump() {
+    let dir = dump_root().join("a_failed_step_leaves_a_failure_dump");
+    let _ = fs::remove_dir_all(&dir);
+
+    let outcome = std::panic::catch_unwind(|| {
+        let mut app = sh("printf doomed; exit 0");
+        app.wait_for_screen("a marker that never appears", |app| {
+            app.screen_text().contains("never-appears")
+        });
+    });
+    assert!(outcome.is_err(), "the failing wait must panic");
+
+    let screen = fs::read_to_string(dir.join("screen.txt")).expect("screen.txt written");
+    assert!(screen.contains("doomed"), "final screen text in the dump");
+    let tail = fs::read(dir.join("pty-tail.bin")).expect("pty-tail.bin written");
+    assert!(
+        String::from_utf8_lossy(&tail).contains("doomed"),
+        "raw PTY tail in the dump"
+    );
+    let actions = fs::read_to_string(dir.join("actions.log")).expect("actions.log written");
+    assert!(
+        actions.contains("wait_for_screen(\"a marker that never appears\")"),
+        "ordered action log in the dump:\n{actions}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `E2e::dump_evidence(name)` writes the same dump under an explicit
+/// name — the hook the scenario runner (E01-T4) uses per failing
+/// scenario, where no test-thread name exists to derive one from.
+#[test]
+fn dump_evidence_writes_the_dump_under_an_explicit_name() {
+    let mut app = sh("printf evidence; read y");
+    app.wait_for_screen("the marker", |app| app.screen_text().contains("evidence"));
+
+    let dir = app
+        .dump_evidence("selftest-explicit-dump")
+        .expect("dump writes");
+
+    assert_eq!(dir, dump_root().join("selftest-explicit-dump"));
+    assert!(fs::read_to_string(dir.join("screen.txt"))
+        .unwrap()
+        .contains("evidence"));
+    assert!(
+        String::from_utf8_lossy(&fs::read(dir.join("pty-tail.bin")).unwrap()).contains("evidence")
+    );
+    assert!(fs::read_to_string(dir.join("actions.log"))
+        .unwrap()
+        .contains("wait_for_screen"));
+
+    fs::remove_dir_all(&dir).unwrap();
 }

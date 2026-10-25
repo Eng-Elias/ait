@@ -304,6 +304,44 @@ fn try_recv_event_surfaces_output_and_exit() {
 }
 
 #[test]
+fn output_tail_holds_the_raw_bytes_fed_into_the_grid() {
+    let mut session = spawn_shell_script("printf tail-marker; read x");
+
+    // The tail reports output the session has *consumed* (fed into the
+    // grid), not output the reader has merely produced: bytes the child
+    // already wrote but nobody drained yet are not in it.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.output_tail().is_empty());
+
+    wait_for_event(&mut session, |event| {
+        matches!(event, LiveEvent::OutputReady)
+    });
+    let tail = session.output_tail();
+    assert!(
+        String::from_utf8_lossy(tail).contains("tail-marker"),
+        "tail should hold the raw output: {}",
+        String::from_utf8_lossy(tail)
+    );
+}
+
+#[test]
+fn output_tail_is_bounded_to_the_last_64_kib() {
+    // ~700 KB of output — far past the documented 64 KiB bound.
+    let mut session = spawn_shell_script("seq 1 100000");
+
+    let status = wait_for_exit(&mut session);
+    assert!(status.success());
+
+    let tail = session.output_tail();
+    assert_eq!(tail.len(), 64 * 1024, "the tail is capped at 64 KiB");
+    // It is a *tail*: the last bytes the program emitted.
+    assert!(
+        String::from_utf8_lossy(tail).trim_end().ends_with("100000"),
+        "the tail should end with the program's last output"
+    );
+}
+
+#[test]
 fn osc_events_flow_through_the_live_channel() {
     // OSC 9 (notification) observed by the core while output is fed must
     // surface on the live event stream, in order, before Exited.

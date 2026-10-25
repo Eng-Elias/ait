@@ -9,8 +9,10 @@
 //! the rendered grid; every wait is bounded by [`WAIT_TIMEOUT`] and
 //! polls like `ait-term`'s live tests — never a fixed sleep.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ait_term::{
@@ -19,6 +21,7 @@ use ait_term::{
 };
 
 use crate::chord::parse_chord;
+use crate::evidence::{self, ActionEntry};
 use crate::mouse::{self, MouseEvent};
 use crate::tempdir::TempDir;
 
@@ -71,9 +74,12 @@ pub struct E2e {
     cwd: TempDir,
     /// The child's status once the event stream surfaced `Exited`.
     exited: Option<ExitStatus>,
-    /// Hook point for the raw-PTY-output tail ticket E01-T5 wires
-    /// `LiveSession` into; until then the buffer honestly stays empty.
-    tail: Vec<u8>,
+    /// Spawn time — the `t+` column of the action log.
+    started: Instant,
+    /// The ordered action log every input verb and wait appends to —
+    /// the third failure-evidence file (Spec E01, ticket E01-T5).
+    /// `RefCell` because input verbs take `&self`.
+    log: RefCell<Vec<ActionEntry>>,
 }
 
 impl E2e {
@@ -101,8 +107,20 @@ impl E2e {
             session,
             cwd,
             exited: None,
-            tail: Vec::new(),
+            started: Instant::now(),
+            log: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Append `action` to the ordered action log, stamped with the time
+    /// since spawn and the current screen-state hash (the evidence a
+    /// failure dump prints).
+    fn record(&self, action: String) {
+        self.log.borrow_mut().push(ActionEntry {
+            at: self.started.elapsed(),
+            action,
+            screen_hash: evidence::screen_hash(&self.screen_text()),
+        });
     }
 
     /// Press a named chord (`"Alt+T"`, `"Ctrl+PageDown"`, `"F5"`, …),
@@ -112,6 +130,7 @@ impl E2e {
     /// # Panics
     /// On an unparseable chord or a failed PTY write.
     pub fn press(&self, chord: &str) {
+        self.record(format!("press({chord:?})"));
         let event = parse_chord(chord).unwrap_or_else(|e| panic!("press({chord:?}): {e}"));
         self.session
             .send_key(event)
@@ -125,7 +144,8 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn type_text(&self, text: &str) {
-        self.send_bytes(text.as_bytes());
+        self.record(format!("type_text({text:?})"));
+        self.write(text.as_bytes());
     }
 
     /// The raw-bytes escape hatch — anything [`press`](Self::press)
@@ -134,6 +154,13 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn send_bytes(&self, bytes: &[u8]) {
+        self.record(evidence::describe_bytes(bytes));
+        self.write(bytes);
+    }
+
+    /// The PTY write behind every input verb (each verb logs its own
+    /// action first, so the write itself is shared).
+    fn write(&self, bytes: &[u8]) {
         self.session
             .send_bytes(bytes)
             .expect("send_bytes: PTY write failed");
@@ -145,7 +172,8 @@ impl E2e {
     /// # Panics
     /// On a failed PTY write.
     pub fn send_mouse(&self, event: MouseEvent, column: u16, row: u16) {
-        self.send_bytes(&mouse::encode(event, column, row));
+        self.record(format!("send_mouse({event:?} @{column},{row})"));
+        self.write(&mouse::encode(event, column, row));
     }
 
     /// Resize the PTY winsize and the grid.
@@ -153,6 +181,7 @@ impl E2e {
     /// # Panics
     /// On a failed winsize write (a just-dead child).
     pub fn resize(&mut self, size: Size) {
+        self.record(format!("resize({}x{})", size.columns, size.lines));
         self.session.resize(size).expect("resize: PTY write failed");
     }
 
@@ -164,6 +193,7 @@ impl E2e {
     /// On timeout (with the final screen text), or early when the
     /// program exits while the predicate still fails.
     pub fn wait_for_screen(&mut self, description: &str, mut pred: impl FnMut(&Self) -> bool) {
+        self.record(format!("wait_for_screen({description:?})"));
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             self.pump();
@@ -193,6 +223,7 @@ impl E2e {
     /// # Panics
     /// On timeout (with the final screen text).
     pub fn wait_for_exit(&mut self) -> ExitStatus {
+        self.record("wait_for_exit".to_string());
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             self.pump();
@@ -266,13 +297,46 @@ impl E2e {
         self.exited.as_ref()
     }
 
-    /// The tail of raw PTY output, for failure dumps.
-    ///
-    /// **Hook point**: ticket E01-T5 adds a bounded raw-output tail to
-    /// `LiveSession`; until then this returns the empty buffer the
-    /// harness keeps — the accessor's contract (a byte slice covering
-    /// the most recent output) already holds.
+    /// The tail of raw PTY output (Spec E01, ticket E01-T5): the most
+    /// recent bytes the session consumed — up to `LiveSession`'s 64 KiB
+    /// bound — escapes and all. See [`LiveSession::output_tail`] for
+    /// the exact "consumed" semantics.
     pub fn pty_tail(&self) -> &[u8] {
-        &self.tail
+        self.session.output_tail()
+    }
+
+    /// Write the failure-evidence dump (Spec E01): `screen.txt` (final
+    /// screen text), `pty-tail.bin` (the raw PTY tail) and
+    /// `actions.log` (the ordered action log with screen-state hashes)
+    /// under [`dump_root`](crate::dump_root)`/<test_name>/`; returns
+    /// the dump directory.
+    ///
+    /// Normally nobody calls this — a panic while an `E2e` is alive
+    /// dumps automatically (see `Drop`), naming the dir after the
+    /// test's thread. Call it directly when there is no test-thread
+    /// name to derive one from — e.g. the scenario runner (E01-T4)
+    /// dumps once per failing scenario with the scenario's name.
+    pub fn dump_evidence(&self, test_name: &str) -> io::Result<PathBuf> {
+        evidence::write_dump(
+            test_name,
+            &self.screen_text(),
+            self.pty_tail(),
+            &self.log.borrow(),
+        )
+    }
+}
+
+impl Drop for E2e {
+    /// On unwind — any failed step, whether a harness wait/assert or a
+    /// test-side `assert!` — dump the failure evidence before the panic
+    /// propagates (Spec E01: "a failed step leaves dumps"). The dump is
+    /// best-effort: I/O failure during a panic must not abort.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let name = evidence::current_test_name();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = self.dump_evidence(&name);
+            }));
+        }
     }
 }

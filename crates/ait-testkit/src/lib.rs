@@ -8,12 +8,14 @@
 //! observables a user has (bounded waits only, never fixed sleeps).
 
 mod chord;
+mod evidence;
 mod harness;
 mod mouse;
 mod tempdir;
 
 pub use ait_term::{Cursor, ExitStatus, GridView, Size};
 pub use chord::{parse_chord, ChordError};
+pub use evidence::dump_root;
 pub use harness::{E2e, SpawnConfig};
 pub use mouse::{MouseButton, MouseEvent};
 
