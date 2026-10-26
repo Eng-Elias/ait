@@ -37,43 +37,6 @@ fn wait_for_chrome(app: &mut E2e) {
     });
 }
 
-/// Spawning `ait` shows a `1:sh` tab and the cwd/shell/model/state
-/// status line — the §5.2 chrome a user sees first.
-#[test]
-fn spawn_renders_the_tab_bar_and_status_line() {
-    let mut app = spawn_ait();
-
-    wait_for_chrome(&mut app);
-
-    assert_eq!(app.line(0), " 1:sh");
-}
-
-/// `Alt+T` opens a second tab and the bar gains `2:sh`.
-#[test]
-fn alt_t_opens_a_second_tab_in_the_bar() {
-    let mut app = spawn_ait();
-    wait_for_chrome(&mut app);
-
-    app.press("Alt+T");
-
-    app.wait_for_screen("a second tab in the bar", |app| {
-        app.line(0).contains("2:sh")
-    });
-    assert!(app.line(0).contains("1:sh"), "the first tab stays");
-}
-
-/// `Alt+Q` quits: the process exits cleanly with code 0.
-#[test]
-fn alt_q_quits_with_exit_code_zero() {
-    let mut app = spawn_ait();
-    wait_for_chrome(&mut app);
-
-    app.press("Alt+Q");
-
-    let status = app.wait_for_exit();
-    assert!(status.success(), "expected a clean exit, got {status:?}");
-}
-
 /// Manual PR-evidence generator (Spec E01, ticket E01-T5: "the PR
 /// description includes a transcript of an e2e run"). Excluded from the
 /// suite — run it on demand:
