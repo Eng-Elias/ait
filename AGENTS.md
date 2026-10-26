@@ -37,6 +37,8 @@ cargo test --workspace
 ```
 
 All three must pass before any push. CI runs the same three.
+`rust-toolchain.toml` pins the exact toolchain CI reads it from — bump
+it deliberately, one line per release.
 
 ## Workflow
 

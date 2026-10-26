@@ -12,9 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The pin lives in rust-toolchain.toml (exact version — local and
+      # CI can never disagree on the clippy/fmt version); the action
+      # needs it as an input, so read the channel out of the file.
+      - name: Read toolchain pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt, clippy
+          toolchain: ${{ env.channel }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -34,7 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read toolchain pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
 
       - name: Build
         run: cargo build -p ait
