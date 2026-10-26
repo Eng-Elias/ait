@@ -278,6 +278,43 @@ async fn cancellation_mid_stream_terminates_promptly() {
         .is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_stream_silent_past_the_idle_timeout_fails() {
+    // us-33: 60 s between events is the wedge bound. `start_paused` makes
+    // tokio's clock jump straight to the deadline — real time spent is ms.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let fixture = Fixture::serve(vec![Script::DripSse(rx)]);
+    let provider = provider(&fixture.base_url, fast_retry());
+
+    // Same trick as the cancellation test: the first payload must exceed
+    // tiny_http's ~8 KiB response buffering to reach the client at all.
+    let mut first_payload =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n"
+            .to_vec();
+    first_payload.extend_from_slice(format!(": {}\n", "x".repeat(9 * 1024)).as_bytes());
+    tx.send(first_payload).unwrap();
+
+    let mut stream = provider
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    // Let the socket write land before the clock can jump past the data.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let first = stream.next().await.expect("stream ended early").unwrap();
+    assert!(matches!(first, occ::StreamEvent::TextDelta { text } if text == "Hel"));
+
+    // The server never sends again: the pump's idle deadline is the only
+    // pending timer, so the paused clock jumps to it.
+    let timed_out = stream.next().await.expect("stream ended early");
+    match timed_out {
+        Err(LlmError::StreamTimeout { idle }) => {
+            assert_eq!(idle, Duration::from_secs(60))
+        }
+        other => panic!("expected StreamTimeout, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn cancellation_mid_backoff_terminates_promptly() {
     // A lone 429 puts the adapter into a 5 s backoff; cancelling ~100 ms

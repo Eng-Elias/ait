@@ -36,5 +36,7 @@ thiserror = "2"
 
 [dev-dependencies]
 # In-process HTTP fixture server for the contract tests (Spec R03 us-34):
-# tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002.
+# tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002. tokio's
+# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms.
 tiny_http = "0.12"
+tokio = { version = "1", features = ["test-util"] }
