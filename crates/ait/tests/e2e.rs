@@ -307,3 +307,173 @@ fn hot_reload_swaps_the_model_and_keeps_last_good() {
             .contains("· cat · Second Model · running")
     });
 }
+
+/// Story 24's fallback chain, middle step: a model entry with an EMPTY
+/// `alias` renders its wire `name` in the status line's model slot
+/// (`alias → wire name → —`). `alias` is a required field, so `""` —
+/// not an absent key — is what drives the fallback.
+#[test]
+fn model_slot_falls_back_to_wire_name() {
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(
+        dir.path(),
+        r#"
+[agents.custom_endpoints.local]
+name     = "Local"
+base_url = "http://localhost:11434/v1"
+schema   = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name       = "qwen2.5-coder:14b"
+alias      = ""
+config_key = "key-1"
+
+[agents.execution_profiles.default]
+base_model = "key-1"
+"#,
+    );
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+
+    app.wait_for_screen("the wire name on the status line", |app| {
+        app.line(STATUS_ROW)
+            .contains("· sh · qwen2.5-coder:14b · running")
+    });
+}
+
+/// Endpoints declared but no `default` profile (or no `base_model` on
+/// it): `resolve_model` yields `None` and the model slot renders `—` —
+/// a quiet empty state, not a config error.
+#[test]
+fn model_slot_is_dash_without_a_default_profile() {
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(
+        dir.path(),
+        r#"
+[agents.custom_endpoints.local]
+name     = "Local"
+base_url = "http://localhost:11434/v1"
+schema   = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name       = "wire-name"
+config_key = "key-1"
+"#,
+    );
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+
+    app.wait_for_screen("the dash model slot", |app| {
+        app.line(STATUS_ROW).contains("· sh · — · running")
+    });
+    // A toast renders on the same tick the status does — by the time the
+    // summary is up, an error would already be on screen.
+    assert!(
+        !app.line(STATUS_ROW).contains("config error:"),
+        "no error toast for a merely-unconfigured profile: {}",
+        app.line(STATUS_ROW)
+    );
+}
+
+/// Story 10's creation case: the watcher attaches to the settings
+/// file's parent directory — creating it on the first-run path where
+/// `$XDG_CONFIG_HOME/ait/` doesn't exist yet — so the user's first-ever
+/// `settings.toml` save flips `—` to the resolved model without a
+/// restart.
+#[test]
+fn settings_created_after_spawn_hot_loads() {
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    // No `ait/` directory at all — the true first-run state.
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    app.wait_for_screen("defaults before any settings file", |app| {
+        app.line(STATUS_ROW).contains("· sh · — · running")
+    });
+
+    write_settings(dir.path(), &settings_with_model("Late Model"));
+
+    app.wait_for_screen("the hot-loaded model on the status line", |app| {
+        app.line(STATUS_ROW).contains("· sh · Late Model · running")
+    });
+}
+
+/// Deleting `settings.toml` mid-session reloads to built-in defaults —
+/// `load()` treats a missing file as defaults and the watcher reports
+/// the deletion, so the model slot returns to `—`.
+#[test]
+fn settings_deleted_reverts_to_defaults() {
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let settings_path = dir.path().join("ait").join("settings.toml");
+    write_settings(dir.path(), &settings_with_model("Going Away"));
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    app.wait_for_screen("the model before deletion", |app| {
+        app.line(STATUS_ROW).contains("· sh · Going Away · running")
+    });
+
+    fs::remove_file(&settings_path).expect("delete settings.toml");
+
+    app.wait_for_screen("defaults after the file is deleted", |app| {
+        app.line(STATUS_ROW).contains("· sh · — · running")
+    });
+}
+
+/// Story 14's scrollback half: a reloaded `scrollback_lines` bounds NEW
+/// sessions only — the pre-reload tab keeps its full spawn-time
+/// history (the `seq 1 100` echo survives at its scroll top), while a
+/// tab spawned after the reload is capped at 5 lines.
+#[test]
+fn existing_tabs_keep_spawn_time_scrollback_after_reload() {
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let settings_path = dir.path().join("ait").join("settings.toml");
+    // No [terminal] — the spawn-time scrollback is the default 10k.
+    write_settings(dir.path(), &settings_with_model("First Model"));
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    app.wait_for_screen("the first model and a prompt", |app| {
+        app.line(STATUS_ROW).contains("First Model") && app.line(1) == "$"
+    });
+    app.type_text("seq 1 100\n");
+    app.wait_for_screen("seq's output and a fresh prompt", |app| app.line(22) == "$");
+
+    // Reload: a 5-line scrollback cap plus a new model — the model swap
+    // on the status line gates that the reload landed.
+    let reloaded = format!(
+        "[terminal]\nscrollback_lines = 5\n{}",
+        settings_with_model("Second Model")
+    );
+    fs::write(&settings_path, reloaded).expect("rewrite settings.toml");
+    app.wait_for_screen("the reloaded model on the status line", |app| {
+        app.line(STATUS_ROW)
+            .contains("· sh · Second Model · running")
+    });
+
+    // The live tab keeps its spawn-time capacity: Shift+Home reaches
+    // the command echo at the very top of its history.
+    app.press("Shift+Home");
+    app.wait_for_screen("the echo still at the old tab's scroll top", |app| {
+        app.screen_text().contains("seq 1 100")
+    });
+
+    // A post-reload tab gets the 5-line cap — the bounded-history
+    // assertion from terminal_scrollback_lines_bounds_retained_history.
+    app.press("Alt+T");
+    app.wait_for_screen("a second tab in the bar", |app| {
+        app.line(0).contains("2:sh")
+    });
+    app.wait_for_screen("the new tab's prompt", |app| app.line(1) == "$");
+    app.type_text("seq 1 100\n");
+    app.wait_for_screen("seq's output and a fresh prompt", |app| app.line(22) == "$");
+    app.press("Shift+Home");
+    app.wait_for_screen("a truncated scroll top on the new tab", |app| {
+        !app.screen_text().contains("seq 1 100") && app.line(1).chars().all(|c| c.is_ascii_digit())
+    });
+    let oldest: u32 = app
+        .line(1)
+        .parse()
+        .expect("the scroll top is a seq output line");
+    assert!(
+        oldest >= 50,
+        "the reloaded 5-line cap bounds only the new tab, got line {oldest}"
+    );
+}

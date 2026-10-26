@@ -1,0 +1,12 @@
+# Spec R03: an unrecognized argument is a usage error on stderr —
+# `ait: unknown argument "--bogus"` plus the usage text — never a
+# silent TUI launch. Exit code 1.
+feature = "Configurations and providers"
+size = [80, 24]
+args = ["--bogus"]
+
+[[steps]]
+expect_text = "unknown argument \"--bogus\""
+
+[[steps]]
+expect_exit = 1
