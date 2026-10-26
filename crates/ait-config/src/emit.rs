@@ -3,7 +3,9 @@
 //! backs `ait --print-schema`. The binary shells over these — no
 //! business logic lives in `ait` itself (CODING_STANDARDS §9).
 
-use crate::Settings;
+use std::path::Path;
+
+use crate::{ConfigError, Settings};
 
 /// The commented default `settings.toml` `ait --init` writes (§4): an
 /// example local endpoint whose model gets a fresh v4 UUID `config_key`
@@ -61,6 +63,34 @@ command_model = ""
 context_window_limit = 0 # 0 = the model's own limit
 "#
     )
+}
+
+/// `ait --init` (user stories 2–4): write [`default_template`] to `path`,
+/// creating missing parent directories. An existing file is refused unless
+/// `force` — a flag the user never passed must not destroy a hand-tuned
+/// config (story 3); the refusal error names the path.
+pub fn init_settings(path: impl AsRef<Path>, force: bool) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    if !force && path.exists() {
+        return Err(ConfigError::unlocated(format!(
+            "{}: already exists (pass --force to overwrite)",
+            path.display()
+        )));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|err| {
+            ConfigError::unlocated(format!(
+                "{}: cannot create config directory: {err}",
+                dir.display()
+            ))
+        })?;
+    }
+    std::fs::write(path, default_template()).map_err(|err| {
+        ConfigError::unlocated(format!(
+            "{}: cannot write settings file: {err}",
+            path.display()
+        ))
+    })
 }
 
 /// The JSON Schema of the [`Settings`] model (schemars 1.x, draft

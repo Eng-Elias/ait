@@ -26,11 +26,13 @@ dependencies = [
 name = "ait"
 version = "0.1.0"
 dependencies = [
+ "ait-config",
  "ait-term",
  "ait-testkit",
  "crossterm",
  "insta",
  "ratatui",
+ "tempfile",
 ]
 
 [[package]]

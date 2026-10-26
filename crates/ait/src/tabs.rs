@@ -208,18 +208,27 @@ pub struct TabManager {
     /// live outside it); updated by [`resize_all`](Self::resize_all) so
     /// tabs spawned later match.
     size: Size,
+    /// The spawn-options template [`new_tab`](Self::new_tab) clones —
+    /// where `[terminal]` `shell`/`scrollback_lines` land (Spec R03).
+    /// Applying a template reaches only sessions spawned from then on;
+    /// live tabs keep their spawn-time values (story 14).
+    session_options: LiveSessionOptions,
 }
 
 impl TabManager {
-    /// Spawn the manager with its first tab: `$SHELL` (fallback
-    /// `/bin/sh`) in the directory `ait` was launched from.
-    pub fn spawn(size: Size) -> Result<Self, SpawnError> {
+    /// Spawn the manager with its first tab in the directory `ait` was
+    /// launched from: `options` — the app's `[terminal]`-derived
+    /// template (Spec R03), `LiveSessionOptions::default()` for
+    /// `$SHELL`-or-`/bin/sh` — shapes the first tab AND every
+    /// `new_tab` after it.
+    pub fn spawn_with(size: Size, options: LiveSessionOptions) -> Result<Self, SpawnError> {
         let launch_cwd = std::env::current_dir().unwrap_or_default();
-        Self::spawn_at(size, launch_cwd, LiveSessionOptions::default())
+        Self::spawn_at(size, launch_cwd, options)
     }
 
-    /// `spawn` with explicit launch cwd and session options — the test
-    /// seam; the app always uses [`spawn`](Self::spawn).
+    /// `spawn_with` with an explicit launch cwd — the test seam.
+    /// `options` spawns the first tab and becomes the template for
+    /// later ones.
     fn spawn_at(
         size: Size,
         launch_cwd: PathBuf,
@@ -230,9 +239,18 @@ impl TabManager {
             active: 0,
             launch_cwd,
             size,
+            session_options: options.clone(),
         };
         manager.spawn_tab(options)?;
         Ok(manager)
+    }
+
+    /// Replace the spawn-options template: sessions spawned from now on
+    /// get `options` — the `[terminal]` half of a settings reload —
+    /// while live tabs keep their spawn-time program and scrollback
+    /// (Spec R03 user story 14).
+    pub fn set_session_options(&mut self, options: LiveSessionOptions) {
+        self.session_options = options;
     }
 
     /// The cwd a tab spawned right now inherits: the active tab's
@@ -267,13 +285,14 @@ impl TabManager {
         Ok(())
     }
 
-    /// `Alt+T`: a fresh `$SHELL` tab in the active tab's cwd.
+    /// `Alt+T`: a fresh tab from the current spawn-options template, in
+    /// the active tab's cwd.
     ///
     /// A spawn failure (e.g. the tracked cwd was deleted) leaves the tab
     /// set untouched and propagates — the caller surfaces it as a
     /// status-line toast.
     pub fn new_tab(&mut self) -> Result<(), SpawnError> {
-        self.spawn_tab(LiveSessionOptions::default())
+        self.spawn_tab(self.session_options.clone())
     }
 
     /// `Alt+W`: drop the active tab. Returns `false` when that was the
@@ -768,6 +787,63 @@ mod tests {
         assert_eq!(
             manager.titles(),
             vec!["1:sh".to_string(), "2:sh".to_string(), "3:bash".to_string()]
+        );
+    }
+
+    /// Spec R03 stories 12–14: the session-options template shapes NEW
+    /// tabs — the spawned program and the scrollback capacity — while a
+    /// tab spawned before the template changed keeps its spawn-time
+    /// values. `new_tab` used to hardcode `LiveSessionOptions::default()`;
+    /// the template is what `[terminal]` writes land on at reload.
+    #[test]
+    fn session_options_template_shapes_new_tabs_only() {
+        use ait_term::SessionOptions;
+
+        // Tab 1 spawns under the default template — /bin/sh with the
+        // 10_000-line scrollback. Flood it past a small cap so the
+        // contrast with a reconfigured tab is observable.
+        let mut manager = manager(1, "/tmp");
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"i=0; while [ $i -lt 50 ]; do echo line$i; i=$((i+1)); done\n")
+            .unwrap();
+        drain_until(&mut manager, |m| m.tabs()[0].scrollback() > 5);
+
+        // What a config reload does: swap the template, then Alt+T.
+        manager.set_session_options(LiveSessionOptions {
+            program: Some(OsString::from("/bin/cat")),
+            session: SessionOptions {
+                scrollback: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.new_tab().unwrap();
+
+        let tab = manager.active().unwrap();
+        assert_eq!(tab.title(), "cat", "the shell override spawned (story 12)");
+        // cat echoes its input; flood it past the 3-line cap.
+        let mut blob = Vec::new();
+        for _ in 0..50 {
+            blob.extend_from_slice(b"x\n");
+        }
+        tab.session.send_bytes(&blob).unwrap();
+        drain_until(&mut manager, |m| m.tabs()[1].scrollback() >= 3);
+        assert!(
+            manager.tabs()[1].scrollback() <= 3,
+            "scrollback_lines capped the new session (story 13)"
+        );
+
+        assert!(
+            manager.tabs()[0].scrollback() > 5,
+            "the pre-reload tab kept its spawn-time scrollback (story 14)"
+        );
+        assert_eq!(
+            manager.tabs()[0].title(),
+            "sh",
+            "the pre-reload tab kept its spawn-time program"
         );
     }
 }

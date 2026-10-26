@@ -19,7 +19,11 @@
 //!    tab's grid and surfaces lifecycle events — background sessions keep
 //!    up, `Exited` marks the tab rather than ending the loop, OSC 7
 //!    reports track each tab's cwd for `Alt+T` to inherit, and OSC 9/777
-//!    `Notification`s become a ~3 s toast on the status line.
+//!    `Notification`s become a ~3 s toast on the status line. On the
+//!    same tick the settings watcher's channel is drained (Spec R03):
+//!    a good reload swaps the live [`Settings`] — status line and
+//!    NEW-session `[terminal]` options included — while a broken save
+//!    toasts the error and keeps last-good.
 //! 3. A frame renders when the active session reports damage or what the
 //!    last frame showed changed (view offset, selection, active tab, tab
 //!    count, status-line text). The status text is part of that snapshot,
@@ -41,8 +45,10 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use ait_config::{ConfigError, Settings};
 use ait_term::{Cell, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
@@ -52,6 +58,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
 use crate::backend::StyledBackend;
+use crate::config::{self, LiveSettings, NoSecrets};
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::render::{
@@ -125,6 +132,10 @@ struct AppState {
     /// message that replaces the summary until its deadline (~3 s),
     /// expiring on the loop's 8 ms tick, not on a thread.
     toast: Option<Toast>,
+    /// The live configuration: last-good [`Settings`] plus the derived
+    /// status-line model slot, swapped wholesale by a successful
+    /// reload (Spec R03 stories 10–11).
+    config: LiveSettings,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -184,16 +195,36 @@ pub fn run() -> io::Result<ExitCode> {
         }
     };
     let (columns, rows) = crossterm::terminal::size()?;
+    // Settings load BEFORE the first session spawns: `[terminal]` shapes
+    // every tab including the first (Spec R03 stories 12–13). A missing
+    // file silently yields built-in defaults (story 6); an invalid one
+    // runs on defaults with the `ConfigError` toasted (stories 7–8) —
+    // a typo never costs the terminal.
+    let (config, load_error) = match ait_config::load() {
+        Ok(settings) => (LiveSettings::adopt(settings, &NoSecrets), None),
+        Err(error) => (
+            LiveSettings::adopt(Settings::default(), &NoSecrets),
+            Some(error.message().to_string()),
+        ),
+    };
+    // Hot reload watches the same settings path. `watch` fails when the
+    // config directory does not exist yet — a normal first-run state,
+    // not an error worth a toast; ait simply runs without reload.
+    let watcher = ait_config::watch().ok();
     let mut state = AppState {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: None,
+        toast: load_error.map(|text| Toast::new(format!("config error: {text}"), Instant::now())),
+        config,
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
-    let mut tabs = TabManager::spawn(content_size(state.screen))
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut tabs = TabManager::spawn_with(
+        content_size(state.screen),
+        config::session_options(&state.config.settings().terminal),
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
 
     let backend = StyledBackend::new(io::stdout());
     let underlines = backend.underline_overlay();
@@ -266,6 +297,12 @@ pub fn run() -> io::Result<ExitCode> {
             }
         }
 
+        // Config reloads drain on the same tick — one 8 ms frame is the
+        // worst-case latency, so no extra waking machinery is needed.
+        if let Some(watcher) = &watcher {
+            drain_config_events(watcher.receiver(), &mut state, &mut tabs);
+        }
+
         // Standard 6: the last close already exits via `Handled::Quit`;
         // this guard is the belt for any path that could empty the set —
         // never index an empty tab list.
@@ -295,6 +332,7 @@ pub fn run() -> io::Result<ExitCode> {
             status: status_text(
                 tab.cwd(),
                 tab.title(),
+                state.config.model(),
                 tab.exit_status(),
                 state.toast.as_ref(),
                 now,
@@ -562,6 +600,33 @@ fn service_input<W: Write>(
     InputOutcome::Continue
 }
 
+/// Drain one tick of settings-watcher events (Spec R03 stories 10–11):
+/// a good reload swaps the live [`Settings`] — model slot included —
+/// and replaces the NEW-session `[terminal]` template (existing tabs
+/// keep spawn-time values, story 14); a broken save toasts the
+/// `ConfigError` and keeps last-good. `try_recv` keeps the drain
+/// zero-cost inside the 8 ms poll loop — no async, no extra waking.
+fn drain_config_events(
+    receiver: &Receiver<Result<Settings, ConfigError>>,
+    state: &mut AppState,
+    tabs: &mut TabManager,
+) {
+    while let Ok(event) = receiver.try_recv() {
+        match event {
+            Ok(settings) => {
+                tabs.set_session_options(config::session_options(&settings.terminal));
+                state.config = LiveSettings::adopt(settings, &NoSecrets);
+            }
+            Err(error) => {
+                state.toast = Some(Toast::new(
+                    format!("config error: {}", error.message()),
+                    Instant::now(),
+                ));
+            }
+        }
+    }
+}
+
 /// Screen mouse position → grid coordinates: the line by
 /// [`grid_line`]'s screen→grid rule (the same rule the painters use),
 /// `column = column - content.x` clamped at the band's left edge.
@@ -664,14 +729,14 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
-    use ait_term::Size;
+    use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
         KeyCode, KeyEvent as CtKeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
     };
     use std::collections::VecDeque;
 
     fn manager() -> TabManager {
-        TabManager::spawn(Size::new(40, 10)).unwrap()
+        TabManager::spawn_with(Size::new(40, 10), LiveSessionOptions::default()).unwrap()
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -725,6 +790,7 @@ mod tests {
                     copied_text: None,
                     last_exit: None,
                     toast: None,
+                    config: LiveSettings::adopt(Settings::default(), &NoSecrets),
                 },
                 sink: Vec::new(),
             }
@@ -1058,6 +1124,70 @@ mod tests {
             events.borrow().len(),
             10,
             "the cap released control with the tail still queued"
+        );
+    }
+
+    /// Spec R03 stories 10–11 and 14: a good watcher event swaps the
+    /// live settings — the model slot and the NEW-session `[terminal]`
+    /// template both follow it — while a broken save toasts the
+    /// `ConfigError` and keeps last-good.
+    #[test]
+    fn config_events_swap_last_good_or_toast() {
+        let mut harness = Harness::new(manager());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let good = Settings::from_toml(
+            r#"
+[terminal]
+shell = "/bin/cat"
+
+[agents.custom_endpoints.local]
+name     = "Local"
+base_url = "http://localhost:11434/v1"
+schema   = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name       = "wire-name"
+alias      = "Alias Name"
+config_key = "key-1"
+
+[agents.execution_profiles.default]
+base_model = "key-1"
+"#,
+        )
+        .unwrap();
+
+        tx.send(Ok(good)).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        assert_eq!(
+            harness.state.config.model(),
+            "Alias Name",
+            "the status slot follows the swap (story 10)"
+        );
+        // The `[terminal]` half lands on the template: the NEXT tab
+        // spawns the configured shell; the open one is untouched.
+        harness.tabs.new_tab().unwrap();
+        assert_eq!(
+            harness.tabs.active().unwrap().title(),
+            "cat",
+            "the shell override applies to new sessions (story 12)"
+        );
+
+        let broken = Settings::from_toml("[terminal]\nbogus = 1\n").unwrap_err();
+        tx.send(Err(broken)).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        let toast = harness.state.toast.as_ref().expect("a bad save toasts");
+        assert!(
+            toast.text().contains("terminal.bogus"),
+            "the toast names the offending key: {}",
+            toast.text()
+        );
+        assert_eq!(
+            harness.state.config.model(),
+            "Alias Name",
+            "last-good settings are kept (story 11)"
         );
     }
 }
