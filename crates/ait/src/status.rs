@@ -22,9 +22,6 @@ use ait_term::ExitStatus;
 /// `cwd · shell · model · state` rendering returns (Spec R02: ~3 s).
 pub const TOAST_DURATION: Duration = Duration::from_secs(3);
 
-/// The model slot until Round 3 wires a real endpoint (Spec R02).
-const MODEL_PLACEHOLDER: &str = "—";
-
 /// A transient message on the status line: `text` until `deadline`,
 /// then gone. One toast at a time — a new one replaces the old.
 pub struct Toast {
@@ -59,11 +56,13 @@ impl Toast {
 /// otherwise `cwd · shell · model · state` for the described tab.
 ///
 /// `cwd` is the tab's tracked working directory (OSC 7, else spawn
-/// cwd), `shell` its program basename, `exit` the session's exit
-/// status once `LiveEvent::Exited` surfaced.
+/// cwd), `shell` its program basename, `model` the resolved
+/// `base_model`'s display name (`—` when unset — Spec R03 story 24),
+/// `exit` the session's exit status once `LiveEvent::Exited` surfaced.
 pub fn status_text(
     cwd: &Path,
     shell: &str,
+    model: &str,
     exit: Option<&ExitStatus>,
     toast: Option<&Toast>,
     now: Instant,
@@ -72,7 +71,7 @@ pub fn status_text(
         return toast.text().to_string();
     }
     format!(
-        "{} · {shell} · {MODEL_PLACEHOLDER} · {}",
+        "{} · {shell} · {model} · {}",
         cwd.display(),
         state_text(exit),
     )
@@ -118,13 +117,25 @@ mod tests {
         }
     }
 
-    /// The spec's exact layout: `cwd · shell · model · state`, model
-    /// `—` until Round 3, `running` while the session lives.
+    /// The spec's exact layout: `cwd · shell · model · state` —
+    /// `model` is the resolved `base_model`'s display name (Spec R03
+    /// story 24), `running` while the session lives.
     #[test]
     fn status_line_is_cwd_shell_model_state() {
         let text = status_text(
             Path::new("/home/u/project"),
             "bash",
+            "Qwen Coder",
+            None,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/home/u/project · bash · Qwen Coder · running");
+
+        let text = status_text(
+            Path::new("/home/u/project"),
+            "bash",
+            "—",
             None,
             None,
             Instant::now(),
@@ -139,13 +150,13 @@ mod tests {
         let now = Instant::now();
         let code3 = exit(3, None);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", Some(&code3), None, now),
+            status_text(Path::new("/tmp"), "sh", "—", Some(&code3), None, now),
             "/tmp · sh · — · exited 3"
         );
         // A signaled exit keeps its description readable.
         let hung_up = exit(1, Some("Terminated by SIGHUP"));
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", Some(&hung_up), None, now),
+            status_text(Path::new("/tmp"), "sh", "—", Some(&hung_up), None, now),
             "/tmp · sh · — · exited 1 (Terminated by SIGHUP)"
         );
     }
@@ -157,7 +168,7 @@ mod tests {
         let now = Instant::now();
         let toast = Toast::new("build finished", now);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", None, Some(&toast), now),
+            status_text(Path::new("/tmp"), "sh", "—", None, Some(&toast), now),
             "build finished"
         );
     }
@@ -178,6 +189,7 @@ mod tests {
         let summary = status_text(
             Path::new("/tmp"),
             "sh",
+            "—",
             None,
             Some(&toast),
             now + TOAST_DURATION,

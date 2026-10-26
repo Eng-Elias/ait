@@ -24,7 +24,7 @@ mod secrets;
 mod settings;
 mod watch;
 
-pub use emit::{default_template, json_schema};
+pub use emit::{default_template, init_settings, json_schema};
 pub use error::ConfigError;
 pub use load::{load, load_from, settings_path};
 pub use resolve::{ModelRole, ResolvedModel};

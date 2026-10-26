@@ -53,9 +53,10 @@ pub struct SpawnConfig {
     pub args: Vec<OsString>,
     /// The PTY's initial size in cells.
     pub size: Size,
-    /// Extra environment pairs, applied *after* the pinned `SHELL`/`PS1`
-    /// so they can override them — the escape hatch a scenario uses to
-    /// pin a different prompt (or a different inner shell) than the
+    /// Extra environment pairs, applied *after* the pinned
+    /// `SHELL`/`PS1`/`XDG_CONFIG_HOME` so they can override them — the
+    /// escape hatch a scenario uses to pin a different prompt (or a
+    /// different inner shell, or a fixture `settings.toml`) than the
     /// defaults.
     pub env: Vec<(OsString, OsString)>,
     /// Headed mode: mirror the spawned program's raw PTY output to the
@@ -140,11 +141,11 @@ pub struct E2e {
 
 impl E2e {
     /// Spawn `config`'s program in a PTY with the pinned environment:
-    /// `SHELL`/`PS1` overridden, `cwd` a fresh temp dir, `TERM` the
-    /// driver's `xterm-256color` default. OSC 52 is opted in so a
-    /// spawned app's copies surface as events
+    /// `SHELL`/`PS1`/`XDG_CONFIG_HOME` overridden, `cwd` a fresh temp
+    /// dir, `TERM` the driver's `xterm-256color` default. OSC 52 is
+    /// opted in so a spawned app's copies surface as events
     /// ([`clipboard_writes`](Self::clipboard_writes)).
-    /// [`SpawnConfig::env`] pairs apply after the pinned `SHELL`/`PS1`,
+    /// [`SpawnConfig::env`] pairs apply after the pinned variables,
     /// so they override them.
     pub fn spawn(config: SpawnConfig) -> Result<Self, SpawnError> {
         let cwd = TempDir::fresh().map_err(|e| SpawnError::Io(e.to_string()))?;
@@ -152,6 +153,16 @@ impl E2e {
         let mut env = vec![
             (OsString::from("SHELL"), OsString::from(PINNED_SHELL)),
             (OsString::from("PS1"), OsString::from(PINNED_PS1)),
+            // Since Round 3 a spawned `ait` loads
+            // `$XDG_CONFIG_HOME/ait/settings.toml` — an unpinned value
+            // would read the HOST's config and make the screen depend
+            // on the developer's machine. Pin it to a path inside the
+            // fresh cwd (missing → built-in defaults); a scenario can
+            // still point it at a fixture via `SpawnConfig::env`.
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                cwd.path().join("xdg-config").into_os_string(),
+            ),
         ];
         env.extend(config.env);
         let session = LiveSession::spawn(LiveSessionOptions {

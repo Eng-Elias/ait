@@ -5,7 +5,7 @@
 //! prints — a JSON Schema covering endpoints, models, profiles and
 //! `[terminal]`.
 
-use ait_config::{default_template, json_schema, Settings};
+use ait_config::{default_template, init_settings, json_schema, Settings};
 
 #[test]
 fn template_parses_through_from_toml() {
@@ -56,6 +56,57 @@ fn template_teaches_where_secrets_live() {
         template.contains("ait/local") || template.contains("ait/<endpoint-key>"),
         "missing keyring-entry guidance"
     );
+}
+
+/// `ait --init` (stories 2–4): `init_settings` writes the template,
+/// creating missing parent directories, and the written file parses
+/// immediately.
+#[test]
+fn init_writes_a_valid_template_creating_parents() {
+    let dirs = tempfile::tempdir().unwrap();
+    let path = dirs.path().join("ait").join("settings.toml");
+
+    init_settings(&path, false).expect("init on a fresh path must succeed");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# AIT settings"), "not the template");
+    Settings::from_toml(&text).expect("the written file must parse (story 4)");
+}
+
+/// Story 3: an existing `settings.toml` is refused without `force` — the
+/// error names the path, and the file is left byte-for-byte untouched.
+#[test]
+fn init_refuses_to_overwrite_an_existing_file() {
+    let dirs = tempfile::tempdir().unwrap();
+    let path = dirs.path().join("settings.toml");
+    std::fs::write(&path, "# hand-tuned\n").unwrap();
+
+    let err = init_settings(&path, false).unwrap_err();
+
+    assert!(
+        err.to_string().contains("already exists"),
+        "actual: {err:?}"
+    );
+    assert!(err.to_string().contains("settings.toml"), "actual: {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# hand-tuned\n",
+        "a refused init must not touch the file"
+    );
+}
+
+/// Story 3: `--force` replaces the existing file with a valid template.
+#[test]
+fn init_force_overwrites_the_existing_file() {
+    let dirs = tempfile::tempdir().unwrap();
+    let path = dirs.path().join("settings.toml");
+    std::fs::write(&path, "nonsense = [\n").unwrap();
+
+    init_settings(&path, true).expect("init --force must succeed");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# AIT settings"), "not the template");
+    Settings::from_toml(&text).expect("the forced file must parse");
 }
 
 #[test]
