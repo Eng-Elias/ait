@@ -40,9 +40,10 @@ pub enum LlmError {
     /// [`CancellationToken`](tokio_util::sync::CancellationToken) (us-30).
     #[error("request cancelled")]
     Cancelled,
-    /// us-33: no stream event arrived for the 60 s idle-timeout — the
-    /// server went silent mid-reply (there is no whole-request deadline,
-    /// so only silence can wedge a stream).
+    /// us-33: nothing arrived for the 60 s idle-timeout — the server went
+    /// silent mid-reply, stalled the error body, or never answered the
+    /// request at all (there is no whole-request deadline, so only
+    /// silence can wedge a connection).
     #[error("no stream event arrived for {idle:?}")]
     StreamTimeout {
         /// The idle bound that elapsed.

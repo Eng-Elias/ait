@@ -11,9 +11,11 @@
 //!   every other failure is terminal.
 //! - **us-30** — `cancel` aborts promptly: before dispatch, in flight and
 //!   mid-backoff.
-//! - **us-33** — [`STREAM_IDLE_TIMEOUT`] between stream events and no
-//!   whole-request deadline (the 10 s connect timeout is set on the shared
-//!   client, [`crate::endpoint::shared_client`]).
+//! - **us-33** — [`STREAM_IDLE_TIMEOUT`] covers every quiet phase:
+//!   waiting for response headers, between stream events, and mid
+//!   error-body read. There is no whole-request deadline (the 10 s
+//!   connect timeout is set on the shared client,
+//!   [`crate::endpoint::shared_client`]).
 
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
@@ -25,8 +27,10 @@ use tokio_util::sync::CancellationToken;
 use crate::provider::EventStream;
 use crate::LlmError;
 
-/// us-33: the stream may go quiet this long between events before it is
-/// declared wedged. Long generations are not killed — only silence is.
+/// us-33: the connection may go quiet this long before it is declared
+/// wedged — between stream events, while waiting for response headers,
+/// or mid error-body read. Long generations are not killed — only
+/// silence is.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bound on the non-2xx body excerpt kept in [`LlmError::HttpStatus`] — a
@@ -35,7 +39,8 @@ const BODY_EXCERPT_LIMIT: usize = 2048;
 
 /// The bounded-retry policy (us-31): `max_attempts` total tries, `base ×
 /// 2ⁿ` exponential backoff plus jitter, `Retry-After` honored capped at
-/// `retry_after_cap`.
+/// `retry_after_cap`. `idle_timeout` is the us-33 wedge bound carried
+/// alongside so the same injection seam covers it.
 ///
 /// Fields are `pub` so contract tests (via the crate's `#[doc(hidden)]`
 /// `testing` re-export) can inject compressed waits instead of sleeping
@@ -48,15 +53,22 @@ pub struct Retry {
     pub base: Duration,
     /// `Retry-After` is honored only up to this cap.
     pub retry_after_cap: Duration,
+    /// us-33: how long a connection may go silent — waiting for response
+    /// headers, between stream events, or mid error-body read — before
+    /// the request is declared wedged. There is deliberately no
+    /// whole-request deadline; only silence kills.
+    pub idle_timeout: Duration,
 }
 
 impl Default for Retry {
-    /// Spec values: 3 attempts, 250 ms base, 10 s `Retry-After` cap.
+    /// Spec values: 3 attempts, 250 ms base, 10 s `Retry-After` cap,
+    /// 60 s idle bound.
     fn default() -> Self {
         Self {
             max_attempts: 3,
             base: Duration::from_millis(250),
             retry_after_cap: Duration::from_secs(10),
+            idle_timeout: STREAM_IDLE_TIMEOUT,
         }
     }
 }
@@ -106,17 +118,35 @@ pub(crate) async fn send_with_retry(
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-            result = client.execute(attempt) => result,
+            // us-33: the idle bound covers the wait for response headers
+            // too — an endpoint that accepts the connection then goes
+            // silent is the same wedge as a stalled stream.
+            result = tokio::time::timeout(retry.idle_timeout, client.execute(attempt)) => result,
         };
         let (error, retry_after) = match outcome {
-            Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(response) => {
+            Ok(Ok(response)) if response.status().is_success() => return Ok(response),
+            Ok(Ok(response)) => {
                 let retry_after = retry_after(response.headers());
                 let status = response.status();
-                let body = body_excerpt(response, cancel).await?;
-                (LlmError::HttpStatus { status, body }, retry_after)
+                match body_excerpt(response, cancel, retry.idle_timeout).await {
+                    Ok(body) => (LlmError::HttpStatus { status, body }, retry_after),
+                    // The status was read but its error body wasn't: that
+                    // read failure is transport-class — it must reach the
+                    // retry classifier, not bypass the loop (us-31).
+                    Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
+                    Err(read_error) => (read_error, retry_after),
+                }
             }
-            Err(e) => (LlmError::Transport(e), None),
+            Ok(Err(e)) => (LlmError::Transport(e), None),
+            // Silent past the idle bound before headers arrived — the
+            // same wedge class as a stalled stream, and likewise
+            // retryable.
+            Err(_elapsed) => (
+                LlmError::StreamTimeout {
+                    idle: retry.idle_timeout,
+                },
+                None,
+            ),
         };
         failed_attempts += 1;
         if !error.is_retryable() || failed_attempts >= retry.max_attempts {
@@ -135,9 +165,16 @@ pub(crate) async fn send_with_retry(
 /// a float is accepted so injected delays can run sub-second, and the
 /// rarer HTTP-date form (RFC 9110 §10.2.3) is parsed as a fallback.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    /// `Retry-After` magnitudes past a day are junk — `retry_after_cap`
+    /// (10 s spec default) truncates anything real anyway, and rejecting
+    /// here also keeps `from_secs_f64` away from the non-finite and
+    /// overflowing inputs it panics on. Rejected values fall back to the
+    /// attempt's normal backoff.
+    const MAX_SECS: f64 = 86_400.0;
     let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     if let Ok(secs) = value.trim().parse::<f64>() {
-        return (secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+        return (secs.is_finite() && (0.0..=MAX_SECS).contains(&secs))
+            .then(|| Duration::from_secs_f64(secs));
     }
     httpdate::parse_http_date(value)
         .ok()?
@@ -145,16 +182,32 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .ok()
 }
 
-/// A bounded excerpt of a non-2xx body for [`LlmError::HttpStatus`].
+/// A bounded excerpt of a non-2xx body for [`LlmError::HttpStatus`]: read
+/// chunkwise to [`BODY_EXCERPT_LIMIT`] rather than fetching the whole
+/// body — a proxy or provider can stream an endless error page — under
+/// the same cancel (us-30) and idle (us-33) bounds as the event pump.
 async fn body_excerpt(
     response: reqwest::Response,
     cancel: &CancellationToken,
+    idle_timeout: Duration,
 ) -> Result<String, LlmError> {
-    let bytes = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-        body = response.bytes() => body.map_err(LlmError::Transport)?,
-    };
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while bytes.len() <= BODY_EXCERPT_LIMIT {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+            next = tokio::time::timeout(idle_timeout, stream.next()) => next,
+        };
+        match next {
+            Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
+            Ok(Some(Err(e))) => return Err(LlmError::Transport(e)),
+            Ok(None) => break,
+            Err(_elapsed) => {
+                return Err(LlmError::StreamTimeout { idle: idle_timeout });
+            }
+        }
+    }
     let text = String::from_utf8_lossy(&bytes);
     let mut end = text.len().min(BODY_EXCERPT_LIMIT);
     while !text.is_char_boundary(end) {
@@ -214,12 +267,13 @@ impl<E> Decoded<E> {
 /// `decode` receives `Some(event)` per SSE frame and `None` when the body
 /// ends, so decoders that hold back an event (the chat-completions
 /// `Finish` waits for a trailing usage chunk) can flush it. `cancel`
-/// wins mid-poll (us-30) and [`STREAM_IDLE_TIMEOUT`] fires when the
-/// server goes quiet (us-33); there is deliberately no total deadline.
+/// wins mid-poll (us-30) and `idle_timeout` fires when the server goes
+/// quiet (us-33); there is deliberately no total deadline.
 pub(crate) fn sse_stream<E, F>(
     response: reqwest::Response,
     cancel: CancellationToken,
     decode: F,
+    idle_timeout: Duration,
 ) -> EventStream<E>
 where
     E: Send + 'static,
@@ -237,7 +291,9 @@ where
     // variable into each future it produces.
     Box::pin(stream::unfold(
         (sse, cancel, VecDeque::new(), false, decode),
-        |(mut sse, cancel, mut pending, mut closed, mut decode)| async move {
+        // `move` captures `idle_timeout` (Copy) — the closure must own it
+        // since the returned stream may outlive this call.
+        move |(mut sse, cancel, mut pending, mut closed, mut decode)| async move {
             loop {
                 if let Some(item) = pending.pop_front() {
                     return Some((item, (sse, cancel, pending, closed, decode)));
@@ -248,7 +304,7 @@ where
                 let step = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => Step::Cancelled,
-                    next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, sse.next()) => match next {
+                    next = tokio::time::timeout(idle_timeout, sse.next()) => match next {
                         Err(_) => Step::TimedOut,
                         Ok(None) => Step::Ended,
                         Ok(Some(frame)) => Step::Frame(frame),
@@ -261,9 +317,7 @@ where
                     }
                     Step::TimedOut => {
                         closed = true;
-                        pending.push_back(Err(LlmError::StreamTimeout {
-                            idle: STREAM_IDLE_TIMEOUT,
-                        }));
+                        pending.push_back(Err(LlmError::StreamTimeout { idle: idle_timeout }));
                     }
                     Step::Ended => {
                         closed = true;
@@ -334,5 +388,21 @@ mod tests {
         assert!(parsed > Duration::from_secs(5) && parsed <= Duration::from_secs(8));
         headers.insert(reqwest::header::RETRY_AFTER, "garbage".parse().unwrap());
         assert_eq!(retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_non_finite_and_absurd_values() {
+        // `Duration::from_secs_f64` panics on NaN/inf/overflowing input —
+        // a junk header must fall back to backoff, never crash the retry
+        // loop. Magnitudes past a day are absurd anyway (the cap is 10 s).
+        let mut headers = reqwest::header::HeaderMap::new();
+        for junk in ["inf", "-inf", "NaN", "1e300", "99999999999", "-5"] {
+            headers.insert(reqwest::header::RETRY_AFTER, junk.parse().unwrap());
+            assert_eq!(
+                retry_after(&headers),
+                None,
+                "{junk} must be rejected to the backoff fallback"
+            );
+        }
     }
 }

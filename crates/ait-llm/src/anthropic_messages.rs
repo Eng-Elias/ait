@@ -98,9 +98,12 @@ impl LlmProvider for Provider {
         let response =
             http::send_with_retry(&self.client, &http_request, &self.retry, &cancel).await?;
         let mut decoder = Decoder::default();
-        Ok(http::sse_stream(response, cancel, move |event| {
-            decoder.decode(event)
-        }))
+        Ok(http::sse_stream(
+            response,
+            cancel,
+            move |event| decoder.decode(event),
+            self.retry.idle_timeout,
+        ))
     }
 }
 
@@ -357,15 +360,23 @@ impl Decoder {
             // cumulative. A message_delta without a stop reason carries
             // bookkeeping only.
             "message_delta" => match text("/delta/stop_reason") {
-                Some(reason) => http::Decoded::more(vec![Ok(StreamEvent::Finish {
-                    reason: finish_reason(&reason),
-                    usage: Some(Usage {
-                        input_tokens: self.input_tokens,
-                        output_tokens: value
-                            .pointer("/usage/output_tokens")
-                            .and_then(|v| v.as_u64()),
-                    }),
-                })]),
+                Some(reason) => {
+                    let input_tokens = self.input_tokens;
+                    let output_tokens = value
+                        .pointer("/usage/output_tokens")
+                        .and_then(|v| v.as_u64());
+                    // The schema reported nothing at all → `None`, not a
+                    // Usage shell of Nones.
+                    let usage =
+                        (input_tokens.is_some() || output_tokens.is_some()).then_some(Usage {
+                            input_tokens,
+                            output_tokens,
+                        });
+                    http::Decoded::more(vec![Ok(StreamEvent::Finish {
+                        reason: finish_reason(&reason),
+                        usage,
+                    })])
+                }
                 None => http::Decoded::more(vec![]),
             },
             "message_stop" => http::Decoded::over(vec![]),

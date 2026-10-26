@@ -16,6 +16,12 @@ fn template_parses_through_from_toml() {
         profile.base_model.is_some(),
         "the template should ship a usable base_model"
     );
+    // §5.7's shipped default profile: write_to_pty is always_ask.
+    assert_eq!(
+        profile.write_to_pty,
+        Some(ait_config::PermissionLevel::AlwaysAsk),
+        "the template's default profile must match REQUIREMENTS.md §5.7"
+    );
 }
 
 #[test]

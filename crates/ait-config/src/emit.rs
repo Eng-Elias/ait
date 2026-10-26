@@ -46,7 +46,7 @@ config_key = "{config_key}"        # stable id model roles reference
 # to base_model when unset ("").
 [agents.execution_profiles.default]
 read_files        = "agent_decides" # agent_decides | always_allow | always_ask | never
-write_to_pty      = "ask_on_first_write"
+write_to_pty      = "always_ask"      # also: ask_on_first_write
 execute_commands  = "always_ask"
 apply_code_diffs  = "always_ask"
 mcp_permissions   = "always_ask"

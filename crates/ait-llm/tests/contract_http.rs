@@ -9,7 +9,9 @@
 
 mod support;
 
-use std::sync::mpsc;
+use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use ait_llm::openai_chat_completions as occ;
@@ -52,12 +54,65 @@ fn fast_retry() -> Retry {
         max_attempts: 3,
         base: Duration::from_millis(1),
         retry_after_cap: Duration::from_secs(10),
+        // The real spec value — only the *silence* tests inject a
+        // compressed bound; ordinary requests never idle 60 s.
+        idle_timeout: Duration::from_secs(60),
     }
 }
 
 const BOUND: Duration = Duration::from_secs(10);
 const OPENAI_429: &str =
     "{\"error\":{\"message\":\"Rate limit reached.\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}";
+
+/// A raw loopback TCP server for the failure shapes `tiny_http` cannot
+/// script. Each accepted connection consumes one queued reply: `Some`
+/// bytes are written verbatim (the socket then closes — truncate the
+/// body to kill the client mid-read), `None` leaves the socket open and
+/// never answers (the wait-for-headers phase hangs). Each request's
+/// arrival is pushed on the returned channel. Returns `(base_url, arrivals)`.
+fn raw_server(replies: Vec<Option<Vec<u8>>>) -> (String, Receiver<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, arrivals) = mpsc::channel::<()>();
+    let mut replies: VecDeque<Option<Vec<u8>>> = replies.into();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Some(reply) = replies.pop_front() else {
+                break;
+            };
+            let mut stream = stream.expect("fixture accept failed");
+            // Read the request head so an arrival means a real request;
+            // the adapter always writes promptly after connect.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0u8; 8192];
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tx.send(());
+            match reply {
+                Some(bytes) => {
+                    let _ = stream.write_all(&bytes);
+                    // Dropping the socket here is what truncates the body.
+                }
+                None => std::mem::forget(stream), // stay silent forever
+            }
+        }
+    });
+    (format!("http://{addr}"), arrivals)
+}
+
+/// A complete raw HTTP response around `body`.
+fn raw_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
 
 #[tokio::test]
 async fn a_429_with_retry_after_is_retried_after_the_header_s_delay() {
@@ -71,9 +126,8 @@ async fn a_429_with_retry_after_is_retried_after_the_header_s_delay() {
     let provider = provider(
         &fixture.base_url,
         Retry {
-            max_attempts: 3,
             base: Duration::from_secs(10),
-            retry_after_cap: Duration::from_secs(10),
+            ..fast_retry()
         },
     );
 
@@ -107,9 +161,8 @@ async fn a_5xx_is_retried_with_exponential_backoff() {
     let provider = provider(
         &fixture.base_url,
         Retry {
-            max_attempts: 3,
             base: Duration::from_millis(30),
-            retry_after_cap: Duration::from_secs(10),
+            ..fast_retry()
         },
     );
 
@@ -139,9 +192,9 @@ async fn retry_after_is_capped() {
     let provider = provider(
         &fixture.base_url,
         Retry {
-            max_attempts: 3,
             base: Duration::from_secs(10),
             retry_after_cap: Duration::from_millis(200),
+            ..fast_retry()
         },
     );
 
@@ -278,13 +331,22 @@ async fn cancellation_mid_stream_terminates_promptly() {
         .is_none());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_stream_silent_past_the_idle_timeout_fails() {
-    // us-33: 60 s between events is the wedge bound. `start_paused` makes
-    // tokio's clock jump straight to the deadline — real time spent is ms.
+    // us-33: silence between events past the idle bound wedges the
+    // stream. The injected bound stands in for the 60 s spec value —
+    // the same compressed-wait trick as `fast_retry`'s 1 ms base (a
+    // paused clock can't coexist with timers on the dispatch phase:
+    // auto-advance fires them before real I/O lands).
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let fixture = Fixture::serve(vec![Script::DripSse(rx)]);
-    let provider = provider(&fixture.base_url, fast_retry());
+    let provider = provider(
+        &fixture.base_url,
+        Retry {
+            idle_timeout: Duration::from_millis(200),
+            ..fast_retry()
+        },
+    );
 
     // Same trick as the cancellation test: the first payload must exceed
     // tiny_http's ~8 KiB response buffering to reach the client at all.
@@ -298,18 +360,22 @@ async fn a_stream_silent_past_the_idle_timeout_fails() {
         .stream(request(), CancellationToken::new())
         .await
         .unwrap();
-    // Let the socket write land before the clock can jump past the data.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let first = stream.next().await.expect("stream ended early").unwrap();
+    let first = tokio::time::timeout(BOUND, stream.next())
+        .await
+        .expect("first event never arrived")
+        .expect("stream ended early")
+        .unwrap();
     assert!(matches!(first, occ::StreamEvent::TextDelta { text } if text == "Hel"));
 
-    // The server never sends again: the pump's idle deadline is the only
-    // pending timer, so the paused clock jumps to it.
-    let timed_out = stream.next().await.expect("stream ended early");
+    // The server never sends again: the pump's idle deadline fires.
+    let timed_out = tokio::time::timeout(BOUND, stream.next())
+        .await
+        .expect("the idle bound never fired")
+        .expect("stream ended early");
     match timed_out {
         Err(LlmError::StreamTimeout { idle }) => {
-            assert_eq!(idle, Duration::from_secs(60))
+            assert_eq!(idle, Duration::from_millis(200))
         }
         other => panic!("expected StreamTimeout, got {other:?}"),
     }
@@ -323,9 +389,8 @@ async fn cancellation_mid_backoff_terminates_promptly() {
     let provider = provider(
         &fixture.base_url,
         Retry {
-            max_attempts: 3,
             base: Duration::from_secs(5),
-            retry_after_cap: Duration::from_secs(10),
+            ..fast_retry()
         },
     );
     let token = CancellationToken::new();
@@ -347,4 +412,111 @@ async fn cancellation_mid_backoff_terminates_promptly() {
         .expect("cancellation did not interrupt the backoff");
     assert!(matches!(err, Err(LlmError::Cancelled)));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn a_body_read_failure_on_a_retryable_status_is_still_retried() {
+    // The 429's error body is cut off mid-read (Content-Length lies —
+    // the socket closes early). That read failure is transport-class,
+    // not terminal: the retryable status must still retry (us-31).
+    let ok = raw_response(
+        "200 OK",
+        "text/event-stream",
+        include_str!("fixtures/openai_chat_completions_text.sse"),
+    );
+    let (base_url, arrivals) = raw_server(vec![
+        Some(
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"error\":{\"message\":\"Rate limit reached.\",\"type\":\"tok"
+                .to_vec(),
+        ),
+        Some(ok),
+    ]);
+    let provider = provider(&base_url, fast_retry());
+
+    let stream = tokio::time::timeout(BOUND, provider.stream(request(), CancellationToken::new()))
+        .await
+        .expect("the retry loop hung on a truncated error body")
+        .expect("stream should succeed after the truncated 429");
+    let events: Vec<_> = stream.collect().await;
+    assert!(matches!(
+        events.first(),
+        Some(Ok(occ::StreamEvent::TextDelta { .. }))
+    ));
+    arrivals.recv_timeout(BOUND).unwrap();
+    arrivals.recv_timeout(BOUND).unwrap();
+    assert!(
+        arrivals.recv_timeout(Duration::from_millis(200)).is_err(),
+        "one retry only — a second attempt must be the last"
+    );
+}
+
+#[tokio::test]
+async fn a_junk_retry_after_falls_back_to_backoff_without_panicking() {
+    // `Retry-After: inf` parses as f64 but overflows `Duration` — it
+    // must be rejected to the normal backoff: no panic, no giant sleep.
+    let fixture = Fixture::serve(vec![
+        rate_limited("inf", OPENAI_429),
+        sse(include_str!("fixtures/openai_chat_completions_text.sse")),
+    ]);
+    let provider = provider(&fixture.base_url, fast_retry());
+
+    let stream = tokio::time::timeout(BOUND, provider.stream(request(), CancellationToken::new()))
+        .await
+        .expect("a junk Retry-After must not hang or panic the retry loop")
+        .expect("stream should succeed after the retried 429");
+    let events: Vec<_> = stream.collect().await;
+    assert!(matches!(events.first(), Some(Ok(_))));
+    fixture.captured();
+    fixture.captured();
+    fixture.assert_no_more_requests();
+}
+
+#[tokio::test]
+async fn an_absurd_retry_after_falls_back_to_backoff_without_panicking() {
+    // ~3169 years of Retry-After is junk the same way `inf` is — the
+    // attempt waits its normal backoff, not the header's fantasy.
+    let fixture = Fixture::serve(vec![
+        rate_limited("99999999999", OPENAI_429),
+        sse(include_str!("fixtures/openai_chat_completions_text.sse")),
+    ]);
+    let provider = provider(&fixture.base_url, fast_retry());
+
+    let stream = tokio::time::timeout(BOUND, provider.stream(request(), CancellationToken::new()))
+        .await
+        .expect("an absurd Retry-After must not hang or panic the retry loop")
+        .expect("stream should succeed after the retried 429");
+    let events: Vec<_> = stream.collect().await;
+    assert!(matches!(events.first(), Some(Ok(_))));
+    fixture.captured();
+    fixture.captured();
+}
+
+#[tokio::test]
+async fn a_server_silent_before_headers_hits_the_idle_timeout() {
+    // us-33: the wedge bound covers the wait-for-response phase too — a
+    // server that accepts TCP then never answers is the same silence as
+    // a stalled mid-stream event pump. The injected bound stands in for
+    // the 60 s spec value (a paused clock can't coexist with a timer on
+    // the dispatch phase: auto-advance fires it before real I/O lands).
+    let (base_url, arrivals) = raw_server(vec![None]);
+    let provider = provider(
+        &base_url,
+        Retry {
+            max_attempts: 1,
+            idle_timeout: Duration::from_millis(200),
+            ..fast_retry()
+        },
+    );
+
+    let err = tokio::time::timeout(BOUND, provider.stream(request(), CancellationToken::new()))
+        .await
+        .expect("a silent server wedged the request — no idle bound fired")
+        .err()
+        .expect("a silent server should fail the request");
+
+    match err {
+        LlmError::StreamTimeout { idle } => assert_eq!(idle, Duration::from_millis(200)),
+        other => panic!("expected StreamTimeout, got {other:?}"),
+    }
+    arrivals.recv_timeout(BOUND).unwrap();
 }

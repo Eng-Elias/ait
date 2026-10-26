@@ -56,8 +56,10 @@ impl Provider {
         let mut body = serde_json::to_value(request)
             .map_err(|e| LlmError::Parse(format!("failed to serialize request: {e}")))?;
         if let Some(object) = body.as_object_mut() {
-            // Streaming is the adapter's wire detail; `store: false` keeps
-            // responses stateless (no server-side retention).
+            // Streaming is the adapter's wire detail; `store: false` opts
+            // out of the Responses API's server-side retention — §1.1's
+            // local-first principle keeps nothing on the provider's side
+            // the user didn't ask for. Pinned by the contract tests.
             object.insert("stream".into(), true.into());
             object.insert("store".into(), false.into());
         }
@@ -92,7 +94,12 @@ impl LlmProvider for Provider {
         let http_request = self.build_request(&request)?;
         let response =
             http::send_with_retry(&self.client, &http_request, &self.retry, &cancel).await?;
-        Ok(http::sse_stream(response, cancel, decode))
+        Ok(http::sse_stream(
+            response,
+            cancel,
+            decode,
+            self.retry.idle_timeout,
+        ))
     }
 }
 

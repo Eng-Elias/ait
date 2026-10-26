@@ -5,8 +5,9 @@
 //! container a hot reload swaps wholesale.
 
 use std::ffi::OsString;
+use std::path::Path;
 
-use ait_config::{ModelRole, SecretStore, Settings, TerminalSettings};
+use ait_config::{ModelRole, SecretStore, Settings, SettingsWatcher, TerminalSettings};
 use ait_term::LiveSessionOptions;
 
 /// The model slot's text when no model resolves — Spec R02's `—`
@@ -57,6 +58,26 @@ impl LiveSettings {
     pub fn model(&self) -> &str {
         &self.model
     }
+}
+
+/// [`ait_config::watch`] after making sure the settings directory exists
+/// (stories 10–11). The watcher subscribes to the file's PARENT
+/// directory — a first run without `--init` has no config dir yet, and
+/// without creating it the user's first mid-session `settings.toml`
+/// write could never reload. Creating the app's own config dir is safe
+/// (`--init` does the same); a genuine watch failure still yields `None`
+/// — hot reload just stays off, never an error.
+pub fn watcher() -> Option<SettingsWatcher> {
+    watcher_at(&ait_config::settings_path())
+}
+
+/// [`watcher`] at an explicit path — the test seam mirroring
+/// `ait_config::watch_from`.
+fn watcher_at(path: &Path) -> Option<SettingsWatcher> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    ait_config::watch_from(path).ok()
 }
 
 /// `[terminal]` as spawn options for a NEW session (stories 12–13):
@@ -161,6 +182,26 @@ base_model = "key-1"
             "—",
             "no default profile means no model"
         );
+    }
+
+    /// Stories 10–11's first-run case: no config dir exists yet —
+    /// `watch_from` alone errors on the missing parent, so `watcher_at`
+    /// must create it and the user's first mid-session `settings.toml`
+    /// write still reloads.
+    #[test]
+    fn watcher_creates_a_missing_config_dir_and_reloads() {
+        let dirs = tempfile::tempdir().unwrap();
+        let path = dirs.path().join("ait").join("settings.toml");
+
+        let watcher = watcher_at(&path).expect("watcher must land on a fresh config dir");
+
+        std::fs::write(&path, "[terminal]\nshell = \"/bin/fish\"\n").unwrap();
+        let settings = watcher
+            .receiver()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("no reload event arrived")
+            .expect("a valid first write should emit Settings");
+        assert_eq!(settings.terminal.shell.as_deref(), Some("/bin/fish"));
     }
 
     /// Adopting settings resolves the model slot once — the live value
