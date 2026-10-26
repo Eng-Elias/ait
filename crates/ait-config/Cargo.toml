@@ -10,7 +10,8 @@ description = "AIT's settings.toml model: typed Settings, validation, and errors
 # ADR-0002 supply-chain rule: serde 1.0.229 (2026-07-18), toml 1.1.8
 # (2026-10-09), serde_path_to_error 0.1.20 (2025-09-15),
 # schemars 1.2.3 (2026-10-12), serde_json 1.0.154 (2026-10-11),
-# keyring 4.2.0 (2026-08-29), uuid 1.28.0 (2026-10-10).
+# keyring 4.2.0 (2026-08-29), uuid 1.28.0 (2026-10-10),
+# notify 8.2.0 (2025-08-03).
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 serde_path_to_error = "0.1"
@@ -28,6 +29,12 @@ keyring = "4"
 # ADR-0002 — so Cargo.lock is pinned back to 1.28.0 via
 # `cargo update -p uuid --precise 1.28.0`.
 uuid = { version = "1", features = ["v4"] }
+# Hot reload: the `watch` API watches the settings file's PARENT directory
+# (non-recursive) so editor atomic saves — write temp + rename — still fire
+# (Spec R03, user stories 10–11). A semver "8" requirement resolves
+# notify 8.2.1 (2026-10-25) — too fresh for ADR-0002 — so Cargo.lock is
+# pinned back to 8.2.0 via `cargo update -p notify --precise 8.2.0`.
+notify = "8"
 thiserror = "2"
 
 [dev-dependencies]
