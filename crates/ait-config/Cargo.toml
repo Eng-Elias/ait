@@ -9,11 +9,27 @@ description = "AIT's settings.toml model: typed Settings, validation, and errors
 # Semver requirements; the resolved releases are >=7 days old per the
 # ADR-0002 supply-chain rule: serde 1.0.229 (2026-07-18), toml 1.1.8
 # (2026-10-09), serde_path_to_error 0.1.20 (2025-09-15),
-# schemars 1.2.3 (2026-10-12).
+# schemars 1.2.3 (2026-10-12), serde_json 1.0.154 (2026-10-11),
+# keyring 4.2.0 (2026-08-29), uuid 1.28.0 (2026-10-10).
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 serde_path_to_error = "0.1"
 # `JsonSchema` derives on the settings model back `--print-schema`
-# (REQUIREMENTS.md §4).
+# (REQUIREMENTS.md §4); serde_json renders the schema.
 schemars = "1"
+serde_json = "1"
+# OS keyring lookups behind the `SecretStore` seam — service "ait",
+# account "<endpoint-key>" (§4.1, user stories 19–20). Default `v1`
+# feature set: platform stores incl. zbus Secret Service on Linux.
+keyring = "4"
+# `--init`'s template embeds a fresh v4 UUID as the example model's
+# `config_key` so it is immediately valid (user story 4). A semver "1"
+# requirement resolves uuid 1.29.0 (2026-10-23) — too fresh for
+# ADR-0002 — so Cargo.lock is pinned back to 1.28.0 via
+# `cargo update -p uuid --precise 1.28.0`.
+uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
+
+[dev-dependencies]
+# Tempdirs for the load/secret tests' env-override fixtures.
+tempfile = "3"
