@@ -5,12 +5,14 @@
 //! get a validated [`Settings`] back, or a [`ConfigError`] whose message
 //! names the offending key path
 //! (`agents.custom_endpoints.local.models[0].config_key: …`). Layered on
-//! top, this crate owns everything `settings.toml` needs short of
-//! hot-reload: [`load`]/[`settings_path`] resolve
+//! top, this crate owns everything `settings.toml` needs:
+//! [`load`]/[`settings_path`] resolve
 //! `$XDG_CONFIG_HOME/ait/settings.toml` (falling back to `~/.config`),
-//! [`Endpoint::resolve_secret`] reads secrets from the env var named by
-//! `api_key_env` or the OS keyring behind the injectable [`SecretStore`]
-//! seam, [`Settings::resolve_model`] turns a profile + [`ModelRole`] into
+//! [`watch`]/[`watch_from`] hot-reload it onto a channel the consumer
+//! drains (Spec R03, user stories 10–11), [`Endpoint::resolve_secret`]
+//! reads secrets from the env var named by `api_key_env` or the OS keyring
+//! behind the injectable [`SecretStore`] seam,
+//! [`Settings::resolve_model`] turns a profile + [`ModelRole`] into
 //! endpoint + model + secret-or-none, and [`default_template`]/
 //! [`json_schema`] back `ait --init`/`--print-schema`.
 
@@ -20,6 +22,7 @@ mod load;
 mod resolve;
 mod secrets;
 mod settings;
+mod watch;
 
 pub use emit::{default_template, json_schema};
 pub use error::ConfigError;
@@ -30,3 +33,4 @@ pub use settings::{
     AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile, PermissionLevel,
     Settings, TerminalSettings,
 };
+pub use watch::{watch, watch_from, SettingsWatcher};
