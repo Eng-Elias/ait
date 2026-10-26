@@ -21,10 +21,10 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
 - `docs/adr/` — architecture decision records.
 - `docs/agents/` — issue tracker, triage labels, domain-doc rules.
 - Crate map (ADR-0003): `crates/ait-term` — exists (Round 1: pure byte-fed
-  terminal core); `crates/ait` — exists (scaffold stub binary; TUI lands in
-  Round 2); `crates/ait-testkit` — exists (Round E01: e2e testing toolkit;
-  dev-dependency only, no product crate may depend on it; see
-  `docs/testing-toolkit.md`);
+  terminal core); `crates/ait` — exists (Round 2 TUI; Round 3 wires
+  `ait-config` into it); `crates/ait-testkit` — exists (Round E01: e2e
+  testing toolkit; dev-dependency only, no product crate may depend on
+  it; see `docs/testing-toolkit.md`);
   `crates/ait-llm` — exists (Round 3: `LlmProvider` trait, `Endpoint`
   dispatch, per-schema IRs, HTTP/SSE streaming adapters);
   `crates/ait-config` — exists (Round 3: `settings.toml` model, load,

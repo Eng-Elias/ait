@@ -20,6 +20,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `openai_responses`, or `anthropic_messages`.
 - **Model role** — `base_model`, `coding_model`, `command_model`; references a
   model `config_key`.
+- **config_key** — a model entry's stable id, non-empty and unique across all
+  endpoints' models; model roles resolve through it (§4.1–4.2).
 - **Execution profile** — named set of per-tool permission levels plus
   allow/deny lists.
 - **Permission level** — `always_allow`, `always_ask`, `agent_decides`,
