@@ -97,9 +97,12 @@ impl LlmProvider for Provider {
         let response =
             http::send_with_retry(&self.client, &http_request, &self.retry, &cancel).await?;
         let mut decoder = Decoder::default();
-        Ok(http::sse_stream(response, cancel, move |event| {
-            decoder.decode(event)
-        }))
+        Ok(http::sse_stream(
+            response,
+            cancel,
+            move |event| decoder.decode(event),
+            self.retry.idle_timeout,
+        ))
     }
 }
 

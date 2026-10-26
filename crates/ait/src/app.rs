@@ -207,10 +207,11 @@ pub fn run() -> io::Result<ExitCode> {
             Some(error.message().to_string()),
         ),
     };
-    // Hot reload watches the same settings path. `watch` fails when the
-    // config directory does not exist yet — a normal first-run state,
-    // not an error worth a toast; ait simply runs without reload.
-    let watcher = ait_config::watch().ok();
+    // Hot reload watches the same settings path; `config::watcher`
+    // creates the config dir when a first run without `--init` left it
+    // absent so a mid-session first write still reloads — a genuine
+    // watch failure still degrades to running without reload.
+    let watcher = config::watcher();
     let mut state = AppState {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,

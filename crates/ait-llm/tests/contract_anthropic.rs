@@ -182,6 +182,36 @@ async fn a_mid_stream_error_event_surfaces_as_data() {
 }
 
 #[tokio::test]
+async fn a_finish_without_any_reported_usage_carries_none() {
+    // The schema reports `input_tokens` at `message_start` and
+    // `output_tokens` at `message_delta` — when neither arrives, the
+    // Finish's `usage` is `None`, not a shell of `None` fields.
+    let fixture = Fixture::serve(vec![sse(include_str!(
+        "fixtures/anthropic_messages_no_usage.sse"
+    ))]);
+    let provider = provider(&fixture.base_url, Some("sk-ant-test"));
+
+    let stream = provider
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(stream).await;
+
+    assert_eq!(
+        events,
+        vec![
+            am::StreamEvent::TextDelta {
+                text: "Done.".into()
+            },
+            am::StreamEvent::Finish {
+                reason: am::FinishReason::EndTurn,
+                usage: None,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn an_endpoint_without_a_secret_sends_no_api_key_header() {
     // us-21: `x-api-key` omitted entirely; `anthropic-version` is
     // protocol, not secret, so it is still sent.

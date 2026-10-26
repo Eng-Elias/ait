@@ -10,8 +10,8 @@ description = "Provider abstraction: the LlmProvider trait, per-schema message I
 # per the ADR-0002 supply-chain rule (checked 2026-10-26): tokio 1.53.3
 # (2026-10-13; 1.54.x is too fresh), reqwest 0.13.5 (2026-09-08),
 # eventsource-stream 0.2.3 (2022-02-17), tokio-util 0.7.20 (2026-10-09),
-# futures-util 0.3.34 (2026-08-11). serde/serde_json/thiserror already
-# resolve in-tree (see Cargo.lock).
+# futures-util 0.3.34 (2026-08-11), serde 1.0.229 (2026-07-18),
+# serde_json 1.0.154 (2026-10-11), thiserror 2.0.21 (2026-09-23).
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 # reqwest 0.13's default TLS stack is already rustls (platform verifier);
 # default-features = false keeps `charset`/`cookies` out — SSE bodies are

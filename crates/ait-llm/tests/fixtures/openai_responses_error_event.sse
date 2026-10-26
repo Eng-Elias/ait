@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fix03","object":"response","created_at":1761500400,"status":"in_progress","model":"gpt-6-astra","output":[],"usage":null},"sequence_number":0}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_fix03","type":"message","status":"in_progress","role":"assistant","content":[]},"sequence_number":1}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_fix03","output_index":0,"content_index":0,"delta":"Partial answer","sequence_number":2,"logprobs":[]}
+
+event: response.error
+data: {"type":"response.error","code":"rate_limit_exceeded","message":"Upstream rate limit hit mid-stream."}
+
+event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_fix03","object":"response","created_at":1761500400,"status":"failed","error":{"code":"server_error","message":"Model generation failed."},"output":[],"usage":null},"sequence_number":3}
+

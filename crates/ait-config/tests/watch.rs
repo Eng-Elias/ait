@@ -150,6 +150,41 @@ fn burst_writes_collapse_to_one_event() {
 }
 
 #[test]
+fn sibling_file_noise_does_not_starve_the_debounce() {
+    // Only events touching settings.toml may slide the quiet window —
+    // otherwise a busy config dir (other tools' churn on sibling files)
+    // starves the reload forever. Churn a sibling well past the debounce
+    // window and confirm the event still lands on schedule.
+    let dirs = tempfile::tempdir().unwrap();
+    let path = dirs.path().join("settings.toml");
+    write(&path, "[terminal]\nshell = \"/bin/zsh\"\n");
+    let _watcher = watch_from(&path).unwrap();
+
+    // ~2 s of sibling churn — far past the 300 ms window.
+    let noise = dirs.path().join("unrelated.tmp");
+    let churn = std::thread::spawn(move || {
+        let stop = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < stop {
+            write(&noise, "x");
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
+    // Let the churn get going, then touch the target file.
+    std::thread::sleep(Duration::from_millis(100));
+    write(&path, "[terminal]\nshell = \"/bin/fish\"\n");
+
+    // The event lands ~300 ms after the write — long before the churn
+    // ends; a slide-on-anything window would starve past this bound.
+    let settings = _watcher
+        .receiver()
+        .recv_timeout(Duration::from_millis(1500))
+        .expect("sibling noise starved the debounce — no event arrived")
+        .expect("a valid edit should emit Settings");
+    assert_eq!(settings.terminal.shell.as_deref(), Some("/bin/fish"));
+    churn.join().unwrap();
+}
+
+#[test]
 fn atomic_save_via_rename_emits_settings() {
     // The editor-atomic-save landmine: write temp + rename replaces the
     // file's inode, which silences a naive file-level watch. Watching the

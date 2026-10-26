@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -167,12 +167,26 @@ fn pump(
             Ok(RawEvent::Fs(Ok(_))) => {}
         }
         // A touching event: drain the burst until the file has been quiet
-        // for DEBOUNCE — each arriving event slides the window, so a
-        // multi-write save reloads once, from the settled file.
+        // for DEBOUNCE — each *touching* event slides the window, so a
+        // multi-write save reloads once, from the settled file. Events
+        // the path filter rejects are drained without sliding: churn on
+        // sibling files in a busy config dir must not starve the reload.
+        let mut deadline = Instant::now() + DEBOUNCE;
         loop {
-            match raw_rx.recv_timeout(DEBOUNCE) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match raw_rx.recv_timeout(deadline - now) {
                 Ok(RawEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
-                Ok(RawEvent::Fs(_)) => {}
+                // A notify error may mean dropped events — resync by
+                // sliding the window like a touching event.
+                Ok(RawEvent::Fs(Err(_))) => deadline = Instant::now() + DEBOUNCE,
+                Ok(RawEvent::Fs(Ok(event))) => {
+                    if touches_file(&event, &file) {
+                        deadline = Instant::now() + DEBOUNCE;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }
