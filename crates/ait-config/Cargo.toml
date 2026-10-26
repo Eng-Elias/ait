@@ -1,0 +1,19 @@
+[package]
+name = "ait-config"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "AIT's settings.toml model: typed Settings, validation, and errors that name the offending key (REQUIREMENTS.md §4)."
+
+[dependencies]
+# Semver requirements; the resolved releases are >=7 days old per the
+# ADR-0002 supply-chain rule: serde 1.0.229 (2026-07-18), toml 1.1.8
+# (2026-10-09), serde_path_to_error 0.1.20 (2025-09-15),
+# schemars 1.2.3 (2026-10-12).
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_path_to_error = "0.1"
+# `JsonSchema` derives on the settings model back `--print-schema`
+# (REQUIREMENTS.md §4).
+schemars = "1"
+thiserror = "2"
