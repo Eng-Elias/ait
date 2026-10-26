@@ -1,0 +1,32 @@
+[package]
+name = "ait-llm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Provider abstraction: the LlmProvider trait, per-schema message IRs and streaming endpoint adapters."
+
+[dependencies]
+# Semver requirements per Spec R03; the resolved releases are >=7 days old
+# per the ADR-0002 supply-chain rule (checked 2026-10-26): tokio 1.53.3
+# (2026-10-13; 1.54.x is too fresh), reqwest 0.13.5 (2026-09-08),
+# eventsource-stream 0.2.3 (2022-02-17), tokio-util 0.7.20 (2026-10-09),
+# futures-util 0.3.34 (2026-08-11). serde/serde_json/thiserror already
+# resolve in-tree (see Cargo.lock).
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+# reqwest 0.13's default TLS stack is already rustls (platform verifier);
+# default-features = false keeps `charset`/`cookies` out — SSE bodies are
+# decoded via eventsource-stream, never .text()/.json().
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+    "http2",
+    "system-proxy",
+] }
+# The §2-decided SSE parser; the adapters' event pumps land in R03-T5.
+eventsource-stream = "0.2"
+# `tokio_util::sync::CancellationToken` — needs no feature flag.
+tokio-util = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
