@@ -98,23 +98,3 @@ async fn a_cancelled_token_short_circuits_the_request() {
         "unexpected error: {err}"
     );
 }
-
-#[tokio::test]
-async fn adapters_are_stubs_until_the_http_machinery_lands() {
-    // R03-T5 implements the request path; until then the adapter fails
-    // loudly rather than silently doing nothing.
-    let endpoint = Endpoint::new(config(EndpointSchema::OpenAiChatCompletions)).unwrap();
-    let err = endpoint
-        .stream(chat_request(), CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            LlmError::NotImplemented {
-                schema: EndpointSchema::OpenAiChatCompletions,
-            }
-        ),
-        "unexpected error: {err}"
-    );
-}

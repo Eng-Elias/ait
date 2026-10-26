@@ -40,12 +40,13 @@ pub enum LlmError {
     /// [`CancellationToken`](tokio_util::sync::CancellationToken) (us-30).
     #[error("request cancelled")]
     Cancelled,
-    /// The adapter's HTTP/SSE machinery is not implemented yet — the
-    /// R03-T5 stub sentinel.
-    #[error("the {schema} adapter is not implemented yet")]
-    NotImplemented {
-        /// The schema whose adapter was called.
-        schema: EndpointSchema,
+    /// us-33: no stream event arrived for the 60 s idle-timeout — the
+    /// server went silent mid-reply (there is no whole-request deadline,
+    /// so only silence can wedge a stream).
+    #[error("no stream event arrived for {idle:?}")]
+    StreamTimeout {
+        /// The idle bound that elapsed.
+        idle: std::time::Duration,
     },
 }
 
@@ -58,14 +59,11 @@ impl LlmError {
     /// bounded retry (R03-T5) has already consumed its attempts by then.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::StreamTimeout { .. } => true,
             Self::HttpStatus { status, .. } => {
                 *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
-            Self::Parse(_)
-            | Self::SchemaMismatch { .. }
-            | Self::Cancelled
-            | Self::NotImplemented { .. } => false,
+            Self::Parse(_) | Self::SchemaMismatch { .. } | Self::Cancelled => false,
         }
     }
 }

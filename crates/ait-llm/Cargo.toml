@@ -22,11 +22,21 @@ reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "system-proxy",
 ] }
-# The §2-decided SSE parser; the adapters' event pumps land in R03-T5.
+# The §2-decided SSE parser.
 eventsource-stream = "0.2"
 # `tokio_util::sync::CancellationToken` — needs no feature flag.
 tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `Retry-After` in HTTP-date form; already resolved in-tree at 1.0.3
+# (a 2023 release, well past the ADR-0002 cutoff) via tiny_http.
+httpdate = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+
+[dev-dependencies]
+# In-process HTTP fixture server for the contract tests (Spec R03 us-34):
+# tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002. tokio's
+# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms.
+tiny_http = "0.12"
+tokio = { version = "1", features = ["test-util"] }
