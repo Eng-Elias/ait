@@ -55,6 +55,7 @@ dependencies = [
 name = "ait-llm"
 version = "0.1.0"
 dependencies = [
+ "ait-config",
  "eventsource-stream",
  "futures-util",
  "httpdate",
@@ -2901,6 +2902,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

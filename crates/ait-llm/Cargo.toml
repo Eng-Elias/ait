@@ -35,8 +35,19 @@ serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
+# The `chat` example loads settings.toml through ait-config (Spec R03
+# us-35); ait-llm itself stays config-free.
+ait-config = { path = "../ait-config" }
 # In-process HTTP fixture server for the contract tests (Spec R03 us-34):
 # tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002. tokio's
-# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms.
+# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms;
+# `signal` lets the `chat` example wire Ctrl-C to the request's
+# CancellationToken.
 tiny_http = "0.12"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "signal"] }
+
+# `cargo test` compiles examples with the test harness so chat's pure
+# seams (arg parsing, request building, event rendering) are unit-tested.
+[[example]]
+name = "chat"
+test = true
