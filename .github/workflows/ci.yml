@@ -31,6 +31,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # ADR-0002: every Cargo.toml dep documents its resolved version +
+      # release date in a comment block.
+      - name: Dependency release-date comments
+        run: python3 scripts/check-dep-comments.py
+
   # The e2e suite (Spec E01): the real `ait` binary in a real PTY plus
   # the testkit's own PTY self-tests. Needs no TTY and no network (§6) —
   # `portable-pty` provides the terminal. Failure dumps under

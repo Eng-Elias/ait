@@ -27,8 +27,8 @@ eventsource-stream = "0.2"
 # `tokio_util::sync::CancellationToken` — needs no feature flag.
 tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# `Retry-After` in HTTP-date form; already resolved in-tree at 1.0.3
-# (a 2023 release, well past the ADR-0002 cutoff) via tiny_http.
+# `Retry-After` in HTTP-date form; resolved in-tree at httpdate 1.0.3
+# (2023-08-13) via tiny_http — well past the ADR-0002 cutoff.
 httpdate = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

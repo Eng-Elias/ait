@@ -40,7 +40,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-All three must pass before any push. CI runs the same three.
+All three must pass before any push. CI runs the same three, plus
+`scripts/check-dep-comments.py` — every `crates/*/Cargo.toml`
+dependency documents its resolved version + release date in a comment
+(ADR-0002 procedure, `docs/adr/0002`).
 `rust-toolchain.toml` pins the exact toolchain CI reads it from — bump
 it deliberately, one line per release.
 
@@ -49,6 +52,10 @@ it deliberately, one line per release.
 - Issue tracker: GitHub `Eng-Elias/ait`, via the `gh` CLI.
 - Each round of `REQUIREMENTS.md` §7 is one feature:
   grill → spec → tickets → implement → review → PR → retro.
+- A spec issue without `RNN-T*` tickets gets them created from its
+  Implementation Decisions — with blocked-by edges — before
+  implementing; a round that lands a crate flips its crate-map status
+  (and ADR-0003's table) in the same PR.
 - Naming:
   - Spec issue: `Spec RNN: <feature>` (e.g. `Spec R01: Terminal core`)
   - Ticket issues: `RNN-T<k>: <title>`
