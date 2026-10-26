@@ -20,11 +20,11 @@ We adopt the §3.1 six-crate layout unchanged:
 | Crate | Responsibility | Status |
 |---|---|---|
 | `ait-term` | PTY spawn, VT parsing, grid + scrollback, session lifecycle, OSC interception | exists (Round 1) |
-| `ait-config` | `settings.toml` model, JSON Schema emission, secrets lookup | planned (Round 3) |
-| `ait-llm` | Provider trait, per-schema message IR, streaming adapters | planned (Round 3) |
+| `ait-config` | `settings.toml` model, JSON Schema emission, secrets lookup | exists (Round 3) |
+| `ait-llm` | Provider trait, per-schema message IR, streaming adapters | exists (Round 3) |
 | `ait-shell` | Shell-integration scripts (bash/zsh/fish) and the hook/exec protocol | planned (Round 5) |
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction | planned (Round 6) |
-| `ait` | TUI binary (frontend only — no business logic) | exists (scaffold stub; terminal lands in Round 2) |
+| `ait` | TUI binary (frontend only — no business logic) | exists (Round 2 TUI; Round 3 config wiring) |
 
 The layout may still grow (e.g. `ait-store`, `ait-ssh`) — such growth gets its
 own ADR.

@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-fix02","object":"chat.completion.chunk","created":1761500100,"model":"gpt-6-astra","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_9KxV","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fix02","object":"chat.completion.chunk","created":1761500100,"model":"gpt-6-astra","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"location\":"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fix02","object":"chat.completion.chunk","created":1761500100,"model":"gpt-6-astra","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" \"SF\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fix02","object":"chat.completion.chunk","created":1761500100,"model":"gpt-6-astra","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-fix02","object":"chat.completion.chunk","created":1761500100,"model":"gpt-6-astra","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":9,"total_tokens":49}}
+
+data: [DONE]
+

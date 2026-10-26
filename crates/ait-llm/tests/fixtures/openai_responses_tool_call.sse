@@ -1,0 +1,21 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_fix02","object":"response","created_at":1761500300,"status":"in_progress","model":"gpt-6-astra","output":[],"usage":null},"sequence_number":0}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_fix01","type":"function_call","call_id":"call_fix01","name":"get_weather","arguments":"","status":"in_progress"},"sequence_number":1}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_fix01","output_index":0,"delta":"{\"location\":","sequence_number":2}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_fix01","output_index":0,"delta":" \"SF\"}","sequence_number":3}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","item_id":"fc_fix01","output_index":0,"arguments":"{\"location\": \"SF\"}","sequence_number":4}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_fix01","type":"function_call","call_id":"call_fix01","name":"get_weather","arguments":"{\"location\": \"SF\"}","status":"completed"},"sequence_number":5}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_fix02","object":"response","created_at":1761500300,"status":"completed","model":"gpt-6-astra","output":[{"id":"fc_fix01","type":"function_call","call_id":"call_fix01","name":"get_weather","arguments":"{\"location\": \"SF\"}","status":"completed"}],"usage":{"input_tokens":41,"output_tokens":8,"total_tokens":49}},"sequence_number":6}
+

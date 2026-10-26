@@ -1,0 +1,17 @@
+# Spec R03 stories 2–4: `ait --init` writes the commented default
+# settings.toml under `$XDG_CONFIG_HOME/ait/` — the harness pins XDG to
+# a fresh missing path, so the write is hermetic — prints the path it
+# wrote, and exits 0. The overwrite-refusal half needs a second
+# invocation of the same process; it lives at the cli.rs seam.
+feature = "Configurations and providers"
+size = [80, 24]
+args = ["--init"]
+
+[[steps]]
+expect_text = "wrote "
+
+[[steps]]
+expect_text = "settings.toml"
+
+[[steps]]
+expect_exit = 0

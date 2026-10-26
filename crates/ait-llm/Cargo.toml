@@ -1,0 +1,53 @@
+[package]
+name = "ait-llm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Provider abstraction: the LlmProvider trait, per-schema message IRs and streaming endpoint adapters."
+
+[dependencies]
+# Semver requirements per Spec R03; the resolved releases are >=7 days old
+# per the ADR-0002 supply-chain rule (checked 2026-10-26): tokio 1.53.3
+# (2026-10-13; 1.54.x is too fresh), reqwest 0.13.5 (2026-09-08),
+# eventsource-stream 0.2.3 (2022-02-17), tokio-util 0.7.20 (2026-10-09),
+# futures-util 0.3.34 (2026-08-11), serde 1.0.229 (2026-07-18),
+# serde_json 1.0.154 (2026-10-11), thiserror 2.0.21 (2026-09-23).
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+# reqwest 0.13's default TLS stack is already rustls (platform verifier);
+# default-features = false keeps `charset`/`cookies` out — SSE bodies are
+# decoded via eventsource-stream, never .text()/.json().
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+    "http2",
+    "system-proxy",
+] }
+# The §2-decided SSE parser.
+eventsource-stream = "0.2"
+# `tokio_util::sync::CancellationToken` — needs no feature flag.
+tokio-util = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `Retry-After` in HTTP-date form; already resolved in-tree at 1.0.3
+# (a 2023 release, well past the ADR-0002 cutoff) via tiny_http.
+httpdate = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# The `chat` example loads settings.toml through ait-config (Spec R03
+# us-35); ait-llm itself stays config-free.
+ait-config = { path = "../ait-config" }
+# In-process HTTP fixture server for the contract tests (Spec R03 us-34):
+# tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002. tokio's
+# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms;
+# `signal` lets the `chat` example wire Ctrl-C to the request's
+# CancellationToken.
+tiny_http = "0.12"
+tokio = { version = "1", features = ["test-util", "signal"] }
+
+# `cargo test` compiles examples with the test harness so chat's pure
+# seams (arg parsing, request building, event rendering) are unit-tested.
+[[example]]
+name = "chat"
+test = true
