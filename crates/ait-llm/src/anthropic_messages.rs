@@ -1,27 +1,35 @@
 //! IR and adapter for the `anthropic_messages` endpoint schema —
-//! `POST {base_url}/messages` (§4.1).
+//! `POST {base_url}/messages` (§4.1; the real API mounts it at `/v1`, so a
+//! `base_url` ending in `/v1` covers both hosted and compatible servers).
 //!
-//! The types serialize to the wire shape directly: the adapter (HTTP lands
-//! in R03-T5) only has to `serde_json::to_vec` the [`Request`] and decode
-//! SSE `content_block_*`/`message_*` events into [`StreamEvent`]s.
-
-use std::future::Future;
+//! The types serialize to the wire shape directly: the adapter serializes
+//! the [`Request`], forces `stream` on and decodes named
+//! `content_block_*`/`message_*` SSE events into [`StreamEvent`]s — there
+//! is no `[DONE]` marker; `message_stop` ends the stream.
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::EventStream;
-use crate::{EndpointConfig, EndpointSchema, LlmError, LlmProvider};
+use crate::{http, EndpointConfig, EndpointSchema, LlmError, LlmProvider};
+
+/// The API version sent on `anthropic-version`. Newer versions remove
+/// `temperature`/`top_p`/`top_k`; `2023-06-01` is what the documented
+/// examples use and matches the SSE event format decoded here — bump
+/// deliberately, with the wire format.
+const API_VERSION: &str = "2023-06-01";
 
 /// The `anthropic_messages` adapter (us-26).
 ///
-/// Holds the shared HTTP client and endpoint config; the request path —
-/// `x-api-key` + `anthropic-version` headers, SSE decode, retry — lands in
-/// R03-T5. Until then [`stream`](LlmProvider::stream) fails with
-/// [`LlmError::NotImplemented`] (or [`LlmError::Cancelled`] when cancelled).
+/// `x-api-key` (not `Authorization`) plus `anthropic-version` are sent
+/// when the endpoint has a secret — `x-api-key` omitted entirely when it
+/// doesn't (us-21); `anthropic-version` is protocol, always sent. Retry
+/// and timeout policy lives in `crate::http`.
 pub struct Provider {
-    /// The shared client; T5's request path uses it.
+    /// The shared client (10 s connect timeout, no total deadline, us-33).
     client: reqwest::Client,
+    /// The bounded-retry policy — injectable for tests.
+    retry: http::Retry,
     /// The endpoint configuration this adapter was built from.
     config: EndpointConfig,
 }
@@ -30,8 +38,16 @@ impl Provider {
     /// Build the adapter for one endpoint+model pair — normally reached via
     /// [`Endpoint::new`](crate::Endpoint::new), the single construction path.
     pub fn new(config: EndpointConfig) -> Result<Self, LlmError> {
+        Self::with_retry(config, http::Retry::default())
+    }
+
+    /// Build the adapter with an explicit retry policy — the internal
+    /// seam contract tests use to compress backoff, not settings surface.
+    #[doc(hidden)]
+    pub fn with_retry(config: EndpointConfig, retry: http::Retry) -> Result<Self, LlmError> {
         Ok(Self {
             client: crate::endpoint::shared_client()?,
+            retry,
             config,
         })
     }
@@ -39,6 +55,26 @@ impl Provider {
     /// The endpoint configuration this adapter was built from.
     pub fn config(&self) -> &EndpointConfig {
         &self.config
+    }
+
+    /// `POST {base_url}/messages`; `x-api-key` only when a secret is
+    /// configured (us-21), `anthropic-version` always.
+    fn build_request(&self, request: &Request) -> Result<reqwest::Request, LlmError> {
+        let mut body = serde_json::to_value(request)
+            .map_err(|e| LlmError::Parse(format!("failed to serialize request: {e}")))?;
+        if let Some(object) = body.as_object_mut() {
+            object.insert("stream".into(), true.into());
+        }
+        let mut builder = self
+            .client
+            .post(http::url(&self.config.base_url, "messages"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("anthropic-version", API_VERSION)
+            .body(body.to_string());
+        if let Some(secret) = &self.config.secret {
+            builder = builder.header("x-api-key", secret);
+        }
+        builder.build().map_err(LlmError::Transport)
     }
 }
 
@@ -50,21 +86,21 @@ impl LlmProvider for Provider {
         EndpointSchema::AnthropicMessages
     }
 
-    fn stream(
+    async fn stream(
         &self,
-        _request: Request,
+        request: Request,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<EventStream<StreamEvent>, LlmError>> + Send {
-        // R03-T5 stub: fail loudly rather than silently doing nothing.
-        let _ = &self.client;
-        async move {
-            if cancel.is_cancelled() {
-                return Err(LlmError::Cancelled);
-            }
-            Err(LlmError::NotImplemented {
-                schema: EndpointSchema::AnthropicMessages,
-            })
+    ) -> Result<EventStream<StreamEvent>, LlmError> {
+        if cancel.is_cancelled() {
+            return Err(LlmError::Cancelled);
         }
+        let http_request = self.build_request(&request)?;
+        let response =
+            http::send_with_retry(&self.client, &http_request, &self.retry, &cancel).await?;
+        let mut decoder = Decoder::default();
+        Ok(http::sse_stream(response, cancel, move |event| {
+            decoder.decode(event)
+        }))
     }
 }
 
@@ -233,4 +269,126 @@ pub struct Usage {
     /// Output tokens billed, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+}
+
+// ---- SSE decode (wire → IR) ----
+
+/// Stateful event → [`StreamEvent`] decoder.
+///
+/// `input_tokens` is reported once at `message_start` while
+/// `output_tokens` arrives (cumulative) on `message_delta`, so the decoder
+/// holds the input count to attach to `Finish`. Unknown event and delta
+/// types (`ping`, `thinking_delta`, `citations_delta`, …) are skipped —
+/// the API's versioning policy adds them over time.
+#[derive(Default)]
+struct Decoder {
+    /// `message_start.usage.input_tokens`, held for `Finish`.
+    input_tokens: Option<u64>,
+}
+
+impl Decoder {
+    /// Decode one SSE frame (`None` = the body ended — no state to flush;
+    /// `message_stop` is what marks the end, not EOF).
+    fn decode(&mut self, event: Option<eventsource_stream::Event>) -> http::Decoded<StreamEvent> {
+        let Some(event) = event else {
+            return http::Decoded::over(vec![]);
+        };
+        if event.data.trim() == "[DONE]" {
+            return http::Decoded::over(vec![]);
+        }
+        let value = match serde_json::from_str::<serde_json::Value>(&event.data) {
+            Ok(value) => value,
+            Err(e) => {
+                return http::Decoded::over(vec![Err(LlmError::Parse(format!(
+                    "invalid anthropic event: {e}"
+                )))])
+            }
+        };
+        let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let text = |path: &str| {
+            value
+                .pointer(path)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        let index = || {
+            value
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_default() as u32
+        };
+        match kind {
+            "message_start" => {
+                self.input_tokens = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(|v| v.as_u64());
+                http::Decoded::more(vec![])
+            }
+            // `id` + `name` arrive complete in the start event; only the
+            // arguments stream afterwards (us-29).
+            "content_block_start"
+                if value
+                    .pointer("/content_block/type")
+                    .and_then(|t| t.as_str())
+                    == Some("tool_use") =>
+            {
+                http::Decoded::more(vec![Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
+                    index: index(),
+                    id: text("/content_block/id"),
+                    name: text("/content_block/name"),
+                    arguments: String::new(),
+                }))])
+            }
+            "content_block_delta" => match value.pointer("/delta/type").and_then(|t| t.as_str()) {
+                Some("text_delta") => http::Decoded::more(vec![Ok(StreamEvent::TextDelta {
+                    text: text("/delta/text").unwrap_or_default(),
+                })]),
+                Some("input_json_delta") => {
+                    http::Decoded::more(vec![Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
+                        index: index(),
+                        id: None,
+                        name: None,
+                        arguments: text("/delta/partial_json").unwrap_or_default(),
+                    }))])
+                }
+                _ => http::Decoded::more(vec![]),
+            },
+            // `delta.stop_reason` is the finish; `usage.output_tokens` is
+            // cumulative. A message_delta without a stop reason carries
+            // bookkeeping only.
+            "message_delta" => match text("/delta/stop_reason") {
+                Some(reason) => http::Decoded::more(vec![Ok(StreamEvent::Finish {
+                    reason: finish_reason(&reason),
+                    usage: Some(Usage {
+                        input_tokens: self.input_tokens,
+                        output_tokens: value
+                            .pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64()),
+                    }),
+                })]),
+                None => http::Decoded::more(vec![]),
+            },
+            "message_stop" => http::Decoded::over(vec![]),
+            // Mid-stream errors (e.g. `overloaded_error` after the 200)
+            // are provider-reported events — data, not machinery failure.
+            "error" => http::Decoded::over(vec![Ok(StreamEvent::Error {
+                message: text("/error/message").unwrap_or_default(),
+                code: text("/error/type"),
+            })]),
+            _ => http::Decoded::more(vec![]),
+        }
+    }
+}
+
+/// Wire `stop_reason` → [`FinishReason`]; unknown strings (newer models
+/// add values) degrade to `EndTurn` rather than failing the stream.
+fn finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "max_tokens" => FinishReason::MaxTokens,
+        "stop_sequence" => FinishReason::StopSequence,
+        "tool_use" => FinishReason::ToolUse,
+        "pause_turn" => FinishReason::PauseTurn,
+        "refusal" => FinishReason::Refusal,
+        _ => FinishReason::EndTurn,
+    }
 }

@@ -48,16 +48,18 @@ fn http_status_carries_the_code_and_a_body_excerpt() {
 }
 
 #[test]
-fn parse_and_cancelled_are_terminal() {
+fn stream_timeout_is_retryable_but_parse_and_cancelled_are_terminal() {
+    // us-33's idle-timeout is a wedged connection — transient like a
+    // transport error; the caller may re-issue.
+    assert!(LlmError::StreamTimeout {
+        idle: std::time::Duration::from_secs(60),
+    }
+    .is_retryable());
     assert!(!LlmError::Parse("bad frame".into()).is_retryable());
     assert!(!LlmError::Cancelled.is_retryable());
     assert!(!LlmError::SchemaMismatch {
         endpoint: EndpointSchema::OpenAiResponses,
         request: EndpointSchema::OpenAiChatCompletions,
-    }
-    .is_retryable());
-    assert!(!LlmError::NotImplemented {
-        schema: EndpointSchema::AnthropicMessages,
     }
     .is_retryable());
 }

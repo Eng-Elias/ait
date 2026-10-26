@@ -14,13 +14,17 @@
 //! [`tokio_util::sync::CancellationToken`] per request (us-30).
 //!
 //! `tokio` stays inside this crate — `ait` and `ait-term` remain
-//! synchronous (ADR-0004, Spec R03). The HTTP/SSE machinery lands in
-//! R03-T5: the adapters are built and dispatched now, but `stream` returns
-//! [`LlmError::NotImplemented`] until then.
+//! synchronous (ADR-0004, Spec R03). The adapters run real HTTP+SSE:
+//! `reqwest` requests with per-schema auth (omitted entirely without a
+//! secret, us-21), bounded retry on 429/5xx/transport errors honoring
+//! `Retry-After` (us-31), a 10 s connect timeout plus a 60 s stream
+//! idle-timeout with no whole-request deadline (us-33), and cancellation
+//! via a per-request [`tokio_util::sync::CancellationToken`] (us-30).
 
 pub mod anthropic_messages;
 mod endpoint;
 mod error;
+mod http;
 pub mod openai_chat_completions;
 pub mod openai_responses;
 mod provider;
@@ -30,3 +34,10 @@ pub use endpoint::{
 };
 pub use error::LlmError;
 pub use provider::{EventStream, LlmProvider};
+
+/// Internal seams exposed for the crate's contract tests — not public
+/// API and subject to change without notice.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::http::Retry;
+}
