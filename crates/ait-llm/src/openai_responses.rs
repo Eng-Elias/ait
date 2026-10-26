@@ -1,27 +1,28 @@
 //! IR and adapter for the `openai_responses` endpoint schema —
 //! `POST {base_url}/responses` (§4.1).
 //!
-//! The types serialize to the wire shape directly: the adapter (HTTP lands
-//! in R03-T5) only has to `serde_json::to_vec` the [`Request`] and decode
-//! SSE `response.*` events into [`StreamEvent`]s.
-
-use std::future::Future;
+//! The types serialize to the wire shape directly: the adapter serializes
+//! the [`Request`], forces `stream`/`store` on and decodes named
+//! `response.*` SSE events into [`StreamEvent`]s. The `ResponseStreamEvent`
+//! union has dozens of variants — the adapter reads the ones it needs and
+//! skips the rest, so new event types never break it.
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::EventStream;
-use crate::{EndpointConfig, EndpointSchema, LlmError, LlmProvider};
+use crate::{http, EndpointConfig, EndpointSchema, LlmError, LlmProvider};
 
 /// The `openai_responses` adapter (us-26).
 ///
-/// Holds the shared HTTP client and endpoint config; the request path —
-/// `Authorization: Bearer <secret>`, SSE decode, retry — lands in R03-T5.
-/// Until then [`stream`](LlmProvider::stream) fails with
-/// [`LlmError::NotImplemented`] (or [`LlmError::Cancelled`] when cancelled).
+/// `Authorization: Bearer <secret>` is sent when the endpoint has a
+/// secret, and no auth header at all when it doesn't (us-21). Retry and
+/// timeout policy lives in `crate::http`.
 pub struct Provider {
-    /// The shared client; T5's request path uses it.
+    /// The shared client (10 s connect timeout, no total deadline, us-33).
     client: reqwest::Client,
+    /// The bounded-retry policy — injectable for tests.
+    retry: http::Retry,
     /// The endpoint configuration this adapter was built from.
     config: EndpointConfig,
 }
@@ -30,8 +31,16 @@ impl Provider {
     /// Build the adapter for one endpoint+model pair — normally reached via
     /// [`Endpoint::new`](crate::Endpoint::new), the single construction path.
     pub fn new(config: EndpointConfig) -> Result<Self, LlmError> {
+        Self::with_retry(config, http::Retry::default())
+    }
+
+    /// Build the adapter with an explicit retry policy — the internal
+    /// seam contract tests use to compress backoff, not settings surface.
+    #[doc(hidden)]
+    pub fn with_retry(config: EndpointConfig, retry: http::Retry) -> Result<Self, LlmError> {
         Ok(Self {
             client: crate::endpoint::shared_client()?,
+            retry,
             config,
         })
     }
@@ -39,6 +48,28 @@ impl Provider {
     /// The endpoint configuration this adapter was built from.
     pub fn config(&self) -> &EndpointConfig {
         &self.config
+    }
+
+    /// `POST {base_url}/responses`; `Authorization: Bearer` only when a
+    /// secret is configured (us-21).
+    fn build_request(&self, request: &Request) -> Result<reqwest::Request, LlmError> {
+        let mut body = serde_json::to_value(request)
+            .map_err(|e| LlmError::Parse(format!("failed to serialize request: {e}")))?;
+        if let Some(object) = body.as_object_mut() {
+            // Streaming is the adapter's wire detail; `store: false` keeps
+            // responses stateless (no server-side retention).
+            object.insert("stream".into(), true.into());
+            object.insert("store".into(), false.into());
+        }
+        let mut builder = self
+            .client
+            .post(http::url(&self.config.base_url, "responses"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        if let Some(secret) = &self.config.secret {
+            builder = builder.bearer_auth(secret);
+        }
+        builder.build().map_err(LlmError::Transport)
     }
 }
 
@@ -50,21 +81,18 @@ impl LlmProvider for Provider {
         EndpointSchema::OpenAiResponses
     }
 
-    fn stream(
+    async fn stream(
         &self,
-        _request: Request,
+        request: Request,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<EventStream<StreamEvent>, LlmError>> + Send {
-        // R03-T5 stub: fail loudly rather than silently doing nothing.
-        let _ = &self.client;
-        async move {
-            if cancel.is_cancelled() {
-                return Err(LlmError::Cancelled);
-            }
-            Err(LlmError::NotImplemented {
-                schema: EndpointSchema::OpenAiResponses,
-            })
+    ) -> Result<EventStream<StreamEvent>, LlmError> {
+        if cancel.is_cancelled() {
+            return Err(LlmError::Cancelled);
         }
+        let http_request = self.build_request(&request)?;
+        let response =
+            http::send_with_retry(&self.client, &http_request, &self.retry, &cancel).await?;
+        Ok(http::sse_stream(response, cancel, decode))
     }
 }
 
@@ -264,4 +292,114 @@ pub struct Usage {
     pub output_tokens: u64,
     /// Total tokens billed.
     pub total_tokens: u64,
+}
+
+// ---- SSE decode (wire → IR) ----
+
+/// The `response.usage` wire shape nested inside `response.completed` /
+/// `response.incomplete` / `response.failed` payloads.
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    /// Input tokens billed.
+    #[serde(default)]
+    input_tokens: u64,
+    /// Output tokens billed.
+    #[serde(default)]
+    output_tokens: u64,
+    /// Total tokens billed.
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+/// Stateless envelope → [`StreamEvent`] decoder: every payload carries its
+/// `type` (which doubles as the SSE `event:` name), so one `serde_json`
+/// document drives dispatch. Unknown `type`s — the union grows — are
+/// skipped, never fatal (`None` input means the body ended; there is no
+/// held state to flush).
+fn decode(event: Option<eventsource_stream::Event>) -> http::Decoded<StreamEvent> {
+    let Some(event) = event else {
+        return http::Decoded::over(vec![]);
+    };
+    if event.data.trim() == "[DONE]" {
+        return http::Decoded::over(vec![]);
+    }
+    let value = match serde_json::from_str::<serde_json::Value>(&event.data) {
+        Ok(value) => value,
+        Err(e) => {
+            return http::Decoded::over(vec![Err(LlmError::Parse(format!(
+                "invalid responses event: {e}"
+            )))])
+        }
+    };
+    let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let text = |path: &str| {
+        value
+            .pointer(path)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    let usage = || {
+        value
+            .pointer("/response/usage")
+            .and_then(|v| serde_json::from_value::<WireUsage>(v.clone()).ok())
+            .map(|u| Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                total_tokens: u.total_tokens,
+            })
+    };
+    match kind {
+        "response.output_text.delta" => http::Decoded::more(vec![Ok(StreamEvent::TextDelta {
+            text: text("/delta").unwrap_or_default(),
+        })]),
+        // `call_id` + `name` arrive complete on the announced item; only
+        // `arguments` stream afterwards (us-29).
+        "response.output_item.added"
+            if value.pointer("/item/type").and_then(|t| t.as_str()) == Some("function_call") =>
+        {
+            http::Decoded::more(vec![Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
+                item_id: text("/item/id"),
+                call_id: text("/item/call_id"),
+                name: text("/item/name"),
+                arguments: String::new(),
+            }))])
+        }
+        "response.function_call_arguments.delta" => {
+            http::Decoded::more(vec![Ok(StreamEvent::ToolCallDelta(ToolCallDelta {
+                item_id: text("/item_id"),
+                call_id: None,
+                name: None,
+                arguments: text("/delta").unwrap_or_default(),
+            }))])
+        }
+        "response.completed" => http::Decoded::over(vec![Ok(StreamEvent::Finish {
+            reason: FinishReason::Completed,
+            usage: usage(),
+        })]),
+        "response.incomplete" => http::Decoded::over(vec![Ok(StreamEvent::Finish {
+            reason: FinishReason::Incomplete,
+            usage: usage(),
+        })]),
+        // A failed response carries both an error payload and a terminal
+        // status — emit both so callers see the reason and the end.
+        "response.failed" => http::Decoded::over(vec![
+            Ok(StreamEvent::Error {
+                message: text("/response/error/message").unwrap_or_default(),
+                code: text("/response/error/code"),
+            }),
+            Ok(StreamEvent::Finish {
+                reason: FinishReason::Failed,
+                usage: usage(),
+            }),
+        ]),
+        "response.error" => http::Decoded::more(vec![Ok(StreamEvent::Error {
+            message: text("/message").unwrap_or_default(),
+            code: text("/code"),
+        })]),
+        // `response.created`, `response.in_progress`, `content_part.*`,
+        // `output_text.done`, `output_item.done` (non-tool items),
+        // `function_call_arguments.done` (fragments already streamed),
+        // unknown future events: nothing to surface.
+        _ => http::Decoded::more(vec![]),
+    }
 }

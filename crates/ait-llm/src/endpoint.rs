@@ -88,8 +88,7 @@ pub enum Endpoint {
 impl Endpoint {
     /// Build the adapter matching `config.schema`.
     ///
-    /// Fails only if the shared HTTP client cannot be built — the request
-    /// path itself lands in R03-T5.
+    /// Fails only if the shared HTTP client cannot be built.
     pub fn new(config: EndpointConfig) -> Result<Self, LlmError> {
         Ok(match config.schema {
             EndpointSchema::OpenAiChatCompletions => {
@@ -174,7 +173,7 @@ impl EndpointRequest {
 
 /// What [`Endpoint::stream`] hands back: the schema-matched event stream.
 ///
-/// `match` on it to consume the schema-specific [`StreamEvent`]s directly —
+/// `match` on it to consume the schema-specific `StreamEvent`s directly —
 /// or use it as a single [`Stream`] of tagged [`EndpointStreamEvent`]s.
 pub enum EndpointStream {
     /// An `openai_chat_completions` event stream.
@@ -232,9 +231,9 @@ impl Stream for EndpointStream {
 
 /// The HTTP client shared by every adapter.
 ///
-/// Spec R03 us-33: a 10 s connect timeout, a stream idle-timeout enforced
-/// at the event pump (R03-T5) — and deliberately no whole-request deadline
-/// so long generations are never killed.
+/// Spec R03 us-33: a 10 s connect timeout, a 60 s stream idle-timeout
+/// enforced at the event pump (`crate::http`) — and deliberately no
+/// whole-request deadline so long generations are never killed.
 pub(crate) fn shared_client() -> Result<reqwest::Client, LlmError> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
