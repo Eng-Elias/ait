@@ -26,6 +26,7 @@ dependencies = [
 name = "ait"
 version = "0.1.0"
 dependencies = [
+ "ait-agent",
  "ait-config",
  "ait-term",
  "ait-testkit",
