@@ -39,8 +39,13 @@ dependencies = [
 name = "ait-agent"
 version = "0.1.0"
 dependencies = [
+ "ait-config",
  "ait-llm",
+ "futures-util",
  "regex",
+ "tiny_http",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
