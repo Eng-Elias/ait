@@ -3,14 +3,35 @@ name = "ait-agent"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command pure seams — §5.10.3 credential redaction, context assembly and reply sanitization; the CommandSuggester, tool registry, agent loop and permission engine arrive in later tickets."
+description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; the tool registry, agent loop and permission engine arrive in later tickets."
 
 [dependencies]
-# Semver requirement; the resolved release is >=7 days old per the
+# Semver requirements; the resolved releases are >=7 days old per the
 # ADR-0002 supply-chain rule: regex 1.13.1 (2026-07-15) backs the
-# compiled-once credential pattern set behind `redact` (§5.10.3).
+# compiled-once credential pattern set behind `redact` (§5.10.3);
+# tokio 1.53.3 (2026-10-13; 1.54.x is too fresh) — the current-thread
+# runtime on CommandSuggester's worker thread, `rt` + `time` being the
+# minimal feature set it needs (ADR-0004: tokio lives here, never in
+# `ait`; the adapters' timers want the `time` driver); tokio-util
+# 0.7.20 (2026-10-09) — `sync::CancellationToken` for `Endpoint::stream`,
+# needs no feature flag and is NOT re-exported by ait-llm;
+# futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`.
 regex = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+tokio-util = "0.7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `Settings::resolve_model`, `ModelRole::Command`, `OsKeyring` /
+# `SecretStore` — per-request model resolution with the command_model →
+# base_model fallback (§4.2); the caller hands Settings in, the
+# suggester never reads settings.toml.
+ait-config = { path = "../ait-config" }
 # Context assembly returns ait-llm's `EndpointRequest` — the
 # schema-matched IR `Endpoint::stream` accepts — so T3's
 # `CommandSuggester` passes assembled requests through unchanged.
 ait-llm = { path = "../ait-llm" }
+
+[dev-dependencies]
+# In-process HTTP fixture server for the CommandSuggester integration
+# tests (Spec R04 testing decisions) — a copy of ait-llm's contract-test
+# harness: tiny_http 0.12.0 (2022-10-06), >=7 days old per ADR-0002.
+tiny_http = "0.12"
