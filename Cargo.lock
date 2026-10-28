@@ -36,6 +36,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ait-agent"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "ait-config"
 version = "0.1.0"
 dependencies = [
