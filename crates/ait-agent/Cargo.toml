@@ -3,10 +3,14 @@ name = "ait-agent"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.10.3 credential-redaction seam guarding terminal output bound for a provider; tool registry, agent loop and permission engine arrive in Round 6."
+description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command pure seams — §5.10.3 credential redaction, context assembly and reply sanitization; the CommandSuggester, tool registry, agent loop and permission engine arrive in later tickets."
 
 [dependencies]
 # Semver requirement; the resolved release is >=7 days old per the
 # ADR-0002 supply-chain rule: regex 1.13.1 (2026-07-15) backs the
 # compiled-once credential pattern set behind `redact` (§5.10.3).
 regex = "1"
+# Context assembly returns ait-llm's `EndpointRequest` — the
+# schema-matched IR `Endpoint::stream` accepts — so T3's
+# `CommandSuggester` passes assembled requests through unchanged.
+ait-llm = { path = "../ait-llm" }
