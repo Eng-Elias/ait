@@ -46,3 +46,27 @@ deliberate.
   `alacritty_terminal` features we do not need.
 - `portable-pty` remains the PTY layer; no conflict since the emulator's own
   I/O modules are unused.
+
+## Applying the release-age rule (added in the R03 retro)
+
+The rule generalised to every crate in the tree: **every resolved
+dependency release must be ≥7 days old at adoption time**, and every
+`crates/*/Cargo.toml` entry documents its resolved version + release
+date (`name X.Y.Z (YYYY-MM-DD)`) in its comment block — one shared block
+may cover several entries. `scripts/check-dep-comments.py` enforces the
+comment; CI's `check` job runs it.
+
+Procedure when adding or upgrading a dependency:
+
+1. Add a semver requirement (or an `=` pin where the ADR calls for one).
+2. Build; check `Cargo.lock`'s resolved version and that release's date
+   on crates.io (`https://crates.io/api/v1/crates/<name>/<version>`,
+   `created_at`).
+3. If the resolved release is younger than 7 days, roll back to the
+   newest release that qualifies:
+   `cargo update -p <crate> --precise <version>` — the requirement stays
+   semver, the lockfile carries the older release. This happens in
+   practice (tokio, notify and uuid all needed it in R03); it is the
+   normal path, not an exception.
+4. Write the resolved version + release date into the `Cargo.toml`
+   comment block.

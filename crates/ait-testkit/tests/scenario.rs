@@ -52,7 +52,7 @@ wait_text = "MARKER"
 expect_text = "MARKER"
 
 [[steps]]
-text = "printf 'A\\tB'; exit"
+text = "printf 'A\\tB\\n'"
 
 [[steps]]
 keys = ["Enter"]
@@ -61,10 +61,19 @@ keys = ["Enter"]
 expect_regex = "(?m)^A\\t\\s*B$"
 
 [[steps]]
-expect_cursor = [3, 9]
+expect_cursor = [4, 2]
+
+[[steps]]
+text = "exit"
+
+[[steps]]
+keys = ["Enter"]
+
+[[steps]]
+expect_exit = 0
 "#);
-    // `printf` left the cursor right of `B` (tab → column 8); `exit`
-    // then ended the shell mid-scenario.
+    // `printf` left the cursor on the next row's `$ ` prompt (the `\n`
+    // wrapped it past `B`); `exit` then ended the shell mid-scenario.
     let status = app.wait_for_exit();
     assert!(status.success());
 }

@@ -382,12 +382,25 @@ impl E2e {
             if pred(self) {
                 return;
             }
-            if let Some(status) = &self.exited {
-                panic!(
-                    "waiting for {description}: the program exited ({status:?})\n\
-                     --- screen ---\n{}",
-                    self.screen_text()
-                );
+            if let Some(status) = self.exited.clone() {
+                // The exit event can fire while the reader thread still
+                // holds the child's final output — a command that prints
+                // and dies instantly would otherwise flake the wait on a
+                // grid that is one drain behind. Give the reader a short
+                // grace window to land the tail before failing.
+                let grace = Instant::now() + Duration::from_millis(500);
+                while !pred(self) && Instant::now() < grace {
+                    self.pump();
+                    std::thread::sleep(WAIT_POLL);
+                }
+                if !pred(self) {
+                    panic!(
+                        "waiting for {description}: the program exited ({status:?})\n\
+                         --- screen ---\n{}",
+                        self.screen_text()
+                    );
+                }
+                return;
             }
             assert!(
                 Instant::now() < deadline,
