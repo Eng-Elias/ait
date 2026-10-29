@@ -1,7 +1,9 @@
-//! The `# `+Enter trigger (Spec R04 — user stories 1–2, 13–17, 29):
-//! detection and context-collection glue only. The model call lives in
-//! `ait-agent` (CODING_STANDARDS §9 — the TUI holds no business logic);
-//! streaming the reply into the input line is T5.
+//! The `# `+Enter and `Alt+Enter` triggers (Spec R04 — user stories
+//! 1–2, 11–17, 29): detection and context-collection glue only. The
+//! model call lives in `ait-agent` (CODING_STANDARDS §9 — the TUI
+//! holds no business logic); streaming the reply into the input line
+//! is T5, and `Alt+Enter`'s keymap binding plus line-erase dispatch
+//! live in `app` (T6).
 //!
 //! Detection has two halves:
 //!
@@ -13,7 +15,9 @@
 //!   fires only when the shadow starts with `# ` AND the grid's
 //!   current logical line (the cursor row walked over soft-wrap
 //!   boundaries, [`logical_line`]) ENDS WITH it: the shell really
-//!   echoed the request (user story 13).
+//!   echoed the request (user story 13). `Alt+Enter` runs the same
+//!   check via [`InputShadow::verified_line`], minus the `# `
+//!   requirement — the whole verified line is the request (us-11).
 //!
 //! Honesty rules: anything the shadow cannot replay — arrows (history
 //! recall, mid-line editing), control characters, editing keys,
@@ -166,6 +170,28 @@ impl InputShadow {
             .ends_with(shadow)
             .then(|| request.to_owned())
     }
+
+    /// The verified input line for the `Alt+Enter` trigger (us-11):
+    /// `Some` only when the shadow is in sync, non-empty, and
+    /// `logical_line` ENDS WITH it — the same echo-agreement check
+    /// [`request_text`](Self::request_text) runs, minus the `# `
+    /// prefix requirement. The returned text is the whole line —
+    /// a `# ` line keeps its prefix, because here the line itself
+    /// is the request (us-19). An empty, whitespace-only, stale or
+    /// unverifiable line returns `None`: desync is inert.
+    pub fn verified_line(&self, logical_line: &str) -> Option<String> {
+        if self.is_stale() {
+            return None;
+        }
+        let line = self.text().trim_end();
+        if line.is_empty() {
+            return None;
+        }
+        logical_line
+            .trim_end()
+            .ends_with(line)
+            .then(|| line.to_owned())
+    }
 }
 
 /// Whether `event` submits the input line: an Enter key whose encoding
@@ -242,26 +268,44 @@ fn cwd_for(tab: &Tab) -> String {
     tab.cwd().display().to_string()
 }
 
-/// The verified `# ` request for `tab` with its §5.4 context, or
-/// `None` — the trigger seam in one call (us-13, 29). On `Some` the
-/// caller forwards Enter to the PTY normally (us-2) and sends the
-/// returned [`SuggestRequest`] into the `CommandSuggester`; on `None`
-/// nothing about the keypress changes.
-pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
-    let grid = tab.grid();
-    let request = tab
-        .shadow
-        .request_text(&logical_line(&grid, tab.cursor()))?;
-    Some(SuggestRequest {
+/// The §5.4 context bundle around a verified `request` — the tail
+/// [`request_for`] and [`line_request_for`] share (us-15–17, 23).
+fn assemble(tab: &Tab, settings: &Settings, request: String) -> SuggestRequest {
+    SuggestRequest {
         settings: settings.clone(),
         cwd: cwd_for(tab),
         // The spawned program's basename — the same source of truth
         // the tab title uses (us-17).
         shell: tab.title().to_owned(),
         os: std::env::consts::OS.to_owned(),
-        output_lines: recent_output_lines(&grid),
+        output_lines: recent_output_lines(&tab.grid()),
         request,
-    })
+    }
+}
+
+/// The verified `# ` request for `tab` with its §5.4 context, or
+/// `None` — the trigger seam in one call (us-13, 29). On `Some` the
+/// caller forwards Enter to the PTY normally (us-2) and sends the
+/// returned [`SuggestRequest`] into the `CommandSuggester`; on `None`
+/// nothing about the keypress changes.
+pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+    let request = tab
+        .shadow
+        .request_text(&logical_line(&tab.grid(), tab.cursor()))?;
+    Some(assemble(tab, settings, request))
+}
+
+/// The verified `Alt+Enter` request for `tab` — the WHOLE input line
+/// as the request (us-11; no `# ` prefix needed) — with the same §5.4
+/// context [`request_for`] assembles. On `Some` the caller erases the
+/// typed line (us-12) and runs the shared request → stream → insert
+/// path; `None` (bare, empty, stale or unverifiable) changes nothing —
+/// the desync-is-inert rule (us-13).
+pub fn line_request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+    let request = tab
+        .shadow
+        .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
+    Some(assemble(tab, settings, request))
 }
 
 #[cfg(test)]
@@ -459,6 +503,36 @@ mod tests {
         );
     }
 
+    /// The `Alt+Enter` half of the trigger seam (us-11): any verified
+    /// input line is the request — no `# ` prefix needed, and a `# `
+    /// line comes through VERBATIM (the whole line is the request).
+    #[test]
+    fn verified_line_fires_on_a_bare_line() {
+        assert_eq!(
+            typed("how do I undo a commit").verified_line("$ how do I undo a commit"),
+            Some("how do I undo a commit".to_string())
+        );
+        // `# ` is NOT stripped on this path — the whole line asks.
+        assert_eq!(
+            typed("# list files").verified_line("$ # list files"),
+            Some("# list files".to_string())
+        );
+    }
+
+    /// Empty and whitespace-only lines, stale shadows, and grid
+    /// disagreement all refuse — the desync-is-inert rule (us-12/13).
+    #[test]
+    fn verified_line_rejects_empty_stale_and_desynced() {
+        assert_eq!(typed("").verified_line("$ "), None);
+        assert_eq!(typed("   ").verified_line("$    "), None);
+        let mut stale = typed("undo a commit");
+        stale.update(&KeyEvent::new(Key::Up, Modifiers::NONE));
+        assert_eq!(stale.verified_line("$ undo a commit"), None);
+        // The echoed line must END WITH the shadow (us-13).
+        assert_eq!(typed("undo a commit").verified_line("$ make install"), None);
+        assert_eq!(typed("undo a commit").verified_line(">>> print(1)"), None);
+    }
+
     /// Context lines: scrollback + viewport, end-trimmed, trailing
     /// blanks dropped, capped at [`OUTPUT_LINE_BUDGET`] (us-16).
     #[test]
@@ -622,5 +696,64 @@ mod tests {
                 .any(|line| line.ends_with("# list files")),
             "the echoed request line is part of the output tail"
         );
+    }
+
+    /// The `Alt+Enter` trigger bundle (us-11): a bare line echoed by a
+    /// real `/bin/sh` produces a `SuggestRequest` whose request is the
+    /// WHOLE line verbatim — the same §5.4 context `request_for`
+    /// assembles.
+    #[test]
+    fn line_request_for_collects_the_whole_line() {
+        use crate::tabs::TabManager;
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            LiveSessionOptions {
+                program: Some(OsString::from("/bin/sh")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if !logical_line(&tab.grid(), tab.cursor()).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"undo the last commit")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if logical_line(&tab.grid(), tab.cursor()).ends_with("undo the last commit") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Stage the shadow as `handle_event` would have.
+        {
+            let tab = tabs.active_mut().unwrap();
+            for c in "undo the last commit".chars() {
+                tab.shadow.update(&char_key(c));
+            }
+        }
+
+        let settings = Settings::default();
+        let request = line_request_for(tabs.active().unwrap(), &settings).expect("must fire");
+
+        assert_eq!(request.request, "undo the last commit");
+        assert_eq!(request.shell, "sh");
+        assert_eq!(request.os, std::env::consts::OS);
+        assert!(!request.cwd.is_empty());
+        assert_eq!(request.settings, settings);
     }
 }

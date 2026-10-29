@@ -54,6 +54,10 @@ pub enum AppAction {
     NextTab,
     /// Jump to tab N (`Alt+1..=9`, 1-based).
     JumpToTab(usize),
+    /// Treat the current input line as a command request — the Spec R04
+    /// `Alt+Enter` trigger (`ESC CR` vs `CR` is byte-distinct in both
+    /// tiers; ADR-0005).
+    SuggestCommand,
 }
 
 /// The keymap's verdict for one key event.
@@ -201,6 +205,16 @@ const BINDINGS: &[Binding] = &[
         modifiers: ALT,
         enhanced_only: false,
         action: AppAction::Quit,
+    },
+    // Spec R04 `Alt+Enter` trigger — both tiers: `ESC CR` is distinct
+    // from Enter's `CR` on every host (the legacy Alt-prefix and the
+    // kitty modifier report agree), and the chord is unbound in default
+    // readline, so the binding steals no shell input.
+    Binding {
+        code: KeyCode::Enter,
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::SuggestCommand,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
@@ -396,6 +410,18 @@ mod tests {
                 KeyModifiers::SHIFT | KeyModifiers::CONTROL,
                 tier,
             );
+        }
+    }
+
+    /// `Alt+Enter` is the Spec R04 second trigger (`SuggestCommand`):
+    /// `ESC CR` vs `CR` is byte-distinct on every host — no tier gate —
+    /// and unbound in default readline, so binding it steals nothing
+    /// the shell expects (ADR-0005). Plain Enter still passes through.
+    #[test]
+    fn alt_enter_binds_in_both_tiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_action(KeyCode::Enter, ALT, tier, AppAction::SuggestCommand);
+            assert_pass(KeyCode::Enter, KeyModifiers::NONE, tier);
         }
     }
 
