@@ -132,6 +132,15 @@ impl InputShadow {
         self.stale = true;
     }
 
+    /// Clear the shadow back to the post-submission state — text and
+    /// staleness both gone. The T5 Esc-cancel path wipes the input
+    /// line with a `Ctrl+U` byte, which the shadow cannot replay as
+    /// keystrokes; resetting (rather than marking stale) is honest —
+    /// the line really is empty — and lets the next `# ` line trigger.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     /// The verified request, or `None` — the pure trigger seam
     /// (us-29): `Some` only when the shadow is in sync, starts with
     /// `# `, carries a non-empty request, and `logical_line` (the
