@@ -16,6 +16,7 @@ mod render;
 mod scroll;
 mod selection;
 mod status;
+mod suggest;
 mod tabs;
 mod terminal;
 

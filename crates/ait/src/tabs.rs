@@ -35,6 +35,7 @@ use ait_term::{
 
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
+use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
 /// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
@@ -48,6 +49,13 @@ const FALLBACK_TITLE: &str = "sh";
 /// owned data: callers go through the methods so the grid-math they
 /// need (`scrollback` bounds, page size) can't drift out of sync.
 pub struct Tab {
+    /// The tab's stable identity — a [`TabManager`] counter handed out
+    /// at spawn and never reused. It is the locator in-flight
+    /// suggestion pins re-resolve through (Spec R04 user story 14):
+    /// neither the list index (shifts on every close) nor the child
+    /// pid (`None` on pid-less platforms, recycled by the OS) can be
+    /// trusted to keep pointing at the same session.
+    pub(crate) id: u64,
     /// The live PTY session this tab drives.
     pub session: LiveSession,
     /// How far above the live viewport this tab's view sits.
@@ -58,9 +66,20 @@ pub struct Tab {
     /// This tab's mouse-selection state — same `pub(crate)` test seam;
     /// production callers use the `*_selection` methods.
     pub(crate) selection: Selection,
+    /// The shadow of this tab's printable input since the last line
+    /// submission — what the `# `+Enter and `Alt+Enter` triggers verify
+    /// against the grid's echoed line (Spec R04, user story 29). Same
+    /// `pub(crate)` test seam; production drives it through
+    /// `crate::suggest` from the keypress path.
+    pub(crate) shadow: InputShadow,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
     cwd: PathBuf,
+    /// Whether the shell has EVER reported a cwd via OSC 7 — when it
+    /// hasn't, `cwd` is still the spawn directory and
+    /// `/proc/<pid>/cwd` is the better answer for context (Spec R04
+    /// user story 15).
+    cwd_reported: bool,
     /// The child's exit status once `LiveEvent::Exited` surfaced;
     /// `Some` means the session is dead but the tab stays open.
     exit: Option<ExitStatus>,
@@ -72,6 +91,15 @@ impl Tab {
     /// The cwd this tab tracks: OSC-7 reported, else the spawn cwd.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// Whether the shell has ever reported a cwd via OSC 7 — the
+    /// signal that [`cwd()`](Self::cwd) holds a real answer rather than
+    /// the spawn directory. Callers that want the shell's actual cwd
+    /// when no report ever arrived fall back to `/proc/<pid>/cwd`
+    /// (Spec R04 user story 15).
+    pub fn cwd_reported(&self) -> bool {
+        self.cwd_reported
     }
 
     /// The child's exit status, or `None` while the session still runs.
@@ -213,6 +241,10 @@ pub struct TabManager {
     /// Applying a template reaches only sessions spawned from then on;
     /// live tabs keep their spawn-time values (story 14).
     session_options: LiveSessionOptions,
+    /// The id the next spawned [`Tab`] gets — a plain counter rather
+    /// than an index or pid so a tab's identity is immune to list
+    /// shifts and pid-less platforms (Spec R04 user story 14).
+    next_id: u64,
 }
 
 impl TabManager {
@@ -240,6 +272,7 @@ impl TabManager {
             launch_cwd,
             size,
             session_options: options.clone(),
+            next_id: 0,
         };
         manager.spawn_tab(options)?;
         Ok(manager)
@@ -273,11 +306,16 @@ impl TabManager {
         options.cwd = Some(cwd.clone());
         let title = title_for(&options);
         let session = LiveSession::spawn(options)?;
+        let id = self.next_id;
+        self.next_id += 1;
         self.tabs.push(Tab {
+            id,
             session,
             scroll: ScrollState::new(),
             selection: Selection::default(),
+            shadow: InputShadow::new(),
             cwd,
+            cwd_reported: false,
             exit: None,
             title,
         });
@@ -428,6 +466,7 @@ impl TabManager {
                 match &event {
                     LiveEvent::Osc(SessionEvent::CwdChanged(cwd)) => {
                         tab.cwd = cwd.clone();
+                        tab.cwd_reported = true;
                     }
                     LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
                     _ => {}

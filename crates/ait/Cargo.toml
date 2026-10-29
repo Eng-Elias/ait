@@ -10,6 +10,13 @@ ait-term = { path = "../ait-term" }
 # Settings.toml load/watch, the `--init` template, the `--print-schema`
 # schema and base_model resolution (Spec R03, user stories 1–14, 24).
 ait-config = { path = "../ait-config" }
+# Spec R04 NL→command: the `# `+Enter trigger fires a `SuggestRequest`
+# into ait-agent's channel-based `CommandSuggester` (user stories 1–2,
+# 13–17, 29). ait-agent owns its tokio runtime on a worker thread, so
+# `ait` never gains a tokio dependency (ADR-0004, amended 2026-10-28 —
+# the runtime landed in the library crates, not the `ait` binary the
+# original text reserved it for).
+ait-agent = { path = "../ait-agent" }
 # Semver requirements per Spec R02; chosen releases are >=7 days old
 # (ADR-0002 supply-chain rule): ratatui 0.30.2 (2026-06-19),
 # crossterm 0.29.0 (2025-04-05).
@@ -33,3 +40,8 @@ insta = "1.49"
 # `ait --init` writes under a fresh config dir). Release >=7 days old
 # per ADR-0002: tempfile 3.27.0 (2026-03-11).
 tempfile = "3"
+# In-process SSE stub for the Spec R04 e2e tests (ticket R04-T7) — the
+# same tiny_http fixture pattern ait-llm's contract tests and
+# ait-agent's suggester tests use. Release >=7 days old per ADR-0002:
+# tiny_http 0.12.0 (2022-10-06).
+tiny_http = "0.12"

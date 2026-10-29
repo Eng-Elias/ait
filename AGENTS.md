@@ -30,7 +30,11 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   `crates/ait-config` — exists (Round 3: `settings.toml` model, load,
   secrets, hot-reload watcher; wired into the `ait` binary — `--init`,
   `--print-schema`, `[terminal]` session options, status model slot);
-  `crates/ait-shell`, `crates/ait-agent` — planned (Rounds 5/6).
+  `crates/ait-agent` — exists (Round 4: §5.4 NL→command —
+  credential redaction, context assembly and reply sanitization pure
+  seams, channel-based `CommandSuggester`; the tool registry, agent
+  loop and permission engine land in Round 6);
+  `crates/ait-shell` — planned (Round 5).
 
 ## Commands
 

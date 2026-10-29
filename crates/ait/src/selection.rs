@@ -244,17 +244,26 @@ fn cell_texts(row: &Row<'_>) -> Vec<String> {
     chunks
 }
 
+/// The bracketed-paste open marker (DECSET 2004) — one half of the
+/// envelope [`encode_paste`] wraps one-shot paste text in. Spec R04's
+/// streaming suggestion insertion opens and closes the same envelope
+/// by hand around a `Delta` stream — the stream isn't one string, so
+/// `encode_paste` can't apply there — hence `pub(crate)`, not private.
+pub(crate) const PASTE_BEGIN: &[u8] = b"\x1b[200~";
+/// See [`PASTE_BEGIN`].
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
+
 /// Encode paste text for the PTY, wrapped in bracketed-paste markers
 /// (`\x1b[200~` … `\x1b[201~`) iff the session reports mode 2004 —
 /// see [`Session::bracketed_paste`](ait_term::Session::bracketed_paste).
 pub fn encode_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.len() + 12);
     if bracketed_paste {
-        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(PASTE_BEGIN);
     }
     bytes.extend_from_slice(text.as_bytes());
     if bracketed_paste {
-        bytes.extend_from_slice(b"\x1b[201~");
+        bytes.extend_from_slice(PASTE_END);
     }
     bytes
 }
