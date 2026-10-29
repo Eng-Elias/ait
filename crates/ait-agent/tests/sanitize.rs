@@ -27,6 +27,36 @@ const CASES: &[(&str, &str, &str)] = &[
         "ls -la\rrm -rf /",
         "ls -la",
     ),
+    // Control bytes: a hostile or garbage reply can never type SIGINT,
+    // a readline completion Tab, DEL or an escape sequence into the
+    // PTY — every `char::is_control` byte is dropped.
+    ("sigint byte dropped", "\x03rm -rf /", "rm -rf /"),
+    ("control byte dropped mid-text", "ls\x03-la", "ls-la"),
+    ("tab is a control byte", "ls\t-la", "ls-la"),
+    ("vertical tab is a control byte", "ls\x0b-la", "ls-la"),
+    ("delete byte dropped", "del\x7fete", "delete"),
+    (
+        "bracketed-paste injection can't escape",
+        "\x1b[200~evil",
+        "[200~evil",
+    ),
+    (
+        "escape sequence loses its escape",
+        "ls\x1b[31m-la",
+        "ls[31m-la",
+    ),
+    ("ctrl-u byte dropped", "git\x15 -l", "git -l"),
+    (
+        "truncate at the line break before dropping controls",
+        "ls\x03\nrm -rf /",
+        "ls",
+    ),
+    (
+        "control byte before the dollar marker keeps it",
+        "\x03$ ls",
+        "$ ls",
+    ),
+    ("control byte after the stripped marker", "$ \x03x", "x"),
     (
         "fenced multi line keeps first",
         "```sh\nls\nrm -rf /\n```",
@@ -46,7 +76,10 @@ fn model_reply_collapses_to_one_command_line() {
 
 /// The never-execute guarantee (us-5): whatever a model sends back —
 /// newlines, carriage returns, fences — the command bytes can never
-/// contain a line break the PTY would read as Enter.
+/// contain a line break the PTY would read as Enter. And the wider
+/// never-inject guarantee: no `char::is_control` byte survives either,
+/// so no SIGINT, no readline-Tab, no DEL and no escape sequence can
+/// reach the PTY as input.
 #[test]
 fn output_never_contains_a_line_break() {
     for reply in [
@@ -61,6 +94,36 @@ fn output_never_contains_a_line_break() {
         assert!(
             !command.contains(['\n', '\r']),
             "line break survived in {command:?} (reply {reply:?})"
+        );
+    }
+}
+
+/// The never-inject half of us-5: no control byte survives — not even
+/// embedded mid-text, on the fence line, or around the `"$ "` marker.
+#[test]
+fn output_never_contains_a_control_byte() {
+    for reply in [
+        "\x03rm -rf /",
+        "ls\x03-la",
+        "ls\t-la",
+        "ls\x0b-la",
+        "ls\x0c-la",
+        "del\x7fete",
+        "git\x15 -l",
+        "\x1b[200~evil",
+        "ls\x1b[31m-la",
+        "$\x03 ls",
+        " \x03$ ls",
+        "$ \x03x",
+        "$ \x0b",
+        "``\x03x",
+        "```sh\n\x03$ ls",
+        "ls \x03 -la",
+    ] {
+        let command = sanitize_reply(reply);
+        assert!(
+            !command.chars().any(|c| c.is_control()),
+            "control byte survived in {command:?} (reply {reply:?})"
         );
     }
 }
@@ -97,6 +160,24 @@ const STREAM_REPLIES: &[&str] = &[
     "ls -la   tail",
     "\n\n  ls -la",
     "  \n\n  ",
+    // Control bytes at every state boundary the machine can sit in —
+    // mid-text, around the `$ ` marker, on the fence line, in the lead.
+    "ls\x03-la",
+    "ls\t-la",
+    "del\x7fete",
+    "\x1b[200~evil",
+    "ls\x1b[31m-la",
+    "\x03rm -rf /",
+    "$\x03x",
+    "$ \x03",
+    "$ \x03x",
+    "$ \x0b",
+    "$\x0bX",
+    " \x03$ ls",
+    "``\x03x",
+    "```sh\n\x03$ ls",
+    "ls \x03 -la",
+    "ls\x03\nrm -rf /",
     "",
 ];
 
@@ -120,8 +201,8 @@ fn chunked_streaming_matches_batch_sanitize() {
                 sanitizer.finish(),
             ] {
                 assert!(
-                    !piece.contains(['\n', '\r']),
-                    "line break emitted mid-stream for {reply:?} split at {cut}"
+                    !piece.chars().any(|c| c.is_control()),
+                    "control byte emitted mid-stream for {reply:?} split at {cut}"
                 );
                 streamed.push_str(&piece);
             }
@@ -161,4 +242,21 @@ fn streamed_pieces_never_contain_a_line_break() {
         );
     }
     assert!(!sanitizer.finish().contains(['\n', '\r']));
+}
+
+/// The never-inject guarantee at the streaming seam: fragments never
+/// carry a control byte either — a paste-envelope injection
+/// (`\x1b[200~`) degrades to inert literal text, and Tab/SIGINT/DEL
+/// bytes drop wherever they land.
+#[test]
+fn streamed_pieces_never_contain_a_control_byte() {
+    let mut sanitizer = ReplySanitizer::new();
+    for fragment in ["ls \x03", "-la\t", "\x1b[200~evil", "\x7fok", "end"] {
+        let piece = sanitizer.push(fragment);
+        assert!(
+            !piece.chars().any(|c| c.is_control()),
+            "control byte emitted in {piece:?}"
+        );
+    }
+    assert!(!sanitizer.finish().chars().any(|c| c.is_control()));
 }

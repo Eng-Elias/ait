@@ -20,7 +20,8 @@
 //!
 //! The `Delta` text is already sanitized: raw reply fragments pass
 //! through [`ReplySanitizer`] *inside* the worker, so the never-execute
-//! guarantee (us-4/5 — no `\n`/`\r` ever crosses the channel) is
+//! guarantee (us-4/5 — no control byte ever crosses the channel: no
+//! `\n`/`\r` to self-execute, no `\x03`/`\t`/`\x1b…` to inject) is
 //! enforced at this seam and cannot be bypassed by a caller.
 
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -72,7 +73,8 @@ pub struct SuggestRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SuggestEvent {
     /// Already-sanitized reply text to append to the input line —
-    /// contains no `\n`/`\r`, so appending can never execute (us-4/5).
+    /// contains no control characters, so appending can never execute
+    /// or inject (us-4/5).
     /// Concatenating every `Delta` of a request yields the full
     /// `sanitize_reply` output.
     Delta(String),
@@ -243,29 +245,28 @@ fn serve(
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
 ) {
-    // `resolve_model` takes `&impl SecretStore` (Sized); wrap the
-    // worker's boxed store so the dyn reference fits the bound.
-    let resolved =
-        match request
-            .settings
-            .resolve_model(PROFILE, ModelRole::Command, &StoreRef(store))
-        {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => {
-                emit(
-                    events,
-                    SuggestEvent::Error(format!(
-                        "profile {PROFILE:?} has no command_model configured \
+    // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
+    // store's `&dyn` reference flows straight through.
+    let resolved = match request
+        .settings
+        .resolve_model(PROFILE, ModelRole::Command, store)
+    {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            emit(
+                events,
+                SuggestEvent::Error(format!(
+                    "profile {PROFILE:?} has no command_model configured \
                      (and no base_model fallback) — set it in settings.toml"
-                    )),
-                );
-                return;
-            }
-            Err(error) => {
-                emit(events, SuggestEvent::Error(format!("{error}")));
-                return;
-            }
-        };
+                )),
+            );
+            return;
+        }
+        Err(error) => {
+            emit(events, SuggestEvent::Error(format!("{error}")));
+            return;
+        }
+    };
 
     let schema = llm_schema(resolved.endpoint.schema);
     let endpoint = match Endpoint::new(EndpointConfig {
@@ -345,17 +346,6 @@ async fn stream_and_emit(
             return;
         }
         emit(events, SuggestEvent::Done);
-    }
-}
-
-/// A sized reference to the worker's `dyn SecretStore` —
-/// `Settings::resolve_model` is generic over `impl SecretStore`, which
-/// a `dyn` reference cannot fill directly.
-struct StoreRef<'a>(&'a dyn SecretStore);
-
-impl SecretStore for StoreRef<'_> {
-    fn get(&self, service: &str, account: &str) -> Option<String> {
-        self.0.get(service, account)
     }
 }
 

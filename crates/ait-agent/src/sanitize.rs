@@ -7,9 +7,12 @@
 
 /// Collapse a model reply to one command line: drop code-fence lines
 /// and a leading `$ ` prompt marker, trim, then keep only the text
-/// before the first `\n` or `\r`. Whatever a chatty or fenced reply
-/// carries, the returned bytes hold no line break — the never-execute
-/// guarantee behind user story 5.
+/// before the first `\n` or `\r`, drop every control character
+/// (`char::is_control`), and trim again. Whatever a chatty, fenced or
+/// hostile reply carries, the returned bytes hold no line break — the
+/// never-execute guarantee behind user story 5 — and no control byte
+/// either: a reply can never type `\x03` (SIGINT), `\x15`, `\t`
+/// (readline completion), `\x7f` or an `\x1b…` escape into the PTY.
 pub fn sanitize_reply(reply: &str) -> String {
     let mut text = reply.trim();
     // An opening fence line is ``` plus an optional language tag.
@@ -29,14 +32,24 @@ pub fn sanitize_reply(reply: &str) -> String {
     let text = text.trim_start();
     let text = text.strip_prefix("$ ").unwrap_or(text);
     let end = text.find(['\n', '\r']).unwrap_or(text.len());
-    text[..end].trim().to_owned()
+    // Truncate first (a line break ENDS the command — it is never
+    // skipped over to reach a second line), then drop control bytes,
+    // then trim the whitespace their removal may have exposed.
+    text[..end]
+        .chars()
+        .filter(|byte| !byte.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 /// Incremental [`sanitize_reply`] for the streaming path (§5.4's
 /// "streaming preview"): raw reply fragments go in via
 /// [`push`](ReplySanitizer::push), sanitized text safe to append to the
-/// input line comes out — guaranteed free of `\n`/`\r` at every chunk
-/// boundary, so a multi-line reply can never leak a newline to the
+/// input line comes out — guaranteed free of control bytes
+/// (`char::is_control`, line breaks included) at every chunk boundary,
+/// so a hostile or garbage reply can never leak a newline, a `\t`
+/// completion trigger, a `\x03` SIGINT or an `\x1b…` escape to the
 /// frontend mid-stream.
 ///
 /// Sanitization cannot be applied per-delta: `$ ` and ```` ``` ````
@@ -90,6 +103,10 @@ enum State {
     /// `"$ "` prefix. Emit only the `$` if the stream ends here;
     /// a non-whitespace byte means the whole prefix is stripped.
     DollarWs,
+    /// A `"$ "` marker WAS stripped — the post-strip `trim_start` zone.
+    /// Like [`PostFenceLead`](State::PostFenceLead) except a second `$`
+    /// is plain body text: `sanitize_reply` strips `"$ "` only once.
+    StrippedLead,
     /// Emitting body bytes; whitespace rides in `pending_ws`.
     Body,
     /// A line break was seen: `sanitize_reply` truncates at the first
@@ -148,6 +165,10 @@ impl ReplySanitizer {
                 // `sanitize_reply` trims the whole reply first, so only
                 // a break *after* content truncates.
                 _ if byte.is_whitespace() => {}
+                // A leading control byte is dropped by the batch filter
+                // — but it still counts as the reply's first byte, so a
+                // `$ ` or fence after it is body text, not a marker.
+                _ if byte.is_control() => self.state = State::Body,
                 _ => {
                     out.push(byte);
                     self.state = State::Body;
@@ -167,13 +188,17 @@ impl ReplySanitizer {
                 }
             },
             State::FenceLine => {
-                if matches!(byte, '\n' | '\r') {
+                // `sanitize_reply` drops to the first `\n` — a `\r` is
+                // just another byte on the fence line, not its end.
+                if byte == '\n' {
                     self.state = State::PostFenceLead;
                 }
             }
             State::PostFenceLead => match byte {
                 '$' => self.state = State::Dollar,
                 _ if byte.is_whitespace() => {}
+                // As in `Lead`: dropped, but it ends the marker zone.
+                _ if byte.is_control() => self.state = State::Body,
                 _ => {
                     out.push(byte);
                     self.state = State::Body;
@@ -184,6 +209,12 @@ impl ReplySanitizer {
                 '\n' | '\r' => {
                     out.push('$');
                     self.state = State::Truncated;
+                }
+                // A control byte can't be emitted, but the `$` commits
+                // as body text (`"$\x03"` filters to `"$"`).
+                _ if byte.is_control() => {
+                    out.push('$');
+                    self.state = State::Body;
                 }
                 _ if byte.is_whitespace() => {
                     // `"$\t…"` is not the `"$ "` marker — the `$` is
@@ -204,11 +235,29 @@ impl ReplySanitizer {
                     // reply's first byte — the output stays empty.
                     self.state = State::Truncated;
                 }
+                // More whitespace — control whitespace included — is
+                // still inside the marker's trim zone: it may yet prove
+                // trailing and re-resolve the prefix to a bare `"$"`.
                 _ if byte.is_whitespace() => {}
+                // A NON-whitespace control byte resolves the marker:
+                // batch strips `"$ "` then drops the byte — continue in
+                // the post-strip zone.
+                _ if byte.is_control() => self.state = State::StrippedLead,
                 _ => {
                     // A real byte after `"$ "<ws>`: the marker is
                     // stripped and the inner whitespace is trimmed
                     // (`sanitize_reply`'s post-strip `trim`).
+                    out.push(byte);
+                    self.state = State::Body;
+                }
+            },
+            State::StrippedLead => match byte {
+                '\n' | '\r' => self.state = State::Truncated,
+                // The post-strip trim zone: leading whitespace is
+                // trimmed and control bytes are dropped — neither
+                // commits body text.
+                _ if byte.is_whitespace() || byte.is_control() => {}
+                _ => {
                     out.push(byte);
                     self.state = State::Body;
                 }
@@ -218,6 +267,10 @@ impl ReplySanitizer {
                     self.pending_ws.clear();
                     self.state = State::Truncated;
                 }
+                // Control bytes — control whitespace like `\t` included
+                // — are dropped outright, never emitted and never
+                // parked in `pending_ws`.
+                _ if byte.is_control() => {}
                 _ if byte.is_whitespace() => self.pending_ws.push(byte),
                 _ => {
                     self.flush_ws(out);

@@ -39,3 +39,22 @@ not take a tokio dependency.
 - The sync→async bridge is a Round 2 frontend concern; if polling ever
   proves insufficient, `spawn_blocking` or a dedicated pump thread lives in
   `ait`, not `ait-term`.
+
+## Amendment — 2026-10-28 (Spec R04)
+
+The "tokio joins at the `ait` binary in Round 2" half of the decision
+landed differently than written; this section records what actually
+shipped (the original text is kept above for the record).
+
+- Round 2's `ait` event loop never took a tokio dependency at all — it
+  runs the synchronous 8 ms `poll`/`try_recv` tick described in
+  `crates/ait/src/app.rs`, and still does.
+- Round 3 put the first tokio runtime inside `ait-llm`'s HTTP/SSE
+  adapters, behind a synchronous `Endpoint` API; Round 4 put another on
+  `ait-agent`'s `CommandSuggester` worker thread, behind a synchronous
+  channel API (`suggest`/`cancel` in, `try_recv`-drained events out).
+- Net effect: tokio lives in the library crates that need it, each
+  presenting a synchronous facade at the crate edge — and the `ait`
+  *binary* stays tokio-free alongside `ait-term`. Any later need for an
+  app-level runtime should be decided on its own merits, not assumed
+  from this ADR's original wording.
