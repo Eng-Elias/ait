@@ -27,7 +27,8 @@
 //!    drains on that tick too (Spec R04): the `# `+Enter trigger
 //!    verified in [`suggest`] fires a request from the pass-through
 //!    key path, and `Alt+Enter` fires the same request from the whole
-//!    verified input line (erasing it first via DELs), `Delta`s type
+//!    verified input line (erasing it via DELs once the request was
+//!    accepted — never before), `Delta`s type
 //!    into the pinned tab's session — one bracketed-paste envelope
 //!    when the child enabled mode 2004 — and errors land on the
 //!    status line. While a suggestion is in flight on the focused
@@ -57,7 +58,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use ait_agent::{CommandSuggester, SuggestEvent};
+use ait_agent::CommandSuggester;
 use ait_config::{ConfigError, Settings};
 use ait_term::{Cell, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
 use crossterm::clipboard::CopyToClipboard;
@@ -80,7 +81,7 @@ use crate::render::{
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
 use crate::status::{notification_text, status_text, Toast};
-use crate::suggest;
+use crate::suggest::{self, SuggestionPin};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
 
@@ -156,62 +157,14 @@ struct AppState {
     /// thread (ADR-0004).
     suggester: CommandSuggester,
     /// The in-flight suggestion, pinned to the tab that fired it
-    /// (Spec R04 user story 14) — `None` while idle. One request at a
-    /// time is the suggester's frontend contract, so a live pin also
-    /// gates the next trigger. `Delta` text streams into the pinned
-    /// tab's session, under one bracketed-paste envelope when the
-    /// child enabled mode 2004.
-    suggestion: Option<InFlightSuggestion>,
-}
-
-/// An in-flight command suggestion, pinned to the tab that fired it
-/// (Spec R04 user story 14). Tab indices shift when tabs close, so
-/// the pin re-resolves through the session's child pid — insertion
-/// can never drift onto a different session.
-struct InFlightSuggestion {
-    /// The tab position in the tab list at trigger time — the
-    /// fallback locator when no child pid is available, and the
-    /// position the toast-attribution label wants.
-    tab: usize,
-    /// The pinned session's child pid — the stable identity
-    /// [`pinned_index`] re-resolves through. `None` (a platform that
-    /// reports no child pid) degrades the pin to the index alone.
-    pid: Option<u32>,
-    /// Whether a `\x1b[200~` envelope is currently open on the pinned
-    /// session — opened lazily on the first `Delta` while mode 2004
-    /// is on, closed on `Done`/`Error`/Esc-cancel so the whole stream
-    /// is one undoable, non-executing insertion (user story 7).
-    paste_open: bool,
-    /// Esc-cancelled but not yet terminated: the pin stays until the
-    /// worker's terminal event lands, so post-cancel `Delta`s drop
-    /// instead of retyping after the `Ctrl+U` wipe, and the
-    /// cancellation `Error` doesn't toast (user story 8). A
-    /// cancelled-but-live pin also keeps the trigger gate shut until
-    /// the stream is really over.
-    cancelled: bool,
-}
-
-/// The bracketed-paste markers (DECSET 2004): the same six-byte
-/// literals [`encode_paste`] wraps one-shot paste text in. Streaming
-/// insertion can't use `encode_paste` — the stream isn't one string —
-/// so the envelope is opened and closed by hand around the `Delta`s.
-const PASTE_BEGIN: &[u8] = b"\x1b[200~";
-/// See [`PASTE_BEGIN`].
-const PASTE_END: &[u8] = b"\x1b[201~";
-
-/// The pinned suggestion's CURRENT position in the tab list, or
-/// `None` when its session is gone from the list. The child pid is
-/// the honest locator — tab indices shift when a tab closes
-/// mid-stream; without it a stale index could type suggestion bytes
-/// into an unrelated session (Spec R04 user story 14).
-fn pinned_index(pin: &InFlightSuggestion, tabs: &TabManager) -> Option<usize> {
-    match pin.pid {
-        Some(pid) => tabs
-            .tabs()
-            .iter()
-            .position(|tab| tab.session.child_pid() == Some(pid)),
-        None => (pin.tab < tabs.len()).then_some(pin.tab),
-    }
+    /// (Spec R04 user story 14) — idle while no request streams. One
+    /// request at a time is the suggester's frontend contract, so a
+    /// live pin also gates the next trigger. `Delta` text streams into
+    /// the pinned tab's session, under one bracketed-paste envelope
+    /// when the child enabled mode 2004; the pin re-resolves through
+    /// the tab's stable [`id`](crate::tabs::Tab) — see
+    /// [`suggest::SuggestionPin`] for the whole state machine.
+    suggestion: SuggestionPin,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -297,7 +250,7 @@ pub fn run() -> io::Result<ExitCode> {
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
         suggester: CommandSuggester::new(),
-        suggestion: None,
+        suggestion: SuggestionPin::new(),
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
@@ -386,7 +339,9 @@ pub fn run() -> io::Result<ExitCode> {
         // Suggester events on the same tick too (Spec R04): T4 drains
         // errors to the status line and clears the in-flight pin; T5
         // streams `Delta`s into the pinned tab.
-        drain_suggest_events(&mut state, &tabs);
+        state
+            .suggestion
+            .drain(state.suggester.events(), &tabs, &mut state.toast);
 
         // Standard 6: the last close already exits via `Handled::Quit`;
         // this guard is the belt for any path that could empty the set —
@@ -522,15 +477,14 @@ fn handle_event<W: Write>(
                 Resolution::Action(AppAction::JumpToTab(n)) => tabs.jump_to(n),
                 // `Alt+Enter` (Spec R04 us-11/12): the input line itself
                 // is the request — same shadow+grid verification as the
-                // `# ` path, then the typed line is erased via DELs so
-                // request text and the streamed command can never
-                // interleave, and the shared request path runs. A live
-                // pin gates it just like the `# ` trigger — one request
-                // in flight at a time.
+                // `# ` path, then, once the request was accepted, the
+                // typed line is erased via DELs so request text and the
+                // streamed command can never interleave. A live pin
+                // gates it just like the `# ` trigger — one request in
+                // flight at a time. The request pins to the tab's
+                // stable id, so a mid-stream tab switch or close can
+                // never redirect the stream (us-14).
                 Resolution::Action(AppAction::SuggestCommand) => {
-                    // The originating tab's index BEFORE the mutable
-                    // borrow — a fired request is pinned to it (us-14).
-                    let index = tabs.active_index();
                     let Some(tab) = tabs.active_mut() else {
                         return Handled::Continue;
                     };
@@ -538,7 +492,12 @@ fn handle_event<W: Write>(
                     // and snap to the live viewport like typing does.
                     tab.clear_selection();
                     tab.snap_to_bottom();
-                    suggest_from_line(state, tab, index);
+                    state.suggestion.suggest_from_line(
+                        &state.suggester,
+                        state.config.settings(),
+                        tab,
+                        &mut state.toast,
+                    );
                 }
                 // Per-active-tab viewport actions: scrollback + paste.
                 Resolution::Action(action) => {
@@ -587,9 +546,9 @@ fn handle_event<W: Write>(
                     }
                 }
                 Resolution::PassThrough => {
-                    // The originating tab's index BEFORE the mutable
-                    // borrow — a fired request is pinned to it (Spec R04
-                    // user story 14).
+                    // The active tab's index BEFORE the mutable borrow —
+                    // in-flight keys are scoped to the pinned tab
+                    // (Spec R04 user story 14).
                     let index = tabs.active_index();
                     // In-flight keys (Spec R04 us-8/9/10): intercepted
                     // BEFORE the PTY-input path, and scoped to the pinned
@@ -599,9 +558,7 @@ fn handle_event<W: Write>(
                     // behave normally (the request types into ITS origin
                     // session whatever is focused, but the keys that
                     // steer it belong to the user watching that line).
-                    let suggestion_here = state.suggestion.as_ref().is_some_and(|pin| {
-                        !pin.cancelled && pinned_index(pin, tabs) == Some(index)
-                    });
+                    let suggestion_here = state.suggestion.is_live_for(tabs, index);
                     let Some(tab) = tabs.active_mut() else {
                         return Handled::Continue;
                     };
@@ -616,7 +573,7 @@ fn handle_event<W: Write>(
                             // `Ctrl+U` to wipe the partial line. A modified
                             // Esc is left for the PTY like any other chord.
                             KeyCode::Esc if key_event.modifiers.is_empty() => {
-                                cancel_suggestion(state, tab);
+                                state.suggestion.cancel(&state.suggester, tab);
                                 return Handled::Continue;
                             }
                             // Any Enter variant is swallowed — including
@@ -641,7 +598,12 @@ fn handle_event<W: Write>(
                                 if let Some(request) =
                                     suggest::request_for(tab, state.config.settings())
                                 {
-                                    fire_suggestion(state, index, tab.session.child_pid(), request);
+                                    state.suggestion.fire(
+                                        &state.suggester,
+                                        tab.id,
+                                        request,
+                                        &mut state.toast,
+                                    );
                                 }
                             }
                             tab.shadow.update(&key_event);
@@ -785,183 +747,6 @@ fn drain_config_events(
     }
 }
 
-/// Queue a verified request and take the in-flight pin on its tab —
-/// the shared tail of both triggers (the `# `+Enter path in
-/// [`handle_event`]'s pass-through arm, `Alt+Enter` in
-/// [`suggest_from_line`]). A dead suggester surfaces as a §6 toast
-/// instead of a pin.
-fn fire_suggestion(
-    state: &mut AppState,
-    index: usize,
-    pid: Option<u32>,
-    request: ait_agent::SuggestRequest,
-) {
-    match state.suggester.suggest(request) {
-        Ok(()) => {
-            state.suggestion = Some(InFlightSuggestion {
-                tab: index,
-                pid,
-                paste_open: false,
-                cancelled: false,
-            });
-        }
-        Err(error) => {
-            state.toast = Some(Toast::new(format!("{error}"), Instant::now()));
-        }
-    }
-}
-
-/// The `Alt+Enter` trigger's app half (Spec R04 us-11/12): verify the
-/// input line through [`suggest::line_request_for`] — the same
-/// shadow+grid echo agreement the `# ` path requires — then erase the
-/// typed line with one DEL (`\x7f`) per shadowed character so the
-/// request text and the streamed command can never interleave, reset
-/// the shadow (the line really is empty, so the streamed text lands
-/// on a fresh shadow, not a stale one), and run the shared request →
-/// stream → insert path. A live pin keeps the gate shut — one request
-/// in flight at a time, same rule as the `# ` trigger — and an exited
-/// session drops the whole action like any PTY input. An empty,
-/// stale or unverifiable line does nothing at all: desync is inert
-/// (us-13).
-fn suggest_from_line(state: &mut AppState, tab: &mut crate::tabs::Tab, index: usize) {
-    if state.suggestion.is_some() || tab.exit_status().is_some() {
-        return;
-    }
-    let Some(request) = suggest::line_request_for(tab, state.config.settings()) else {
-        return;
-    };
-    let erased = tab.shadow.text().chars().count();
-    let _ = tab.session.send_bytes(&vec![0x7f; erased]);
-    tab.shadow.reset();
-    fire_suggestion(state, index, tab.session.child_pid(), request);
-}
-
-/// Esc on the pinned tab (Spec R04 user story 8): cancel the stream at
-/// its `CancellationToken`, close the paste envelope if one is open,
-/// and send `Ctrl+U` (`\x15` — readline's kill-to-start-of-line) to
-/// wipe the partial suggestion. The pin is kept, marked `cancelled`:
-/// the worker's terminal event still has to release it, which keeps
-/// post-cancel `Delta`s from retyping onto the just-wiped line and
-/// makes the cancellation `Error` arrive silently rather than as a
-/// toast the user never asked about. `tab` is the pinned (== active)
-/// tab; writes to an exited session drop like all PTY input does.
-fn cancel_suggestion(state: &mut AppState, tab: &mut crate::tabs::Tab) {
-    let Some(pin) = state.suggestion.as_mut() else {
-        return;
-    };
-    pin.cancelled = true;
-    state.suggester.cancel();
-    if tab.exit_status().is_none() {
-        if pin.paste_open {
-            let _ = tab.session.send_bytes(PASTE_END);
-            pin.paste_open = false;
-        }
-        let _ = tab.session.send_bytes(b"\x15");
-    }
-    // `Ctrl+U` wiped the line through a side channel the shadow cannot
-    // replay — the honest state is a fresh, empty one so the next
-    // `# ` line can trigger.
-    tab.shadow.reset();
-}
-
-/// Write `\x1b[201~` to the pinned session if an envelope is open —
-/// the close half of [`PASTE_BEGIN`]'s contract. Called on `Done`,
-/// `Error` and (inline, before `Ctrl+U`) Esc-cancel; a dead session
-/// makes the whole question moot, so writes there drop.
-fn close_paste_envelope(state: &mut AppState, tabs: &TabManager) {
-    let Some(pin) = state.suggestion.as_mut() else {
-        return;
-    };
-    if !pin.paste_open {
-        return;
-    }
-    pin.paste_open = false;
-    if let Some(tab) = pinned_index(pin, tabs).and_then(|index| tabs.tabs().get(index)) {
-        if tab.exit_status().is_none() {
-            let _ = tab.session.send_bytes(PASTE_END);
-        }
-    }
-}
-
-/// One suggester event applied to app state — the seam
-/// [`drain_suggest_events`] shares with the tests, which inject
-/// `SuggestEvent`s directly instead of running a model (Spec R04's
-/// testable-seam rule).
-///
-/// `Delta` text arrives pre-sanitized from `ait-agent` (no `\n`/`\r`
-/// can cross the channel — us-4/5), so it is typed verbatim into the
-/// PINNED tab's session via [`LiveSession::send_bytes`]: the stream
-/// stays with its origin tab across a tab switch (us-14), and deltas
-/// aimed at an exited session are dropped. When the child enabled
-/// bracketed paste (`Session::bracketed_paste`), the first `Delta`
-/// opens one `\x1b[200~`…`\x1b[201~` envelope the whole stream rides
-/// inside (us-7) — `Done`/`Error` close it via [`close_paste_envelope`].
-///
-/// `Done` releases the pin; `Error` additionally surfaces the §6
-/// status-line toast — prefixed with the pinned tab's `N:title` label
-/// when it points at a background tab, the same attribution rule the
-/// notification toasts use — except an Esc-cancelled request, whose
-/// `Error` is the user's own doing and arrives silently.
-fn apply_suggest_event(state: &mut AppState, tabs: &TabManager, event: SuggestEvent) {
-    match event {
-        SuggestEvent::Delta(text) => {
-            let Some(pin) = state.suggestion.as_mut() else {
-                return;
-            };
-            if pin.cancelled {
-                return;
-            }
-            let Some(tab) = pinned_index(pin, tabs).and_then(|index| tabs.tabs().get(index)) else {
-                return;
-            };
-            if tab.exit_status().is_some() {
-                return;
-            }
-            if !pin.paste_open && tab.session.bracketed_paste() {
-                let _ = tab.session.send_bytes(PASTE_BEGIN);
-                pin.paste_open = true;
-            }
-            let _ = tab.session.send_bytes(text.as_bytes());
-        }
-        SuggestEvent::Done => {
-            close_paste_envelope(state, tabs);
-            state.suggestion = None;
-        }
-        SuggestEvent::Error(message) => {
-            // Tab indices shift on close — resolve the pin through its
-            // child pid (a gone session just toasts unlabeled).
-            let pin = state.suggestion.as_ref();
-            let cancelled = pin.is_some_and(|pin| pin.cancelled);
-            let source = pin.and_then(|pin| {
-                pinned_index(pin, tabs).and_then(|index| {
-                    if index == tabs.active_index() {
-                        None
-                    } else {
-                        tabs.tabs().get(index).map(|tab| tab.label(index))
-                    }
-                })
-            });
-            close_paste_envelope(state, tabs);
-            state.suggestion = None;
-            if !cancelled {
-                state.toast = Some(match source {
-                    Some(label) => Toast::new(format!("{label}: {message}"), Instant::now()),
-                    None => Toast::new(message, Instant::now()),
-                });
-            }
-        }
-    }
-}
-
-/// Drain one tick of suggester events (Spec R04) — every queued event
-/// through [`apply_suggest_event`]. `try_recv` keeps the drain
-/// zero-cost inside the 8 ms loop.
-fn drain_suggest_events(state: &mut AppState, tabs: &TabManager) {
-    while let Ok(event) = state.suggester.events().try_recv() {
-        apply_suggest_event(state, tabs, event);
-    }
-}
-
 /// Screen mouse position → grid coordinates: the line by
 /// [`grid_line`]'s screen→grid rule (the same rule the painters use),
 /// `column = column - content.x` clamped at the band's left edge.
@@ -1064,6 +849,7 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
+    use ait_agent::SuggestEvent;
     use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
         KeyCode, KeyEvent as CtKeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
@@ -1144,7 +930,7 @@ mod tests {
                     // `NoSecrets` keeps keyring lookups out of tests —
                     // resolution never blocks on the Secret Service.
                     suggester: CommandSuggester::with_secret_store(NoSecrets),
-                    suggestion: None,
+                    suggestion: SuggestionPin::new(),
                 },
                 sink: Vec::new(),
             }
@@ -1487,7 +1273,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !pred(harness) {
             harness.tabs.drain_events();
-            drain_suggest_events(&mut harness.state, &harness.tabs);
+            harness.state.suggestion.drain(
+                harness.state.suggester.events(),
+                &harness.tabs,
+                &mut harness.state.toast,
+            );
             assert!(Instant::now() < deadline, "timed out waiting");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1528,10 +1318,10 @@ mod tests {
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
 
-        // The verified request fired, pinned to tab 0 (us-14).
+        // The verified request fired, pinned to tab 0's id (us-14).
         assert_eq!(
-            harness.state.suggestion.as_ref().map(|s| s.tab),
-            Some(0),
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
             "the '# ' request fired into the suggester"
         );
         // The shadow reset for the next line.
@@ -1697,8 +1487,8 @@ base_model = "key-1"
     // `stty raw; head -c N > <file>`, so the file ends up holding the
     // exact byte stream the PTY received — bracketed-paste markers,
     // `Ctrl+U` and all. `SuggestEvent`s are injected through
-    // `apply_suggest_event` (the seam `drain_suggest_events` uses)
-    // instead of a real model — no network, standard 11.
+    // `SuggestionPin::apply` (the seam `drain` uses) instead of a real
+    // model — no network, standard 11.
 
     /// A unique temp path for one test's capture file.
     fn capture_path(name: &str) -> std::path::PathBuf {
@@ -1729,19 +1519,17 @@ base_model = "key-1"
     }
 
     /// The state a fired `SuggestRequest` leaves behind — a pin on
-    /// `tab`, re-resolved through its child pid.
+    /// `tab`, re-resolved through the tab's stable id.
     fn pin_suggestion(harness: &mut Harness, tab: usize) {
-        harness.state.suggestion = Some(InFlightSuggestion {
-            tab,
-            pid: harness.tabs.tabs()[tab].session.child_pid(),
-            paste_open: false,
-            cancelled: false,
-        });
+        harness.state.suggestion = SuggestionPin::staged(harness.tabs.tabs()[tab].id);
     }
 
     /// Inject one suggester event through the drain's seam.
     fn fire(harness: &mut Harness, event: SuggestEvent) {
-        apply_suggest_event(&mut harness.state, &harness.tabs, event);
+        harness
+            .state
+            .suggestion
+            .apply(&harness.tabs, event, &mut harness.state.toast);
     }
 
     /// Wait for the capture file to hold `len` bytes, then read it.
@@ -1850,13 +1638,14 @@ base_model = "key-1"
             b"\x1b[200~partial\x1b[201~\x15",
             "close the envelope, THEN wipe the line — spec order"
         );
-        let pin = harness
-            .state
-            .suggestion
-            .as_ref()
-            .expect("the pin survives until the terminal event");
-        assert!(pin.cancelled);
-        assert!(!pin.paste_open, "the envelope is closed");
+        assert!(
+            harness.state.suggestion.is_cancelled(),
+            "the pin survives until the terminal event"
+        );
+        assert!(
+            !harness.state.suggestion.paste_is_open(),
+            "the envelope is closed"
+        );
         assert!(
             harness.tabs.active().unwrap().shadow.text().is_empty(),
             "the wiped line resets the input shadow"
@@ -1954,11 +1743,7 @@ base_model = "key-1"
         harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(wait_file(&mut harness, &f1, 2), b"\r\x1b");
         assert!(
-            harness
-                .state
-                .suggestion
-                .as_ref()
-                .is_some_and(|p| !p.cancelled),
+            harness.state.suggestion.is_some() && !harness.state.suggestion.is_cancelled(),
             "Esc on another tab never touches the request"
         );
 
@@ -2074,8 +1859,8 @@ base_model = "key-1"
         harness.handle(key(KeyCode::Enter, KeyModifiers::ALT));
 
         assert_eq!(
-            harness.state.suggestion.as_ref().map(|s| s.tab),
-            Some(0),
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
             "the bare line fired as a request, pinned to its tab"
         );
         let shadow = &harness.tabs.active().unwrap().shadow;
@@ -2146,11 +1931,7 @@ base_model = "key-1"
         harness.handle(key(KeyCode::Enter, KeyModifiers::ALT));
 
         assert!(
-            harness
-                .state
-                .suggestion
-                .as_ref()
-                .is_some_and(|pin| !pin.cancelled),
+            harness.state.suggestion.is_some() && !harness.state.suggestion.is_cancelled(),
             "the in-flight pin is untouched"
         );
         assert!(
@@ -2160,7 +1941,11 @@ base_model = "key-1"
         // Let any wrongly-sent request surface its error before the
         // negative assertions.
         std::thread::sleep(Duration::from_millis(200));
-        drain_suggest_events(&mut harness.state, &harness.tabs);
+        harness.state.suggestion.drain(
+            harness.state.suggester.events(),
+            &harness.tabs,
+            &mut harness.state.toast,
+        );
         assert!(harness.state.toast.is_none());
         assert!(
             harness

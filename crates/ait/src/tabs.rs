@@ -49,6 +49,13 @@ const FALLBACK_TITLE: &str = "sh";
 /// owned data: callers go through the methods so the grid-math they
 /// need (`scrollback` bounds, page size) can't drift out of sync.
 pub struct Tab {
+    /// The tab's stable identity — a [`TabManager`] counter handed out
+    /// at spawn and never reused. It is the locator in-flight
+    /// suggestion pins re-resolve through (Spec R04 user story 14):
+    /// neither the list index (shifts on every close) nor the child
+    /// pid (`None` on pid-less platforms, recycled by the OS) can be
+    /// trusted to keep pointing at the same session.
+    pub(crate) id: u64,
     /// The live PTY session this tab drives.
     pub session: LiveSession,
     /// How far above the live viewport this tab's view sits.
@@ -234,6 +241,10 @@ pub struct TabManager {
     /// Applying a template reaches only sessions spawned from then on;
     /// live tabs keep their spawn-time values (story 14).
     session_options: LiveSessionOptions,
+    /// The id the next spawned [`Tab`] gets — a plain counter rather
+    /// than an index or pid so a tab's identity is immune to list
+    /// shifts and pid-less platforms (Spec R04 user story 14).
+    next_id: u64,
 }
 
 impl TabManager {
@@ -261,6 +272,7 @@ impl TabManager {
             launch_cwd,
             size,
             session_options: options.clone(),
+            next_id: 0,
         };
         manager.spawn_tab(options)?;
         Ok(manager)
@@ -294,7 +306,10 @@ impl TabManager {
         options.cwd = Some(cwd.clone());
         let title = title_for(&options);
         let session = LiveSession::spawn(options)?;
+        let id = self.next_id;
+        self.next_id += 1;
         self.tabs.push(Tab {
+            id,
             session,
             scroll: ScrollState::new(),
             selection: Selection::default(),

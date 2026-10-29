@@ -41,8 +41,14 @@ impl Endpoint {
     /// keyring entry `ait/<endpoint-key>` is tried. Endpoints without
     /// `api_key_env` go straight to the keyring, and an endpoint with no
     /// secret anywhere resolves to `None` — request-time code sends no
-    /// `Authorization` header then (user story 21).
-    pub fn resolve_secret(&self, endpoint_key: &str, store: &impl SecretStore) -> Option<String> {
+    /// `Authorization` header then (user story 21). The `?Sized` store
+    /// lets a `&dyn SecretStore` flow straight through — e.g. from a
+    /// boxed store — with no sized wrapper in between.
+    pub fn resolve_secret(
+        &self,
+        endpoint_key: &str,
+        store: &(impl SecretStore + ?Sized),
+    ) -> Option<String> {
         if let Some(env_name) = &self.api_key_env {
             if let Ok(value) = env::var(env_name) {
                 if !value.is_empty() {

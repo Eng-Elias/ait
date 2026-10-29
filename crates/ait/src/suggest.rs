@@ -1,9 +1,12 @@
 //! The `# `+Enter and `Alt+Enter` triggers (Spec R04 — user stories
-//! 1–2, 11–17, 29): detection and context-collection glue only. The
-//! model call lives in `ait-agent` (CODING_STANDARDS §9 — the TUI
-//! holds no business logic); streaming the reply into the input line
-//! is T5, and `Alt+Enter`'s keymap binding plus line-erase dispatch
-//! live in `app` (T6).
+//! 1–2, 11–17, 29) plus the in-flight request state machine
+//! ([`SuggestionPin`] — user stories 7–10, 14): the detection halves,
+//! the context collection, and the machinery that pins a fired request
+//! to its origin tab, streams sanitized `Delta`s into it under one
+//! bracketed-paste envelope, and releases the pin on `Done`/`Error`/
+//! Esc-cancel. The model call lives in `ait-agent` (CODING_STANDARDS
+//! §9 — the TUI holds no business logic); `app` keeps only the thin
+//! call-site glue — the keypress dispatch and the per-tick drain.
 //!
 //! Detection has two halves:
 //!
@@ -38,11 +41,16 @@
 //! whole trigger is the testable seam (us-29): every case below is
 //! exercised without a PTY via byte-fed [`ait_term::Session`]s.
 
-use ait_agent::{SuggestRequest, OUTPUT_LINE_BUDGET};
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
+
+use ait_agent::{CommandSuggester, SuggestEvent, SuggestRequest, OUTPUT_LINE_BUDGET};
 use ait_config::Settings;
 use ait_term::{Cursor, GridView, Key, KeyEvent, Keypad, Modifiers};
 
-use crate::tabs::Tab;
+use crate::selection::{PASTE_BEGIN, PASTE_END};
+use crate::status::Toast;
+use crate::tabs::{Tab, TabManager};
 
 /// The request prefix: a submitted input line starting `# ` is a
 /// natural-language command request — while remaining a perfectly
@@ -145,52 +153,51 @@ impl InputShadow {
         *self = Self::new();
     }
 
-    /// The verified request, or `None` — the pure trigger seam
-    /// (us-29): `Some` only when the shadow is in sync, starts with
-    /// `# `, carries a non-empty request, and `logical_line` (the
-    /// grid's current logical input line, prompt included) ENDS WITH
-    /// it. The returned text is the request verbatim — the shadow
-    /// minus the prefix (us-19).
-    ///
-    /// `ends_with` rather than equality because the logical line leads
-    /// with the prompt (`$ `, `>>> `, …). Trailing blanks are ignored
-    /// on both sides — grid rows are space-padded, and the echoed text
-    /// is what the user meant.
-    pub fn request_text(&self, logical_line: &str) -> Option<String> {
+    /// The shared verification tail of [`request_text`](Self::request_text)
+    /// and [`verified_line`](Self::verified_line): the shadow's trimmed
+    /// text, `Some` only when the shadow is in sync, non-empty, and
+    /// `logical_line` (the grid's current logical input line, prompt
+    /// included) ENDS WITH it — the echo-agreement check both triggers
+    /// run (us-13). `ends_with` rather than equality because the logical
+    /// line leads with the prompt (`$ `, `>>> `, …); trailing blanks are
+    /// ignored on both sides — grid rows are space-padded, and the
+    /// echoed text is what the user meant.
+    fn verified_shadow(&self, logical_line: &str) -> Option<&str> {
         if self.is_stale() {
             return None;
         }
         let shadow = self.text().trim_end();
-        let request = shadow.strip_prefix(TRIGGER_PREFIX)?;
+        if shadow.is_empty() {
+            return None;
+        }
+        logical_line.trim_end().ends_with(shadow).then_some(shadow)
+    }
+
+    /// The verified request, or `None` — the pure trigger seam
+    /// (us-29): `Some` only when the shadow verifies through
+    /// [`verified_shadow`](Self::verified_shadow), starts with `# `,
+    /// and carries a non-empty request. The returned text is the
+    /// request verbatim — the shadow minus the prefix (us-19).
+    pub fn request_text(&self, logical_line: &str) -> Option<String> {
+        let request = self
+            .verified_shadow(logical_line)?
+            .strip_prefix(TRIGGER_PREFIX)?;
         if request.is_empty() {
             return None;
         }
-        logical_line
-            .trim_end()
-            .ends_with(shadow)
-            .then(|| request.to_owned())
+        Some(request.to_owned())
     }
 
     /// The verified input line for the `Alt+Enter` trigger (us-11):
-    /// `Some` only when the shadow is in sync, non-empty, and
-    /// `logical_line` ENDS WITH it — the same echo-agreement check
-    /// [`request_text`](Self::request_text) runs, minus the `# `
-    /// prefix requirement. The returned text is the whole line —
-    /// a `# ` line keeps its prefix, because here the line itself
-    /// is the request (us-19). An empty, whitespace-only, stale or
-    /// unverifiable line returns `None`: desync is inert.
+    /// `Some` only when the shadow verifies through
+    /// [`verified_shadow`](Self::verified_shadow) — the same
+    /// echo-agreement check [`request_text`](Self::request_text) runs,
+    /// minus the `# ` prefix requirement. The returned text is the
+    /// whole line — a `# ` line keeps its prefix, because here the
+    /// line itself is the request (us-19). An empty, whitespace-only,
+    /// stale or unverifiable line returns `None`: desync is inert.
     pub fn verified_line(&self, logical_line: &str) -> Option<String> {
-        if self.is_stale() {
-            return None;
-        }
-        let line = self.text().trim_end();
-        if line.is_empty() {
-            return None;
-        }
-        logical_line
-            .trim_end()
-            .ends_with(line)
-            .then(|| line.to_owned())
+        self.verified_shadow(logical_line).map(str::to_owned)
     }
 }
 
@@ -306,6 +313,328 @@ pub fn line_request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest
         .shadow
         .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
     Some(assemble(tab, settings, request))
+}
+
+/// The in-flight suggestion state machine `app` delegates to (Spec R04
+/// tickets T5/T6 — user stories 7–10, 14): `Some(InFlightSuggestion)`
+/// inside while a request streams, `None` while idle. One request at a
+/// time is the suggester's frontend contract, so a live pin also gates
+/// the next trigger. `Delta` text streams into the pinned tab's session
+/// — one `\x1b[200~`…`\x1b[201~` envelope when the child enabled mode
+/// 2004 — and `Error`s land on the status line; Esc on the pinned tab
+/// cancels (token + `Ctrl+U` wipe) while Enter is swallowed upstream in
+/// `app`'s pass-through arm.
+///
+/// The pin resolves through the tab's stable [`id`](Tab::id) — a
+/// `TabManager` counter immune both to the index shifts a mid-stream
+/// tab close causes AND to pid-less platforms where `child_pid` is
+/// `None`. A locator that could drift would type suggestion bytes into
+/// an unrelated session (us-14), which is why identity — not position —
+/// is what gets pinned.
+#[derive(Default)]
+pub(crate) struct SuggestionPin {
+    /// The live pin; `None` while no request is in flight.
+    inner: Option<InFlightSuggestion>,
+}
+
+/// An in-flight command suggestion, pinned to the tab that fired it
+/// (Spec R04 user story 14).
+struct InFlightSuggestion {
+    /// The pinned tab's stable [`id`](Tab::id) — the identity the pin
+    /// re-resolves through [`index_in`](Self::index_in); indices shift
+    /// on close and child pids can be absent or recycled, so neither
+    /// can substitute.
+    id: u64,
+    /// Whether a `\x1b[200~` envelope is currently open on the pinned
+    /// session — opened lazily on the first `Delta` while mode 2004
+    /// is on, closed on `Done`/`Error`/Esc-cancel so the whole stream
+    /// is one undoable, non-executing insertion (user story 7).
+    paste_open: bool,
+    /// Esc-cancelled but not yet terminated: the pin stays until the
+    /// worker's terminal event lands, so post-cancel `Delta`s drop
+    /// instead of retyping after the `Ctrl+U` wipe, and the
+    /// cancellation `Error` doesn't toast (user story 8). A
+    /// cancelled-but-live pin also keeps the trigger gate shut until
+    /// the stream is really over.
+    cancelled: bool,
+}
+
+impl SuggestionPin {
+    /// An idle pin — the state before the first request fires.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a request is in flight — the gate both triggers check
+    /// (one request at a time is the suggester's frontend contract).
+    pub(crate) fn is_some(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Whether no request is in flight.
+    pub(crate) fn is_none(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    /// Whether a live (non-cancelled) pin currently resolves to the tab
+    /// at `index` — the in-flight key scope (us-8/9/10): Esc and Enter
+    /// are intercepted only on the tab the request streams into; on
+    /// every other tab both keys behave normally.
+    pub(crate) fn is_live_for(&self, tabs: &TabManager, index: usize) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|pin| !pin.cancelled && pin.index_in(tabs) == Some(index))
+    }
+
+    /// Queue a verified request and take the in-flight pin on tab `id`
+    /// — the shared tail of both triggers (the `# `+Enter path in
+    /// `app`'s pass-through arm, `Alt+Enter` via
+    /// [`suggest_from_line`](Self::suggest_from_line)). `true` when the
+    /// suggester accepted the request and the pin was taken; a dead
+    /// suggester surfaces as a §6 toast instead, and the caller must
+    /// then leave the user's line — and its shadow — untouched.
+    pub(crate) fn fire(
+        &mut self,
+        suggester: &CommandSuggester,
+        id: u64,
+        request: SuggestRequest,
+        toast: &mut Option<Toast>,
+    ) -> bool {
+        match suggester.suggest(request) {
+            Ok(()) => {
+                self.inner = Some(InFlightSuggestion {
+                    id,
+                    paste_open: false,
+                    cancelled: false,
+                });
+                true
+            }
+            Err(error) => {
+                *toast = Some(Toast::new(format!("{error}"), Instant::now()));
+                false
+            }
+        }
+    }
+
+    /// The `Alt+Enter` trigger's app half (Spec R04 us-11/12): verify
+    /// the input line through [`line_request_for`] — the same
+    /// shadow+grid echo agreement the `# ` path requires — then, ONLY
+    /// once the request was accepted, erase the typed line with one DEL
+    /// (`\x7f`) per shadowed character so the request text and the
+    /// streamed command can never interleave, and reset the shadow
+    /// (the line really is empty, so the streamed text lands on a
+    /// fresh shadow, not a stale one). A live pin keeps the gate shut
+    /// — one request in flight at a time, same rule as the `# `
+    /// trigger — and an exited session drops the whole action like
+    /// any PTY input. An empty, stale or unverifiable line does
+    /// nothing at all: desync is inert (us-13). Erase-after-fire is
+    /// the honest ordering: a `suggest()` failure (a dead worker)
+    /// toasts the error and leaves the typed line exactly as the user
+    /// left it, instead of erasing a line whose request never ran.
+    pub(crate) fn suggest_from_line(
+        &mut self,
+        suggester: &CommandSuggester,
+        settings: &Settings,
+        tab: &mut Tab,
+        toast: &mut Option<Toast>,
+    ) {
+        if self.is_some() || tab.exit_status().is_some() {
+            return;
+        }
+        let Some(request) = line_request_for(tab, settings) else {
+            return;
+        };
+        if !self.fire(suggester, tab.id, request, toast) {
+            return;
+        }
+        let erased = tab.shadow.text().chars().count();
+        let _ = tab.session.send_bytes(&vec![0x7f; erased]);
+        tab.shadow.reset();
+    }
+
+    /// Esc on the pinned tab (Spec R04 user story 8): cancel the stream
+    /// at its `CancellationToken`, close the paste envelope if one is
+    /// open, and send `Ctrl+U` (`\x15` — readline's
+    /// kill-to-start-of-line) to wipe the partial suggestion. The pin
+    /// is kept, marked `cancelled`: the worker's terminal event still
+    /// has to release it, which keeps post-cancel `Delta`s from
+    /// retyping onto the just-wiped line and makes the cancellation
+    /// `Error` arrive silently rather than as a toast the user never
+    /// asked about. `tab` is the pinned (== active) tab; writes to an
+    /// exited session drop like all PTY input does.
+    pub(crate) fn cancel(&mut self, suggester: &CommandSuggester, tab: &mut Tab) {
+        let Some(pin) = self.inner.as_mut() else {
+            return;
+        };
+        pin.cancelled = true;
+        suggester.cancel();
+        if tab.exit_status().is_none() {
+            if pin.paste_open {
+                let _ = tab.session.send_bytes(PASTE_END);
+                pin.paste_open = false;
+            }
+            let _ = tab.session.send_bytes(b"\x15");
+        }
+        // `Ctrl+U` wiped the line through a side channel the shadow
+        // cannot replay — the honest state is a fresh, empty one so
+        // the next `# ` line can trigger.
+        tab.shadow.reset();
+    }
+
+    /// One suggester event applied — the seam the app's per-tick drain
+    /// shares with the tests, which inject `SuggestEvent`s directly
+    /// instead of running a model (Spec R04's testable-seam rule).
+    ///
+    /// `Delta` text arrives pre-sanitized from `ait-agent` (no control
+    /// byte can cross the channel — us-4/5), so it is typed verbatim
+    /// into the PINNED tab's session via
+    /// [`LiveSession::send_bytes`](ait_term::LiveSession::send_bytes):
+    /// the stream stays with its origin tab across a tab switch
+    /// (us-14), and deltas aimed at an exited session are dropped. When
+    /// the child enabled bracketed paste (`Session::bracketed_paste`),
+    /// the first `Delta` opens one `\x1b[200~`…`\x1b[201~` envelope the
+    /// whole stream rides inside (us-7) — `Done`/`Error` close it via
+    /// [`close_envelope`](Self::close_envelope).
+    ///
+    /// `Done` releases the pin; `Error` additionally surfaces the §6
+    /// status-line toast — prefixed with the pinned tab's `N:title`
+    /// label when it points at a background tab, the same attribution
+    /// rule the notification toasts use — except an Esc-cancelled
+    /// request, whose `Error` is the user's own doing and arrives
+    /// silently.
+    pub(crate) fn apply(
+        &mut self,
+        tabs: &TabManager,
+        event: SuggestEvent,
+        toast: &mut Option<Toast>,
+    ) {
+        match event {
+            SuggestEvent::Delta(text) => {
+                let Some(pin) = self.inner.as_mut() else {
+                    return;
+                };
+                if pin.cancelled {
+                    return;
+                }
+                let Some(tab) = pin.index_in(tabs).and_then(|index| tabs.tabs().get(index)) else {
+                    return;
+                };
+                if tab.exit_status().is_some() {
+                    return;
+                }
+                if !pin.paste_open && tab.session.bracketed_paste() {
+                    let _ = tab.session.send_bytes(PASTE_BEGIN);
+                    pin.paste_open = true;
+                }
+                let _ = tab.session.send_bytes(text.as_bytes());
+            }
+            SuggestEvent::Done => {
+                self.close_envelope(tabs);
+                self.inner = None;
+            }
+            SuggestEvent::Error(message) => {
+                // Tab indices shift on close — resolve the pin through
+                // its stable id (a gone tab just toasts unlabeled).
+                let pin = self.inner.as_ref();
+                let cancelled = pin.is_some_and(|pin| pin.cancelled);
+                let source = pin.and_then(|pin| {
+                    pin.index_in(tabs).and_then(|index| {
+                        if index == tabs.active_index() {
+                            None
+                        } else {
+                            tabs.tabs().get(index).map(|tab| tab.label(index))
+                        }
+                    })
+                });
+                self.close_envelope(tabs);
+                self.inner = None;
+                if !cancelled {
+                    *toast = Some(match source {
+                        Some(label) => Toast::new(format!("{label}: {message}"), Instant::now()),
+                        None => Toast::new(message, Instant::now()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain one tick of suggester events (Spec R04) — every queued
+    /// event through [`apply`](Self::apply). `try_recv` keeps the drain
+    /// zero-cost inside the app's 8 ms loop.
+    pub(crate) fn drain(
+        &mut self,
+        events: &Receiver<SuggestEvent>,
+        tabs: &TabManager,
+        toast: &mut Option<Toast>,
+    ) {
+        while let Ok(event) = events.try_recv() {
+            self.apply(tabs, event, toast);
+        }
+    }
+
+    /// Write `\x1b[201~` to the pinned session if an envelope is open —
+    /// the close half of [`PASTE_BEGIN`]'s contract. Called on `Done`,
+    /// `Error` and (inline, before `Ctrl+U`) Esc-cancel; a dead session
+    /// makes the whole question moot, so writes there drop.
+    fn close_envelope(&mut self, tabs: &TabManager) {
+        let Some(pin) = self.inner.as_mut() else {
+            return;
+        };
+        if !pin.paste_open {
+            return;
+        }
+        pin.paste_open = false;
+        if let Some(tab) = pin.index_in(tabs).and_then(|index| tabs.tabs().get(index)) {
+            if tab.exit_status().is_none() {
+                let _ = tab.session.send_bytes(PASTE_END);
+            }
+        }
+    }
+
+    /// The pinned state a fired request leaves behind — staged directly
+    /// by `app`'s dispatch tests, which inject `SuggestEvent`s through
+    /// [`apply`](Self::apply) instead of running a model.
+    #[cfg(test)]
+    pub(crate) fn staged(id: u64) -> Self {
+        Self {
+            inner: Some(InFlightSuggestion {
+                id,
+                paste_open: false,
+                cancelled: false,
+            }),
+        }
+    }
+
+    /// The pinned tab's stable id — what the dispatch tests assert the
+    /// pin resolved to.
+    #[cfg(test)]
+    pub(crate) fn pinned_id(&self) -> Option<u64> {
+        self.inner.as_ref().map(|pin| pin.id)
+    }
+
+    /// Whether the live pin was Esc-cancelled — a test view.
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.as_ref().is_some_and(|pin| pin.cancelled)
+    }
+
+    /// Whether a paste envelope is currently open — a test view.
+    #[cfg(test)]
+    pub(crate) fn paste_is_open(&self) -> bool {
+        self.inner.as_ref().is_some_and(|pin| pin.paste_open)
+    }
+}
+
+impl InFlightSuggestion {
+    /// The pinned suggestion's CURRENT position in the tab list, or
+    /// `None` when its tab is gone. The stable [`id`](Tab::id) is the
+    /// honest locator — tab indices shift when a tab closes mid-stream
+    /// and `child_pid` can be `None` on pid-less platforms, so neither
+    /// can substitute; a drifting locator would type suggestion bytes
+    /// into an unrelated session (Spec R04 user story 14).
+    fn index_in(&self, tabs: &TabManager) -> Option<usize> {
+        tabs.tabs().iter().position(|tab| tab.id == self.id)
+    }
 }
 
 #[cfg(test)]

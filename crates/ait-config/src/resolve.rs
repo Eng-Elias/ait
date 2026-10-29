@@ -99,12 +99,15 @@ impl Settings {
     /// unset; `Err` means the profile does not exist, or a role
     /// references a `config_key` no model declares (unreachable through
     /// [`Settings::from_toml`], which rejects dangling references, but
-    /// the fields are public).
+    /// the fields are public). The `?Sized` store lets a
+    /// `&dyn SecretStore` flow straight through — e.g. from the boxed
+    /// store `ait-agent`'s worker holds — with no sized wrapper in
+    /// between.
     pub fn resolve_model(
         &self,
         profile: &str,
         role: ModelRole,
-        store: &impl SecretStore,
+        store: &(impl SecretStore + ?Sized),
     ) -> Result<Option<ResolvedModel<'_>>, ConfigError> {
         let profile_ref = self.agents.execution_profiles.get(profile).ok_or_else(|| {
             ConfigError::at(
