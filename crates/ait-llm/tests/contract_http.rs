@@ -7,17 +7,15 @@
 //! `testing::Retry` seam so the suite never sleeps real seconds. The
 //! mechanics are adapter-agnostic; `openai_chat_completions` stands in.
 
-mod support;
-
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use ait_llm::openai_chat_completions as occ;
-use ait_llm::{testing::Retry, EndpointConfig, EndpointSchema, LlmError, LlmProvider};
+use ait_llm::testing::{error_status, rate_limited, sse, Fixture, Retry, Script};
+use ait_llm::{EndpointConfig, EndpointSchema, LlmError, LlmProvider};
 use futures_util::StreamExt;
-use support::{error_status, rate_limited, sse, Fixture, Script};
 use tokio_util::sync::CancellationToken;
 
 /// A provider pointed at the fixture with an injected retry policy.

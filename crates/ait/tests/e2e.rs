@@ -12,16 +12,13 @@
 //! and passes the path through [`SpawnConfig::env`], which applies after
 //! the harness's pinned `XDG_CONFIG_HOME` and therefore overrides it.
 
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
 use std::path::Path;
 use std::sync::mpsc;
-use std::thread;
 
+use ait_llm::testing::{sse, Fixture, Script};
 use ait_testkit::{ait_bin, E2e, Size, SpawnConfig};
-use tiny_http::{Header, Response, Server, StatusCode};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line.
 const SIZE: Size = Size {
@@ -455,103 +452,10 @@ fn existing_tabs_keep_spawn_time_scrollback_after_reload() {
 // wire format, and the sanitized deltas type themselves onto the input
 // line. Code-first for the same reason as the R03 tests, plus one more:
 // the stub's ephemeral port cannot be interpolated into a scenario's
-// `env` either (backlog #37). The stub is a trimmed copy of the
-// ait-llm/ait-agent `tests/support` fixture — one scripted response per
-// incoming request, on a daemon thread.
+// `env` either (backlog #37). The stub is `ait_llm::testing`'s shared
+// fixture — one scripted response per incoming request, on a daemon
+// thread.
 // ---------------------------------------------------------------------------
-
-/// One scripted response — one entry per incoming request, consumed in
-/// order (the fixture's own convention).
-enum Script {
-    /// A complete SSE body, sent in one response.
-    Sse(String),
-    /// A body fed chunk-by-chunk through a channel — the mid-stream
-    /// stall the Esc test needs: send what must arrive, hold the rest,
-    /// and the stream pauses exactly there (the test's pacing knob;
-    /// nothing sleeps).
-    Drip(mpsc::Receiver<Vec<u8>>),
-}
-
-/// A `Read` fed by a channel: `Ok(chunk)` appends, a dropped sender is
-/// EOF, a live-but-silent sender blocks. Copied from the fixture's
-/// `ChannelRead`.
-struct ChannelRead {
-    rx: mpsc::Receiver<Vec<u8>>,
-    buf: VecDeque<u8>,
-}
-
-impl Read for ChannelRead {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.buf.is_empty() {
-            match self.rx.recv() {
-                Ok(chunk) => self.buf.extend(chunk),
-                Err(_) => return Ok(0),
-            }
-        }
-        let n = self.buf.len().min(out.len());
-        for slot in out.iter_mut().take(n) {
-            *slot = self.buf.pop_front().expect("n is bounded by buf len");
-        }
-        Ok(n)
-    }
-}
-
-/// The in-process SSE stub: a `tiny_http` server on
-/// `127.0.0.1:<ephemeral>` replaying `Script`s, one per request.
-struct SseStub {
-    /// `http://127.0.0.1:<port>` — the fixture `base_url` the settings
-    /// file points `[agents.custom_endpoints.local]` at.
-    base_url: String,
-    /// The daemon serving thread — exits with the test process.
-    _thread: thread::JoinHandle<()>,
-}
-
-impl SseStub {
-    /// Start the stub replaying `scripts`, one response per request.
-    fn serve(scripts: Vec<Script>) -> Self {
-        let server = Server::http("127.0.0.1:0").expect("bind the SSE stub on loopback");
-        let addr = server.server_addr().to_ip().expect("the stub has an IP");
-        let mut scripts: VecDeque<Script> = scripts.into();
-        let thread = thread::spawn(move || {
-            while let Some(script) = scripts.pop_front() {
-                let Ok(mut request) = server.recv() else {
-                    break;
-                };
-                // Drain the POST body so the reply goes out clean.
-                let mut payload = String::new();
-                let _ = request.as_reader().read_to_string(&mut payload);
-                match script {
-                    Script::Sse(body) => {
-                        let mut response =
-                            Response::from_string(body).with_status_code(StatusCode(200));
-                        response.add_header(
-                            Header::from_bytes("Content-Type", "text/event-stream")
-                                .expect("ASCII header"),
-                        );
-                        let _ = request.respond(response);
-                    }
-                    Script::Drip(rx) => {
-                        let _ = request.respond(Response::new(
-                            StatusCode(200),
-                            vec![Header::from_bytes("Content-Type", "text/event-stream")
-                                .expect("ASCII header")],
-                            ChannelRead {
-                                rx,
-                                buf: VecDeque::new(),
-                            },
-                            None,
-                            None,
-                        ));
-                    }
-                }
-            }
-        });
-        SseStub {
-            base_url: format!("http://{addr}"),
-            _thread: thread,
-        }
-    }
-}
 
 /// A JSON string literal (`"…"`) for the chunk body — the same
 /// hand-rolled escaping ait-agent's suggester tests use; the transcripts
@@ -640,7 +544,7 @@ fn wait_for_typed_echo(app: &mut E2e, text: &str) {
 /// executed (the Enter the user presses is the only one).
 #[test]
 fn hash_enter_streams_the_suggested_command() {
-    let stub = SseStub::serve(vec![Script::Sse(sse_transcript(&[
+    let stub = Fixture::serve(vec![sse(&sse_transcript(&[
         "find ",
         ". -type f -size +1G",
     ]))]);
@@ -670,10 +574,7 @@ fn hash_enter_streams_the_suggested_command() {
 /// suggestion streams onto the same prompt row.
 #[test]
 fn alt_enter_suggests_for_a_bare_line() {
-    let stub = SseStub::serve(vec![Script::Sse(sse_transcript(&[
-        "git reset --soft ",
-        "HEAD~1",
-    ]))]);
+    let stub = Fixture::serve(vec![sse(&sse_transcript(&["git reset --soft ", "HEAD~1"]))]);
     let dir = tempfile::tempdir().expect("fixture tempdir");
     write_settings(dir.path(), &settings_with_stub(&stub.base_url));
 
@@ -698,10 +599,10 @@ fn alt_enter_suggests_for_a_bare_line() {
 #[test]
 fn escape_mid_stream_wipes_the_partial_command() {
     let (drip_tx, drip_rx) = mpsc::channel::<Vec<u8>>();
-    let stub = SseStub::serve(vec![
-        Script::Drip(drip_rx),
+    let stub = Fixture::serve(vec![
+        Script::DripSse(drip_rx),
         // The post-cancel request: proof the trigger refires.
-        Script::Sse(sse_transcript(&["du -sh ."])),
+        sse(&sse_transcript(&["du -sh ."])),
     ]);
     let dir = tempfile::tempdir().expect("fixture tempdir");
     write_settings(dir.path(), &settings_with_stub(&stub.base_url));

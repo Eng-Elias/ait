@@ -2,12 +2,10 @@
 //! recorded SSE transcripts replayed through the in-process fixture
 //! server — the real HTTP+SSE path, zero external network.
 
-mod support;
-
 use ait_llm::openai_responses as or;
-use ait_llm::{testing::Retry, EndpointConfig, EndpointSchema, LlmError, LlmProvider};
+use ait_llm::testing::{assert_post, error_status, sse, Fixture, Retry};
+use ait_llm::{EndpointConfig, EndpointSchema, LlmError, LlmProvider};
 use futures_util::StreamExt;
-use support::{assert_post, error_status, sse, Fixture};
 use tokio_util::sync::CancellationToken;
 
 fn provider(base_url: &str, secret: Option<&str>) -> or::Provider {
