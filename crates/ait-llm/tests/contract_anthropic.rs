@@ -2,12 +2,10 @@
 //! recorded SSE transcripts replayed through the in-process fixture
 //! server — the real HTTP+SSE path, zero external network.
 
-mod support;
-
 use ait_llm::anthropic_messages as am;
+use ait_llm::testing::{assert_post, sse, Fixture};
 use ait_llm::{EndpointConfig, EndpointSchema, LlmError, LlmProvider};
 use futures_util::StreamExt;
-use support::{assert_post, sse, Fixture};
 use tokio_util::sync::CancellationToken;
 
 fn provider(base_url: &str, secret: Option<&str>) -> am::Provider {

@@ -31,7 +31,8 @@ ait-config = { path = "../ait-config" }
 ait-llm = { path = "../ait-llm" }
 
 [dev-dependencies]
-# In-process HTTP fixture server for the CommandSuggester integration
-# tests (Spec R04 testing decisions) — a copy of ait-llm's contract-test
-# harness: tiny_http 0.12.0 (2022-10-06), >=7 days old per ADR-0002.
-tiny_http = "0.12"
+# The in-process HTTP fixture server for the CommandSuggester
+# integration tests (Spec R04 testing decisions) lives in ait-llm behind
+# `test-fixtures` — `ait_llm::testing`, one shared harness for every
+# crate's tests.
+ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }

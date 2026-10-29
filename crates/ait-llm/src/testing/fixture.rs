@@ -1,10 +1,9 @@
-//! In-process HTTP fixture server for the contract tests (Spec R03
-//! us-34): a scripted `tiny_http` server on a `std::thread` — the real
-//! HTTP+SSE path over loopback, zero external network. Recorded SSE
-//! transcripts live under `tests/fixtures/` and are replayed verbatim.
-
-// A shared harness: each contract test file uses the parts it needs.
-#![allow(dead_code)]
+//! In-process HTTP fixture server for contract and integration tests
+//! (Spec R03 us-34): a scripted `tiny_http` server on a `std::thread` —
+//! the real HTTP+SSE path over loopback, zero external network. Recorded
+//! SSE transcripts live under `tests/fixtures/` and are replayed
+//! verbatim. Behind the `test-fixtures` feature so `tiny_http` never
+//! reaches a normal build.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};

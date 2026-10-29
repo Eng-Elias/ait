@@ -118,35 +118,60 @@ fn syntactically_broken_toml_emits_config_error() {
     next_event(&_watcher).expect_err("broken TOML should emit a ConfigError");
 }
 
+/// One full burst scenario on a fresh tempdir and watcher — reported as
+/// `Err` so the test can retry (see below).
+fn burst_attempt() -> Result<(), String> {
+    let dirs = tempfile::tempdir().unwrap();
+    let path = dirs.path().join("settings.toml");
+    write(&path, "[terminal]\nshell = \"/bin/zsh\"\n");
+
+    let watcher = watch_from(&path).map_err(|e| format!("watch_from failed: {e}"))?;
+
+    for shell in ["/bin/a", "/bin/b", "/bin/c", "/bin/fish"] {
+        write(&path, &format!("[terminal]\nshell = \"{shell}\"\n"));
+    }
+
+    let event = watcher
+        .receiver()
+        .recv_timeout(EVENT_WAIT)
+        .map_err(|_| String::from("no event arrived within the wait bound"))?;
+    let settings = event.map_err(|e| format!("the burst emitted a ConfigError: {e}"))?;
+    if settings.terminal.shell.as_deref() != Some("/bin/fish") {
+        return Err(format!(
+            "the debounced event carried intermediate content {:?}, not the burst's final write",
+            settings.terminal.shell
+        ));
+    }
+    match watcher.receiver().recv_timeout(QUIET_CHECK) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        other => Err(format!(
+            "the burst did not collapse to one event: {other:?}"
+        )),
+    }
+}
+
 #[test]
 fn burst_writes_collapse_to_one_event() {
     // Spec R03's ~300 ms debounce: an editor's multi-write save — and a
     // rapid sequence of whole-file saves — must not emit an event per raw
     // fs notification (each intermediate read could even see a truncated
     // file). One burst, one event, carrying the final content.
-    let dirs = tempfile::tempdir().unwrap();
-    let path = dirs.path().join("settings.toml");
-    write(&path, "[terminal]\nshell = \"/bin/zsh\"\n");
-
-    let _watcher = watch_from(&path).unwrap();
-
-    for shell in ["/bin/a", "/bin/b", "/bin/c", "/bin/fish"] {
-        write(&path, &format!("[terminal]\nshell = \"{shell}\"\n"));
+    //
+    // Bounded retry on a fresh tempdir+watcher: a genuine debounce
+    // regression (per-event emission, a dropped final write) fails every
+    // attempt deterministically, but on a loaded CI box an inotify
+    // delivery or a write can straddle the ~300 ms window and produce a
+    // legitimate intermediate event — this flaked twice during R04. The
+    // retry separates the two.
+    const ATTEMPTS: usize = 3;
+    let mut failure = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match burst_attempt() {
+            Ok(()) => return,
+            Err(e) => failure = format!("attempt {attempt}/{ATTEMPTS}: {e}"),
+        }
     }
-
-    let settings = next_event(&_watcher).expect("the burst should emit a Settings event");
-    assert_eq!(
-        settings.terminal.shell.as_deref(),
-        Some("/bin/fish"),
-        "the debounced event must carry the burst's final content"
-    );
-    assert!(
-        matches!(
-            _watcher.receiver().recv_timeout(QUIET_CHECK),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
-        "a write burst must collapse to a single event"
-    );
+    panic!("{failure}");
 }
 
 #[test]

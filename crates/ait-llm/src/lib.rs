@@ -38,6 +38,4 @@ pub use provider::{EventStream, LlmProvider};
 /// Internal seams exposed for the crate's contract tests — not public
 /// API and subject to change without notice.
 #[doc(hidden)]
-pub mod testing {
-    pub use crate::http::Retry;
-}
+pub mod testing;

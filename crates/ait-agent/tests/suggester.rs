@@ -1,22 +1,21 @@
 //! Integration tests at the `CommandSuggester` channel seam (Spec R04
 //! testing decisions): a real request in on one `mpsc` channel, ordered
 //! `Delta`s / `Done` / `Error` out on the other — against the in-process
-//! `tiny_http` SSE fixture copied from `ait-llm`'s contract tests, so
-//! the full HTTP+SSE+retry+sanitize path runs with zero external
-//! network (§6, standard 11).
+//! `tiny_http` SSE fixture ait-llm exports for tests
+//! (`ait_llm::testing`, `test-fixtures` feature), so the full
+//! HTTP+SSE+retry+sanitize path runs with zero external network
+//! (§6, standard 11).
 //!
 //! The fixture server speaks `openai_chat_completions`; secrets resolve
 //! through a stub `SecretStore` (`NoSecrets`) — the production path uses
 //! `OsKeyring`.
-
-mod support;
 
 use std::sync::mpsc;
 use std::time::Duration;
 
 use ait_agent::{CommandSuggester, SuggestEvent, SuggestRequest};
 use ait_config::{SecretStore, Settings};
-use support::{assert_post, error_status, sse, Fixture, Script};
+use ait_llm::testing::{assert_post, error_status, sse, Fixture, Script};
 
 /// Tests never touch a real keyring — a missing secret is `None`, so
 /// fixture requests go out with no `Authorization` header.

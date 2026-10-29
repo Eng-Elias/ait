@@ -33,17 +33,29 @@ httpdate = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# In-process HTTP fixture server (Spec R03 us-34) shared by every crate's
+# tests through `ait_llm::testing` — optional behind `test-fixtures`, so
+# resolver v2 keeps it out of normal builds. tiny_http 0.12.0
+# (2022-10-06) is >=7 days old per ADR-0002.
+tiny_http = { version = "0.12", optional = true }
+
+[features]
+# Exposes the tiny_http fixture server under `ait_llm::testing` for
+# downstream crates' test builds — wired in through their
+# dev-dependencies only (standard 8's optional-dependency sanction).
+test-fixtures = ["dep:tiny_http"]
 
 [dev-dependencies]
 # The `chat` example loads settings.toml through ait-config (Spec R03
 # us-35); ait-llm itself stays config-free.
 ait-config = { path = "../ait-config" }
-# In-process HTTP fixture server for the contract tests (Spec R03 us-34):
-# tiny_http 0.12.0 (2022-10-06) is >=7 days old per ADR-0002. tokio's
-# `test-util` pauses the clock so the 60 s idle-timeout test runs in ms;
-# `signal` lets the `chat` example wire Ctrl-C to the request's
+# The crate's own contract tests import the fixture through
+# `ait_llm::testing` — the self dev-dependency is how `test-fixtures`
+# turns on for `cargo test` builds only.
+ait-llm = { path = ".", features = ["test-fixtures"] }
+# tokio's `test-util` pauses the clock so the 60 s idle-timeout test runs
+# in ms; `signal` lets the `chat` example wire Ctrl-C to the request's
 # CancellationToken.
-tiny_http = "0.12"
 tokio = { version = "1", features = ["test-util", "signal"] }
 
 # `cargo test` compiles examples with the test harness so chat's pure

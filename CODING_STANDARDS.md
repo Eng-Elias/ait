@@ -19,3 +19,9 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
 11. Tests at agreed seams only; core logic is testable without TTY or
     network.
 12. Resist feature creep — every round ships something usable.
+13. Model-originated text bound for PTY input passes the sanitizer — no
+    control bytes, truncated at the first line break; it types, never
+    self-executes (the mirror of 5's terminal→context redaction).
+14. In-flight async work pins a stable identity (`Tab::id`, a session
+    token) — never a positional index or an OS handle that reorder or
+    recycle underneath it (R04's `SuggestionPin`).

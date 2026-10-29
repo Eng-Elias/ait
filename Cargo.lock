@@ -28,13 +28,13 @@ version = "0.1.0"
 dependencies = [
  "ait-agent",
  "ait-config",
+ "ait-llm",
  "ait-term",
  "ait-testkit",
  "crossterm",
  "insta",
  "ratatui",
  "tempfile",
- "tiny_http",
 ]
 
 [[package]]
@@ -45,7 +45,6 @@ dependencies = [
  "ait-llm",
  "futures-util",
  "regex",
- "tiny_http",
  "tokio",
  "tokio-util",
 ]
@@ -71,6 +70,7 @@ name = "ait-llm"
 version = "0.1.0"
 dependencies = [
  "ait-config",
+ "ait-llm",
  "eventsource-stream",
  "futures-util",
  "httpdate",

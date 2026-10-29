@@ -40,8 +40,8 @@ insta = "1.49"
 # `ait --init` writes under a fresh config dir). Release >=7 days old
 # per ADR-0002: tempfile 3.27.0 (2026-03-11).
 tempfile = "3"
-# In-process SSE stub for the Spec R04 e2e tests (ticket R04-T7) — the
-# same tiny_http fixture pattern ait-llm's contract tests and
-# ait-agent's suggester tests use. Release >=7 days old per ADR-0002:
-# tiny_http 0.12.0 (2022-10-06).
-tiny_http = "0.12"
+# In-process SSE stub for the Spec R04 e2e tests (ticket R04-T7) —
+# `ait_llm::testing`'s shared fixture server behind `test-fixtures`,
+# the same harness ait-llm's contract tests and ait-agent's suggester
+# tests use.
+ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }
