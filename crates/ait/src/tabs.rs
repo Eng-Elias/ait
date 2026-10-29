@@ -60,10 +60,10 @@ pub struct Tab {
     /// production callers use the `*_selection` methods.
     pub(crate) selection: Selection,
     /// The shadow of this tab's printable input since the last line
-    /// submission — what the `# `+Enter trigger verifies against the
-    /// grid's echoed line (Spec R04, user story 29). Same `pub(crate)`
-    /// test seam; production drives it through `crate::suggest` from
-    /// the keypress path.
+    /// submission — what the `# `+Enter and `Alt+Enter` triggers verify
+    /// against the grid's echoed line (Spec R04, user story 29). Same
+    /// `pub(crate)` test seam; production drives it through
+    /// `crate::suggest` from the keypress path.
     pub(crate) shadow: InputShadow,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
