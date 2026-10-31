@@ -34,6 +34,7 @@ use ait_term::{
     SessionEvent, Size, SpawnError,
 };
 
+use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
@@ -121,6 +122,12 @@ pub struct Tab {
     /// [`IntegrationState::observe`]; `__ait_run` gating and the
     /// status line consume it in later tickets.
     integration: IntegrationState,
+    /// The §5.5.1 in-band exec seam: per-tab `__ait_run` request ids,
+    /// the frame accumulator and the `id → waiter` map
+    /// (`crate::inband`, Spec R05 / issue #75). `drain_events` feeds it
+    /// every observed OSC; `pub(crate)` so tests inspect pending
+    /// state — production callers go through [`run_in_shell`](Self::run_in_shell).
+    pub(crate) inband: InBandExec,
     /// The materialized injection the session was spawned with —
     /// holding the guard here ties the per-session `0700` snippet dir's
     /// lifetime to the tab's (drop removes it best-effort, Spec R05
@@ -190,6 +197,27 @@ impl Tab {
     /// The renderable cursor: viewport position and shape.
     pub fn cursor(&self) -> Cursor {
         self.session.cursor()
+    }
+
+    /// Ask this tab's live shell to run `command` invisibly and report
+    /// `{merged output, exit_code}` back over `OSC 7701` — the §5.5.1
+    /// in-band seam (Spec R05 / issue #75). Writes
+    /// `__ait_run <id> <hex(cmd)>` to the PTY — which the shell echoes,
+    /// so the request always leaves a visible trace — and returns the
+    /// [`RunRequest`] the result arrives on.
+    ///
+    /// Refuses unless the tab is `Integrated` (a shell without the
+    /// snippet can't answer, so nothing is typed) or already exited —
+    /// Round 6's `CommandExecutor` is the intended caller; only tests
+    /// drive it today.
+    #[allow(dead_code)]
+    pub fn run_in_shell(&mut self, command: &[u8]) -> Result<RunRequest, InBandError> {
+        if self.exit.is_some() {
+            return Err(InBandError::SessionExited);
+        }
+        self.inband.request(self.integration, command, |bytes| {
+            self.session.send_bytes(bytes)
+        })
     }
 
     /// The `N:title` label for the tab at position `index` (0-based) —
@@ -424,6 +452,7 @@ impl TabManager {
             title,
             prompt_marks: VecDeque::new(),
             integration: IntegrationState::Absent,
+            inband: InBandExec::new(),
             materialized,
         });
         self.active = self.tabs.len() - 1;
@@ -599,6 +628,9 @@ impl TabManager {
                 // sequences.
                 if let LiveEvent::Osc(osc) = &event {
                     tab.integration.observe(osc);
+                    // §5.5.1: `OSC 7701` frames resolve pending
+                    // `__ait_run` requests against the waiters' map.
+                    tab.inband.observe(osc);
                 }
                 events.push(TabEvent { tab: index, event });
             }
@@ -1233,6 +1265,203 @@ mod tests {
         assert!(
             !dir.exists(),
             "the session dir was removed with the tab: {dir:?}"
+        );
+    }
+
+    /// A shell command line whose output is a complete `7701`
+    /// `A … R×N … B` response for `payload` — one `printf` emitting the
+    /// same sequences `ait_shell::{run_begin_sequence,
+    /// chunk_run_payload, run_end_sequence}` produce (the snippets'
+    /// `__ait_run` emits the identical shape). Payloads over the
+    /// snippet's 500-byte slice exercise the multi-frame path.
+    fn run_response_line(payload: &[u8]) -> Vec<u8> {
+        let mut line = b"printf '".to_vec();
+        line.extend_from_slice(b"\\033]7701;A\\007");
+        for chunk in payload.chunks(500) {
+            line.extend_from_slice(format!("\\033]7701;R;{};", chunk.len()).as_bytes());
+            for byte in chunk {
+                line.extend_from_slice(format!("{byte:02x}").as_bytes());
+            }
+            line.extend_from_slice(b"\\007");
+        }
+        line.extend_from_slice(b"\\033]7701;B\\007'\n");
+        line
+    }
+
+    /// Spec R05 / issue #75 — the §5.5.1 seam through a real
+    /// interactive `/bin/sh`: `Absent`/`MarksOnly` requests are refused
+    /// with NO bytes typed; once `Integrated`, `run_in_shell` types a
+    /// visible `__ait_run <id> <hex>` line, and hand-emitted `7701`
+    /// frames resolve the waiter's channel while their decoded payload
+    /// never lands in the grid.
+    #[test]
+    fn inband_run_gates_then_round_trips() {
+        let mut manager = manager(1, "/tmp");
+        fn emit(manager: &TabManager, bytes: &[u8]) {
+            manager.active().unwrap().session.send_bytes(bytes).unwrap();
+        }
+
+        // Absent: refused before anything is typed. The marker command
+        // afterwards flushes the input stream — had the request leaked
+        // bytes, its echo would precede the marker.
+        let err = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect_err("an Absent tab refuses");
+        assert!(
+            matches!(err, InBandError::NotIntegrated(IntegrationState::Absent)),
+            "{err:?}"
+        );
+        emit(&manager, b"echo gate-marker\n");
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("gate-marker")
+        });
+        assert!(
+            !grid_text(&manager.tabs()[0].session).contains("__ait_run"),
+            "a refused request typed nothing"
+        );
+
+        // MarksOnly (a stray OSC 133) refuses the same way.
+        emit(&manager, b"printf '\\033]133;A\\007'\n");
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::MarksOnly
+        });
+        let err = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect_err("a MarksOnly tab refuses");
+        assert!(
+            matches!(err, InBandError::NotIntegrated(IntegrationState::MarksOnly)),
+            "{err:?}"
+        );
+
+        // Integrated via a hand-emitted init_shell hook.
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"init_shell","value":{"session_id":0,"shell":"sh"}}"#),
+        );
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+
+        // The request types `__ait_run 0 <hex(echo hi)>` — visible in
+        // the grid (us-23 transparency); sh can't run it, which is fine.
+        let req = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect("an Integrated tab accepts the request");
+        assert_eq!(req.id(), 0);
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("__ait_run 0 6563686f206869")
+        });
+
+        // A two-frame response (>500 decoded bytes → two `R` chunks)
+        // resolves the waiter's channel by id.
+        let output = format!("RUN-MARKER-{}", "x".repeat(1200));
+        let payload = format!("0;{output};7").into_bytes();
+        emit(&manager, &run_response_line(&payload));
+        drain_until(&mut manager, |m| !m.tabs()[0].inband.is_pending(0));
+
+        let result = req.wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.id, "0");
+        assert_eq!(result.output, output.into_bytes());
+        assert_eq!(result.exit_code, 7);
+
+        // The decoded payload rendered nowhere — it only ever crossed
+        // the PTY hex-inside-OSC, and private OSCs never render. (The
+        // typed `printf` line itself is grid text, like `__ait_run`.)
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(
+            !text.contains("RUN-MARKER"),
+            "7701 output is invisible: {text}"
+        );
+    }
+
+    /// `OSC 7701` bytes on a session's output never reach the grid:
+    /// the emulator swallows private OSCs (the observer still decodes
+    /// them — resolution coverage lives in the tests above). Printed
+    /// mid-text, `PRE` and `POST` land contiguous.
+    #[test]
+    fn run_frames_never_render() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: sh_script(
+                    "printf 'PRE\\033]7701;A\\007\\033]7701;R;3;616263\\007\\033]7701;B\\007POST\\n'",
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("POST")
+        });
+
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(
+            text.contains("PREPOST"),
+            "the OSCs rendered nothing: {text}"
+        );
+        assert!(!text.contains("7701"), "{text}");
+        // `616263` decodes to `abc` — the payload is invisible too.
+        assert!(!text.contains("abc"), "{text}");
+    }
+
+    /// The real round-trip: injected bash defines `__ait_run`, so a
+    /// `run_in_shell` request executes inside the live shell — merged
+    /// output and exit code come back over `7701` while the typed
+    /// request line stays visible (us-23). The e2e-harness version of
+    /// this is T9's; this covers the tab-level seam end to end.
+    #[test]
+    fn injected_bash_executes_run_requests_in_band() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+
+        let req = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"printf 'inband-ok\\n'; (exit 7)")
+            .expect("the integrated tab accepts");
+        assert_eq!(req.id(), 0);
+        drain_until(&mut manager, |m| !m.tabs()[0].inband.is_pending(0));
+
+        let result = req.wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.id, "0");
+        assert_eq!(result.exit_code, 7);
+        assert!(
+            String::from_utf8_lossy(&result.output).contains("inband-ok"),
+            "{result:?}"
+        );
+
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(
+            text.contains("__ait_run 0"),
+            "the request left a trace: {text}"
+        );
+        assert!(
+            !text.contains("inband-ok"),
+            "captured output stayed off the grid: {text}"
         );
     }
 
