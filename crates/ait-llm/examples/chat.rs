@@ -229,7 +229,9 @@ fn run(args: &Args) -> ExitCode {
 
 /// `ait-config`'s schema enum and `ait-llm`'s are deliberately separate
 /// types (the llm crate owns its wire vocabulary); the example bridges
-/// them.
+/// them. Two copies exist by design (ait-llm stays config-free); keep
+/// them in sync with `crates/ait-agent/src/suggester.rs`'s `llm_schema`
+/// when a fourth `EndpointSchema` variant lands.
 fn llm_schema(schema: ait_config::EndpointSchema) -> EndpointSchema {
     match schema {
         ait_config::EndpointSchema::OpenAiChatCompletions => EndpointSchema::OpenAiChatCompletions,

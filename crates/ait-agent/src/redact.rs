@@ -40,8 +40,9 @@ const PATTERNS: &[&str] = &[
     r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}",
     // Private-key PEM blocks — `[\s\S]` lets the match span lines, so
     // a whole `-----BEGIN …-----`…`-----END …-----` block collapses
-    // to one marker.
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    // to one marker. Trailing words after `PRIVATE KEY` (` BLOCK` in
+    // `PGP PRIVATE KEY BLOCK`) stay inside the anchor.
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[ A-Z0-9]*-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY[ A-Z0-9]*-----",
 ];
 
 /// The compiled-once pattern set: a `RegexSet` only reports which

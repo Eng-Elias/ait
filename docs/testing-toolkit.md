@@ -218,6 +218,11 @@ target/e2e-failures/<test>/
 `AIT_E2E_DUMP_DIR` overrides the root. CI's `e2e` job uploads
 `target/e2e-failures/` as an artifact on failure.
 
+Both files are **raw output, unredacted** — a credential printed in a
+failing test lands in the CI artifact verbatim. Per
+`docs/e2e-driver-protocol.md`, scenarios never type or print real
+secrets; keep it that way.
+
 ## Environment variables
 
 | var | effect |

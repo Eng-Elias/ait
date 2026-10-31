@@ -131,6 +131,36 @@ fn the_typed_request_is_never_redacted() {
     assert!(user.contains("[REDACTED]"));
 }
 
+/// A credential spanning grid lines still redacts (us-18): the tail is
+/// joined before `redact` runs, so a PEM block split across
+/// `output_lines` entries collapses to one marker — per-line redaction
+/// could never see both anchors.
+#[test]
+fn a_pem_block_split_across_output_lines_collapses() {
+    let lines = vec![
+        String::from("$ cat ~/.ssh/id_rsa"),
+        String::from("-----BEGIN RSA PRIVATE KEY-----"),
+        String::from("MIIEpAIBAAKCAQEA7qWJf+0AbCdEfGhIjKlMnOpQrStUvWxYz0"),
+        String::from("-----END RSA PRIVATE KEY-----"),
+        String::from("$ "),
+    ];
+    let context = SuggestContext {
+        cwd: "/home/u",
+        shell: "bash",
+        os: "linux",
+        output_lines: &lines,
+        request: "what is this key",
+    };
+    let request = assemble_request(&context, EndpointSchema::OpenAiChatCompletions, "m");
+    let (_, user, _, _) = parts(&request);
+    assert!(
+        !user.contains("RSA PRIVATE KEY"),
+        "the PEM block leaked: {user:?}"
+    );
+    assert!(!user.contains("MIIEpAIB"), "the PEM body leaked: {user:?}");
+    assert_eq!(user.matches("[REDACTED]").count(), 1);
+}
+
 /// §5.4's "last N lines": when more than `OUTPUT_LINE_BUDGET` lines are
 /// offered, only the tail reaches the prompt.
 #[test]

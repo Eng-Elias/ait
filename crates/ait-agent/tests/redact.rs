@@ -141,3 +141,15 @@ fn pem_block_spanning_lines_collapses_to_one_marker() {
                  after";
     assert_eq!(redact(input), "before\n[REDACTED]\nafter");
 }
+
+/// The PGP armor variant ends in `KEY BLOCK`, not `PRIVATE KEY` — the
+/// anchor must still catch it.
+#[test]
+fn pgp_private_key_block_collapses_to_one_marker() {
+    let input = "before\n\
+                 -----BEGIN PGP PRIVATE KEY BLOCK-----\n\
+                 xVgEZ2FiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MDEyMzQ1Njc4\n\
+                 -----END PGP PRIVATE KEY BLOCK-----\n\
+                 after";
+    assert_eq!(redact(input), "before\n[REDACTED]\nafter");
+}

@@ -408,7 +408,10 @@ fn provider_error(message: String, code: Option<String>) -> String {
 
 /// `ait-config`'s schema enum and `ait-llm`'s are deliberately separate
 /// types (the llm crate owns its wire vocabulary); bridge them here —
-/// the same seam `ait-llm`'s `chat` example uses.
+/// the same seam `ait-llm`'s `chat` example uses. Two copies exist by
+/// design (ait-llm stays config-free); keep them in sync with
+/// `crates/ait-llm/examples/chat.rs`'s `llm_schema` when a fourth
+/// `EndpointSchema` variant lands.
 fn llm_schema(schema: ait_config::EndpointSchema) -> EndpointSchema {
     match schema {
         ait_config::EndpointSchema::OpenAiChatCompletions => EndpointSchema::OpenAiChatCompletions,

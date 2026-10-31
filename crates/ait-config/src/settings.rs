@@ -111,6 +111,10 @@ pub struct TerminalSettings {
     pub shell: Option<String>,
     /// Scrollback capacity in lines for new sessions.
     pub scrollback_lines: Option<usize>,
+    /// Let child applications write the host clipboard via OSC 52
+    /// (Spec R02 — off by default; `ait` performs the write itself when
+    /// enabled).
+    pub osc52: Option<bool>,
 }
 
 /// `[agents]` — endpoint declarations (§4.1) and execution profiles (§5.7).

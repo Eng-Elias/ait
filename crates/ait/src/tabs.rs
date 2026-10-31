@@ -26,11 +26,12 @@
 //! - every tab is drained and resized each pass — background grids stay
 //!   current and their exits/OSC events surface.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use ait_term::{
-    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, SessionEvent, Size,
-    SpawnError,
+    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
+    SessionEvent, Size, SpawnError,
 };
 
 use crate::scroll::ScrollState;
@@ -41,6 +42,32 @@ use crate::suggest::InputShadow;
 /// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
 /// this only guards pathological paths (e.g. `/`).
 const FALLBACK_TITLE: &str = "sh";
+
+/// How many prompt marks a tab retains — four arrive per shell
+/// command (A/B/C/D), so this covers ~1000 commands of history; the
+/// oldest drop off the front, same rule as scrollback.
+const PROMPT_MARK_CAP: usize = 4096;
+
+/// One OSC 133 mark recorded against the line it landed on (Spec R01
+/// user story 14). `line` indexes the "scrollback then viewport" row
+/// sequence — the same coordinates [`Tab::grid`]'s `scrollback_rows` +
+/// `visible_rows` iterate — and stays valid as scrollback grows because
+/// new history only ever appends below it. Two caveats for Round 5's
+/// block assembly (the consumer): `line` is the cursor's row once the
+/// feeding chunk has fully landed, so a mark mid-burst can sit a row
+/// late; and once scrollback is full and evicts rows, indices recorded
+/// before the eviction drift. Round 5's block assembly reads these
+/// instead of re-parsing output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMark {
+    /// Which boundary the mark delimits.
+    pub kind: PromptMarkKind,
+    /// The mark's payload, if present — e.g. the exit code on
+    /// `OSC 133;D;0`.
+    pub payload: Option<String>,
+    /// The mark's line in scrollback-then-viewport coordinates.
+    pub line: usize,
+}
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
 ///
@@ -85,6 +112,9 @@ pub struct Tab {
     exit: Option<ExitStatus>,
     /// Shell basename for the tab bar (`bash`, `sh`, …).
     title: String,
+    /// OSC 133 marks recorded at drain time (Spec R01 us-14) — the
+    /// observable-and-kept half of "marks recorded in the grid".
+    prompt_marks: VecDeque<PromptMark>,
 }
 
 impl Tab {
@@ -105,6 +135,15 @@ impl Tab {
     /// The child's exit status, or `None` while the session still runs.
     pub fn exit_status(&self) -> Option<&ExitStatus> {
         self.exit.as_ref()
+    }
+
+    /// The OSC 133 marks recorded so far, oldest first (Spec R01 user
+    /// story 14). Capped at [`PROMPT_MARK_CAP`] — the newest win.
+    /// Only tests read them today; Round 5's block assembly is the
+    /// consumer this accessor exists for.
+    #[allow(dead_code)]
+    pub fn prompt_marks(&self) -> impl Iterator<Item = &PromptMark> {
+        self.prompt_marks.iter()
     }
 
     /// The tab-bar title: the spawned program's basename.
@@ -318,6 +357,7 @@ impl TabManager {
             cwd_reported: false,
             exit: None,
             title,
+            prompt_marks: VecDeque::new(),
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -467,6 +507,20 @@ impl TabManager {
                     LiveEvent::Osc(SessionEvent::CwdChanged(cwd)) => {
                         tab.cwd = cwd.clone();
                         tab.cwd_reported = true;
+                    }
+                    LiveEvent::Osc(SessionEvent::PromptMark { kind, payload }) => {
+                        if tab.prompt_marks.len() == PROMPT_MARK_CAP {
+                            tab.prompt_marks.pop_front();
+                        }
+                        tab.prompt_marks.push_back(PromptMark {
+                            kind: *kind,
+                            payload: payload.clone(),
+                            // The line the cursor sits on as the drain
+                            // surfaces the mark — the whole feeding
+                            // chunk is already in the grid — indexed in
+                            // scrollback-then-viewport coordinates.
+                            line: tab.session.grid().scrollback() + tab.session.cursor().line,
+                        });
                     }
                     LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
                     _ => {}
@@ -761,6 +815,32 @@ mod tests {
         assert_eq!(manager.active_index(), 0);
         assert_eq!(manager.tabs()[1].exit_status().unwrap().code, 5);
         assert!(grid_text(&manager.tabs()[1].session).contains("bg-done"));
+    }
+
+    /// OSC 133 marks are recorded on the tab, not dropped (Spec R01
+    /// user story 14): each lands with its kind, payload and the
+    /// scrollback-then-viewport line the cursor sat on.
+    #[test]
+    fn prompt_marks_are_recorded_on_the_tab() {
+        let mut manager = manager(1, "/tmp");
+        manager
+            .spawn_tab(sh_script(
+                "printf '\\033]133;A\\007prompt\\033]133;B\\007\\n\\033]133;D;0\\007'",
+            ))
+            .unwrap();
+
+        drain_until(&mut manager, |m| m.tabs()[1].prompt_marks().count() >= 3);
+
+        let marks: Vec<_> = manager.tabs()[1].prompt_marks().collect();
+        assert_eq!(marks[0].kind, ait_term::PromptMarkKind::PromptStart);
+        assert_eq!(marks[1].kind, ait_term::PromptMarkKind::CommandStart);
+        assert_eq!(marks[2].kind, ait_term::PromptMarkKind::CommandEnd);
+        assert_eq!(marks[2].payload.as_deref(), Some("0"));
+        let grid = manager.tabs()[1].grid();
+        let total = grid.scrollback() + grid.lines();
+        for mark in marks {
+            assert!(mark.line < total, "mark line out of grid: {mark:?}");
+        }
     }
 
     /// Resize reaches every tab's session, not just the visible one.

@@ -82,8 +82,9 @@ fn watcher_at(path: &Path) -> Option<SettingsWatcher> {
 
 /// `[terminal]` as spawn options for a NEW session (stories 12–13):
 /// `shell` becomes the spawned program — unset keeps `ait-term`'s
-/// `$SHELL` → `/bin/sh` resolution (§5.1) — and `scrollback_lines` the
-/// scrollback capacity. The rest of the options stay the manager's
+/// `$SHELL` → `/bin/sh` resolution (§5.1) — `scrollback_lines` the
+/// scrollback capacity, and `osc52` the child-app clipboard-write
+/// opt-in (Spec R02). The rest of the options stay the manager's
 /// (size is the content area, cwd is inherited).
 pub fn session_options(terminal: &TerminalSettings) -> LiveSessionOptions {
     let mut options = LiveSessionOptions::default();
@@ -92,6 +93,9 @@ pub fn session_options(terminal: &TerminalSettings) -> LiveSessionOptions {
     }
     if let Some(lines) = terminal.scrollback_lines {
         options.session.scrollback = lines;
+    }
+    if let Some(osc52) = terminal.osc52 {
+        options.session.osc52 = osc52;
     }
     options
 }
@@ -132,14 +136,16 @@ config_key = "key-1"
 base_model = "key-1"
 "#;
 
-    /// `[terminal]` `shell` becomes the spawned program and
-    /// `scrollback_lines` the scrollback capacity (stories 12–13);
-    /// unset fields keep `ait-term`'s defaults.
+    /// `[terminal]` `shell` becomes the spawned program,
+    /// `scrollback_lines` the scrollback capacity and `osc52` the
+    /// child-app clipboard opt-in (stories 12–13, Spec R02); unset
+    /// fields keep `ait-term`'s defaults.
     #[test]
     fn session_options_maps_terminal_settings() {
         let terminal = TerminalSettings {
             shell: Some("/usr/bin/fish".to_string()),
             scrollback_lines: Some(42_000),
+            osc52: Some(true),
         };
         let options = session_options(&terminal);
         assert_eq!(
@@ -147,6 +153,7 @@ base_model = "key-1"
             Some(OsStr::new("/usr/bin/fish"))
         );
         assert_eq!(options.session.scrollback, 42_000);
+        assert!(options.session.osc52);
 
         let unset = session_options(&TerminalSettings::default());
         assert!(
@@ -154,6 +161,7 @@ base_model = "key-1"
             "unset shell keeps ait-term's $SHELL → /bin/sh resolution (§5.1)"
         );
         assert_eq!(unset.session.scrollback, DEFAULT_SCROLLBACK);
+        assert!(!unset.session.osc52, "OSC 52 stays opt-in");
     }
 
     /// Story 24: the model slot is the resolved `base_model`'s display
@@ -171,17 +179,18 @@ base_model = "key-1"
         .unwrap();
         assert_eq!(model_slot(&no_alias, &NoSecrets), "wire-name");
 
-        // Unset roles — empty settings, or a config whose only profile
-        // binds no base_model — render the placeholder dash.
-        assert_eq!(model_slot(&Settings::default(), &NoSecrets), "—");
+        // No profiles at all: the sole configured model is the
+        // implicit `default` (us-23); empty settings — zero models —
+        // still render the placeholder dash.
         let no_profile =
             Settings::from_toml(&CONFIG[..CONFIG.find("[agents.execution_profiles").unwrap()])
                 .unwrap();
         assert_eq!(
             model_slot(&no_profile, &NoSecrets),
-            "—",
-            "no default profile means no model"
+            "Alias Name",
+            "one configured model resolves without a profile"
         );
+        assert_eq!(model_slot(&Settings::default(), &NoSecrets), "—");
     }
 
     /// Stories 10–11's first-run case: no config dir exists yet —

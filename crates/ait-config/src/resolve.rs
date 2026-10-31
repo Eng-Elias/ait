@@ -96,10 +96,12 @@ impl Settings {
     /// endpoint + model + secret (§4.2).
     ///
     /// `Ok(None)` means the role — and its `base_model` fallback — is
-    /// unset; `Err` means the profile does not exist, or a role
-    /// references a `config_key` no model declares (unreachable through
-    /// [`Settings::from_toml`], which rejects dangling references, but
-    /// the fields are public). The `?Sized` store lets a
+    /// unset; `Err` means a named profile is missing (with any profiles
+    /// declared), or a role references a `config_key` no model declares
+    /// (unreachable through [`Settings::from_toml`], which rejects
+    /// dangling references, but the fields are public). With NO
+    /// profiles declared, the sole configured model is an implicit
+    /// `default` for every role (us-23). The `?Sized` store lets a
     /// `&dyn SecretStore` flow straight through — e.g. from the boxed
     /// store `ait-agent`'s worker holds — with no sized wrapper in
     /// between.
@@ -109,12 +111,22 @@ impl Settings {
         role: ModelRole,
         store: &(impl SecretStore + ?Sized),
     ) -> Result<Option<ResolvedModel<'_>>, ConfigError> {
-        let profile_ref = self.agents.execution_profiles.get(profile).ok_or_else(|| {
-            ConfigError::at(
-                format!("agents.execution_profiles.{profile}"),
-                "unknown execution profile",
-            )
-        })?;
+        let Some(profile_ref) = self.agents.execution_profiles.get(profile) else {
+            // us-23's "one configured model is enough": when no
+            // profiles are declared at all, the sole configured model
+            // serves every role implicitly. Zero models resolves to
+            // `None`; two or more is ambiguous, so the error asks for
+            // the profile. Named profiles exist → the missing name
+            // stays a hard "unknown profile" error.
+            return if self.agents.execution_profiles.is_empty() {
+                self.resolve_implicit_default(store)
+            } else {
+                Err(ConfigError::at(
+                    format!("agents.execution_profiles.{profile}"),
+                    "unknown execution profile",
+                ))
+            };
+        };
 
         let (effective_role, config_key) = match role_key(profile_ref, role) {
             Some(config_key) => (role.name(), config_key),
@@ -142,6 +154,45 @@ impl Settings {
             format!("agents.execution_profiles.{profile}.{effective_role}"),
             format!("references unknown config_key {config_key:?}"),
         ))
+    }
+}
+
+impl Settings {
+    /// The no-profiles fallback (us-23): exactly one model declared
+    /// across all endpoints resolves for any role; zero resolves to
+    /// `None` (the status line's `—`); two or more is ambiguous — the
+    /// error names the missing profile table.
+    fn resolve_implicit_default(
+        &self,
+        store: &(impl SecretStore + ?Sized),
+    ) -> Result<Option<ResolvedModel<'_>>, ConfigError> {
+        let mut models =
+            self.agents
+                .custom_endpoints
+                .iter()
+                .flat_map(|(endpoint_key, endpoint)| {
+                    endpoint
+                        .models
+                        .iter()
+                        .map(move |model| (endpoint_key, endpoint, model))
+                });
+        let Some((endpoint_key, endpoint, model)) = models.next() else {
+            return Ok(None);
+        };
+        if models.next().is_some() {
+            return Err(ConfigError::at(
+                String::from("agents.execution_profiles"),
+                "no `default` profile — add \
+                 `[agents.execution_profiles.default]` with `base_model` \
+                 pointing at a model's `config_key`",
+            ));
+        }
+        Ok(Some(ResolvedModel {
+            endpoint_key,
+            endpoint,
+            model,
+            secret: endpoint.resolve_secret(endpoint_key, store),
+        }))
     }
 }
 
