@@ -27,6 +27,7 @@ pub fn default_template() -> String {
 # [terminal]
 # shell            = "/usr/bin/fish"  # program new sessions spawn (default: $SHELL)
 # scrollback_lines = 20000            # scrollback capacity for new sessions
+# osc52            = false            # let child apps write the host clipboard via OSC 52
 
 # A declared endpoint — any OpenAI- or Anthropic-compatible server.
 [agents.custom_endpoints.local]

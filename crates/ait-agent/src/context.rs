@@ -45,8 +45,9 @@ pub struct SuggestContext<'a> {
     /// The OS name — `std::env::consts::OS`, e.g. `linux` (us-17).
     pub os: &'a str,
     /// Recent logical output lines, oldest first. Only the last
-    /// [`OUTPUT_LINE_BUDGET`] are sent and each passes through
-    /// [`redact`](crate::redact) (us-16, 18).
+    /// [`OUTPUT_LINE_BUDGET`] are sent; they pass through
+    /// [`redact`](crate::redact) as one joined block so a credential
+    /// spanning lines (a PEM block) still matches (us-16, 18).
     pub output_lines: &'a [String],
     /// The typed request — sent verbatim, never redacted (us-19).
     pub request: &'a str,
@@ -129,10 +130,11 @@ fn user_content(context: &SuggestContext) -> String {
     let tail = &context.output_lines[tail_start..];
     if !tail.is_empty() {
         content.push_str("recent terminal output (oldest first):\n");
-        for line in tail {
-            content.push_str(&redact(line));
-            content.push('\n');
-        }
+        // Redact the joined tail, not each line: a credential spanning
+        // grid lines (a PEM block) only matches the assembled block —
+        // no single `output_lines` entry holds both anchors.
+        content.push_str(&redact(&tail.join("\n")));
+        content.push('\n');
     }
     content.push_str("request: ");
     content.push_str(context.request);

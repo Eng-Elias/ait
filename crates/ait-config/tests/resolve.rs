@@ -146,6 +146,48 @@ fn unknown_profile_is_an_error_naming_it() {
     );
 }
 
+/// us-23's "one configured model is enough": with no profiles declared
+/// at all, the sole configured model is the implicit `default` — every
+/// role lands on it.
+#[test]
+fn a_single_model_with_no_profiles_is_the_implicit_default() {
+    let one_model = &DOCUMENT[..DOCUMENT.find("[agents.custom_endpoints.hosted").unwrap()];
+    let settings = Settings::from_toml(one_model).unwrap();
+    for role in [ModelRole::Base, ModelRole::Coding, ModelRole::Command] {
+        let resolved = settings
+            .resolve_model("default", role, &StubStore::empty())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{role:?} should resolve"));
+        assert_eq!(resolved.model.config_key, "key-local");
+        assert_eq!(resolved.endpoint_key, "local");
+    }
+}
+
+/// Two models and no profile is ambiguous — the error asks for the
+/// `default` table rather than guessing.
+#[test]
+fn several_models_with_no_profiles_is_an_error_asking_for_default() {
+    let no_profiles = &DOCUMENT[..DOCUMENT.find("[agents.execution_profiles").unwrap()];
+    let settings = Settings::from_toml(no_profiles).unwrap();
+    let err = settings
+        .resolve_model("default", ModelRole::Base, &StubStore::empty())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("agents.execution_profiles"),
+        "actual: {err:?}"
+    );
+}
+
+/// No profiles and no models at all resolves to `None`, never an error.
+#[test]
+fn no_profiles_and_no_models_resolves_to_none() {
+    let settings = Settings::default();
+    let resolved = settings
+        .resolve_model("default", ModelRole::Command, &StubStore::empty())
+        .unwrap();
+    assert!(resolved.is_none());
+}
+
 #[test]
 fn role_names_round_trip_and_unknown_roles_are_errors_naming_them() {
     assert_eq!(ModelRole::from_name("base_model").unwrap(), ModelRole::Base);

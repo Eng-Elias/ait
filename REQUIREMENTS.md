@@ -54,7 +54,7 @@ cloud dependency, no vendor lock-in.
 | UI | `ratatui` + `crossterm` | TUI only in v1 |
 | PTY | `portable-pty` | Own the master side; spawn `$SHELL` |
 | VT emulation | `alacritty_terminal` (grid + `vte` parser), exact-pinned | Do not hand-write a full emulator (ADR-0002) |
-| Async | `tokio` | App runtime at the `ait` binary (agent loop, HTTP, SSE). The PTY reader runs on `std::thread` inside `ait-term`; the core stays synchronous (ADR-0004) |
+| Async | `tokio` | Lives in the library crates that need it (`ait-llm` HTTP/SSE, `ait-agent` worker), each behind a synchronous facade — the `ait` binary stays tokio-free (ADR-0004, amended 2026-10-28). The PTY reader runs on `std::thread` inside `ait-term`; the core stays synchronous |
 | HTTP / streaming | `reqwest` + `eventsource-stream` (SSE) | Streaming for every provider schema |
 | Config | `toml` + `serde` + `schemars` | `settings.toml` + emitted JSON Schema |
 | Secrets | env vars + `keyring` crate | Never in `settings.toml` |
@@ -143,7 +143,7 @@ Each role references a model `config_key`. Unset roles fall back to `base_model`
 
 ### 4.3 Other settings (Proposed)
 
-- `[terminal]` shell path override, scrollback lines, keybindings.
+- `[terminal]` shell path override, scrollback lines, `osc52` child-app clipboard opt-in, keybindings.
 - `[ssh]` `enable_integration`, `hosts_denylist`, `reuse_existing_control_master`.
 - `[redaction]` extra user regexes, toggle per built-in pattern.
 

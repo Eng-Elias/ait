@@ -146,6 +146,36 @@ async fn tool_call_streams_id_name_then_argument_fragments() {
     );
 }
 
+/// us-34's per-schema error transcript: a 200 stream can carry a
+/// `{"error": {…}}` chunk mid-flight — provider-reported data, not
+/// machinery failure, so it surfaces as an `Error` item, not an `Err`.
+#[tokio::test]
+async fn a_mid_stream_error_chunk_surfaces_as_data() {
+    let fixture = Fixture::serve(vec![sse(include_str!(
+        "fixtures/openai_chat_completions_error_event.sse"
+    ))]);
+    let provider = provider(&fixture.base_url, Some("sk-test-key"));
+
+    let stream = provider
+        .stream(request(), CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(stream).await;
+
+    assert_eq!(
+        events,
+        vec![
+            occ::StreamEvent::TextDelta {
+                text: "Partial answer".into()
+            },
+            occ::StreamEvent::Error {
+                message: "Upstream rate limit hit mid-stream.".into(),
+                code: Some("rate_limit_exceeded".into()),
+            },
+        ]
+    );
+}
+
 #[tokio::test]
 async fn an_endpoint_without_a_secret_sends_no_auth_header() {
     // us-21: local OpenAI-compatible servers (Ollama, …) must see no

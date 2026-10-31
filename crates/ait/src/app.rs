@@ -60,7 +60,9 @@ use std::time::{Duration, Instant};
 
 use ait_agent::CommandSuggester;
 use ait_config::{ConfigError, Settings};
-use ait_term::{Cell, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent};
+use ait_term::{
+    Cell, ClipboardSelection, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent,
+};
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -321,12 +323,26 @@ pub fn run() -> io::Result<ExitCode> {
                         Instant::now(),
                     ));
                 }
-                // Child-app OSC 52 stays off (`SessionOptions::osc52`
-                // default), so this event can't fire — when Round 3's
-                // config flips the option, honor the request by copying
-                // `contents` to the host clipboard exactly like our own
-                // selection copies.
-                LiveEvent::Osc(SessionEvent::ClipboardWrite { .. }) => {}
+                // Child-app OSC 52 — the event only fires when
+                // `[terminal] osc52` opted in (`SessionOptions::osc52`,
+                // Spec R02). Honor the request through the same OSC 52
+                // write our own selection copy uses: a silent no-op
+                // where the host denies it.
+                LiveEvent::Osc(SessionEvent::ClipboardWrite {
+                    selection,
+                    contents,
+                }) => {
+                    let writer = terminal.backend_mut().writer_mut();
+                    let _ = match selection {
+                        ClipboardSelection::Clipboard => {
+                            queue!(writer, CopyToClipboard::to_clipboard_from(&contents))
+                        }
+                        ClipboardSelection::Selection => {
+                            queue!(writer, CopyToClipboard::to_primary_from(&contents))
+                        }
+                    };
+                    let _ = writer.flush();
+                }
                 _ => {}
             }
         }
@@ -1087,6 +1103,10 @@ mod tests {
         let mut harness = Harness::new(manager());
         // A marker the whole grid knows: the sh output `HELLOWORLD` on
         // its own line. Wait for it, then find its grid line.
+        // Same gate `run_line` uses: the first `send_bytes` must wait
+        // for the prompt or the kernel echo races it onto the marker's
+        // row (deterministic failure on fast machines).
+        wait_until(&mut harness, |h| !logical(h).is_empty());
         harness
             .tabs
             .active()
