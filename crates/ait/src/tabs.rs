@@ -203,7 +203,8 @@ impl Tab {
     /// the shell reported one, else the `B→C` echo slice. A command
     /// still running shows `completed: false` as the last block; a tab
     /// whose shell emits nothing simply has none (§5.5 graceful
-    /// degrade). The status line and block select/copy consume this.
+    /// degrade). The status line, block select/copy and the
+    /// suggester's context assembly (Spec R05 us-31) consume this.
     pub fn blocks(&self) -> Vec<Block> {
         let grid = self.grid();
         let extent = self.scrollback() + grid.lines();
@@ -216,10 +217,9 @@ impl Tab {
     /// The shell-integration state this tab's session has reported
     /// (Spec R05): `Absent` until hooks or marks arrive, `MarksOnly`
     /// when `OSC 133` arrives without `init_shell`, `Integrated` once
-    /// `init_shell`/`bootstrapped` lands. Only tests read it today;
-    /// `__ait_run` gating and the status line are the consumers this
-    /// accessor exists for.
-    #[allow(dead_code)]
+    /// `init_shell`/`bootstrapped` lands. `__ait_run` gating, the
+    /// status line and the suggester's `/proc` cwd fallback (Spec R05,
+    /// issue #76) consume it.
     pub fn integration_state(&self) -> IntegrationState {
         self.integration
     }

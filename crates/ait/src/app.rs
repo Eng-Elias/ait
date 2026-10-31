@@ -1136,8 +1136,19 @@ mod tests {
         // its own line. Wait for it, then find its grid line.
         // Same gate `run_line` uses: the first `send_bytes` must wait
         // for the prompt or the kernel echo races it onto the marker's
-        // row (deterministic failure on fast machines).
-        wait_until(&mut harness, |h| !logical(h).is_empty());
+        // row (deterministic failure on fast machines). `logical` is
+        // NOT the gate: a prompt that ends exactly at the right margin
+        // leaves the cursor on a fresh blank row below it, so the
+        // cursor's logical line stays empty even though the prompt
+        // already rendered — any non-empty row means the prompt landed.
+        wait_until(&mut harness, |h| {
+            h.tabs
+                .active()
+                .unwrap()
+                .grid()
+                .visible_rows()
+                .any(|row| !row.text().trim_end().is_empty())
+        });
         harness
             .tabs
             .active()
