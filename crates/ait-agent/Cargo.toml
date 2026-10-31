@@ -23,8 +23,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # `Settings::resolve_model`, `ModelRole::Command`, `OsKeyring` /
 # `SecretStore` — per-request model resolution with the command_model →
 # base_model fallback (§4.2); the caller hands Settings in, the
-# suggester never reads settings.toml.
-ait-config = { path = "../ait-config" }
+# suggester never reads settings.toml. `secrets` pulls in the
+# `keyring`-backed `OsKeyring` `CommandSuggester::new` resolves through.
+ait-config = { path = "../ait-config", features = ["secrets"] }
 # Context assembly returns ait-llm's `EndpointRequest` — the
 # schema-matched IR `Endpoint::stream` accepts — so T3's
 # `CommandSuggester` passes assembled requests through unchanged.

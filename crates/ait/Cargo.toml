@@ -9,7 +9,9 @@ description = "AIT's TUI binary: a full-screen terminal frontend over ait-term s
 ait-term = { path = "../ait-term" }
 # Settings.toml load/watch, the `--init` template, the `--print-schema`
 # schema and base_model resolution (Spec R03, user stories 1–14, 24).
-ait-config = { path = "../ait-config" }
+# `watch` adds hot reload (us-10–11) and `schema` the `--print-schema`
+# JSON Schema; `secrets` (OsKeyring) arrives via ait-agent.
+ait-config = { path = "../ait-config", features = ["schema", "watch"] }
 # Spec R04 NL→command: the `# `+Enter trigger fires a `SuggestRequest`
 # into ait-agent's channel-based `CommandSuggester` (user stories 1–2,
 # 13–17, 29). ait-agent owns its tokio runtime on a worker thread, so

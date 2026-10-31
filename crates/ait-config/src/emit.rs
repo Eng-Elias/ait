@@ -5,7 +5,9 @@
 
 use std::path::Path;
 
-use crate::{ConfigError, Settings};
+use crate::ConfigError;
+#[cfg(feature = "schema")]
+use crate::Settings;
 
 /// The commented default `settings.toml` `ait --init` writes (§4): an
 /// example local endpoint whose model gets a fresh v4 UUID `config_key`
@@ -98,7 +100,9 @@ pub fn init_settings(path: impl AsRef<Path>, force: bool) -> Result<(), ConfigEr
 /// 2020-12) — what `ait --print-schema` prints for editor validation
 /// and completion (user story 5). `deny_unknown_fields` on the model
 /// surfaces as `additionalProperties: false`, so editors flag typos the
-/// same way the loader does.
+/// same way the loader does. Behind the `schema` cargo feature (issue
+/// #77) — `ait --print-schema` is the only consumer.
+#[cfg(feature = "schema")]
 pub fn json_schema() -> String {
     let schema = schemars::schema_for!(Settings);
     serde_json::to_string_pretty(&schema).expect("serializing a JsonSchema cannot fail")

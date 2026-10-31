@@ -8,13 +8,31 @@
 //! top, this crate owns everything `settings.toml` needs:
 //! [`load`]/[`settings_path`] resolve
 //! `$XDG_CONFIG_HOME/ait/settings.toml` (falling back to `~/.config`),
-//! [`watch`]/[`watch_from`] hot-reload it onto a channel the consumer
+//! the `watch` feature hot-reloads it onto a channel the consumer
 //! drains (Spec R03, user stories 10–11), [`Endpoint::resolve_secret`]
 //! reads secrets from the env var named by `api_key_env` or the OS keyring
 //! behind the injectable [`SecretStore`] seam,
 //! [`Settings::resolve_model`] turns a profile + [`ModelRole`] into
 //! endpoint + model + secret-or-none, and [`default_template`]/
-//! [`json_schema`] back `ait --init`/`--print-schema`.
+//! `json_schema` back `ait --init`/`--print-schema`.
+//!
+//! ## Cargo features
+//!
+//! The R05-T8 dependency audit (issue #77) puts each heavy dependency
+//! behind the feature area that uses it, so a consumer that only needs
+//! the model takes no filesystem/keyring/schema machinery — the `ait`
+//! binary enables `schema` + `watch`, `ait-agent` `secrets`:
+//!
+//! - `secrets` — `OsKeyring`, the `keyring`-backed production
+//!   [`SecretStore`] (zbus Secret Service on Linux, Keychain on macOS,
+//!   Credential Manager on Windows). The trait and [`Endpoint`]'s
+//!   env-first resolution are always present; only the concrete OS
+//!   store is gated.
+//! - `watch` — `watch`/`watch_from`/`SettingsWatcher` hot reload on
+//!   `notify`.
+//! - `schema` — `json_schema` (`ait --print-schema`) plus the
+//!   `schemars::JsonSchema` derives on the settings model, on
+//!   `schemars` + `serde_json`.
 
 mod emit;
 mod error;
@@ -22,15 +40,21 @@ mod load;
 mod resolve;
 mod secrets;
 mod settings;
+#[cfg(feature = "watch")]
 mod watch;
 
-pub use emit::{default_template, init_settings, json_schema};
+#[cfg(feature = "schema")]
+pub use emit::json_schema;
+pub use emit::{default_template, init_settings};
 pub use error::ConfigError;
 pub use load::{load, load_from, settings_path};
 pub use resolve::{ModelRole, ResolvedModel};
-pub use secrets::{OsKeyring, SecretStore};
+#[cfg(feature = "secrets")]
+pub use secrets::OsKeyring;
+pub use secrets::SecretStore;
 pub use settings::{
     AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile, PermissionLevel,
     Settings, TerminalSettings,
 };
+#[cfg(feature = "watch")]
 pub use watch::{watch, watch_from, SettingsWatcher};
