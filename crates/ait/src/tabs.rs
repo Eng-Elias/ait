@@ -52,8 +52,12 @@ const PROMPT_MARK_CAP: usize = 4096;
 /// user story 14). `line` indexes the "scrollback then viewport" row
 /// sequence — the same coordinates [`Tab::grid`]'s `scrollback_rows` +
 /// `visible_rows` iterate — and stays valid as scrollback grows because
-/// new history only ever appends below it. Round 5's block assembly
-/// reads these instead of re-parsing output.
+/// new history only ever appends below it. Two caveats for Round 5's
+/// block assembly (the consumer): `line` is the cursor's row once the
+/// feeding chunk has fully landed, so a mark mid-burst can sit a row
+/// late; and once scrollback is full and evicts rows, indices recorded
+/// before the eviction drift. Round 5's block assembly reads these
+/// instead of re-parsing output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptMark {
     /// Which boundary the mark delimits.
@@ -511,9 +515,10 @@ impl TabManager {
                         tab.prompt_marks.push_back(PromptMark {
                             kind: *kind,
                             payload: payload.clone(),
-                            // The mark delimits the line the emulator's
-                            // cursor sits on when the OSC lands, indexed
-                            // in scrollback-then-viewport coordinates.
+                            // The line the cursor sits on as the drain
+                            // surfaces the mark — the whole feeding
+                            // chunk is already in the grid — indexed in
+                            // scrollback-then-viewport coordinates.
                             line: tab.session.grid().scrollback() + tab.session.cursor().line,
                         });
                     }
