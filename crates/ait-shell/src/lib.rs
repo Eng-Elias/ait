@@ -16,13 +16,18 @@
 //!   as [`ShellEvent::Reserved`]; nothing consumes them this round.
 //!
 //! Malformed, truncated or over-long sequences decode to `None`, never
-//! panic (§5.5 graceful degrade). Nothing here touches a TTY, PTY or the
-//! filesystem — every function is a pure seam (CODING_STANDARDS.md 11).
+//! panic (§5.5 graceful degrade). Nothing here touches a TTY or PTY —
+//! the only filesystem access is [`Injection::materialize_in`], which
+//! writes snippet assets into a fresh per-session `0700` temp dir and
+//! never anywhere else (CODING_STANDARDS.md 11).
 
 mod codec;
+mod inject;
 mod run;
+mod snippets;
 
 pub use codec::{decode, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE};
+pub use inject::{plan, plan_with_zdotdir, Injection, Materialized, ShellKind, ENV_SESSION_ID};
 pub use run::{
     chunk_run_payload, run_begin_sequence, run_end_sequence, run_request, RunAccumulator, RunResult,
 };
