@@ -84,6 +84,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ait-shell"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "ait-term"
 version = "0.1.0"
 dependencies = [

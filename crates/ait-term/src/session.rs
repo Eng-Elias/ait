@@ -16,6 +16,15 @@ use crate::key::{self, EncodingModes, KeyEvent};
 /// Default scrollback capacity, in lines (REQUIREMENTS.md §5.1).
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
+/// Raw OSC buffer for the parallel observer parser, raised well above
+/// `vte`'s `MAX_OSC_RAW` (1024) so over-long private sequences — a fat
+/// OSC 7701 result frame or a misbehaving script — reach
+/// `SessionEvent::Private` whole and degrade in `ait-shell` instead of
+/// silently truncating mid-param (REQUIREMENTS.md §5.5, ADR-0008).
+/// Under `vte`'s `std` feature the buffer is a `Vec` anyway; the explicit
+/// bound keeps the guarantee for `no_std` `ArrayVec` builds.
+const OSC_OBSERVER_RAW_BUF: usize = 64 * 1024;
+
 /// Grid dimensions in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -117,7 +126,7 @@ impl EventListener for SessionListener {
 pub struct Session {
     term: Term<SessionListener>,
     processor: Processor,
-    osc_parser: Parser,
+    osc_parser: Parser<OSC_OBSERVER_RAW_BUF>,
     osc_observer: OscObserver,
     pty_responses: Arc<Mutex<VecDeque<String>>>,
     pending_events: Arc<Mutex<VecDeque<SessionEvent>>>,
@@ -143,7 +152,7 @@ impl Session {
         Self {
             term,
             processor: Processor::new(),
-            osc_parser: Parser::new(),
+            osc_parser: Parser::default(),
             osc_observer: OscObserver::default(),
             pty_responses,
             pending_events,
