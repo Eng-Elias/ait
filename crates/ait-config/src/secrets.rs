@@ -24,8 +24,14 @@ pub trait SecretStore {
 /// The production [`SecretStore`]: the platform keyring via the
 /// `keyring` crate's default `v1` store set (zbus Secret Service on
 /// Linux, Keychain on macOS, Windows Credential Manager on Windows).
+/// Behind the `secrets` cargo feature (issue #77): the heavy
+/// platform-store tree stays out of builds that never touch an OS
+/// keyring — the trait and [`Endpoint::resolve_secret`] are
+/// unconditional, so injecting another store needs no feature.
+#[cfg(feature = "secrets")]
 pub struct OsKeyring;
 
+#[cfg(feature = "secrets")]
 impl SecretStore for OsKeyring {
     fn get(&self, service: &str, account: &str) -> Option<String> {
         keyring::Entry::new(service, account)

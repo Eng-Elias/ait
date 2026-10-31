@@ -47,8 +47,9 @@ test-fixtures = ["dep:tiny_http"]
 
 [dev-dependencies]
 # The `chat` example loads settings.toml through ait-config (Spec R03
-# us-35); ait-llm itself stays config-free.
-ait-config = { path = "../ait-config" }
+# us-35) and resolves secrets through `OsKeyring` (`secrets` feature);
+# ait-llm itself stays config-free.
+ait-config = { path = "../ait-config", features = ["secrets"] }
 # The crate's own contract tests import the fixture through
 # `ait_llm::testing` — the self dev-dependency is how `test-fixtures`
 # turns on for `cargo test` builds only.

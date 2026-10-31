@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 
-use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::error::ConfigError;
@@ -14,7 +13,8 @@ use crate::error::ConfigError;
 /// unknown-key rejection (`deny_unknown_fields` on every table), and
 /// `from_toml` adds the validation serde cannot express — unique, non-empty
 /// `config_key`s and resolvable model-role references.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// `[terminal]` — shell + scrollback applied to NEW sessions only
@@ -103,7 +103,8 @@ impl Settings {
 }
 
 /// `[terminal]` (§4.3) — settings applied when spawning NEW sessions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TerminalSettings {
     /// Program new sessions spawn; unset falls back to `$SHELL` then
@@ -118,7 +119,8 @@ pub struct TerminalSettings {
 }
 
 /// `[agents]` — endpoint declarations (§4.1) and execution profiles (§5.7).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AgentsSettings {
     /// `[agents.custom_endpoints.<key>]` — endpoint declarations keyed by
@@ -133,7 +135,8 @@ pub struct AgentsSettings {
 }
 
 /// One declared endpoint — `[agents.custom_endpoints.<key>]` (§4.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     /// Display name (`"Local Ollama"`).
@@ -153,7 +156,8 @@ pub struct Endpoint {
 }
 
 /// One entry in an endpoint's `[[models]]` list (§4.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct EndpointModel {
     /// Model id sent on the wire (`"qwen2.5-coder:14b"`).
@@ -171,7 +175,8 @@ pub struct EndpointModel {
 }
 
 /// Wire format of an [`Endpoint`] (§4.1): which `ait-llm` adapter serves it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum EndpointSchema {
     /// `openai_chat_completions` — OpenAI-compatible `/chat/completions`.
     #[serde(rename = "openai_chat_completions")]
@@ -188,7 +193,8 @@ pub enum EndpointSchema {
 ///
 /// Parsed and validated so the emitted JSON Schema is stable, but inert:
 /// no permission engine consumes it until Round 7.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProfile {
     /// Permission level for reading files.
@@ -251,7 +257,8 @@ impl ExecutionProfile {
 }
 
 /// Per-tool permission level (§5.7, GLOSSARY "Permission level").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionLevel {
     /// The model flags the call safe/unsafe; unsafe falls back to asking.

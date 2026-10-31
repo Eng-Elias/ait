@@ -53,6 +53,7 @@ dependencies = [
 name = "ait-config"
 version = "0.1.0"
 dependencies = [
+ "ait-config",
  "keyring",
  "notify",
  "schemars",
