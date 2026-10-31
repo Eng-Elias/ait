@@ -58,6 +58,14 @@ pub enum AppAction {
     /// `Alt+Enter` trigger (`ESC CR` vs `CR` is byte-distinct in both
     /// tiers; ADR-0005).
     SuggestCommand,
+    /// Scroll the view to the previous block's start (`Alt+Up`;
+    /// Spec R05 §5.5 block navigation).
+    PrevBlockStart,
+    /// Scroll the view to the next block's start (`Alt+Down`).
+    NextBlockStart,
+    /// Select the current block's range through the existing selection
+    /// machinery (`Alt+B`; Spec R05 §5.5 — copy rides the OSC-52 path).
+    SelectBlock,
 }
 
 /// The keymap's verdict for one key event.
@@ -215,6 +223,31 @@ const BINDINGS: &[Binding] = &[
         modifiers: ALT,
         enhanced_only: false,
         action: AppAction::SuggestCommand,
+    },
+    // Spec R05 §5.5 block UX — both tiers: `Alt+Up`/`Alt+Down` report
+    // as `ESC [1;3A`-style sequences (the kitty modifier report agrees)
+    // vs the plain arrows' `ESC [A`, and `Alt+B` is `ESC b` vs `b` —
+    // distinguishable on every host, so no tier gate. None of the three
+    // is a default readline editing key (`M-b`'s backward-word is the
+    // chord the spec trades for block select — the grid-side feature
+    // wins per the spec's keymap decision).
+    Binding {
+        code: KeyCode::Up,
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::PrevBlockStart,
+    },
+    Binding {
+        code: KeyCode::Down,
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::NextBlockStart,
+    },
+    Binding {
+        code: KeyCode::Char('b'),
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::SelectBlock,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
@@ -408,6 +441,51 @@ mod tests {
             assert_pass(
                 KeyCode::PageUp,
                 KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+                tier,
+            );
+        }
+    }
+
+    /// The Spec R05 block-UX chords bind in both tiers: `Alt+Up`/
+    /// `Alt+Down` arrive as `ESC [1;3A`-style sequences (the kitty
+    /// modifier report agrees) — byte-distinct from the plain arrows'
+    /// `ESC [A` — and `Alt+B` is `ESC b` vs `b`. `ESC`-prefixing makes
+    /// every one distinguishable without the enhancement, so there is
+    /// no tier gate. Plain arrows and typing still pass through, and
+    /// added modifiers unbind the chords.
+    #[test]
+    fn block_chords_bind_in_both_tiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_action(KeyCode::Up, ALT, tier, AppAction::PrevBlockStart);
+            assert_action(KeyCode::Down, ALT, tier, AppAction::NextBlockStart);
+            assert_action(KeyCode::Char('b'), ALT, tier, AppAction::SelectBlock);
+            // The un-modified keys are shell input, not app actions.
+            assert_pass(KeyCode::Up, KeyModifiers::NONE, tier);
+            assert_pass(KeyCode::Down, KeyModifiers::NONE, tier);
+            assert_pass(KeyCode::Char('b'), KeyModifiers::NONE, tier);
+        }
+    }
+
+    /// Bound means the exact combo: `Alt+Shift`/`Ctrl+Alt` variants and
+    /// a shifted codepoint with an extra modifier all fall through to
+    /// the PTY (same rule `extra_modifiers_unbind` enforces).
+    #[test]
+    fn block_chords_unbind_with_extra_modifiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_pass(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT, tier);
+            assert_pass(
+                KeyCode::Down,
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+                tier,
+            );
+            assert_pass(
+                KeyCode::Char('b'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                tier,
+            );
+            assert_pass(
+                KeyCode::Char('b'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
                 tier,
             );
         }
