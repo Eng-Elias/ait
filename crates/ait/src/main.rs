@@ -15,6 +15,7 @@ mod backend;
 #[allow(dead_code)]
 mod blocks;
 mod config;
+mod inband;
 mod integration;
 mod keymap;
 mod keys;
