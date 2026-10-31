@@ -10,6 +10,7 @@
 mod app;
 mod backend;
 mod config;
+mod integration;
 mod keymap;
 mod keys;
 mod render;

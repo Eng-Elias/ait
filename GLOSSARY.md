@@ -12,6 +12,9 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   emits OSC 133/7 and AIT hook events.
 - **Hook event** — a hex-encoded JSON message on OSC 7700 (`precmd`,
   `preexec`, …).
+- **Integration state** — how much shell integration a tab's session has
+  reported: `Absent` (none), `MarksOnly` (`OSC 133` without
+  `init_shell`), `Integrated` (`init_shell`/`bootstrapped` seen).
 - **OSC 133** — the standard semantic-prompt sequences marking prompt/command
   boundaries.
 - **Endpoint** — a configured LLM server (`name`, `base_url`, `schema`,

@@ -29,6 +29,7 @@ dependencies = [
  "ait-agent",
  "ait-config",
  "ait-llm",
+ "ait-shell",
  "ait-term",
  "ait-testkit",
  "crossterm",

@@ -258,7 +258,7 @@ pub fn run() -> io::Result<ExitCode> {
     // status-line row are chrome outside the session grid (Spec R02).
     let mut tabs = TabManager::spawn_with(
         content_size(state.screen),
-        config::session_options(&state.config.settings().terminal),
+        config::session_template(&state.config.settings().terminal),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -750,7 +750,7 @@ fn drain_config_events(
     while let Ok(event) = receiver.try_recv() {
         match event {
             Ok(settings) => {
-                tabs.set_session_options(config::session_options(&settings.terminal));
+                tabs.set_session_template(config::session_template(&settings.terminal));
                 state.config = LiveSettings::adopt(settings, &NoSecrets);
             }
             Err(error) => {
@@ -865,6 +865,7 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
+    use crate::tabs::SessionTemplate;
     use ait_agent::SuggestEvent;
     use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
@@ -873,7 +874,7 @@ mod tests {
     use std::collections::VecDeque;
 
     fn manager() -> TabManager {
-        TabManager::spawn_with(Size::new(40, 10), LiveSessionOptions::default()).unwrap()
+        TabManager::spawn_with(Size::new(40, 10), SessionTemplate::default()).unwrap()
     }
 
     /// A manager on `/bin/sh` — deterministic tty echo for the trigger
@@ -883,8 +884,11 @@ mod tests {
     fn sh_manager() -> TabManager {
         TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(std::ffi::OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

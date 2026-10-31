@@ -10,6 +10,8 @@ use std::path::Path;
 use ait_config::{ModelRole, SecretStore, Settings, SettingsWatcher, TerminalSettings};
 use ait_term::LiveSessionOptions;
 
+use crate::tabs::SessionTemplate;
+
 /// The model slot's text when no model resolves — Spec R02's `—`
 /// placeholder becomes story 24's "unset" rendering.
 pub const MODEL_UNSET: &str = "—";
@@ -80,13 +82,15 @@ fn watcher_at(path: &Path) -> Option<SettingsWatcher> {
     ait_config::watch_from(path).ok()
 }
 
-/// `[terminal]` as spawn options for a NEW session (stories 12–13):
-/// `shell` becomes the spawned program — unset keeps `ait-term`'s
-/// `$SHELL` → `/bin/sh` resolution (§5.1) — `scrollback_lines` the
-/// scrollback capacity, and `osc52` the child-app clipboard-write
-/// opt-in (Spec R02). The rest of the options stay the manager's
-/// (size is the content area, cwd is inherited).
-pub fn session_options(terminal: &TerminalSettings) -> LiveSessionOptions {
+/// `[terminal]` as the spawn template for NEW sessions (stories 12–13,
+/// Spec R05 us-3): `shell` becomes the spawned program — unset keeps
+/// `ait-term`'s `$SHELL` → `/bin/sh` resolution (§5.1) —
+/// `scrollback_lines` the scrollback capacity, `osc52` the child-app
+/// clipboard-write opt-in (Spec R02) and `shell_integration` whether
+/// the injection planner runs at spawn — on when unset (§5.5). The
+/// rest of the options stay the manager's (size is the content area,
+/// cwd is inherited).
+pub fn session_template(terminal: &TerminalSettings) -> SessionTemplate {
     let mut options = LiveSessionOptions::default();
     if let Some(shell) = &terminal.shell {
         options.program = Some(OsString::from(shell));
@@ -97,7 +101,10 @@ pub fn session_options(terminal: &TerminalSettings) -> LiveSessionOptions {
     if let Some(osc52) = terminal.osc52 {
         options.session.osc52 = osc52;
     }
-    options
+    SessionTemplate {
+        options,
+        shell_integration: terminal.shell_integration.unwrap_or(true),
+    }
 }
 
 /// The status line's model slot (story 24): the resolved `base_model`'s
@@ -137,31 +144,39 @@ base_model = "key-1"
 "#;
 
     /// `[terminal]` `shell` becomes the spawned program,
-    /// `scrollback_lines` the scrollback capacity and `osc52` the
-    /// child-app clipboard opt-in (stories 12–13, Spec R02); unset
-    /// fields keep `ait-term`'s defaults.
+    /// `scrollback_lines` the scrollback capacity, `osc52` the
+    /// child-app clipboard opt-in (stories 12–13, Spec R02) and
+    /// `shell_integration` the injection planner's switch (Spec R05
+    /// us-3); unset fields keep `ait-term`'s defaults.
     #[test]
-    fn session_options_maps_terminal_settings() {
+    fn session_template_maps_terminal_settings() {
         let terminal = TerminalSettings {
             shell: Some("/usr/bin/fish".to_string()),
             scrollback_lines: Some(42_000),
             osc52: Some(true),
+            shell_integration: Some(false),
         };
-        let options = session_options(&terminal);
+        let template = session_template(&terminal);
+        let options = &template.options;
         assert_eq!(
             options.program.as_deref(),
             Some(OsStr::new("/usr/bin/fish"))
         );
         assert_eq!(options.session.scrollback, 42_000);
         assert!(options.session.osc52);
+        assert!(!template.shell_integration, "explicit false opts out");
 
-        let unset = session_options(&TerminalSettings::default());
+        let unset = session_template(&TerminalSettings::default());
         assert!(
-            unset.program.is_none(),
+            unset.options.program.is_none(),
             "unset shell keeps ait-term's $SHELL → /bin/sh resolution (§5.1)"
         );
-        assert_eq!(unset.session.scrollback, DEFAULT_SCROLLBACK);
-        assert!(!unset.session.osc52, "OSC 52 stays opt-in");
+        assert_eq!(unset.options.session.scrollback, DEFAULT_SCROLLBACK);
+        assert!(!unset.options.session.osc52, "OSC 52 stays opt-in");
+        assert!(
+            unset.shell_integration,
+            "shell_integration defaults on when unset (§5.5)"
+        );
     }
 
     /// Story 24: the model slot is the resolved `base_model`'s display

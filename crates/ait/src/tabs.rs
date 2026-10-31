@@ -34,6 +34,7 @@ use ait_term::{
     SessionEvent, Size, SpawnError,
 };
 
+use crate::integration::{self, IntegrationState};
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
 use crate::suggest::InputShadow;
@@ -115,6 +116,18 @@ pub struct Tab {
     /// OSC 133 marks recorded at drain time (Spec R01 us-14) — the
     /// observable-and-kept half of "marks recorded in the grid".
     prompt_marks: VecDeque<PromptMark>,
+    /// How much shell integration this tab's session has reported
+    /// (Spec R05): `drain_events` drives it via
+    /// [`IntegrationState::observe`]; `__ait_run` gating and the
+    /// status line consume it in later tickets.
+    integration: IntegrationState,
+    /// The materialized injection the session was spawned with —
+    /// holding the guard here ties the per-session `0700` snippet dir's
+    /// lifetime to the tab's (drop removes it best-effort, Spec R05
+    /// us-30). `None` when the spawn wasn't injected: opt-out, unknown
+    /// shell or a materialize failure.
+    #[allow(dead_code)] // held for its Drop alone
+    materialized: Option<ait_shell::Materialized>,
 }
 
 impl Tab {
@@ -149,6 +162,17 @@ impl Tab {
     /// The tab-bar title: the spawned program's basename.
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The shell-integration state this tab's session has reported
+    /// (Spec R05): `Absent` until hooks or marks arrive, `MarksOnly`
+    /// when `OSC 133` arrives without `init_shell`, `Integrated` once
+    /// `init_shell`/`bootstrapped` lands. Only tests read it today;
+    /// `__ait_run` gating and the status line are the consumers this
+    /// accessor exists for.
+    #[allow(dead_code)]
+    pub fn integration_state(&self) -> IntegrationState {
+        self.integration
     }
 
     /// Read-only view of the session's grid (viewport + scrollback) —
@@ -260,6 +284,33 @@ pub struct TabEvent {
     pub event: LiveEvent,
 }
 
+/// The spawn-time template every new tab clones — the `[terminal]`
+/// half of settings (Spec R03, Spec R05). Applying a template reaches
+/// only sessions spawned from then on; live tabs keep their spawn-time
+/// values (story 14).
+#[derive(Debug, Clone)]
+pub struct SessionTemplate {
+    /// Options the spawned session is built from — `[terminal]`
+    /// `shell`, `scrollback_lines` and `osc52` land here.
+    pub options: LiveSessionOptions,
+    /// Whether the spawn consults `ait_shell`'s injection planner —
+    /// `[terminal] shell_integration` (Spec R05 us-3). `false` spawns
+    /// plain terminals: no argv/env rewrite, no `AIT_SESSION_ID`, no
+    /// snippet dir.
+    pub shell_integration: bool,
+}
+
+impl Default for SessionTemplate {
+    /// Integration is on when `[terminal] shell_integration` is unset
+    /// (§5.5).
+    fn default() -> Self {
+        Self {
+            options: LiveSessionOptions::default(),
+            shell_integration: true,
+        }
+    }
+}
+
 /// The ordered list of tabs plus the active index.
 ///
 /// The empty state is reachable only through
@@ -275,11 +326,10 @@ pub struct TabManager {
     /// live outside it); updated by [`resize_all`](Self::resize_all) so
     /// tabs spawned later match.
     size: Size,
-    /// The spawn-options template [`new_tab`](Self::new_tab) clones —
-    /// where `[terminal]` `shell`/`scrollback_lines` land (Spec R03).
-    /// Applying a template reaches only sessions spawned from then on;
-    /// live tabs keep their spawn-time values (story 14).
-    session_options: LiveSessionOptions,
+    /// The spawn template [`new_tab`](Self::new_tab) clones — where
+    /// `[terminal]` `shell`/`scrollback_lines`/`shell_integration`
+    /// land (Spec R03, Spec R05).
+    session_template: SessionTemplate,
     /// The id the next spawned [`Tab`] gets — a plain counter rather
     /// than an index or pid so a tab's identity is immune to list
     /// shifts and pid-less platforms (Spec R04 user story 14).
@@ -288,41 +338,42 @@ pub struct TabManager {
 
 impl TabManager {
     /// Spawn the manager with its first tab in the directory `ait` was
-    /// launched from: `options` — the app's `[terminal]`-derived
-    /// template (Spec R03), `LiveSessionOptions::default()` for
+    /// launched from: `template` — the app's `[terminal]`-derived
+    /// template (Spec R03), `SessionTemplate::default()` for
     /// `$SHELL`-or-`/bin/sh` — shapes the first tab AND every
     /// `new_tab` after it.
-    pub fn spawn_with(size: Size, options: LiveSessionOptions) -> Result<Self, SpawnError> {
+    pub fn spawn_with(size: Size, template: SessionTemplate) -> Result<Self, SpawnError> {
         let launch_cwd = std::env::current_dir().unwrap_or_default();
-        Self::spawn_at(size, launch_cwd, options)
+        Self::spawn_at(size, launch_cwd, template)
     }
 
     /// `spawn_with` with an explicit launch cwd — the test seam.
-    /// `options` spawns the first tab and becomes the template for
+    /// `template` spawns the first tab and becomes the template for
     /// later ones.
     fn spawn_at(
         size: Size,
         launch_cwd: PathBuf,
-        options: LiveSessionOptions,
+        template: SessionTemplate,
     ) -> Result<Self, SpawnError> {
         let mut manager = Self {
             tabs: Vec::new(),
             active: 0,
             launch_cwd,
             size,
-            session_options: options.clone(),
+            session_template: template,
             next_id: 0,
         };
+        let options = manager.session_template.options.clone();
         manager.spawn_tab(options)?;
         Ok(manager)
     }
 
-    /// Replace the spawn-options template: sessions spawned from now on
-    /// get `options` — the `[terminal]` half of a settings reload —
+    /// Replace the spawn template: sessions spawned from now on get
+    /// `template` — the `[terminal]` half of a settings reload —
     /// while live tabs keep their spawn-time program and scrollback
     /// (Spec R03 user story 14).
-    pub fn set_session_options(&mut self, options: LiveSessionOptions) {
-        self.session_options = options;
+    pub fn set_session_template(&mut self, template: SessionTemplate) {
+        self.session_template = template;
     }
 
     /// The cwd a tab spawned right now inherits: the active tab's
@@ -344,8 +395,22 @@ impl TabManager {
         let cwd = options.cwd.take().unwrap_or_else(|| self.spawn_cwd());
         options.cwd = Some(cwd.clone());
         let title = title_for(&options);
-        let session = LiveSession::spawn(options)?;
         let id = self.next_id;
+        // Shell integration (Spec R05): when the template allows it,
+        // plan + materialize an injection on the resolved program and
+        // apply its argv/env rewrite; the `Materialized` guard rides on
+        // the `Tab` so the `0700` snippet dir dies with it (us-30).
+        // `AIT_SESSION_ID` is the tab's stable id — hook payloads echo
+        // it back so events stay attributable to this tab
+        // (CODING_STANDARDS.md 14). Opt-out, unknown shells and
+        // materialize failures all return `None` — the session then
+        // spawns exactly as without integration (standard 1).
+        let materialized = self
+            .session_template
+            .shell_integration
+            .then(|| integration::inject(&mut options, &id.to_string()))
+            .flatten();
+        let session = LiveSession::spawn(options)?;
         self.next_id += 1;
         self.tabs.push(Tab {
             id,
@@ -358,6 +423,8 @@ impl TabManager {
             exit: None,
             title,
             prompt_marks: VecDeque::new(),
+            integration: IntegrationState::Absent,
+            materialized,
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -370,7 +437,7 @@ impl TabManager {
     /// set untouched and propagates — the caller surfaces it as a
     /// status-line toast.
     pub fn new_tab(&mut self) -> Result<(), SpawnError> {
-        self.spawn_tab(self.session_options.clone())
+        self.spawn_tab(self.session_template.options.clone())
     }
 
     /// `Alt+W`: drop the active tab. Returns `false` when that was the
@@ -525,6 +592,14 @@ impl TabManager {
                     LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
                     _ => {}
                 }
+                // Shell-integration bookkeeping (Spec R05): marks move
+                // `Absent` → `MarksOnly`, decoded 7700 hooks move to and
+                // from `Integrated` — the state machine itself lives in
+                // `crate::integration` and never panics on malformed
+                // sequences.
+                if let LiveEvent::Osc(osc) = &event {
+                    tab.integration.observe(osc);
+                }
                 events.push(TabEvent { tab: index, event });
             }
             tab.on_output();
@@ -580,8 +655,15 @@ mod tests {
     /// A manager with `tabs` `/bin/sh` tabs (the first carrying
     /// `launch_cwd`), all at a small size.
     fn manager(tabs: usize, launch_cwd: &str) -> TabManager {
-        let mut manager =
-            TabManager::spawn_at(Size::new(40, 10), PathBuf::from(launch_cwd), sh()).unwrap();
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from(launch_cwd),
+            SessionTemplate {
+                options: sh(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for _ in 1..tabs {
             manager.spawn_tab(sh()).unwrap();
         }
@@ -766,7 +848,10 @@ mod tests {
         let mut manager = TabManager::spawn_at(
             Size::new(40, 10),
             PathBuf::from("/tmp"),
-            sh_script("exit 3"),
+            SessionTemplate {
+                options: sh_script("exit 3"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -909,13 +994,13 @@ mod tests {
         );
     }
 
-    /// Spec R03 stories 12–14: the session-options template shapes NEW
+    /// Spec R03 stories 12–14: the session template shapes NEW
     /// tabs — the spawned program and the scrollback capacity — while a
     /// tab spawned before the template changed keeps its spawn-time
     /// values. `new_tab` used to hardcode `LiveSessionOptions::default()`;
     /// the template is what `[terminal]` writes land on at reload.
     #[test]
-    fn session_options_template_shapes_new_tabs_only() {
+    fn session_template_shapes_new_tabs_only() {
         use ait_term::SessionOptions;
 
         // Tab 1 spawns under the default template — /bin/sh with the
@@ -931,10 +1016,13 @@ mod tests {
         drain_until(&mut manager, |m| m.tabs()[0].scrollback() > 5);
 
         // What a config reload does: swap the template, then Alt+T.
-        manager.set_session_options(LiveSessionOptions {
-            program: Some(OsString::from("/bin/cat")),
-            session: SessionOptions {
-                scrollback: 3,
+        manager.set_session_template(SessionTemplate {
+            options: LiveSessionOptions {
+                program: Some(OsString::from("/bin/cat")),
+                session: SessionOptions {
+                    scrollback: 3,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -964,5 +1052,213 @@ mod tests {
             "sh",
             "the pre-reload tab kept its spawn-time program"
         );
+    }
+
+    /// `OSC 7700 ; <hex(json)>` as a line an interactive shell prints —
+    /// how the tests below hand-emit hook events through a real
+    /// `/bin/sh` (the seam `prompt_marks_are_recorded_on_the_tab`
+    /// established).
+    fn hook_line(json: &str) -> Vec<u8> {
+        let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("printf '\\033]7700;{hex}\\007'\n").into_bytes()
+    }
+
+    /// Spec R05 / issue #72: decoded hook events drive the tab's
+    /// integration state through `drain_events` — `init_shell` →
+    /// `Integrated`, an `OSC 133` mark on an integrated tab changes
+    /// nothing, `exit_shell` → `Absent`, and a mark on an absent tab →
+    /// `MarksOnly`. A real interactive `/bin/sh` prints the sequences.
+    #[test]
+    fn decoded_hooks_drive_the_tabs_integration_state() {
+        let mut manager = manager(1, "/tmp");
+        assert_eq!(
+            manager.active().unwrap().integration_state(),
+            IntegrationState::Absent,
+            "a fresh tab starts Absent"
+        );
+
+        // Send a line to the interactive sh — a borrow-free helper so
+        // `drain_until` can take `&mut manager` between sends.
+        fn emit(manager: &TabManager, bytes: &[u8]) {
+            manager.active().unwrap().session.send_bytes(bytes).unwrap();
+        }
+
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"init_shell","value":{"session_id":0,"shell":"sh"}}"#),
+        );
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+
+        // Marks on an integrated tab don't downgrade it.
+        emit(&manager, b"printf '\\033]133;A\\007'\n");
+        drain_until(&mut manager, |m| m.tabs()[0].prompt_marks().count() == 1);
+        assert_eq!(
+            manager.active().unwrap().integration_state(),
+            IntegrationState::Integrated
+        );
+
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"exit_shell","value":{"session_id":0}}"#),
+        );
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Absent
+        });
+
+        // OSC 133 without init_shell → MarksOnly (a shell with its own
+        // semantic-prompt integration, Spec R05 us-19).
+        emit(&manager, b"printf '\\033]133;A\\007'\n");
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::MarksOnly
+        });
+    }
+
+    /// An unknown program's spawn is untouched: `sh` plans to `None` —
+    /// no materialized dir, no argv/env rewrite — and a session that
+    /// emits nothing stays `Absent` (§5.5 graceful degrade).
+    #[test]
+    fn unknown_shell_stays_absent_and_uninjected() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: sh_script("echo plain-done"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("plain-done")
+        });
+
+        let tab = manager.tabs().first().unwrap();
+        assert!(tab.materialized.is_none(), "sh plans to no injection");
+        assert_eq!(tab.integration_state(), IntegrationState::Absent);
+    }
+
+    /// The injection's `AIT_SESSION_ID` really lands in the spawned
+    /// shell's environment — and `shell_integration = false` opts the
+    /// spawn out entirely (Spec R05 us-3): no env var, no dir. `bash -c`
+    /// never reads the injected rcfile, so this also proves the rewrite
+    /// is transparent to non-interactive arg forms.
+    #[test]
+    fn injected_env_reaches_the_shell_and_opt_out_skips_it() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let echo_sid = || LiveSessionOptions {
+            program: Some(OsString::from("/bin/bash")),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo SID=${AIT_SESSION_ID:-none}"),
+            ],
+            ..Default::default()
+        };
+
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: echo_sid(),
+                shell_integration: false,
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("SID=")
+        });
+        let tab = manager.tabs().first().unwrap();
+        assert!(tab.materialized.is_none(), "opt-out spawns no injection");
+        assert!(
+            grid_text(&tab.session).contains("SID=none"),
+            "no AIT_SESSION_ID was exported: {:?}",
+            grid_text(&tab.session)
+        );
+
+        // Flip the template — the reload path — and spawn again.
+        manager.set_session_template(SessionTemplate {
+            options: echo_sid(),
+            ..Default::default()
+        });
+        manager.new_tab().unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[1].session).contains("SID=")
+        });
+        let tab = &manager.tabs()[1];
+        let materialized = tab
+            .materialized
+            .as_ref()
+            .expect("an injected spawn keeps its dir guard");
+        assert!(materialized.dir().is_dir());
+        assert!(
+            grid_text(&tab.session).contains(&format!("SID={}", tab.id)),
+            "AIT_SESSION_ID is the tab's stable id: {:?}",
+            grid_text(&tab.session)
+        );
+    }
+
+    /// The materialized `0700` dir lives exactly as long as its tab:
+    /// closing the tab drops the guard and the dir goes away (Spec R05
+    /// us-30 — integration leaves no litter).
+    #[test]
+    fn snippet_dir_dies_with_the_tab() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    args: vec![OsString::from("-c"), OsString::from("sleep 30")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dir = manager.tabs()[0]
+            .materialized
+            .as_ref()
+            .expect("bash spawns injected")
+            .dir()
+            .to_path_buf();
+        assert!(dir.is_dir());
+
+        assert!(!manager.close_active(), "the last tab closes the app");
+        assert!(
+            !dir.exists(),
+            "the session dir was removed with the tab: {dir:?}"
+        );
+    }
+
+    /// Real bash, injected for real: the `--rcfile` wrapper sources the
+    /// snippet, which emits `init_shell` — the tab reports `Integrated`
+    /// without a single dotfile touched (Spec R05 us-1).
+    #[test]
+    fn injected_bash_reports_integrated() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
     }
 }
