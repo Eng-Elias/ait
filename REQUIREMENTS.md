@@ -208,7 +208,8 @@ parsing output.
 - Ship rc snippets for bash, zsh and fish. `ait` injects them on session start
   without editing the user's dotfiles (e.g. via `--rcfile`/`ZDOTDIR` wrappers).
 - Snippets emit standard `OSC 133;A/B/C/D;<exit>` and `OSC 7`.
-- Snippets also emit AIT hook events on a private channel (Proposed protocol):
+- Snippets also emit AIT hook events on a private channel (Decided,
+  ADR-0008):
 
   ```
   ESC ] 7700 ; <hex(json)> BEL
@@ -223,22 +224,32 @@ parsing output.
 - **Graceful degrade:** if integration is absent (unknown shell, `sudo -i`,
   dumb remote shell), the terminal still works — no blocks, no errors.
 
-#### 5.5.1 In-band command execution (Proposed protocol)
+#### 5.5.1 In-band command execution (Decided, ADR-0008 — amended)
 
 Lets `ait` run a command inside the user's live shell (with their env, aliases,
 functions) and capture the result without a second channel:
 
 ```
-ait → PTY input : __ait_run <id> '<command>'
+ait → PTY input : __ait_run <id> <hex(command)>
 shell → output  : ESC ] 7701 ; A BEL
-                  ESC ] 7701 ; R ; <len> ; <hex("<id>;<stdout+stderr>;<exit_code>")> BEL
+                  ESC ] 7701 ; R ; <len> ; <hex> BEL          (repeated)
                   ESC ] 7701 ; B BEL
 ```
 
-The shell function runs the command in the background, so the user's prompt is
-not disturbed. Responses are not rendered in the grid.
+The `R` frames carry successive slices of one `<id>;<stdout+stderr>;
+<exit_code>` payload — `<len>` is the decoded byte length of *that* frame, and
+every complete OSC stays under ~1024 raw bytes (the `vte` parser cap). The
+shell function runs the command in a capture subshell, so the user's prompt is
+not disturbed. Responses are not rendered in the grid; the typed `__ait_run`
+line stays visible.
 
-#### 5.5.2 Shell-native completions (stretch, Proposed protocol)
+#### 5.5.2 Shell-native completions (stretch — protocol reserved, not implemented)
+
+Codes `7702` and `7703` are reserved by ADR-0008; nothing emits or consumes
+them yet. The sketch below is still proposal-grade:
+
+`__ait_complete <hex(line)>` asks the shell's own completion system (bash
+`complete -p` + dynamic loaders, zsh compsys, fish `complete -C`) for matches:
 
 `__ait_complete <hex(line)>` asks the shell's own completion system (bash
 `complete -p` + dynamic loaders, zsh compsys, fish `complete -C`) for matches:
