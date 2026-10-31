@@ -912,13 +912,16 @@ mod tests {
     /// spawn — needs no host TTY (same allowance as the tabs tests).
     #[test]
     fn cwd_falls_back_to_proc_then_prefers_osc7() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -964,13 +967,16 @@ mod tests {
     /// tail — plus the caller's `Settings` snapshot (us-23).
     #[test]
     fn request_for_collects_context() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1033,13 +1039,16 @@ mod tests {
     /// assembles.
     #[test]
     fn line_request_for_collects_the_whole_line() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

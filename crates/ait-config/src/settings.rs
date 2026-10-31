@@ -116,6 +116,11 @@ pub struct TerminalSettings {
     /// (Spec R02 — off by default; `ait` performs the write itself when
     /// enabled).
     pub osc52: Option<bool>,
+    /// Inject shell integration (OSC 133 marks + OSC 7700 hook events)
+    /// into new sessions on supported shells — on when unset (§5.5,
+    /// Spec R05). `false` opts out: new sessions spawn as plain
+    /// terminals, live ones are untouched.
+    pub shell_integration: Option<bool>,
 }
 
 /// `[agents]` — endpoint declarations (§4.1) and execution profiles (§5.7).

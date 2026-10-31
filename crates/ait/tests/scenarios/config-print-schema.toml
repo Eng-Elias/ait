@@ -1,13 +1,14 @@
 # Spec R03 story 5: `ait --print-schema` emits the settings JSON
-# Schema and exits 0. The schema is ~330 lines — the last screenful is
-# its `$defs` tail, where `scrollback_lines` (TerminalSettings) and
-# `additionalProperties` (`deny_unknown_fields` on every table) land.
+# Schema and exits 0. The schema is ~340 lines — the last screenful is
+# its `$defs` tail, where TerminalSettings' `shell_integration` (Spec
+# R05) and `additionalProperties` (`deny_unknown_fields` on every
+# table) land.
 feature = "Configurations and providers"
 size = [80, 24]
 args = ["--print-schema"]
 
 [[steps]]
-expect_text = "scrollback_lines"
+expect_text = "shell_integration"
 
 [[steps]]
 expect_text = "additionalProperties"
