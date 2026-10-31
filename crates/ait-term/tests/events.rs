@@ -269,6 +269,34 @@ fn malformed_osc_bytes_never_panic_or_corrupt_the_grid() {
 }
 
 #[test]
+fn over_long_private_osc_surfaces_whole_instead_of_truncating() {
+    let mut session = session();
+    // The observer's raw buffer is raised above vte's `MAX_OSC_RAW` (1024):
+    // a several-KB private sequence still reaches `Private` complete, so
+    // downstream decoders (ait-shell's OSC 7701 R-frames) see the full
+    // payload and can degrade on their own terms.
+    let payload = vec![b'x'; 8 * 1024];
+    let mut osc = b"\x1b]7701;R;".to_vec();
+    osc.extend_from_slice(payload.len().to_string().as_bytes());
+    osc.push(b';');
+    osc.extend_from_slice(&payload);
+    osc.push(0x07);
+
+    let events = session.feed_bytes(&osc);
+    assert_eq!(
+        events,
+        vec![SessionEvent::Private {
+            code: b"7701".to_vec(),
+            params: vec![
+                b"R".to_vec(),
+                payload.len().to_string().into_bytes(),
+                payload,
+            ],
+        }]
+    );
+}
+
+#[test]
 fn osc_sequences_split_across_feeds_complete_later() {
     let mut session = session();
     // A PTY read boundary can split an OSC mid-sequence; the parser buffers
