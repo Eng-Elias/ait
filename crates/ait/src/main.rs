@@ -9,6 +9,11 @@
 
 mod app;
 mod backend;
+// Spec R05 / issue #73: the assembler is wired into `TabManager`'s
+// drain, but its read side (`Tab::blocks` → `Block`) has no caller
+// until R05-T5 (status/nav/select) and R05-T7 (suggester context).
+#[allow(dead_code)]
+mod blocks;
 mod config;
 mod inband;
 mod integration;
