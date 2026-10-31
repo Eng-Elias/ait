@@ -4,6 +4,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 (Seeded from REQUIREMENTS.md §9.)
 
 - **Session** — one PTY + shell process + its grid and blocks.
+- **Tab** — one session plus its viewport, scroll offset and selection
+  state.
 - **Grid** — the styled cell matrix plus scrollback for a session.
 - **Block** — one command, its output and exit code, delimited by shell hooks.
 - **Shell integration / rc snippet** — the script injected into a shell that
@@ -18,6 +20,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `openai_responses`, or `anthropic_messages`.
 - **Model role** — `base_model`, `coding_model`, `command_model`; references a
   model `config_key`.
+- **config_key** — a model entry's stable id, non-empty and unique across all
+  endpoints' models; model roles resolve through it (§4.1–4.2).
 - **Execution profile** — named set of per-tool permission levels plus
   allow/deny lists.
 - **Permission level** — `always_allow`, `always_ask`, `agent_decides`,
@@ -30,3 +34,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 - **Remote bootstrap** — injecting shell integration into a remote shell over
   SSH.
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **Scenario** — a declarative TOML test of user-visible behavior.
+- **Recording** — the committed concrete inputs an agent step resolved to.
+- **Driver** — the backing that resolves agent steps.
+- **Replay** — re-sending recorded inputs with no model calls.
+- **Drift** — a screen-state hash mismatch between recording and replay.

@@ -1,3 +1,8 @@
+# Exact toolchain pin, ADR-0002's determinism rule applied to the
+# toolchain itself: a stale local "stable" once passed clippy locally
+# while CI's latest-stable flagged it (E01 retro). CI reads this same
+# file (dtolnay/rust-toolchain with no `toolchain:` input), so both
+# sides always agree. Bump deliberately, one line per release.
 [toolchain]
-channel = "stable"
+channel = "1.99"
 components = ["rustfmt", "clippy"]

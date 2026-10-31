@@ -1,0 +1,44 @@
+# Spec R02 stories 14-15: a left-drag across screen text copies the
+# selection — ait emits its own OSC 52, which the harness sees as a
+# `ClipboardWrite` event (the session opted into `osc52`) — and
+# `Shift+Insert` pastes the copied text into the inner shell.
+#
+# Screen coords below are 0-based (the scenario `col`/`row`
+# convention): after `echo HELLOWORLD` at the first prompt, row 2 holds
+# `HELLOWORLD` starting at column 0 — the drag covers columns 0..9,
+# and the release extends the copy through its cell.
+feature = "selection"
+size = [80, 24]
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "echo HELLOWORLD\n"
+
+# Gate on `HELLOWORLD` as a whole line — `wait_text` would pass on the
+# command's own echo before the output row exists, and the drag below
+# would select a row that hasn't printed yet.
+[[steps]]
+expect_regex = "(?m)^HELLOWORLD$"
+
+[[steps]]
+mouse = { event = "down", col = 0, row = 2 }
+
+[[steps]]
+mouse = { event = "drag", col = 9, row = 2 }
+
+[[steps]]
+mouse = { event = "up", col = 9, row = 2 }
+
+[[steps]]
+expect_clipboard = "HELLOWORLD"
+
+# Shift+Insert pastes the copy at the fresh prompt (row 4's `$ ` ->
+# `$ HELLOWORLD`); dash never enables bracketed paste, so the text
+# lands raw.
+[[steps]]
+keys = ["Shift+Insert"]
+
+[[steps]]
+expect_text = "$ HELLOWORLD"

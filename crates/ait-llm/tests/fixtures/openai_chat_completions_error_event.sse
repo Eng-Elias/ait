@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-fix03","object":"chat.completion.chunk","created":1761500400,"model":"gpt-6-astra","choices":[{"index":0,"delta":{"role":"assistant","content":"Partial answer"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fix03","object":"chat.completion.chunk","created":1761500400,"model":"gpt-6-astra","choices":[],"usage":null,"error":{"message":"Upstream rate limit hit mid-stream.","type":"server_error","code":"rate_limit_exceeded"}}
+
+data: [DONE]
+

@@ -1,0 +1,14 @@
+# Spec R03 CLI surface: `ait --help` documents the config flags —
+# `--init [--force]` and `--print-schema` — and exits 0.
+feature = "Configurations and providers"
+size = [80, 24]
+args = ["--help"]
+
+[[steps]]
+expect_text = "--init"
+
+[[steps]]
+expect_text = "--print-schema"
+
+[[steps]]
+expect_exit = 0

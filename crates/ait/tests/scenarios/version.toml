@@ -1,0 +1,10 @@
+# Spec R02 story 24: `ait --version` prints its version and exits 0.
+feature = "lifecycle"
+size = [80, 24]
+args = ["--version"]
+
+[[steps]]
+expect_text = "ait 0.1.0"
+
+[[steps]]
+expect_exit = 0

@@ -3,5 +3,45 @@ name = "ait"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "AIT's TUI binary: a full-screen terminal frontend over ait-term sessions."
 
 [dependencies]
+ait-term = { path = "../ait-term" }
+# Settings.toml load/watch, the `--init` template, the `--print-schema`
+# schema and base_model resolution (Spec R03, user stories 1–14, 24).
+ait-config = { path = "../ait-config" }
+# Spec R04 NL→command: the `# `+Enter trigger fires a `SuggestRequest`
+# into ait-agent's channel-based `CommandSuggester` (user stories 1–2,
+# 13–17, 29). ait-agent owns its tokio runtime on a worker thread, so
+# `ait` never gains a tokio dependency (ADR-0004, amended 2026-10-28 —
+# the runtime landed in the library crates, not the `ait` binary the
+# original text reserved it for).
+ait-agent = { path = "../ait-agent" }
+# Semver requirements per Spec R02; chosen releases are >=7 days old
+# (ADR-0002 supply-chain rule): ratatui 0.30.2 (2026-06-19),
+# crossterm 0.29.0 (2025-04-05).
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "crossterm_0_29",
+] }
+# `osc52` gives `crossterm::clipboard::CopyToClipboard` — our own host
+# clipboard writes (R02-T3). It does NOT touch child-app OSC 52, which
+# stays off in ait-term's `SessionOptions`.
+crossterm = { version = "0.29", features = ["osc52"] }
+
+[dev-dependencies]
+# Test-only e2e harness over ait-term's LiveSession (Spec E01) — never a
+# dependency of any product crate.
+ait-testkit = { path = "../ait-testkit" }
+# Semver requirement per Spec E01; the release is >=7 days old
+# (ADR-0002 supply-chain rule): insta 1.49.0 (2026-10-03).
+insta = "1.49"
+# Tempdirs for the CLI tests' XDG_CONFIG_HOME fixtures (Spec R03:
+# `ait --init` writes under a fresh config dir). Release >=7 days old
+# per ADR-0002: tempfile 3.27.0 (2026-03-11).
+tempfile = "3"
+# In-process SSE stub for the Spec R04 e2e tests (ticket R04-T7) —
+# `ait_llm::testing`'s shared fixture server behind `test-fixtures`,
+# the same harness ait-llm's contract tests and ait-agent's suggester
+# tests use.
+ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }

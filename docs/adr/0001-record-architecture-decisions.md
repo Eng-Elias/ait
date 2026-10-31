@@ -25,6 +25,12 @@ Per `REQUIREMENTS.md`, an ADR wins over `REQUIREMENTS.md` where they
 disagree, and `REQUIREMENTS.md` must be updated in the same PR that adds a
 conflicting ADR.
 
+When a later round lands differently than an ADR decided, the ADR gains a
+dated `## Amendment — YYYY-MM-DD` section recording what actually shipped
+— the original text stays for the record (see ADR-0004's 2026-10-28
+amendment). Amending at ticket time is the norm; a reviewer catching the
+drift later is the failure mode.
+
 ## Consequences
 
 - Decisions have a permanent, reviewable home; spec and tickets can cite ADR
