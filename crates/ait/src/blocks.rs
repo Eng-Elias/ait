@@ -85,6 +85,17 @@ pub struct BlockEntry {
     completed: bool,
 }
 
+/// The `(exit code, duration)` pair the status line renders for the
+/// newest finished block (Spec R05 us-15) — kept narrow so that read
+/// side needs no grid-resolved [`Block`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockStatus {
+    /// The `OSC 133;D` exit code.
+    pub exit: u32,
+    /// Execution time (`D.at − C.at`, `B.at` fallback).
+    pub duration: Duration,
+}
+
 /// A block resolved against the live grid — what
 /// [`Tab::blocks`](crate::tabs::Tab::blocks) hands consumers (Spec R05).
 /// Line coordinates are **live** scrollback-then-viewport indices,
@@ -186,6 +197,21 @@ impl BlockAssembler {
         self.blocks.iter().chain(self.open.iter())
     }
 
+    /// The newest block's [`BlockStatus`] — the status line's
+    /// `✓/✗ <code> · <dur>` segment (Spec R05 us-15). Only blocks that
+    /// reported an `OSC 133;D` exit code count: a still-running or
+    /// abandoned command has nothing to report. Cheaper than
+    /// [`blocks`](Self::blocks) + [`resolve`](BlockEntry::resolve) — it
+    /// reads the raw entries, no grid pass.
+    pub fn last_status(&self) -> Option<BlockStatus> {
+        self.blocks.iter().rev().find_map(|entry| {
+            entry
+                .exit()
+                .zip(entry.duration())
+                .map(|(exit, duration)| BlockStatus { exit, duration })
+        })
+    }
+
     fn push_block(&mut self, entry: BlockEntry) {
         if self.blocks.len() == BLOCK_CAP {
             self.blocks.pop_front();
@@ -238,11 +264,13 @@ impl BlockEntry {
     }
 
     /// The `preexec`-reported command, if one arrived.
+    #[allow(dead_code)] // test-side inspection today; `resolve` reads the field
     fn command(&self) -> Option<&str> {
         self.command.as_deref()
     }
 
     /// Whether `D` closed this block.
+    #[allow(dead_code)] // test-side inspection today
     fn completed(&self) -> bool {
         self.completed
     }
@@ -346,6 +374,10 @@ impl BlockEntry {
     }
 }
 
+// The full read-side surface stays: `range` is consumed by the
+// block nav/select/status paths (R05-T5); the rest serve the seams'
+// tests today and R05-T7's suggester context next (Spec R05).
+#[allow(dead_code)]
 impl Block {
     /// The block's clamped live-coordinate line range (`B→D`), inclusive.
     pub fn range(&self) -> RangeInclusive<usize> {

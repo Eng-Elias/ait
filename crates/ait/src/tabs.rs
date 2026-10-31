@@ -35,7 +35,7 @@ use ait_term::{
     SessionEvent, Size, SpawnError,
 };
 
-use crate::blocks::{Block, BlockAssembler};
+use crate::blocks::{Block, BlockAssembler, BlockStatus};
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::scroll::ScrollState;
@@ -304,6 +304,106 @@ impl Tab {
     /// Snap back to the live viewport — what a keypress does.
     pub fn snap_to_bottom(&mut self) {
         self.scroll.snap_to_bottom();
+    }
+
+    /// `Alt+↑` (Spec R05 §5.5/us-16): scroll the view to the previous
+    /// block's start line. "Previous" is measured against the view's
+    /// top row in live coordinates: the highest block start above it —
+    /// so a view sitting mid-block lands on that block's own start and
+    /// repeated presses walk the starts upward. No-op when no block
+    /// starts above the current top.
+    pub fn prev_block_start(&mut self) {
+        let top = self.viewport_top();
+        let start = self
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .filter(|start| *start < top)
+            .max();
+        if let Some(line) = start {
+            self.scroll_to_line(line);
+        }
+    }
+
+    /// `Alt+↓`: scroll the view to the next block's start line — the
+    /// lowest block start below the view's top row. A start inside the
+    /// live viewport clamps to the bottom, which is where the user
+    /// expects to land past the newest block anyway. No-op when no
+    /// block starts below.
+    pub fn next_block_start(&mut self) {
+        let top = self.viewport_top();
+        let start = self
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .filter(|start| *start > top)
+            .min();
+        if let Some(line) = start {
+            self.scroll_to_line(line);
+        }
+    }
+
+    /// `Alt+B` (Spec R05 §5.5/us-17): program the existing mouse-drag
+    /// [`Selection`] over the *current* block's clamped range and
+    /// return the finished range for the caller's copy path — `None`
+    /// when the tab has no blocks.
+    ///
+    /// "Current" is the block the view's bottom row sits in: the last
+    /// block starting at or above it — at the live viewport that is
+    /// the region around the cursor; scrolled up it is the block the
+    /// user is looking at. A view above every block start still
+    /// selects the first block.
+    pub fn select_block(&mut self) -> Option<SelectionRange> {
+        let blocks = self.blocks();
+        if blocks.is_empty() {
+            return None;
+        }
+        let bottom = self.viewport_top() + self.grid().lines().saturating_sub(1);
+        let index = blocks
+            .iter()
+            .rposition(|block| *block.range().start() <= bottom)
+            .unwrap_or(0);
+        let range = blocks[index].range();
+        // Live → grid coordinates: `line − scrollback` — `0..lines` is
+        // the viewport, negatives reach into scrollback (`GridPoint`'s
+        // rule, shared with mouse hit-testing).
+        let scrollback = i32::try_from(self.scrollback()).unwrap_or(i32::MAX);
+        let to_grid = |line: usize| i32::try_from(line).unwrap_or(i32::MAX) - scrollback;
+        // Whole lines: column 0 through the last column — the extract
+        // path trims trailing blanks itself.
+        let last_column = self.grid().columns().saturating_sub(1);
+        self.begin_selection(GridPoint::new(to_grid(*range.start()), 0));
+        self.extend_selection(GridPoint::new(to_grid(*range.end()), last_column));
+        self.finish_selection()
+    }
+
+    /// The last finished block's exit code and duration — the status
+    /// line's `✓/✗ <code> · <dur>` segment (Spec R05 us-15). `None`
+    /// when no block has reported an `OSC 133;D` exit code yet.
+    pub fn last_block_status(&self) -> Option<BlockStatus> {
+        self.blocks.last_status()
+    }
+
+    /// The view's top row in live scrollback-then-viewport coordinates
+    /// — the anchor block navigation and block selection measure
+    /// against (`scrollback − offset`; the offset is clamped to the
+    /// scrollback depth, so this never underflows).
+    fn viewport_top(&self) -> usize {
+        self.scrollback().saturating_sub(self.scroll.offset())
+    }
+
+    /// Scroll so live line `line` tops the viewport — `offset =
+    /// scrollback − line`, reached through the same clamped
+    /// `scroll_up`/`scroll_down` the page bindings use. Lines inside
+    /// the live viewport clamp to the bottom (offset 0).
+    fn scroll_to_line(&mut self, line: usize) {
+        let target = self.scrollback().saturating_sub(line);
+        let offset = self.scroll.offset();
+        match target.cmp(&offset) {
+            std::cmp::Ordering::Greater => self.scroll_up(target - offset),
+            std::cmp::Ordering::Less => self.scroll_down(offset - target),
+            std::cmp::Ordering::Equal => {}
+        }
     }
 
     /// Begin a mouse-drag selection at `point` (grid coordinates).
@@ -1310,6 +1410,192 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].command(), "echo hi", "echo slice, no prompt");
         assert_eq!(blocks[0].exit(), Some(3));
+    }
+
+    /// A two-block script on a 10-row grid: each `B→D` quadruple is
+    /// separated by sleeps so every mark records its own row, and the
+    /// padding between them pushes enough lines into scrollback that
+    /// block navigation has somewhere to go.
+    fn two_block_script() -> LiveSessionOptions {
+        sh_script(
+            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+             printf 'first'; sleep 0.2; \
+             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+             printf 'out1\\n'; sleep 0.2; \
+             printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+             i=0; while [ $i -lt 14 ]; do echo pad$i; i=$((i+1)); done; sleep 0.2; \
+             printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+             printf 'second'; sleep 0.2; \
+             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+             printf 'out2\\n'; sleep 0.2; \
+             printf '\\033]133;D;7\\007'; sleep 0.5",
+        )
+    }
+
+    /// Spec R05 / issue #74: `Alt+B` programs the existing
+    /// drag-selection machinery over the block's clamped range — the
+    /// finished range is what `extract` (and so the OSC-52 copy path)
+    /// reads, yielding command + output as the one copy granularity.
+    #[test]
+    fn select_block_programs_the_existing_selection() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let range = manager
+            .active_mut()
+            .unwrap()
+            .select_block()
+            .expect("a tab with blocks selects");
+
+        let tab = manager.active().unwrap();
+        let block = &tab.blocks()[0];
+        let scrollback = i32::try_from(tab.scrollback()).unwrap();
+        // The finished range IS the block's live range, re-expressed
+        // in selection coordinates (`line − scrollback`) — and it
+        // stays programmed as the tab's highlight.
+        assert_eq!(range.start.line, *block.range().start() as i32 - scrollback);
+        assert_eq!(range.end.line, *block.range().end() as i32 - scrollback);
+        assert_eq!(tab.selection_range(), Some(range));
+        let text = crate::selection::extract(&tab.grid(), range);
+        assert!(text.contains("echo hi"), "the echo row: {text:?}");
+        assert!(text.contains("\nhi"), "the output row: {text:?}");
+    }
+
+    /// The status segment's data source (Spec R05 us-15): the newest
+    /// block that reported an exit code — here the only block, `D;3`.
+    #[test]
+    fn last_block_status_reports_the_newest_exit() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let status = manager.tabs()[1].last_block_status().unwrap();
+        assert_eq!(status.exit, 3);
+        assert!(status.duration > Duration::ZERO);
+        assert!(
+            manager.tabs()[0].last_block_status().is_none(),
+            "the markless tab reports nothing (graceful degrade)"
+        );
+    }
+
+    /// `Alt+↑`/`Alt+↓` scroll the view between block starts (Spec R05
+    /// us-16): up from the bottom lands on the newest start above the
+    /// view's top row, another press walks further back (or goes inert
+    /// at the oldest), and down walks back toward the live viewport.
+    /// A view parked mid-block jumps to that block's own start first.
+    #[test]
+    fn block_navigation_walks_block_starts() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: two_block_script(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active()
+                .unwrap()
+                .blocks()
+                .iter()
+                .filter(|b| b.completed())
+                .count()
+                == 2
+                && m.active().unwrap().scrollback() > 0
+        });
+
+        let tab = manager.active_mut().unwrap();
+        let scrollback = tab.scrollback();
+        let starts: Vec<usize> = tab
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .collect();
+        assert_eq!(starts.len(), 2, "two quadruples → two blocks");
+
+        // Up from the bottom: the newest start above the view's top
+        // row (`top = scrollback`) wins — that's the earlier block.
+        let target = starts
+            .iter()
+            .copied()
+            .filter(|start| *start < scrollback)
+            .max()
+            .expect("the first block sits in scrollback");
+        tab.prev_block_start();
+        assert_eq!(
+            tab.scroll_offset(),
+            scrollback - target,
+            "view tops on the block's start line"
+        );
+
+        // Another press goes inert when no earlier start exists — or
+        // walks further back when it does.
+        let top = scrollback - tab.scroll_offset();
+        let prior = starts.iter().copied().filter(|start| *start < top).max();
+        let before = tab.scroll_offset();
+        tab.prev_block_start();
+        match prior {
+            Some(line) => assert_eq!(tab.scroll_offset(), scrollback - line),
+            None => assert_eq!(
+                tab.scroll_offset(),
+                before,
+                "no earlier start — the press is inert"
+            ),
+        }
+
+        // Down walks back toward the live viewport: the next start
+        // below the top row.
+        let top = scrollback - tab.scroll_offset();
+        let next = starts
+            .iter()
+            .copied()
+            .filter(|start| *start > top)
+            .min()
+            .expect("the second block is below");
+        tab.next_block_start();
+        assert_eq!(
+            tab.scroll_offset(),
+            scrollback.saturating_sub(next),
+            "a start inside the live viewport clamps to the bottom"
+        );
+
+        // Mid-block anchor: park the view's top INSIDE the first
+        // block's range — `Alt+↑` lands on that block's own start
+        // rather than skipping it.
+        let first = starts[0];
+        let inside = *tab.blocks()[0].range().end();
+        if inside > first && inside < scrollback {
+            tab.snap_to_bottom();
+            tab.scroll.scroll_up(scrollback - inside, scrollback);
+            assert_eq!(scrollback - tab.scroll_offset(), inside, "fixture check");
+            tab.prev_block_start();
+            assert_eq!(
+                tab.scroll_offset(),
+                scrollback - first,
+                "a mid-block view lands on the block's own start"
+            );
+        }
+    }
+
+    /// Blocks-only UX degrades quietly (§5.5): a tab with no marks
+    /// scrolls nowhere, selects nothing, reports no block status.
+    #[test]
+    fn block_ux_is_inert_without_blocks() {
+        let mut manager = manager(1, "/tmp");
+        let tab = manager.active_mut().unwrap();
+
+        tab.prev_block_start();
+        tab.next_block_start();
+        assert_eq!(tab.scroll_offset(), 0, "no blocks — the view stays");
+        assert_eq!(tab.select_block(), None);
+        assert!(tab.selection_range().is_none());
+        assert!(tab.last_block_status().is_none());
     }
 
     /// Scrollback truncation (`ESC[3J`) drops the lines a block sat on:
