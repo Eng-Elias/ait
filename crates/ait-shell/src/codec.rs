@@ -40,12 +40,10 @@ pub enum ShellEvent {
     },
     /// `OSC 7701 ; A` — a `__ait_run` response begins.
     RunBegin,
-    /// `OSC 7701 ; R ; <len> ; <hex>` — one response frame. `len` is the
-    /// declared decoded-byte length, checked against `payload` during
-    /// decode, so it always equals `payload.len()`.
+    /// `OSC 7701 ; R ; <len> ; <hex>` — one response frame. The wire
+    /// `<len>` is checked against the decoded payload during decode, so
+    /// what survives here always measured up.
     RunChunk {
-        /// Declared frame length in decoded bytes (== `payload.len()`).
-        len: usize,
         /// This frame's slice of the `<id>;<merged>;<exit_code>` stream.
         payload: Vec<u8>,
     },
@@ -81,18 +79,6 @@ pub enum HookName {
 }
 
 impl HookName {
-    /// The wire name used inside the hook JSON.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::InitShell => "init_shell",
-            Self::Bootstrapped => "bootstrapped",
-            Self::Precmd => "precmd",
-            Self::Preexec => "preexec",
-            Self::ExitShell => "exit_shell",
-            Self::Unknown(name) => name,
-        }
-    }
-
     /// Map a wire name to a hook; unrecognized names land in `Unknown`.
     fn from_wire(name: &str) -> Self {
         match name {
@@ -103,6 +89,19 @@ impl HookName {
             "exit_shell" => Self::ExitShell,
             other => Self::Unknown(other.to_owned()),
         }
+    }
+}
+
+/// The `session_id` a hook `value` carries, normalized to a plain
+/// string: the snippets emit a quoted JSON string, but a numeric
+/// literal from an older or foreign emitter normalizes to its digits —
+/// either way consumers compare against one allocated id. Absent,
+/// null, empty or non-scalar values yield `None`.
+pub fn session_id(value: &Value) -> Option<String> {
+    match value.get("session_id") {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(Value::Number(id)) => Some(id.to_string()),
+        _ => None,
     }
 }
 
@@ -149,7 +148,7 @@ fn decode_run(params: &[&[u8]]) -> Option<ShellEvent> {
             if payload.len() != len {
                 return None;
             }
-            Some(ShellEvent::RunChunk { len, payload })
+            Some(ShellEvent::RunChunk { payload })
         }
         _ => None,
     }

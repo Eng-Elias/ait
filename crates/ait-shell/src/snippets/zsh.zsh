@@ -8,7 +8,7 @@
 # restored real ZDOTDIR, never sees this file, and degrades cleanly
 # instead of double-hooking (Spec R05 us-27).
 if [[ -n ${__AIT_INTEGRATED_ZSH:-} ]] && (( $+functions[__ait_emit] )); then
-    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null}}}"
+    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":$(__ait_sid)}}"
     return 0
 fi
 
@@ -26,9 +26,17 @@ __ait_emit() {
     printf '\033]7700;%s\007' "$hex"
 }
 
-# A named hook whose value is just the session id (null when unset).
+# The session id as a JSON string literal — always quoted, so a
+# non-numeric or unset value can never produce invalid JSON (an
+# undecodable payload moves nothing — the tab would silently never
+# integrate). Unset reads as `""`, which matches no allocated id.
+__ait_sid() {
+    printf '"%s"' "$(__ait_json_escape "${AIT_SESSION_ID:-}")"
+}
+
+# A named hook whose value is just the session id.
 __ait_hook() {
-    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null}}}"
+    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":$(__ait_sid)}}"
 }
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -105,7 +113,7 @@ __ait_zsh_preexec() {
     local command
     printf '\033]133;C\007'
     command=$(__ait_json_escape "$1")
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null},\"command\":\"$command\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$(__ait_sid),\"command\":\"$command\"}}"
 }
 
 __ait_zsh_exit() {
@@ -128,5 +136,5 @@ if ! add-zle-hook-widget line-init __ait_zsh_line_init 2>/dev/null; then
     add-zsh-hook precmd __ait_zsh_precmd_b
 fi
 
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null},\"shell\":\"zsh\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"zsh\"}}"
 __AIT_INTEGRATED_ZSH=1

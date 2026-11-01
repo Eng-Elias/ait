@@ -54,34 +54,39 @@ impl Toast {
     }
 }
 
+/// The status summary's inputs for one tab — bundled so
+/// [`status_text`] takes three arguments instead of seven.
+pub struct StatusLine<'a> {
+    /// The tab's tracked working directory (OSC 7, else spawn cwd).
+    pub cwd: &'a Path,
+    /// The tab's program basename.
+    pub shell: &'a str,
+    /// The resolved `base_model`'s display name (`—` when unset —
+    /// Spec R03 story 24).
+    pub model: &'a str,
+    /// The newest finished block's status (`✓/✗ <code> · <dur>` —
+    /// Spec R05 us-15; absent when no block has reported an exit code).
+    pub block: Option<BlockStatus>,
+    /// The session's exit status once `LiveEvent::Exited` surfaced.
+    pub exit: Option<&'a ExitStatus>,
+}
+
 /// The status line's content at `now`: a live toast wins outright;
-/// otherwise `cwd · shell · model · [block ·] state` for the described
-/// tab.
-///
-/// `cwd` is the tab's tracked working directory (OSC 7, else spawn
-/// cwd), `shell` its program basename, `model` the resolved
-/// `base_model`'s display name (`—` when unset — Spec R03 story 24),
-/// `block` the newest finished command block's status (`✓/✗ <code> ·
-/// <dur>` — Spec R05 us-15; absent when no block has reported an exit
-/// code), `exit` the session's exit status once `LiveEvent::Exited`
-/// surfaced.
-pub fn status_text(
-    cwd: &Path,
-    shell: &str,
-    model: &str,
-    block: Option<BlockStatus>,
-    exit: Option<&ExitStatus>,
-    toast: Option<&Toast>,
-    now: Instant,
-) -> String {
+/// otherwise `cwd · shell · model · [block ·] state` for the tab
+/// `line` describes.
+pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -> String {
     if let Some(toast) = toast.filter(|toast| toast.is_live(now)) {
         return toast.text().to_string();
     }
-    let block = block.map_or_else(String::new, |status| format!("{} · ", block_text(status)));
+    let block = line
+        .block
+        .map_or_else(String::new, |status| format!("{} · ", block_text(status)));
     format!(
-        "{} · {shell} · {model} · {block}{}",
-        cwd.display(),
-        state_text(exit),
+        "{} · {} · {} · {block}{}",
+        line.cwd.display(),
+        line.shell,
+        line.model,
+        state_text(line.exit),
     )
 }
 
@@ -154,22 +159,26 @@ mod tests {
     #[test]
     fn status_line_is_cwd_shell_model_state() {
         let text = status_text(
-            Path::new("/home/u/project"),
-            "bash",
-            "Qwen Coder",
-            None,
-            None,
+            &StatusLine {
+                cwd: Path::new("/home/u/project"),
+                shell: "bash",
+                model: "Qwen Coder",
+                block: None,
+                exit: None,
+            },
             None,
             Instant::now(),
         );
         assert_eq!(text, "/home/u/project · bash · Qwen Coder · running");
 
         let text = status_text(
-            Path::new("/home/u/project"),
-            "bash",
-            "—",
-            None,
-            None,
+            &StatusLine {
+                cwd: Path::new("/home/u/project"),
+                shell: "bash",
+                model: "—",
+                block: None,
+                exit: None,
+            },
             None,
             Instant::now(),
         );
@@ -187,7 +196,17 @@ mod tests {
             duration: Duration::from_millis(1200),
         };
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", Some(ok), None, None, now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    block: Some(ok),
+                    exit: None,
+                },
+                None,
+                now
+            ),
             "/tmp · sh · — · ✓ 0 · 1.2s · running"
         );
 
@@ -196,7 +215,17 @@ mod tests {
             duration: Duration::from_millis(60),
         };
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", Some(failed), None, None, now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    block: Some(failed),
+                    exit: None,
+                },
+                None,
+                now
+            ),
             "/tmp · sh · — · ✗ 1 · 0.1s · running"
         );
     }
@@ -220,18 +249,30 @@ mod tests {
         let now = Instant::now();
         let code3 = exit(3, None);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", None, Some(&code3), None, now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    block: None,
+                    exit: Some(&code3),
+                },
+                None,
+                now
+            ),
             "/tmp · sh · — · exited 3"
         );
         // A signaled exit keeps its description readable.
         let hung_up = exit(1, Some("Terminated by SIGHUP"));
         assert_eq!(
             status_text(
-                Path::new("/tmp"),
-                "sh",
-                "—",
-                None,
-                Some(&hung_up),
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    block: None,
+                    exit: Some(&hung_up),
+                },
                 None,
                 now
             ),
@@ -246,7 +287,17 @@ mod tests {
         let now = Instant::now();
         let toast = Toast::new("build finished", now);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", None, None, Some(&toast), now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    block: None,
+                    exit: None,
+                },
+                Some(&toast),
+                now
+            ),
             "build finished"
         );
     }
@@ -265,11 +316,13 @@ mod tests {
         );
 
         let summary = status_text(
-            Path::new("/tmp"),
-            "sh",
-            "—",
-            None,
-            None,
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                block: None,
+                exit: None,
+            },
             Some(&toast),
             now + TOAST_DURATION,
         );

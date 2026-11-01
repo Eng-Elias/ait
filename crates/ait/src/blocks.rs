@@ -26,7 +26,7 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use ait_shell::{HookName, ShellEvent};
-use ait_term::{GridView, PromptMarkKind};
+use ait_term::{GridView, PromptMarkKind, Row};
 
 use crate::tabs::{PromptMark, PROMPT_MARK_CAP};
 
@@ -49,6 +49,56 @@ pub struct BlockAssembler {
     /// A `preexec` command that arrived before its `B` mark — held for
     /// the next block, cleared when a new prompt starts instead.
     pending_command: Option<String>,
+}
+
+/// FNV-1a offset basis — shared by [`row_hash`] and the multi-row
+/// fingerprints [`hash_combine`] builds.
+const FNV_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a step over one hashed value — folds a row's fingerprint into
+/// a range fingerprint preserving order.
+pub(crate) fn hash_combine(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(0x100_0000_01b3)
+}
+
+/// A scrollback row's fingerprint — FNV-1a over cell text plus the wrap
+/// flag, cheap enough to refresh per drained event. Used for the
+/// rotation anchor window and for block seal verification at resolve.
+pub(crate) fn row_hash(row: &Row<'_>) -> u64 {
+    let mut hash = FNV_INIT;
+    for cell in row.cells() {
+        hash = hash_combine(hash, cell.character as u64);
+    }
+    hash_combine(hash, row.wrapped() as u64)
+}
+
+/// Fingerprint the grid rows covering an absolute `(start, end)` span:
+/// `dropped`/`scrollback` translate to live grid indices; `None` when
+/// any row of the span is gone (nothing stable to seal against). The
+/// caller feeds the pair to [`BlockAssembler::observe_mark_row`].
+pub(crate) fn seal_fingerprint(
+    grid: &GridView<'_>,
+    dropped: usize,
+    scrollback: usize,
+    range: (usize, usize),
+) -> Option<(u64, usize)> {
+    let (start, end) = range;
+    let first = start as i64 - dropped as i64 - scrollback as i64;
+    let last = end as i64 - dropped as i64 - scrollback as i64;
+    (first..=last)
+        .try_fold(FNV_INIT, |hash, i| {
+            i32::try_from(i)
+                .ok()
+                .and_then(|line| grid.line(line))
+                .map(|row| hash_combine(hash, row_hash(&row)))
+        })
+        .map(|hash| (hash, end - start + 1))
+}
+
+/// Row text for debug dumps — trimmed trailing blanks.
+#[allow(dead_code)]
+pub(crate) fn row_text(row: &Row<'_>) -> String {
+    row.text().trim_end().to_string()
 }
 
 /// A recorded mark boundary in **absolute** line space: the record-time
@@ -74,6 +124,12 @@ pub struct BlockEntry {
     output_start: Option<Mark>,
     /// The block's last absolute line.
     end: usize,
+    /// The column bound on `end`, from the `D` mark's cursor position:
+    /// `D` lands on the next prompt's row, so content at/after its
+    /// column is foreign (prompt + the next command's echo — Spec R05
+    /// us-11's "through the last output line"). `None` = whole row
+    /// (abandoned blocks, whose end is a line-only estimate).
+    end_column: Option<usize>,
     /// The command text the `preexec` hook reported, if any.
     command: Option<String>,
     /// The `OSC 133;D` exit code, if the mark carried one.
@@ -83,6 +139,13 @@ pub struct BlockEntry {
     /// `D` arrived — the block is finished. `false` covers both
     /// still-running commands and ones abandoned without a `D`.
     completed: bool,
+    /// `(first absolute line, row count, fingerprint)` over the
+    /// block's echo span, taken at the mark that closed it. Checked at
+    /// [`resolve`](Self::resolve): absolute-line bookkeeping can lose
+    /// track when scrollback rotation goes unmeasured, and content —
+    /// not coordinates — is the last word on whether the range still
+    /// covers its own block. `None` (no grid at seal) skips the check.
+    seal: Option<(usize, usize, u64)>,
 }
 
 /// The `(exit code, duration)` pair the status line renders for the
@@ -108,6 +171,10 @@ pub struct Block {
     /// The output's first line (the `C` mark's, clamped into `range`);
     /// `None` when `C` never arrived — nothing is known to be output.
     output_start: Option<usize>,
+    /// The inclusive column bound on `range.end()` — set when the `D`
+    /// mark landed mid-row, so the row's tail (prompt + next echo)
+    /// stays out of a copy; `None` selects the whole row.
+    end_column: Option<usize>,
     /// The command text: the `preexec` hook's report when the shell
     /// sent one, else the `B→C` echo slice — whose first row is cut at
     /// the `B` mark's cursor column so the prompt itself stays out.
@@ -138,7 +205,27 @@ impl BlockAssembler {
     /// open means its `D` never came — the open block closes
     /// best-effort, ending on the row above the new boundary. `C`/`D`
     /// with no open command are orphans and ignored.
+    #[allow(dead_code)] // the drain feeds `observe_mark_row`; tests use this
     pub fn observe_mark(&mut self, mark: &PromptMark, dropped: usize) {
+        self.observe_mark_row(mark, dropped, None);
+    }
+
+    /// [`observe_mark`](Self::observe_mark) plus a fingerprint of the
+    /// open block's echo span, computed by the caller (it owns the
+    /// grid) over [`open_seal_range`](Self::open_seal_range) while this
+    /// mark surfaces: every row in the span is final once the command
+    /// runs, and a mark that CLOSES the block stores it as the seal
+    /// [`resolve`](BlockEntry::resolve) checks — so a range that slid
+    /// onto wrong-but-valid rows (a scrollback rotation the caller
+    /// could not measure) resolves to nothing instead of selecting
+    /// stale content (Spec R05 us-20). The triple is
+    /// `(first absolute line, row count, fingerprint)`.
+    pub fn observe_mark_row(
+        &mut self,
+        mark: &PromptMark,
+        dropped: usize,
+        seal: Option<(usize, usize, u64)>,
+    ) {
         let m = BlockEntry::mark(mark, dropped);
         match mark.kind {
             PromptMarkKind::PromptStart => {
@@ -147,12 +234,14 @@ impl BlockAssembler {
                 self.pending_command = None;
                 if let Some(mut open) = self.open.take() {
                     open.abandon(m.line);
+                    open.seal(seal);
                     self.push_block(open);
                 }
             }
             PromptMarkKind::CommandStart => {
                 if let Some(mut open) = self.open.take() {
                     open.abandon(m.line);
+                    open.seal(seal);
                     self.push_block(open);
                 }
                 self.open = Some(BlockEntry::open(m, self.pending_command.take()));
@@ -160,12 +249,16 @@ impl BlockAssembler {
             PromptMarkKind::OutputStart => {
                 if let Some(open) = &mut self.open {
                     open.output_start = Some(m);
-                    open.end = open.end.max(m.line);
+                    if m.line > open.end {
+                        open.end = m.line;
+                        open.end_column = None;
+                    }
                 }
             }
             PromptMarkKind::CommandEnd => {
                 if let Some(mut open) = self.open.take() {
                     open.complete(m, mark.payload.as_deref());
+                    open.seal(seal);
                     self.push_block(open);
                 }
             }
@@ -191,10 +284,45 @@ impl BlockAssembler {
         }
     }
 
+    /// The open block's echo span `(start, end)` in this assembler's
+    /// absolute space — the rows through the one above `C` (or the
+    /// whole block when no `C` arrived). Every row in it is final the
+    /// moment the command starts running — echo text cannot grow — so
+    /// the caller hashes exactly these for
+    /// [`observe_mark_row`](Self::observe_mark_row) (see its doc).
+    pub fn open_seal_range(&self) -> Option<(usize, usize)> {
+        self.open.as_ref().map(|open| {
+            let end = open
+                .output_start
+                .map(|mark| mark.line.saturating_sub(1))
+                .unwrap_or(open.end);
+            (open.start.line, end.max(open.start.line))
+        })
+    }
+
     /// Closed blocks oldest-first, then the still-open one if any —
     /// the trailing `completed: false` entry is the running command.
     pub fn blocks(&self) -> impl Iterator<Item = &BlockEntry> {
         self.blocks.iter().chain(self.open.iter())
+    }
+
+    /// Whether any block — closed or still open — is tracked. The
+    /// block chords consult it: a tab with none treats `Alt+B`/`Alt+↑`/
+    /// `Alt+↓` as ordinary PTY input again (Spec R05 Out-of-Scope).
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.open.is_none()
+    }
+
+    /// Forget every tracked range: the caller detected scrollback
+    /// rotation it could no longer measure, so recorded absolute lines
+    /// can point at wrong-but-valid rows — the spec's bound is that a
+    /// mis-select must be impossible, so every block this stream
+    /// assembled drops rather than resolves stale (us-20). Marks
+    /// arriving after the loss anchor correctly again.
+    pub fn discard_ranges(&mut self) {
+        self.blocks.clear();
+        self.open = None;
+        self.pending_command = None;
     }
 
     /// The newest block's [`BlockStatus`] — the status line's
@@ -228,29 +356,62 @@ impl BlockEntry {
             start,
             output_start: None,
             end: start.line,
+            end_column: None,
             command,
             exit: None,
             duration: None,
             completed: false,
+            seal: None,
         }
     }
 
     /// `D` arrived: the exit code rides its payload, the duration is
     /// execution time `D.at − C.at` — `B.at` when `C` never came, so
-    /// typing time never counts as runtime (Spec R05 us-14).
+    /// typing time never counts as runtime (Spec R05 us-14). Its cursor
+    /// column bounds the end row — see [`BlockEntry::end_column`].
     fn complete(&mut self, mark: Mark, payload: Option<&str>) {
-        self.end = self.end.max(mark.line);
+        if mark.line >= self.end {
+            self.end = mark.line;
+            self.end_column = Some(mark.column);
+        }
         self.exit = payload.and_then(exit_code);
         let began = self.output_start.map_or(self.start.at, |m| m.at);
         self.duration = Some(mark.at.saturating_duration_since(began));
         self.completed = true;
     }
 
+    /// Store the seal fingerprint — the caller hashed the block's
+    /// [`open_seal_range`](BlockAssembler::open_seal_range) rows as
+    /// this mark surfaced. Stored on whatever block the mark closes.
+    fn seal(&mut self, seal: Option<(usize, usize, u64)>) {
+        if seal.is_some() {
+            self.seal = seal;
+        }
+    }
+
     /// The stream moved on without a `D`: the block ends best-effort on
-    /// the row above the boundary that displaced it — no exit code, no
+    /// the row above the boundary that displaced it — a whole-row
+    /// estimate, so the column bound is cleared — no exit code, no
     /// duration, `completed` stays `false`.
     fn abandon(&mut self, anchor: usize) {
-        self.end = anchor.saturating_sub(1).max(self.end);
+        let line = anchor.saturating_sub(1);
+        if line > self.end {
+            self.end = line;
+            self.end_column = None;
+        }
+    }
+
+    /// The block's last content line and the inclusive column bound on
+    /// it. `D` lands on the next prompt's row: at column 0 that row is
+    /// wholly foreign and the block ends one line up; mid-row means
+    /// unterminated output filled `0..column` and the row ends at
+    /// `column - 1` (Spec R05 us-11).
+    fn effective_end(&self) -> (usize, Option<usize>) {
+        match self.end_column {
+            Some(0) => (self.end.saturating_sub(1), None),
+            Some(c) => (self.end, Some(c - 1)),
+            None => (self.end, None),
+        }
     }
 
     /// The `D` mark's exit code, once it closed the block.
@@ -277,11 +438,14 @@ impl BlockEntry {
 
     /// The block's line range in LIVE scrollback-then-viewport
     /// coordinates: absolute lines minus `dropped` (lines evicted since
-    /// the session started), clamped to `0..extent`. `None` when every
-    /// line fell out of the grid — fully-evicted ranges drop cleanly —
-    /// or the range sits past the current bottom.
+    /// the session started), clamped to `0..extent`. The end line is
+    /// [`effective_end`](Self::effective_end)'s — a `D` at column 0
+    /// already excludes its wholly-foreign prompt row. `None` when
+    /// every line fell out of the grid — fully-evicted ranges drop
+    /// cleanly — or the range sits past the current bottom.
     pub fn range(&self, dropped: usize, extent: usize) -> Option<RangeInclusive<usize>> {
-        if extent == 0 || self.end < dropped {
+        let (end_line, _) = self.effective_end();
+        if extent == 0 || end_line < dropped {
             return None;
         }
         let bottom = dropped + extent - 1;
@@ -289,7 +453,7 @@ impl BlockEntry {
             return None;
         }
         let start = self.start.line.max(dropped) - dropped;
-        let end = self.end.min(bottom) - dropped;
+        let end = end_line.min(bottom).max(start + dropped) - dropped;
         Some(start..=end)
     }
 
@@ -303,10 +467,28 @@ impl BlockEntry {
         dropped: usize,
         extent: usize,
     ) -> Option<Block> {
+        // Content verification: the rows fingerprinted at seal time
+        // must still sit at their recorded absolute positions. A range
+        // that slid onto wrong-but-valid rows — rotation the caller
+        // could not measure — fails here instead of mis-selecting
+        // (Spec R05 us-20); rows that left the grid fail the same way.
+        if let Some((first, rows, expected)) = self.seal {
+            let recomputed =
+                seal_fingerprint(grid, dropped, grid.scrollback(), (first, first + rows - 1));
+            if recomputed.map(|(hash, _)| hash) != Some(expected) {
+                return None;
+            }
+        }
         let range = self.range(dropped, extent)?;
         let output_start = self
             .output_start
             .map(|m| (m.line.max(dropped) - dropped).clamp(*range.start(), *range.end()));
+        // The `D` column bound applies only while the live end still
+        // sits on the `D` row — a clamped end is a different row.
+        let end_column = match self.end_column {
+            Some(c) if c > 0 && *range.end() + dropped == self.end => Some(c - 1),
+            _ => None,
+        };
         let command = self
             .command
             .clone()
@@ -314,6 +496,7 @@ impl BlockEntry {
         Some(Block {
             range,
             output_start,
+            end_column,
             command,
             exit: self.exit,
             duration: self.duration,
@@ -374,9 +557,9 @@ impl BlockEntry {
     }
 }
 
-// The full read-side surface stays: `range` is consumed by the
-// block nav/select/status paths (R05-T5); the rest serve the seams'
-// tests today and R05-T7's suggester context next (Spec R05).
+// The full read-side surface stays: `range`/`end_column` are consumed
+// by the block nav/select/status paths; the rest serve the seams'
+// tests and the suggester's context assembly (Spec R05).
 #[allow(dead_code)]
 impl Block {
     /// The block's clamped live-coordinate line range (`B→D`), inclusive.
@@ -389,6 +572,13 @@ impl Block {
     /// `None` when `C` never arrived.
     pub fn output_start(&self) -> Option<usize> {
         self.output_start
+    }
+
+    /// The inclusive column bound on the range's last line — a
+    /// mid-row `D` keeps the prompt and next echo out of a copy
+    /// (Spec R05 us-18). `None` = whole row.
+    pub fn end_column(&self) -> Option<usize> {
+        self.end_column
     }
 
     /// The command text — `preexec`-accurate when integrated, the
@@ -493,10 +683,14 @@ mod tests {
         assert_eq!(block.exit(), Some(3));
         assert_eq!(block.duration(), Some(30 * MS));
         assert_eq!(block.command(), Some("ls -la"));
-        assert_eq!(block.range(0, 24), Some(0..=2));
+        assert_eq!(
+            block.range(0, 24),
+            Some(0..=1),
+            "D at column 0: the prompt row is foreign — end is the last output line"
+        );
     }
 
-    /// Spec R05: with no `C` mark the duration falls back to `B.at` —
+    /// Spec R05: with no `C` mark the duration falls back to `B.at` the duration falls back to `B.at` —
     /// the spec's `D.at − C.at` (fallback `B.at`).
     #[test]
     fn duration_falls_back_to_b_when_c_is_missing() {
@@ -555,7 +749,7 @@ mod tests {
             "ends above the new prompt"
         );
         assert!(blocks[1].completed());
-        assert_eq!(blocks[1].range(0, 24), Some(5..=6));
+        assert_eq!(blocks[1].range(0, 24), Some(5..=5));
     }
 
     /// Orphaned and duplicated marks are inert — never a panic, never a
@@ -634,7 +828,7 @@ mod tests {
         // Fully evicted: the top 5 lines are gone, the block sat at 0..3.
         assert_eq!(block.range(5, 10), None);
         // Partially evicted: start clamps to the oldest live row.
-        assert_eq!(block.range(2, 10), Some(0..=1));
+        assert_eq!(block.range(2, 10), Some(0..=0));
         // Shrunk extent (post-reflow): end clamps to the bottom.
         assert_eq!(block.range(0, 2), Some(0..=1));
         // Degenerate grid: no rows at all.
@@ -667,8 +861,8 @@ mod tests {
         assert_eq!(blocks[0].range(4, 10), None, "abs 2..=3 all below drop 4");
         assert_eq!(
             blocks[1].range(4, 10),
-            Some(1..=2),
-            "abs 5..=6 → live 1..=2"
+            Some(1..=1),
+            "abs 5 (D col 0 → end 5) → live 1"
         );
     }
 
@@ -698,7 +892,7 @@ mod tests {
             .resolve(&grid, 0, extent)
             .unwrap();
         assert_eq!(block.command(), "echo hi");
-        assert_eq!(block.range(), 0..=2);
+        assert_eq!(block.range(), 0..=1, "D col 0 ends on the last output row");
         assert_eq!(block.output_start(), Some(1));
         assert_eq!(block.exit(), Some(0));
         assert!(block.completed());
@@ -718,6 +912,72 @@ mod tests {
         let blocks: Vec<_> = asm.blocks().collect();
         assert_eq!(blocks.len(), BLOCK_CAP);
         // The five oldest are gone — the survivor's start line moved up.
-        assert_eq!(blocks[0].range(0, usize::MAX / 2), Some(10..=11));
+        assert_eq!(blocks[0].range(0, usize::MAX / 2), Some(10..=10));
+    }
+
+    /// A `D` landing mid-row — unterminated output — ends the block on
+    /// that row at `column - 1`, so a copy stops before the prompt that
+    /// follows (Spec R05 us-11/18); a `D` at column 0 ends one line up
+    /// because its whole row is the next prompt.
+    #[test]
+    fn a_mid_row_d_bounds_the_end_column() {
+        let mut session = Session::new(SessionOptions {
+            size: Size::new(40, 10),
+            ..Default::default()
+        });
+        // `no-newline` leaves the cursor mid-row; the prompt continues
+        // on the same row — exactly what a mid-row `D` models.
+        session.feed_bytes(b"$ echo x\nno-newline");
+        let grid = session.grid();
+        let extent = grid.scrollback() + grid.lines();
+
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 2, t0), 0);
+        asm.observe_mark(&mark(PromptMarkKind::OutputStart, 1, 0, t0 + MS), 0);
+        // `D` at column 10 on the output row: cells 0..9 are the
+        // output tail, 10+ is whatever drew after.
+        asm.observe_mark(
+            &PromptMark {
+                kind: PromptMarkKind::CommandEnd,
+                payload: Some("0".to_owned()),
+                line: 1,
+                column: 10,
+                at: t0 + 2 * MS,
+            },
+            0,
+        );
+
+        let block = asm
+            .blocks()
+            .next()
+            .unwrap()
+            .resolve(&grid, 0, extent)
+            .unwrap();
+        assert_eq!(block.range(), 0..=1);
+        assert_eq!(
+            block.end_column(),
+            Some(9),
+            "the copy stops before the prompt"
+        );
+    }
+
+    /// Rotation insurance: ranges the assembler can no longer anchor
+    /// drop wholesale rather than resolve stale (Spec R05 us-20 —
+    /// mis-select must be impossible, a dropped range is the
+    /// spec-sanctioned worst case).
+    #[test]
+    fn unanchorable_ranges_discard_cleanly() {
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 0, t0), 0);
+        asm.observe_mark(&end_mark(1, t0 + MS, Some("0")), 0);
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 2, 0, t0 + 2 * MS), 0);
+        assert!(!asm.is_empty());
+
+        asm.discard_ranges();
+
+        assert!(asm.is_empty());
+        assert_eq!(asm.blocks().count(), 0);
     }
 }

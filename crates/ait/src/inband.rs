@@ -42,8 +42,7 @@ use std::io;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use ait_shell::{RunAccumulator, RunResult};
-use ait_term::SessionEvent;
+use ait_shell::{RunAccumulator, RunResult, ShellEvent};
 
 use crate::integration::IntegrationState;
 
@@ -99,23 +98,20 @@ impl InBandExec {
         Ok(RunRequest { id, result: rx })
     }
 
-    /// Fold one observed session event into the channel — the
+    /// Fold one decoded shell event into the channel — the
     /// `drain_events` bookkeeping that sits beside
-    /// [`IntegrationState::observe`]. Only `OSC 7701` frames move it:
-    /// `A`/`R`/`B` reassemble the in-flight stream, and a completed run
-    /// resolves against the pending map by the payload's `<id>` —
-    /// the [`RunResult`] goes to its waiter.
+    /// [`IntegrationState::observe`] and shares that drain's single
+    /// `ait_shell::decode` per `Private` sequence. Only `OSC 7701`
+    /// frames move it: `A`/`R`/`B` reassemble the in-flight stream,
+    /// and a completed run resolves against the pending map by the
+    /// payload's `<id>` — the [`RunResult`] goes to its waiter.
     ///
-    /// Returns the completed result, or `None` for non-run events,
-    /// malformed frames and torn streams. A completion whose id was
-    /// never requested (stray traffic, a torn earlier stream) is
-    /// dropped from the map but still returned so callers can log it.
-    pub fn observe(&mut self, event: &SessionEvent) -> Option<RunResult> {
-        let SessionEvent::Private { code, params } = event else {
-            return None;
-        };
-        let event = ait_shell::decode(code, params)?;
-        let result = self.accumulator.feed(&event)?;
+    /// Returns the completed result, or `None` for non-run events and
+    /// torn streams. A completion whose id was never requested (stray
+    /// traffic, a torn earlier stream) is dropped from the map but
+    /// still returned so callers can log it.
+    pub fn observe(&mut self, event: &ShellEvent) -> Option<RunResult> {
+        let result = self.accumulator.feed(event)?;
         if let Some(waiter) = self.pending.remove(&result.id) {
             // A gone receiver only means the caller stopped waiting.
             let _ = waiter.send(result.clone());
@@ -211,27 +207,19 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// `OSC 7701` wire params as the `SessionEvent::Private` shape
-    /// [`InBandExec::observe`] consumes.
-    fn run_event(params: &[&[u8]]) -> SessionEvent {
-        SessionEvent::Private {
-            code: b"7701".to_vec(),
-            params: params.iter().map(|p| p.to_vec()).collect(),
-        }
-    }
-
     /// One complete `A … R×N … B` response stream for `payload` — the
-    /// events a well-formed `__ait_run` reply decodes to. Chunks at the
-    /// snippet's 500-byte slice so oversized payloads exercise the
-    /// multi-frame path.
-    fn run_stream(payload: &[u8]) -> Vec<SessionEvent> {
-        let mut events = vec![run_event(&[b"A"])];
+    /// events a well-formed `__ait_run` reply decodes to (wire-level
+    /// coverage of those same frames lives in `ait-shell`'s codec
+    /// tests). Chunks at the snippet's 500-byte slice so oversized
+    /// payloads exercise the multi-frame path.
+    fn run_stream(payload: &[u8]) -> Vec<ShellEvent> {
+        let mut events = vec![ShellEvent::RunBegin];
         for chunk in payload.chunks(500) {
-            let len = chunk.len().to_string();
-            let hex: String = chunk.iter().map(|b| format!("{b:02x}")).collect();
-            events.push(run_event(&[b"R", len.as_bytes(), hex.as_bytes()]));
+            events.push(ShellEvent::RunChunk {
+                payload: chunk.to_vec(),
+            });
         }
-        events.push(run_event(&[b"B"]));
+        events.push(ShellEvent::RunEnd);
         events
     }
 
@@ -396,9 +384,9 @@ mod tests {
         // A torn stream for 0 — a second `A` resets the accumulator —
         // then 0's real response still resolves cleanly.
         for event in [
-            run_event(&[b"A"]),
+            ShellEvent::RunBegin,
             run_stream(b"0;cut-")[1].clone(),
-            run_event(&[b"A"]),
+            ShellEvent::RunBegin,
         ] {
             exec.observe(&event);
         }
@@ -408,34 +396,30 @@ mod tests {
         assert_eq!(req.wait(Duration::from_secs(1)).unwrap().output, b"real");
     }
 
-    /// Events that aren't `7701` frames — prompt marks, cwd reports,
-    /// hook OSCs, reserved codes, foreign private OSCs — move nothing.
+    /// Events that aren't `7701` frames — hook events, reserved codes,
+    /// stray `R`/`B` outside a run — move nothing.
     #[test]
     fn non_run_events_are_inert() {
-        use ait_term::PromptMarkKind;
         let mut exec = InBandExec::new();
         let req = exec
             .request(IntegrationState::Integrated, b"echo", |_| Ok(()))
             .unwrap();
 
+        // A real precmd hook through the wire decode (ait has no
+        // serde_json dep to build `value` literals with).
+        let precmd = {
+            let hex: String =
+                r#"{"hook":"precmd","value":{}}"#.bytes().map(|b| format!("{b:02x}")).collect();
+            ait_shell::decode(b"7700", &[hex.into_bytes()]).unwrap()
+        };
         for event in [
-            SessionEvent::PromptMark {
-                kind: PromptMarkKind::PromptStart,
-                payload: None,
+            precmd,
+            ShellEvent::Reserved { code: 7702 },
+            // Stray run frames outside an `A` bracket are inert.
+            ShellEvent::RunChunk {
+                payload: b"x".to_vec(),
             },
-            SessionEvent::CwdChanged("/tmp".into()),
-            // A 7700 hook and a reserved 770x code are Private but not runs.
-            SessionEvent::Private {
-                code: b"7700".to_vec(),
-                params: vec![b"deadbeef".to_vec()],
-            },
-            SessionEvent::Private {
-                code: b"7702".to_vec(),
-                params: vec![],
-            },
-            // Malformed run frames decode to None — inert.
-            run_event(&[b"R", b"3", b"zz"]),
-            run_event(&[b"X"]),
+            ShellEvent::RunEnd,
         ] {
             assert_eq!(exec.observe(&event), None, "{event:?}");
         }

@@ -82,7 +82,7 @@ use crate::render::{
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
-use crate::status::{notification_text, status_text, Toast};
+use crate::status::{notification_text, status_text, StatusLine, Toast};
 use crate::suggest::{self, SuggestionPin};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
@@ -386,11 +386,13 @@ pub fn run() -> io::Result<ExitCode> {
             offset: tab.scroll_offset(),
             selection: tab.selection_range(),
             status: status_text(
-                tab.cwd(),
-                tab.title(),
-                state.config.model(),
-                tab.last_block_status(),
-                tab.exit_status(),
+                &StatusLine {
+                    cwd: tab.cwd(),
+                    shell: tab.title(),
+                    model: state.config.model(),
+                    block: tab.last_block_status(),
+                    exit: tab.exit_status(),
+                },
                 state.toast.as_ref(),
                 now,
             ),
@@ -531,7 +533,27 @@ fn handle_event<W: Write>(
                         // the page bindings; `Alt+B` programs the
                         // existing selection over the current block's
                         // clamped range and copies it through the same
-                        // OSC-52 path a mouse release uses.
+                        // OSC-52 path a mouse release uses. On a tab
+                        // with NO blocks the chords are ordinary input
+                        // again — encoded to the PTY like PassThrough
+                        // (`ESC b`, `ESC [1;3A`, …) rather than eaten
+                        // inertly (§5.5 Out-of-Scope: no integration ⇒
+                        // no behavior change). The spec's readline
+                        // trade-off — `M-b` is backward-word — applies
+                        // only where blocks exist to act on.
+                        AppAction::PrevBlockStart
+                        | AppAction::NextBlockStart
+                        | AppAction::SelectBlock
+                            if !tab.has_blocks() =>
+                        {
+                            tab.snap_to_bottom();
+                            if tab.exit_status().is_none() {
+                                if let Some(key_event) = keys::translate(&key_event) {
+                                    tab.shadow.update(&key_event);
+                                    let _ = tab.session.send_key(key_event);
+                                }
+                            }
+                        }
                         AppAction::PrevBlockStart => tab.prev_block_start(),
                         AppAction::NextBlockStart => tab.next_block_start(),
                         AppAction::SelectBlock => {
