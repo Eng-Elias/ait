@@ -45,17 +45,6 @@ pub enum ShellKind {
     Fish,
 }
 
-impl ShellKind {
-    /// The wire name emitted in the `init_shell` hook payload.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Bash => "bash",
-            Self::Zsh => "zsh",
-            Self::Fish => "fish",
-        }
-    }
-}
-
 /// A planned integration for one supported shell — pure data until
 /// [`Injection::materialize_in`] writes it out. All accessors take the
 /// session `dir` the files will live in so the rewrite is fully

@@ -95,19 +95,16 @@ fn accumulator_reassembles_a_chunked_response() {
     assert!(acc.feed(&ShellEvent::RunBegin).is_none());
     assert!(acc
         .feed(&ShellEvent::RunChunk {
-            len: 9,
             payload: b"42;first;".to_vec(),
         })
         .is_none());
     assert!(acc
         .feed(&ShellEvent::RunChunk {
-            len: 11,
             payload: b" second\nlast;".to_vec(),
         })
         .is_none());
     assert!(acc
         .feed(&ShellEvent::RunChunk {
-            len: 1,
             payload: b"0".to_vec(),
         })
         .is_none());
@@ -127,7 +124,6 @@ fn accumulator_binary_output_and_nonzero_exit() {
     let mut acc = RunAccumulator::new();
     acc.feed(&ShellEvent::RunBegin);
     acc.feed(&ShellEvent::RunChunk {
-        len: 9,
         payload: b"r-9;\xFF\x00x;127".to_vec(),
     });
     assert_eq!(
@@ -146,7 +142,6 @@ fn accumulator_ignores_events_outside_and_inside_a_run() {
     // Stray frames without a preceding A produce nothing.
     assert!(acc
         .feed(&ShellEvent::RunChunk {
-            len: 1,
             payload: b"x".to_vec(),
         })
         .is_none());
@@ -159,7 +154,6 @@ fn accumulator_ignores_events_outside_and_inside_a_run() {
         value: serde_json::json!({}),
     });
     acc.feed(&ShellEvent::RunChunk {
-        len: 6,
         payload: b"1;o;0".to_vec(),
     });
     assert_eq!(
@@ -185,7 +179,6 @@ fn accumulator_malformed_payloads_yield_no_result() {
         let mut acc = RunAccumulator::new();
         acc.feed(&ShellEvent::RunBegin);
         acc.feed(&ShellEvent::RunChunk {
-            len: payload.len(),
             payload: payload.clone(),
         });
         assert_eq!(acc.feed(&ShellEvent::RunEnd), None, "payload {payload:?}");
@@ -197,12 +190,10 @@ fn accumulator_a_second_begin_restarts_the_run() {
     let mut acc = RunAccumulator::new();
     acc.feed(&ShellEvent::RunBegin);
     acc.feed(&ShellEvent::RunChunk {
-        len: 7,
         payload: b"stale;x".to_vec(),
     });
     acc.feed(&ShellEvent::RunBegin); // torn frame: previous run dropped
     acc.feed(&ShellEvent::RunChunk {
-        len: 5,
         payload: b"2;y;1".to_vec(),
     });
     assert_eq!(

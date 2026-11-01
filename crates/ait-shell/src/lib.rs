@@ -26,7 +26,9 @@ mod inject;
 mod run;
 mod snippets;
 
-pub use codec::{decode, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE};
+pub use codec::{
+    decode, session_id, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE,
+};
 pub use inject::{plan, plan_with_zdotdir, Injection, Materialized, ShellKind, ENV_SESSION_ID};
 pub use run::{
     chunk_run_payload, run_begin_sequence, run_end_sequence, run_request, RunAccumulator, RunResult,

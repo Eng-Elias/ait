@@ -9,11 +9,7 @@
 # normal config, never sees this file, and degrades cleanly instead of
 # double-hooking (Spec R05 us-27).
 if set -q __AIT_INTEGRATED_FISH; and functions -q __ait_emit
-    set -l __ait_sid null
-    if set -q AIT_SESSION_ID
-        set __ait_sid $AIT_SESSION_ID
-    end
-    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":$__ait_sid}}"
+    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":(__ait_sid)}}"
     return 0
 end
 
@@ -30,13 +26,21 @@ function __ait_emit
     printf '\033]7700;%s\007' "$hex"
 end
 
-# A named hook whose value is just the session id (null when unset).
-function __ait_hook -a name
-    set -l sid null
+# The session id as a JSON string literal — always quoted, so a
+# non-numeric or unset value can never produce invalid JSON (an
+# undecodable payload moves nothing — the tab would silently never
+# integrate). Unset reads as `""`, which matches no allocated id.
+function __ait_sid
     if set -q AIT_SESSION_ID
-        set sid $AIT_SESSION_ID
+        printf '"%s"' (__ait_json_escape "$AIT_SESSION_ID")
+    else
+        printf '""'
     end
-    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":$sid}}"
+end
+
+# A named hook whose value is just the session id.
+function __ait_hook -a name
+    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":(__ait_sid)}}"
 end
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -56,12 +60,8 @@ end
 
 # preexec carries the typed command text alongside the session id.
 function __ait_hook_preexec -a command
-    set -l sid null
-    if set -q AIT_SESSION_ID
-        set sid $AIT_SESSION_ID
-    end
     set -l escaped (__ait_json_escape "$command")
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$sid,\"command\":\"$escaped\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":(__ait_sid),\"command\":\"$escaped\"}}"
 end
 
 # --- §5.5.1 in-band exec ------------------------------------------------
@@ -125,9 +125,5 @@ end
 
 # --- install ------------------------------------------------------------
 
-set -l __ait_sid null
-if set -q AIT_SESSION_ID
-    set __ait_sid $AIT_SESSION_ID
-end
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$__ait_sid,\"shell\":\"fish\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":(__ait_sid),\"shell\":\"fish\"}}"
 set -g __AIT_INTEGRATED_FISH 1

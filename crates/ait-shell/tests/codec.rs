@@ -101,7 +101,6 @@ fn osc7701_r_frame_decodes_len_checked_payload() {
     assert_eq!(
         event,
         Some(ShellEvent::RunChunk {
-            len: 5,
             payload: b"abc;e".to_vec(),
         })
     );
@@ -115,18 +114,11 @@ fn osc7701_r_frame_accepts_binary_and_empty_payloads() {
         b"7701",
         &[vec![b'R'], b"3".to_vec(), hex_payload.into_bytes()],
     );
-    assert_eq!(
-        event,
-        Some(ShellEvent::RunChunk {
-            len: 3,
-            payload: binary,
-        })
-    );
+    assert_eq!(event, Some(ShellEvent::RunChunk { payload: binary }));
 
     assert_eq!(
         decode(b"7701", &params(&["R", "0", ""])),
         Some(ShellEvent::RunChunk {
-            len: 0,
             payload: Vec::new(),
         })
     );

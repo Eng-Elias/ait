@@ -1276,8 +1276,10 @@ mod tests {
             .collect();
         let lines = block_output_lines(&grid, &blocks);
         assert_eq!(lines.len(), OUTPUT_LINE_BUDGET);
-        assert_eq!(lines.first().unwrap(), "line 50");
-        assert_eq!(lines.last().unwrap(), "line 149");
+        // `D` at column 0 ends the block on line 148 — the newest
+        // budget slice runs line 49..=148.
+        assert_eq!(lines.first().unwrap(), "line 49");
+        assert_eq!(lines.last().unwrap(), "line 148");
     }
 
     /// Spec R05 us-31, the dispatch half: a tab WITH blocks draws its
@@ -1457,7 +1459,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // init_shell integrates the tab; no OSC 7 ever arrives.
+        // init_shell integrates the tab — the hook's echoed
+        // `session_id` must equal the allocated id (review fix: only a
+        // vetted stream promotes); no OSC 7 ever arrives.
+        tabs.active_mut().unwrap().session_id = Some("0".to_owned());
         tabs.active()
             .unwrap()
             .session

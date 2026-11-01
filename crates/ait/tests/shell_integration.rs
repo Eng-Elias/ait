@@ -162,12 +162,12 @@ fn bash_blocks_copy_and_inband_roundtrip() {
         "the copy includes the command echo: {copied:?}"
     );
     assert!(
-        copied.contains("\n40\n"),
-        "the copy includes the command's output: {copied:?}"
+        copied.trim_end().ends_with("\n40"),
+        "the copy ends at the last output line: {copied:?}"
     );
     assert!(
-        copied.contains("echo TAILMARKER"),
-        "the range runs to the block's last row: {copied:?}"
+        !copied.contains("echo TAILMARKER"),
+        "the next command's echo stays out of the copy: {copied:?}"
     );
 }
 

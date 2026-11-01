@@ -8,7 +8,7 @@
 # nested bash never sees this file — --rcfile is not inherited — so it
 # degrades to a plain shell instead of double-hooking (Spec R05 us-27).
 if [[ -n ${__AIT_INTEGRATED_BASH:-} ]] && declare -F __ait_emit >/dev/null 2>&1; then
-    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null}}}"
+    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":$(__ait_sid)}}"
     return 0
 fi
 
@@ -26,9 +26,17 @@ __ait_emit() {
     printf '\033]7700;%s\007' "$hex"
 }
 
-# A named hook whose value is just the session id (null when unset).
+# The session id as a JSON string literal — always quoted, so a
+# non-numeric or unset value can never produce invalid JSON (an
+# undecodable payload moves nothing — the tab would silently never
+# integrate). Unset reads as `""`, which matches no allocated id.
+__ait_sid() {
+    printf '"%s"' "$(__ait_json_escape "${AIT_SESSION_ID:-}")"
+}
+
+# A named hook whose value is just the session id.
 __ait_hook() {
-    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null}}}"
+    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":$(__ait_sid)}}"
 }
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -51,7 +59,7 @@ __ait_json_escape() {
 __ait_hook_preexec() {
     local command
     command=$(__ait_json_escape "$1")
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null},\"command\":\"$command\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$(__ait_sid),\"command\":\"$command\"}}"
 }
 
 # --- §5.5.1 in-band exec ------------------------------------------------
@@ -132,5 +140,5 @@ PROMPT_COMMAND=__ait_precmd
 trap '__ait_preexec' DEBUG
 trap '__ait_exit_shell' EXIT
 
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":${AIT_SESSION_ID:-null},\"shell\":\"bash\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"bash\"}}"
 __AIT_INTEGRATED_BASH=1
