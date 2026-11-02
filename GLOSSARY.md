@@ -12,6 +12,9 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   emits OSC 133/7 and AIT hook events.
 - **Hook event** — a hex-encoded JSON message on OSC 7700 (`precmd`,
   `preexec`, …).
+- **Integration state** — how much shell integration a tab's session has
+  reported: `Absent` (none), `MarksOnly` (`OSC 133` without
+  `init_shell`), `Integrated` (`init_shell`/`bootstrapped` seen).
 - **OSC 133** — the standard semantic-prompt sequences marking prompt/command
   boundaries.
 - **Endpoint** — a configured LLM server (`name`, `base_url`, `schema`,
@@ -30,6 +33,9 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   ControlMaster, remote daemon, no-op.
 - **In-band execution** — running a command through the user's live shell and
   capturing the result via OSC 7701.
+- **In-band request** — the `__ait_run <id> <hex(command)>` line ait writes to
+  the PTY of an `Integrated` tab (§5.5.1); it stays visible in the grid while
+  its merged output and exit code return over OSC 7701 frames.
 - **Agent-owned PTY** — a PTY the agent drives itself via `write_to_pty`.
 - **Remote bootstrap** — injecting shell integration into a remote shell over
   SSH.

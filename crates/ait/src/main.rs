@@ -9,7 +9,10 @@
 
 mod app;
 mod backend;
+mod blocks;
 mod config;
+mod inband;
+mod integration;
 mod keymap;
 mod keys;
 mod render;

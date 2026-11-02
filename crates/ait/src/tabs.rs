@@ -28,12 +28,16 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
     SessionEvent, Size, SpawnError,
 };
 
+use crate::blocks::{row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus};
+use crate::inband::{InBandError, InBandExec, RunRequest};
+use crate::integration::{self, IntegrationState};
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
 use crate::suggest::InputShadow;
@@ -46,7 +50,7 @@ const FALLBACK_TITLE: &str = "sh";
 /// How many prompt marks a tab retains — four arrive per shell
 /// command (A/B/C/D), so this covers ~1000 commands of history; the
 /// oldest drop off the front, same rule as scrollback.
-const PROMPT_MARK_CAP: usize = 4096;
+pub(crate) const PROMPT_MARK_CAP: usize = 4096;
 
 /// One OSC 133 mark recorded against the line it landed on (Spec R01
 /// user story 14). `line` indexes the "scrollback then viewport" row
@@ -56,8 +60,10 @@ const PROMPT_MARK_CAP: usize = 4096;
 /// block assembly (the consumer): `line` is the cursor's row once the
 /// feeding chunk has fully landed, so a mark mid-burst can sit a row
 /// late; and once scrollback is full and evicts rows, indices recorded
-/// before the eviction drift. Round 5's block assembly reads these
-/// instead of re-parsing output.
+/// before the eviction drift — block assembly maps `line` into an
+/// absolute space on the eviction signal that IS observable
+/// ([`crate::blocks`]). Round 5's block assembly reads these instead of
+/// re-parsing output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptMark {
     /// Which boundary the mark delimits.
@@ -67,6 +73,13 @@ pub struct PromptMark {
     pub payload: Option<String>,
     /// The mark's line in scrollback-then-viewport coordinates.
     pub line: usize,
+    /// The cursor's column when the mark landed — on `CommandStart` it
+    /// is the command's first column, which is what lets the `B→C`
+    /// echo slice skip the prompt as the `command` fallback (Spec R05).
+    pub column: usize,
+    /// When the drain recorded the mark — block duration is
+    /// `D.at − C.at` (falling back to `B.at` when `C` never arrives).
+    pub at: Instant,
 }
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
@@ -115,6 +128,58 @@ pub struct Tab {
     /// OSC 133 marks recorded at drain time (Spec R01 us-14) — the
     /// observable-and-kept half of "marks recorded in the grid".
     prompt_marks: VecDeque<PromptMark>,
+    /// How much shell integration this tab's session has reported
+    /// (Spec R05): `drain_events` drives it via
+    /// [`IntegrationState::observe`]; `__ait_run` gating and the
+    /// status line consume it in later tickets.
+    integration: IntegrationState,
+    /// Assembled command blocks (Spec R05 / issue #73): `drain_events`
+    /// feeds marks + decoded hook events; [`blocks()`](Self::blocks)
+    /// resolves them against the live grid.
+    blocks: BlockAssembler,
+    /// Scrollback lines evicted since spawn — the offset that maps a
+    /// mark's record-time `line` into the assembler's absolute line
+    /// space (`line + dropped_lines`). Two eviction signals feed it:
+    /// scrollback *decrease* (truncate, `clear_history`, reflow shrink)
+    /// and rotation at the cap, which `observe_scrollback` measures by
+    /// tracking an anchor window of the newest scrollback rows —
+    /// `GridView` itself exposes no eviction counter.
+    dropped_lines: usize,
+    /// Scrollback depth at the previous drain event — the delta
+    /// `dropped_lines` accumulates.
+    last_scrollback: usize,
+    /// Row fingerprints of the newest scrollback rows (`anchor[0]` is
+    /// `line(-1)`, the row that most recently entered history),
+    /// refreshed by [`observe_scrollback`](Self::observe_scrollback).
+    /// At a stable nonzero depth scrollback content only changes
+    /// through rotation, so the window's displacement IS the eviction
+    /// count scrollback depth alone can't expose (Spec R05 us-20).
+    anchor: Vec<u64>,
+    /// The `AIT_SESSION_ID` this tab's spawn allocated (`id` as text)
+    /// — `Some` only when the injection materialized. Hook payloads
+    /// must echo it before [`IntegrationState`] honors them.
+    /// `pub(crate)`: same test seam as `scroll`/`selection` — tests
+    /// stage a vetted stream without a real injected shell.
+    pub(crate) session_id: Option<String>,
+    /// The configured scrollback cap (`SessionOptions::scrollback`).
+    /// `GridView` doesn't expose it, and [`observe_scrollback`]
+    /// (Self::observe_scrollback) needs it: a gap that lands AT the cap
+    /// with an empty anchor may have rotated invisibly, while any
+    /// depth below it provably evicted nothing.
+    scrollback_cap: usize,
+    /// The §5.5.1 in-band exec seam: per-tab `__ait_run` request ids,
+    /// the frame accumulator and the `id → waiter` map
+    /// (`crate::inband`, Spec R05 / issue #75). `drain_events` feeds it
+    /// every observed OSC; `pub(crate)` so tests inspect pending
+    /// state — production callers go through [`run_in_shell`](Self::run_in_shell).
+    pub(crate) inband: InBandExec,
+    /// The materialized injection the session was spawned with —
+    /// holding the guard here ties the per-session `0700` snippet dir's
+    /// lifetime to the tab's (drop removes it best-effort, Spec R05
+    /// us-30). `None` when the spawn wasn't injected: opt-out, unknown
+    /// shell or a materialize failure.
+    #[allow(dead_code)] // held for its Drop alone
+    materialized: Option<ait_shell::Materialized>,
 }
 
 impl Tab {
@@ -151,6 +216,34 @@ impl Tab {
         &self.title
     }
 
+    /// This tab's command blocks, oldest first, resolved against the
+    /// live grid (Spec R05 §5.5): each `range` is clamped to current
+    /// scrollback-then-viewport coordinates — fully-evicted blocks drop
+    /// out entirely — and `command` is the `preexec` hook's text when
+    /// the shell reported one, else the `B→C` echo slice. A command
+    /// still running shows `completed: false` as the last block; a tab
+    /// whose shell emits nothing simply has none (§5.5 graceful
+    /// degrade). The status line, block select/copy and the
+    /// suggester's context assembly (Spec R05 us-31) consume this.
+    pub fn blocks(&self) -> Vec<Block> {
+        let grid = self.grid();
+        let extent = self.scrollback() + grid.lines();
+        self.blocks
+            .blocks()
+            .filter_map(|entry| entry.resolve(&grid, self.dropped_lines, extent))
+            .collect()
+    }
+
+    /// The shell-integration state this tab's session has reported
+    /// (Spec R05): `Absent` until hooks or marks arrive, `MarksOnly`
+    /// when `OSC 133` arrives without `init_shell`, `Integrated` once
+    /// `init_shell`/`bootstrapped` lands. `__ait_run` gating, the
+    /// status line and the suggester's `/proc` cwd fallback (Spec R05,
+    /// issue #76) consume it.
+    pub fn integration_state(&self) -> IntegrationState {
+        self.integration
+    }
+
     /// Read-only view of the session's grid (viewport + scrollback) —
     /// what painting, selection extraction and scroll math all read.
     pub fn grid(&self) -> GridView<'_> {
@@ -166,6 +259,27 @@ impl Tab {
     /// The renderable cursor: viewport position and shape.
     pub fn cursor(&self) -> Cursor {
         self.session.cursor()
+    }
+
+    /// Ask this tab's live shell to run `command` invisibly and report
+    /// `{merged output, exit_code}` back over `OSC 7701` — the §5.5.1
+    /// in-band seam (Spec R05 / issue #75). Writes
+    /// `__ait_run <id> <hex(cmd)>` to the PTY — which the shell echoes,
+    /// so the request always leaves a visible trace — and returns the
+    /// [`RunRequest`] the result arrives on.
+    ///
+    /// Refuses unless the tab is `Integrated` (a shell without the
+    /// snippet can't answer, so nothing is typed) or already exited —
+    /// Round 6's `CommandExecutor` is the intended caller; only tests
+    /// drive it today.
+    #[allow(dead_code)]
+    pub fn run_in_shell(&mut self, command: &[u8]) -> Result<RunRequest, InBandError> {
+        if self.exit.is_some() {
+            return Err(InBandError::SessionExited);
+        }
+        self.inband.request(self.integration, command, |bytes| {
+            self.session.send_bytes(bytes)
+        })
     }
 
     /// The `N:title` label for the tab at position `index` (0-based) —
@@ -212,6 +326,109 @@ impl Tab {
         self.scroll.snap_to_bottom();
     }
 
+    /// `Alt+↑` (Spec R05 §5.5/us-16): scroll the view to the previous
+    /// block's start line. "Previous" is measured against the view's
+    /// top row in live coordinates: the highest block start above it —
+    /// so a view sitting mid-block lands on that block's own start and
+    /// repeated presses walk the starts upward. No-op when no block
+    /// starts above the current top.
+    pub fn prev_block_start(&mut self) {
+        let top = self.viewport_top();
+        let start = self
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .filter(|start| *start < top)
+            .max();
+        if let Some(line) = start {
+            self.scroll_to_line(line);
+        }
+    }
+
+    /// `Alt+↓`: scroll the view to the next block's start line — the
+    /// lowest block start below the view's top row. A start inside the
+    /// live viewport clamps to the bottom, which is where the user
+    /// expects to land past the newest block anyway. No-op when no
+    /// block starts below.
+    pub fn next_block_start(&mut self) {
+        let top = self.viewport_top();
+        let start = self
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .filter(|start| *start > top)
+            .min();
+        if let Some(line) = start {
+            self.scroll_to_line(line);
+        }
+    }
+
+    /// `Alt+B` (Spec R05 §5.5/us-17): program the existing mouse-drag
+    /// [`Selection`] over the *current* block's clamped range and
+    /// return the finished range for the caller's copy path — `None`
+    /// when the tab has no blocks.
+    ///
+    /// "Current" is the block the view's bottom row sits in: the last
+    /// block starting at or above it — at the live viewport that is
+    /// the region around the cursor; scrolled up it is the block the
+    /// user is looking at. A view above every block start still
+    /// selects the first block.
+    pub fn select_block(&mut self) -> Option<SelectionRange> {
+        let blocks = self.blocks();
+        if blocks.is_empty() {
+            return None;
+        }
+        let bottom = self.viewport_top() + self.grid().lines().saturating_sub(1);
+        let index = blocks
+            .iter()
+            .rposition(|block| *block.range().start() <= bottom)
+            .unwrap_or(0);
+        let range = blocks[index].range();
+        // Live → grid coordinates: `line − scrollback` — `0..lines` is
+        // the viewport, negatives reach into scrollback (`GridPoint`'s
+        // rule, shared with mouse hit-testing).
+        let scrollback = i32::try_from(self.scrollback()).unwrap_or(i32::MAX);
+        let to_grid = |line: usize| i32::try_from(line).unwrap_or(i32::MAX) - scrollback;
+        // Whole lines: column 0 through the last column — the extract
+        // path trims trailing blanks itself. A mid-row `D` narrows the
+        // end column so the prompt + next echo on the `D` row stay out
+        // of the copy (Spec R05 us-18).
+        let last_column = self.grid().columns().saturating_sub(1);
+        let end_column = blocks[index].end_column().unwrap_or(last_column);
+        self.begin_selection(GridPoint::new(to_grid(*range.start()), 0));
+        self.extend_selection(GridPoint::new(to_grid(*range.end()), end_column));
+        self.finish_selection()
+    }
+
+    /// The last finished block's exit code and duration — the status
+    /// line's `✓/✗ <code> · <dur>` segment (Spec R05 us-15). `None`
+    /// when no block has reported an `OSC 133;D` exit code yet.
+    pub fn last_block_status(&self) -> Option<BlockStatus> {
+        self.blocks.last_status()
+    }
+
+    /// The view's top row in live scrollback-then-viewport coordinates
+    /// — the anchor block navigation and block selection measure
+    /// against (`scrollback − offset`; the offset is clamped to the
+    /// scrollback depth, so this never underflows).
+    fn viewport_top(&self) -> usize {
+        self.scrollback().saturating_sub(self.scroll.offset())
+    }
+
+    /// Scroll so live line `line` tops the viewport — `offset =
+    /// scrollback − line`, reached through the same clamped
+    /// `scroll_up`/`scroll_down` the page bindings use. Lines inside
+    /// the live viewport clamp to the bottom (offset 0).
+    fn scroll_to_line(&mut self, line: usize) {
+        let target = self.scrollback().saturating_sub(line);
+        let offset = self.scroll.offset();
+        match target.cmp(&offset) {
+            std::cmp::Ordering::Greater => self.scroll_up(target - offset),
+            std::cmp::Ordering::Less => self.scroll_down(offset - target),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
     /// Begin a mouse-drag selection at `point` (grid coordinates).
     pub fn begin_selection(&mut self, point: GridPoint) {
         self.selection.begin(point);
@@ -242,9 +459,138 @@ impl Tab {
     /// Follow new output: a pinned view rides scrollback growth, and a
     /// held selection shifts with it. Called once per drained batch.
     fn on_output(&mut self) {
-        let grown = self.scroll.on_output(self.session.grid().scrollback());
+        let scrollback = self.observe_scrollback();
+        let grown = self.scroll.on_output(scrollback);
         self.selection.on_output(grown);
     }
+
+    /// Whether the tab tracks any block — closed or still open. The
+    /// block chords consult it: a tab with none passes `Alt+B`/`Alt+↑`/
+    /// `Alt+↓` through to the PTY as ordinary input (Spec R05
+    /// Out-of-Scope: no integration ⇒ no behavior change).
+    pub fn has_blocks(&self) -> bool {
+        !self.blocks.is_empty()
+    }
+
+    /// Feed the grid's current scrollback depth into the bookkeeping
+    /// that keeps mark/block absolute lines anchored, returning the
+    /// depth read. Called once per drained event so a mark recorded
+    /// mid-batch maps with a current `dropped_lines`.
+    ///
+    /// Scrollback *decrease* is a directly observable eviction (the top
+    /// lines are gone). At a *stable nonzero* depth, history content
+    /// changes only through cap rotation — the anchor window of the
+    /// newest scrollback rows measures it: the window's displacement
+    /// is the rotation count. An anchor that left the grid entirely
+    /// means an unmeasurable rotation — every range the assembler
+    /// tracks could then point at wrong-but-valid rows, so it is
+    /// discarded wholesale (us-20: mis-select impossible; a dropped
+    /// range is the spec-sanctioned worst case).
+    fn observe_scrollback(&mut self) -> usize {
+        let grid = self.session.grid();
+        let scrollback = grid.scrollback();
+        if scrollback < self.last_scrollback {
+            // History shrank — truncate, clear_history or reflow: the
+            // top lines are gone and recorded indices slide.
+            self.dropped_lines += self.last_scrollback - scrollback;
+        } else if scrollback > 0 && !self.prompt_marks.is_empty() {
+            if self.anchor.is_empty() {
+                // The window holds what the previous pass saw — empty
+                // means scrollback was empty then, so this gap has no
+                // reference. Below the cap nothing could have been
+                // evicted anyway (safe skip); AT the cap the gap may
+                // have rotated invisibly — the recorded ranges are
+                // suspect, drop them rather than resolve stale.
+                if scrollback == self.scrollback_cap {
+                    self.blocks.discard_ranges();
+                }
+            } else {
+                // Growth displaces the window exactly `grew` rows
+                // without evicting; displacement BEYOND it is cap
+                // rotation — the only way history content moves at a
+                // stable-or-deeper depth. This also catches the
+                // boundary-crossing gap that grew AND rotated (a burst
+                // that fills the cap and keeps going).
+                let grew = scrollback - self.last_scrollback;
+                match self.measure_rotation(&grid, grew) {
+                    Rotation::Steady => {}
+                    Rotation::Measured(rotated) => self.dropped_lines += rotated,
+                    Rotation::Lost => self.blocks.discard_ranges(),
+                }
+            }
+        }
+        self.last_scrollback = scrollback;
+        // Field assignment, not a `&mut self` method — `grid` still
+        // borrows `self.session`.
+        self.anchor = anchor_window(&grid, scrollback);
+        scrollback
+    }
+
+    /// Locate the anchor window deeper in the scrollback:
+    /// `anchor[0]` was the newest scrollback row — after `d` combined
+    /// growth+eviction it sits `d` rows deeper, so a `d ≥ floor` whose
+    /// rows all still match is a candidate displacement and `d − floor`
+    /// the rotation count. The match must be UNIQUE: repeated output
+    /// (the same burst replayed) can verify the window at several
+    /// depths at once, and any displacement picked among them may
+    /// anchor recorded ranges on wrong-but-valid rows — ambiguous is
+    /// unmeasurable, so `Lost`. `Steady` when the unique match sits at
+    /// `floor` (unmoved, or growth alone); `Lost` when no `d` verifies —
+    /// the window itself was evicted.
+    fn measure_rotation(&self, grid: &GridView<'_>, floor: usize) -> Rotation {
+        let scrollback = grid.scrollback();
+        // Candidate displacements — the window's own rows are the
+        // verifier. Positions that leave fewer than two rows to check
+        // can't verify. Stop once two positions match: ambiguity is
+        // all the second one has to prove.
+        let mut found = None;
+        for d in floor..scrollback {
+            let overlap = self.anchor.len().min(scrollback - d);
+            if overlap < self.anchor.len().min(2) {
+                break;
+            }
+            let verified = (0..overlap).all(|j| {
+                grid.line(-((d + j + 1) as i32))
+                    .is_some_and(|row| row_hash(&row) == self.anchor[j])
+            });
+            if verified {
+                if found.is_some() {
+                    return Rotation::Lost;
+                }
+                found = Some(d);
+            }
+        }
+        match found {
+            Some(d) if d == floor => Rotation::Steady,
+            Some(d) => Rotation::Measured(d - floor),
+            None => Rotation::Lost,
+        }
+    }
+}
+
+/// Newest scrollback rows the rotation anchor fingerprints — a false
+/// match needs that many consecutive repeated rows.
+const ANCHOR_ROWS: usize = 8;
+
+/// The newest scrollback rows' fingerprints — the window
+/// [`measure_rotation`](Tab::measure_rotation) compares next time.
+fn anchor_window(grid: &GridView<'_>, scrollback: usize) -> Vec<u64> {
+    let depth = scrollback.min(ANCHOR_ROWS);
+    (1..=depth)
+        .filter_map(|i| grid.line(-(i as i32)))
+        .map(|row| row_hash(&row))
+        .collect()
+}
+
+/// The anchor window's verdict at a stable scrollback depth.
+enum Rotation {
+    /// The window's rows are unmoved — no rotation.
+    Steady,
+    /// The window sits `d` rows deeper — `d` lines were evicted.
+    Measured(usize),
+    /// The window left the grid — an unmeasurable rotation; every
+    /// recorded range is suspect.
+    Lost,
 }
 
 /// One [`LiveEvent`] tagged with the index of the tab that produced it.
@@ -258,6 +604,33 @@ pub struct TabEvent {
     pub tab: usize,
     /// What the session surfaced.
     pub event: LiveEvent,
+}
+
+/// The spawn-time template every new tab clones — the `[terminal]`
+/// half of settings (Spec R03, Spec R05). Applying a template reaches
+/// only sessions spawned from then on; live tabs keep their spawn-time
+/// values (story 14).
+#[derive(Debug, Clone)]
+pub struct SessionTemplate {
+    /// Options the spawned session is built from — `[terminal]`
+    /// `shell`, `scrollback_lines` and `osc52` land here.
+    pub options: LiveSessionOptions,
+    /// Whether the spawn consults `ait_shell`'s injection planner —
+    /// `[terminal] shell_integration` (Spec R05 us-3). `false` spawns
+    /// plain terminals: no argv/env rewrite, no `AIT_SESSION_ID`, no
+    /// snippet dir.
+    pub shell_integration: bool,
+}
+
+impl Default for SessionTemplate {
+    /// Integration is on when `[terminal] shell_integration` is unset
+    /// (§5.5).
+    fn default() -> Self {
+        Self {
+            options: LiveSessionOptions::default(),
+            shell_integration: true,
+        }
+    }
 }
 
 /// The ordered list of tabs plus the active index.
@@ -275,11 +648,10 @@ pub struct TabManager {
     /// live outside it); updated by [`resize_all`](Self::resize_all) so
     /// tabs spawned later match.
     size: Size,
-    /// The spawn-options template [`new_tab`](Self::new_tab) clones —
-    /// where `[terminal]` `shell`/`scrollback_lines` land (Spec R03).
-    /// Applying a template reaches only sessions spawned from then on;
-    /// live tabs keep their spawn-time values (story 14).
-    session_options: LiveSessionOptions,
+    /// The spawn template [`new_tab`](Self::new_tab) clones — where
+    /// `[terminal]` `shell`/`scrollback_lines`/`shell_integration`
+    /// land (Spec R03, Spec R05).
+    session_template: SessionTemplate,
     /// The id the next spawned [`Tab`] gets — a plain counter rather
     /// than an index or pid so a tab's identity is immune to list
     /// shifts and pid-less platforms (Spec R04 user story 14).
@@ -288,41 +660,42 @@ pub struct TabManager {
 
 impl TabManager {
     /// Spawn the manager with its first tab in the directory `ait` was
-    /// launched from: `options` — the app's `[terminal]`-derived
-    /// template (Spec R03), `LiveSessionOptions::default()` for
+    /// launched from: `template` — the app's `[terminal]`-derived
+    /// template (Spec R03), `SessionTemplate::default()` for
     /// `$SHELL`-or-`/bin/sh` — shapes the first tab AND every
     /// `new_tab` after it.
-    pub fn spawn_with(size: Size, options: LiveSessionOptions) -> Result<Self, SpawnError> {
+    pub fn spawn_with(size: Size, template: SessionTemplate) -> Result<Self, SpawnError> {
         let launch_cwd = std::env::current_dir().unwrap_or_default();
-        Self::spawn_at(size, launch_cwd, options)
+        Self::spawn_at(size, launch_cwd, template)
     }
 
     /// `spawn_with` with an explicit launch cwd — the test seam.
-    /// `options` spawns the first tab and becomes the template for
+    /// `template` spawns the first tab and becomes the template for
     /// later ones.
     fn spawn_at(
         size: Size,
         launch_cwd: PathBuf,
-        options: LiveSessionOptions,
+        template: SessionTemplate,
     ) -> Result<Self, SpawnError> {
         let mut manager = Self {
             tabs: Vec::new(),
             active: 0,
             launch_cwd,
             size,
-            session_options: options.clone(),
+            session_template: template,
             next_id: 0,
         };
+        let options = manager.session_template.options.clone();
         manager.spawn_tab(options)?;
         Ok(manager)
     }
 
-    /// Replace the spawn-options template: sessions spawned from now on
-    /// get `options` — the `[terminal]` half of a settings reload —
+    /// Replace the spawn template: sessions spawned from now on get
+    /// `template` — the `[terminal]` half of a settings reload —
     /// while live tabs keep their spawn-time program and scrollback
     /// (Spec R03 user story 14).
-    pub fn set_session_options(&mut self, options: LiveSessionOptions) {
-        self.session_options = options;
+    pub fn set_session_template(&mut self, template: SessionTemplate) {
+        self.session_template = template;
     }
 
     /// The cwd a tab spawned right now inherits: the active tab's
@@ -344,8 +717,23 @@ impl TabManager {
         let cwd = options.cwd.take().unwrap_or_else(|| self.spawn_cwd());
         options.cwd = Some(cwd.clone());
         let title = title_for(&options);
-        let session = LiveSession::spawn(options)?;
         let id = self.next_id;
+        // Shell integration (Spec R05): when the template allows it,
+        // plan + materialize an injection on the resolved program and
+        // apply its argv/env rewrite; the `Materialized` guard rides on
+        // the `Tab` so the `0700` snippet dir dies with it (us-30).
+        // `AIT_SESSION_ID` is the tab's stable id — hook payloads echo
+        // it back so events stay attributable to this tab
+        // (CODING_STANDARDS.md 14). Opt-out, unknown shells and
+        // materialize failures all return `None` — the session then
+        // spawns exactly as without integration (standard 1).
+        let materialized = self
+            .session_template
+            .shell_integration
+            .then(|| integration::inject(&mut options, &id.to_string()))
+            .flatten();
+        let scrollback_cap = options.session.scrollback;
+        let session = LiveSession::spawn(options)?;
         self.next_id += 1;
         self.tabs.push(Tab {
             id,
@@ -358,6 +746,15 @@ impl TabManager {
             exit: None,
             title,
             prompt_marks: VecDeque::new(),
+            integration: IntegrationState::Absent,
+            blocks: BlockAssembler::new(),
+            dropped_lines: 0,
+            last_scrollback: 0,
+            anchor: Vec::new(),
+            session_id: materialized.as_ref().map(|_| id.to_string()),
+            scrollback_cap,
+            inband: InBandExec::new(),
+            materialized,
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -370,7 +767,7 @@ impl TabManager {
     /// set untouched and propagates — the caller surfaces it as a
     /// status-line toast.
     pub fn new_tab(&mut self) -> Result<(), SpawnError> {
-        self.spawn_tab(self.session_options.clone())
+        self.spawn_tab(self.session_template.options.clone())
     }
 
     /// `Alt+W`: drop the active tab. Returns `false` when that was the
@@ -503,27 +900,71 @@ impl TabManager {
         let mut events = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             for event in tab.session.drain_events() {
+                // Keeps `dropped_lines` current — shrinkage directly,
+                // cap rotation via the anchor window — so a mark
+                // recorded mid-batch maps into absolute space with a
+                // post-eviction offset.
+                let scrollback = tab.observe_scrollback();
                 match &event {
                     LiveEvent::Osc(SessionEvent::CwdChanged(cwd)) => {
                         tab.cwd = cwd.clone();
                         tab.cwd_reported = true;
                     }
                     LiveEvent::Osc(SessionEvent::PromptMark { kind, payload }) => {
-                        if tab.prompt_marks.len() == PROMPT_MARK_CAP {
-                            tab.prompt_marks.pop_front();
-                        }
-                        tab.prompt_marks.push_back(PromptMark {
+                        let cursor = tab.session.cursor();
+                        let mark = PromptMark {
                             kind: *kind,
                             payload: payload.clone(),
                             // The line the cursor sits on as the drain
                             // surfaces the mark — the whole feeding
                             // chunk is already in the grid — indexed in
                             // scrollback-then-viewport coordinates.
-                            line: tab.session.grid().scrollback() + tab.session.cursor().line,
+                            line: scrollback + cursor.line,
+                            column: cursor.column,
+                            at: Instant::now(),
+                        };
+                        // Fingerprint the open block's echo span —
+                        // final once the command runs — so `resolve`
+                        // can prove the recorded range still covers
+                        // its own content, dropping (never mis-
+                        // selecting) on unmeasured rotation (us-20).
+                        let seal = tab.blocks.open_seal_range().and_then(|range| {
+                            seal_fingerprint(
+                                &tab.session.grid(),
+                                tab.dropped_lines,
+                                scrollback,
+                                range,
+                            )
+                            .map(|(hash, rows)| (range.0, rows, hash))
                         });
+                        tab.blocks.observe_mark_row(&mark, tab.dropped_lines, seal);
+                        if tab.prompt_marks.len() == PROMPT_MARK_CAP {
+                            tab.prompt_marks.pop_front();
+                        }
+                        tab.prompt_marks.push_back(mark);
                     }
                     LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
                     _ => {}
+                }
+                // Shell-integration bookkeeping (Spec R05): marks move
+                // `Absent` → `MarksOnly`, *vetted* decoded 7700 hooks
+                // move to and from `Integrated` — the state machine in
+                // `crate::integration` never panics on malformed
+                // sequences. One `ait_shell::decode` per `Private`
+                // event, shared by all three observers.
+                if let LiveEvent::Osc(osc) = &event {
+                    let decoded = match osc {
+                        SessionEvent::Private { code, params } => ait_shell::decode(code, params),
+                        _ => None,
+                    };
+                    tab.integration
+                        .observe(osc, decoded.as_ref(), tab.session_id.as_deref());
+                    if let Some(shell_event) = &decoded {
+                        tab.blocks.observe_shell(shell_event);
+                        // §5.5.1: `OSC 7701` frames resolve pending
+                        // `__ait_run` requests by their payload id.
+                        tab.inband.observe(shell_event);
+                    }
                 }
                 events.push(TabEvent { tab: index, event });
             }
@@ -580,8 +1021,15 @@ mod tests {
     /// A manager with `tabs` `/bin/sh` tabs (the first carrying
     /// `launch_cwd`), all at a small size.
     fn manager(tabs: usize, launch_cwd: &str) -> TabManager {
-        let mut manager =
-            TabManager::spawn_at(Size::new(40, 10), PathBuf::from(launch_cwd), sh()).unwrap();
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from(launch_cwd),
+            SessionTemplate {
+                options: sh(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for _ in 1..tabs {
             manager.spawn_tab(sh()).unwrap();
         }
@@ -766,7 +1214,10 @@ mod tests {
         let mut manager = TabManager::spawn_at(
             Size::new(40, 10),
             PathBuf::from("/tmp"),
-            sh_script("exit 3"),
+            SessionTemplate {
+                options: sh_script("exit 3"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -836,6 +1287,12 @@ mod tests {
         assert_eq!(marks[1].kind, ait_term::PromptMarkKind::CommandStart);
         assert_eq!(marks[2].kind, ait_term::PromptMarkKind::CommandEnd);
         assert_eq!(marks[2].payload.as_deref(), Some("0"));
+        // Instants are monotonic in stream order (Spec R05:
+        // `D.at − C.at` needs both). Column shares `line`'s caveat: it
+        // is the post-chunk cursor column — here the burst ends after a
+        // newline, so `0`.
+        assert!(marks[0].at <= marks[1].at && marks[1].at <= marks[2].at);
+        assert_eq!(marks[1].column, 0);
         let grid = manager.tabs()[1].grid();
         let total = grid.scrollback() + grid.lines();
         for mark in marks {
@@ -909,13 +1366,13 @@ mod tests {
         );
     }
 
-    /// Spec R03 stories 12–14: the session-options template shapes NEW
+    /// Spec R03 stories 12–14: the session template shapes NEW
     /// tabs — the spawned program and the scrollback capacity — while a
     /// tab spawned before the template changed keeps its spawn-time
     /// values. `new_tab` used to hardcode `LiveSessionOptions::default()`;
     /// the template is what `[terminal]` writes land on at reload.
     #[test]
-    fn session_options_template_shapes_new_tabs_only() {
+    fn session_template_shapes_new_tabs_only() {
         use ait_term::SessionOptions;
 
         // Tab 1 spawns under the default template — /bin/sh with the
@@ -931,10 +1388,13 @@ mod tests {
         drain_until(&mut manager, |m| m.tabs()[0].scrollback() > 5);
 
         // What a config reload does: swap the template, then Alt+T.
-        manager.set_session_options(LiveSessionOptions {
-            program: Some(OsString::from("/bin/cat")),
-            session: SessionOptions {
-                scrollback: 3,
+        manager.set_session_template(SessionTemplate {
+            options: LiveSessionOptions {
+                program: Some(OsString::from("/bin/cat")),
+                session: SessionOptions {
+                    scrollback: 3,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -964,5 +1424,874 @@ mod tests {
             "sh",
             "the pre-reload tab kept its spawn-time program"
         );
+    }
+
+    /// `OSC 7700 ; <hex(json)>` as a line an interactive shell prints —
+    /// how the tests below hand-emit hook events through a real
+    /// `/bin/sh` (the seam `prompt_marks_are_recorded_on_the_tab`
+    /// established).
+    fn hook_line(json: &str) -> Vec<u8> {
+        let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("printf '\\033]7700;{hex}\\007'\n").into_bytes()
+    }
+
+    /// Spec R05 / issue #72 + the session-id vetting fix: on a tab
+    /// that allocated NO `AIT_SESSION_ID` (plain `/bin/sh` — no
+    /// injection), `init_shell`/`bootstrapped`/`exit_shell` bytes are
+    /// unvetted and never promote — the stream lands in `MarksOnly`,
+    /// the spec's state for integration `ait` can't account for, while
+    /// `OSC 133` marks still pay off identically (us-19/20).
+    #[test]
+    fn unvetted_hooks_never_promote() {
+        let mut manager = manager(1, "/tmp");
+        assert_eq!(
+            manager.active().unwrap().integration_state(),
+            IntegrationState::Absent,
+            "a fresh tab starts Absent"
+        );
+
+        // Send a line to the interactive sh — a borrow-free helper so
+        // `drain_until` can take `&mut manager` between sends.
+        fn emit(manager: &TabManager, bytes: &[u8]) {
+            manager.active().unwrap().session.send_bytes(bytes).unwrap();
+        }
+
+        // Forged init_shell bytes: no allocated id exists to match —
+        // MarksOnly, never Integrated.
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"init_shell","value":{"session_id":0,"shell":"sh"}}"#),
+        );
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::MarksOnly
+        });
+
+        // An unvetted exit_shell is ignored too — the state doesn't move.
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"exit_shell","value":{"session_id":0}}"#),
+        );
+        emit(&manager, b"echo after-exit\n");
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("after-exit")
+        });
+        assert_eq!(
+            manager.active().unwrap().integration_state(),
+            IntegrationState::MarksOnly
+        );
+
+        // OSC 133 marks still work regardless (us-19).
+        emit(&manager, b"printf '\\033]133;A\\007'\n");
+        drain_until(&mut manager, |m| m.tabs()[0].prompt_marks().count() == 1);
+        assert_eq!(
+            manager.active().unwrap().integration_state(),
+            IntegrationState::MarksOnly
+        );
+    }
+
+    /// The injected path's end of the vetting: a real injected
+    /// interactive bash's own `init_shell` — which echoes the
+    /// `AIT_SESSION_ID` the spawn exported — promotes the tab on its
+    /// own (no hand-emitted hooks involved).
+    #[test]
+    fn injected_shell_integrates_itself() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+    }
+
+    /// A `sh -c` script emitting the `A B C D` sequence with `sleep`
+    /// separators — the sleeps split the output into separate drains so
+    /// each mark records its own cursor row (marks record post-chunk
+    /// positions; an interactive shell produces the same shape between
+    /// keystrokes, without the typed-line echo an interactive `send`
+    /// would add).
+    fn scripted_marks(preexec_hook: Option<&str>) -> LiveSessionOptions {
+        let hook = preexec_hook
+            .map(|json| {
+                let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+                format!("printf '\\033]7700;{hex}\\007'; sleep 0.2; ")
+            })
+            .unwrap_or_default();
+        sh_script(&format!(
+            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+             printf 'echo hi'; sleep 0.2; \
+             {hook}\
+             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+             printf 'hi\\n'; sleep 0.2; \
+             printf '\\033]133;D;3\\007'; sleep 0.5"
+        ))
+    }
+
+    /// Spec R05 / issue #73: a real `A B C D` mark stream plus a 7700
+    /// `preexec` hook assembles a block on the tab — range, exit code,
+    /// duration and the hook's command text. A tab whose shell emits
+    /// nothing has none (§5.5 graceful degrade: `Absent` → no blocks).
+    #[test]
+    fn blocks_assemble_from_real_marks_and_hooks() {
+        let mut manager = manager(1, "/tmp");
+        assert!(
+            manager.active().unwrap().blocks().is_empty(),
+            "Absent: no marks → no blocks"
+        );
+        manager
+            .spawn_tab(scripted_marks(Some(
+                r#"{"hook":"preexec","value":{"session_id":1,"command":"echo hi"}}"#,
+            )))
+            .unwrap();
+
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let blocks = manager.tabs()[1].blocks();
+        assert_eq!(blocks.len(), 1, "one quadruple → one block");
+        let block = &blocks[0];
+        assert!(block.completed());
+        assert_eq!(block.exit(), Some(3));
+        assert!(block.duration().is_some(), "D.at − C.at");
+        assert_eq!(block.command(), "echo hi", "the preexec hook wins");
+        // The range covers the echo row through the output row.
+        let tab = &manager.tabs()[1];
+        let grid = tab.grid();
+        let range = block.range();
+        let text: Vec<String> = (*range.start()..=*range.end())
+            .map(|line| {
+                grid.line(line as i32 - grid.scrollback() as i32)
+                    .map(|row| row.text().trim_end().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            text[0].contains("echo hi"),
+            "echo starts the block: {text:?}"
+        );
+        assert!(text.iter().any(|line| line == "hi"));
+        assert_eq!(
+            block.output_start(),
+            Some(*range.start() + 1),
+            "C marks the output's first row"
+        );
+    }
+
+    /// Marks without hooks (us-19): the `B→C` echo slice supplies the
+    /// command — the `B` mark's column strips the prompt.
+    #[test]
+    fn marks_only_blocks_slice_the_command_from_the_grid() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let tab = &manager.tabs()[1];
+        assert_eq!(tab.integration_state(), IntegrationState::MarksOnly);
+        let blocks = tab.blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].command(), "echo hi", "echo slice, no prompt");
+        assert_eq!(blocks[0].exit(), Some(3));
+    }
+
+    /// A two-block script on a 10-row grid: each `B→D` quadruple is
+    /// separated by sleeps so every mark records its own row, and the
+    /// padding between them pushes enough lines into scrollback that
+    /// block navigation has somewhere to go.
+    fn two_block_script() -> LiveSessionOptions {
+        sh_script(
+            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+             printf 'first'; sleep 0.2; \
+             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+             printf 'out1\\n'; sleep 0.2; \
+             printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+             i=0; while [ $i -lt 14 ]; do echo pad$i; i=$((i+1)); done; sleep 0.2; \
+             printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+             printf 'second'; sleep 0.2; \
+             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+             printf 'out2\\n'; sleep 0.2; \
+             printf '\\033]133;D;7\\007'; sleep 0.5",
+        )
+    }
+
+    /// Spec R05 / issue #74: `Alt+B` programs the existing
+    /// drag-selection machinery over the block's clamped range — the
+    /// finished range is what `extract` (and so the OSC-52 copy path)
+    /// reads, yielding command + output as the one copy granularity.
+    #[test]
+    fn select_block_programs_the_existing_selection() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let range = manager
+            .active_mut()
+            .unwrap()
+            .select_block()
+            .expect("a tab with blocks selects");
+
+        let tab = manager.active().unwrap();
+        let block = &tab.blocks()[0];
+        let scrollback = i32::try_from(tab.scrollback()).unwrap();
+        // The finished range IS the block's live range, re-expressed
+        // in selection coordinates (`line − scrollback`) — and it
+        // stays programmed as the tab's highlight.
+        assert_eq!(range.start.line, *block.range().start() as i32 - scrollback);
+        assert_eq!(range.end.line, *block.range().end() as i32 - scrollback);
+        assert_eq!(tab.selection_range(), Some(range));
+        let text = crate::selection::extract(&tab.grid(), range);
+        assert!(text.contains("echo hi"), "the echo row: {text:?}");
+        assert!(text.contains("\nhi"), "the output row: {text:?}");
+    }
+
+    /// The status segment's data source (Spec R05 us-15): the newest
+    /// block that reported an exit code — here the only block, `D;3`.
+    #[test]
+    fn last_block_status_reports_the_newest_exit() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let status = manager.tabs()[1].last_block_status().unwrap();
+        assert_eq!(status.exit, 3);
+        assert!(status.duration > Duration::ZERO);
+        assert!(
+            manager.tabs()[0].last_block_status().is_none(),
+            "the markless tab reports nothing (graceful degrade)"
+        );
+    }
+
+    /// `Alt+↑`/`Alt+↓` scroll the view between block starts (Spec R05
+    /// us-16): up from the bottom lands on the newest start above the
+    /// view's top row, another press walks further back (or goes inert
+    /// at the oldest), and down walks back toward the live viewport.
+    /// A view parked mid-block jumps to that block's own start first.
+    #[test]
+    fn block_navigation_walks_block_starts() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: two_block_script(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active()
+                .unwrap()
+                .blocks()
+                .iter()
+                .filter(|b| b.completed())
+                .count()
+                == 2
+                && m.active().unwrap().scrollback() > 0
+        });
+
+        let tab = manager.active_mut().unwrap();
+        let scrollback = tab.scrollback();
+        let starts: Vec<usize> = tab
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .collect();
+        assert_eq!(starts.len(), 2, "two quadruples → two blocks");
+
+        // Up from the bottom: the newest start above the view's top
+        // row (`top = scrollback`) wins — that's the earlier block.
+        let target = starts
+            .iter()
+            .copied()
+            .filter(|start| *start < scrollback)
+            .max()
+            .expect("the first block sits in scrollback");
+        tab.prev_block_start();
+        assert_eq!(
+            tab.scroll_offset(),
+            scrollback - target,
+            "view tops on the block's start line"
+        );
+
+        // Another press goes inert when no earlier start exists — or
+        // walks further back when it does.
+        let top = scrollback - tab.scroll_offset();
+        let prior = starts.iter().copied().filter(|start| *start < top).max();
+        let before = tab.scroll_offset();
+        tab.prev_block_start();
+        match prior {
+            Some(line) => assert_eq!(tab.scroll_offset(), scrollback - line),
+            None => assert_eq!(
+                tab.scroll_offset(),
+                before,
+                "no earlier start — the press is inert"
+            ),
+        }
+
+        // Down walks back toward the live viewport: the next start
+        // below the top row.
+        let top = scrollback - tab.scroll_offset();
+        let next = starts
+            .iter()
+            .copied()
+            .filter(|start| *start > top)
+            .min()
+            .expect("the second block is below");
+        tab.next_block_start();
+        assert_eq!(
+            tab.scroll_offset(),
+            scrollback.saturating_sub(next),
+            "a start inside the live viewport clamps to the bottom"
+        );
+
+        // Mid-block anchor: park the view's top INSIDE the first
+        // block's range — `Alt+↑` lands on that block's own start
+        // rather than skipping it.
+        let first = starts[0];
+        let inside = *tab.blocks()[0].range().end();
+        if inside > first && inside < scrollback {
+            tab.snap_to_bottom();
+            tab.scroll.scroll_up(scrollback - inside, scrollback);
+            assert_eq!(scrollback - tab.scroll_offset(), inside, "fixture check");
+            tab.prev_block_start();
+            assert_eq!(
+                tab.scroll_offset(),
+                scrollback - first,
+                "a mid-block view lands on the block's own start"
+            );
+        }
+    }
+
+    /// Blocks-only UX degrades quietly (§5.5): a tab with no marks
+    /// scrolls nowhere, selects nothing, reports no block status.
+    #[test]
+    fn block_ux_is_inert_without_blocks() {
+        let mut manager = manager(1, "/tmp");
+        let tab = manager.active_mut().unwrap();
+
+        tab.prev_block_start();
+        tab.next_block_start();
+        assert_eq!(tab.scroll_offset(), 0, "no blocks — the view stays");
+        assert_eq!(tab.select_block(), None);
+        assert!(tab.selection_range().is_none());
+        assert!(tab.last_block_status().is_none());
+    }
+
+    /// Scrollback truncation (`ESC[3J`) drops the lines a block sat on:
+    /// the range slides in absolute space and the fully-evicted block
+    /// leaves `blocks()` cleanly — no panic, no phantom range.
+    #[test]
+    fn evicted_blocks_drop_out() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    args: vec![
+                        OsString::from("-c"),
+                        OsString::from(
+                            "printf '\\033]133;B\\007old\\n\\033]133;C\\007done\\n\\033]133;D;0\\007'; \
+                             sleep 0.3; \
+                             i=0; while [ $i -lt 25 ]; do echo line$i; i=$((i+1)); done; \
+                             sleep 0.3; \
+                             printf '\\033[3J'; sleep 0.5",
+                        ),
+                    ],
+                    session: ait_term::SessionOptions {
+                        scrollback: 10,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| m.active().unwrap().blocks().len() == 1);
+        drain_until(&mut manager, |m| m.active().unwrap().scrollback() == 10);
+
+        // `ESC[3J` clears the 10-line history — the recorded block's
+        // whole absolute range falls below `dropped`.
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().scrollback() == 0 && m.active().unwrap().blocks().is_empty()
+        });
+    }
+
+    /// An unknown program's spawn is untouched: `sh` plans to `None` —
+    /// no materialized dir, no argv/env rewrite — and a session that
+    /// emits nothing stays `Absent` (§5.5 graceful degrade).
+    #[test]
+    fn unknown_shell_stays_absent_and_uninjected() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: sh_script("echo plain-done"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("plain-done")
+        });
+
+        let tab = manager.tabs().first().unwrap();
+        assert!(tab.materialized.is_none(), "sh plans to no injection");
+        assert_eq!(tab.integration_state(), IntegrationState::Absent);
+    }
+
+    /// The injection's `AIT_SESSION_ID` really lands in the spawned
+    /// shell's environment — and `shell_integration = false` opts the
+    /// spawn out entirely (Spec R05 us-3): no env var, no dir. `bash -c`
+    /// never reads the injected rcfile, so this also proves the rewrite
+    /// is transparent to non-interactive arg forms.
+    #[test]
+    fn injected_env_reaches_the_shell_and_opt_out_skips_it() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let echo_sid = || LiveSessionOptions {
+            program: Some(OsString::from("/bin/bash")),
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("echo SID=${AIT_SESSION_ID:-none}"),
+            ],
+            ..Default::default()
+        };
+
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: echo_sid(),
+                shell_integration: false,
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("SID=")
+        });
+        let tab = manager.tabs().first().unwrap();
+        assert!(tab.materialized.is_none(), "opt-out spawns no injection");
+        assert!(
+            grid_text(&tab.session).contains("SID=none"),
+            "no AIT_SESSION_ID was exported: {:?}",
+            grid_text(&tab.session)
+        );
+
+        // Flip the template — the reload path — and spawn again.
+        manager.set_session_template(SessionTemplate {
+            options: echo_sid(),
+            ..Default::default()
+        });
+        manager.new_tab().unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[1].session).contains("SID=")
+        });
+        let tab = &manager.tabs()[1];
+        let materialized = tab
+            .materialized
+            .as_ref()
+            .expect("an injected spawn keeps its dir guard");
+        assert!(materialized.dir().is_dir());
+        assert!(
+            grid_text(&tab.session).contains(&format!("SID={}", tab.id)),
+            "AIT_SESSION_ID is the tab's stable id: {:?}",
+            grid_text(&tab.session)
+        );
+    }
+
+    /// The materialized `0700` dir lives exactly as long as its tab:
+    /// closing the tab drops the guard and the dir goes away (Spec R05
+    /// us-30 — integration leaves no litter).
+    #[test]
+    fn snippet_dir_dies_with_the_tab() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    args: vec![OsString::from("-c"), OsString::from("sleep 30")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dir = manager.tabs()[0]
+            .materialized
+            .as_ref()
+            .expect("bash spawns injected")
+            .dir()
+            .to_path_buf();
+        assert!(dir.is_dir());
+
+        assert!(!manager.close_active(), "the last tab closes the app");
+        assert!(
+            !dir.exists(),
+            "the session dir was removed with the tab: {dir:?}"
+        );
+    }
+
+    /// A shell command line that prints `count` numbered lines starting
+    /// at `start` — the flood that overflows a capped scrollback in the
+    /// rotation regression test. Distinct `start`s keep every burst's
+    /// rows unique: repeated content could verify the anchor at a
+    /// smaller displacement (the window can't tell identical rows
+    /// apart — a documented bound of content anchoring).
+    fn flood_line(start: usize, count: usize) -> Vec<u8> {
+        format!("seq {start} {}\n", start + count - 1).into_bytes()
+    }
+
+    /// Spec R05 / issue #75 — the §5.5.1 seam through a real
+    /// interactive `/bin/sh`: `Absent`/`MarksOnly` requests are refused
+    /// with NO bytes typed; once `Integrated`, `run_in_shell` types a
+    /// visible `__ait_run <id> <hex>` line, and hand-emitted `7701`
+    /// frames resolve the waiter's channel while their decoded payload
+    /// never lands in the grid.
+    #[test]
+    fn inband_run_gates_then_round_trips() {
+        let mut manager = manager(1, "/tmp");
+        fn emit(manager: &TabManager, bytes: &[u8]) {
+            manager.active().unwrap().session.send_bytes(bytes).unwrap();
+        }
+
+        // Absent: refused before anything is typed. The marker command
+        // afterwards flushes the input stream — had the request leaked
+        // bytes, its echo would precede the marker.
+        let err = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect_err("an Absent tab refuses");
+        assert!(
+            matches!(err, InBandError::NotIntegrated(IntegrationState::Absent)),
+            "{err:?}"
+        );
+        emit(&manager, b"echo gate-marker\n");
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("gate-marker")
+        });
+        assert!(
+            !grid_text(&manager.tabs()[0].session).contains("__ait_run"),
+            "a refused request typed nothing"
+        );
+
+        // MarksOnly — including forged init_shell bytes, which stay
+        // unvetted on an unallocated tab — refuses the same way.
+        emit(&manager, b"printf '\\033]133;A\\007'\n");
+        emit(
+            &manager,
+            &hook_line(r#"{"hook":"init_shell","value":{"session_id":0,"shell":"sh"}}"#),
+        );
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::MarksOnly
+        });
+        let err = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect_err("a MarksOnly tab refuses");
+        assert!(
+            matches!(err, InBandError::NotIntegrated(IntegrationState::MarksOnly)),
+            "{err:?}"
+        );
+
+        // The round-trip needs a vetted `Integrated` tab: a real
+        // injected bash integrates itself and defines `__ait_run`.
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        manager
+            .spawn_tab(LiveSessionOptions {
+                program: Some(OsString::from("/bin/bash")),
+                ..Default::default()
+            })
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].integration_state() == IntegrationState::Integrated
+        });
+
+        // The request types `__ait_run 0 <hex(echo hi)>` — visible in
+        // the grid (us-23 transparency) — and the snippet's own reply
+        // resolves the waiter: a real end-to-end in-band round-trip.
+        let req = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"echo hi")
+            .expect("an Integrated tab accepts the request");
+        assert_eq!(req.id(), 0);
+        drain_until(&mut manager, |m| !m.tabs()[1].inband.is_pending(0));
+        let result = req.wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.id, "0");
+        assert!(
+            result.output.windows(2).any(|w| w == b"hi"),
+            "the snippet's merged output: {:?}",
+            result.output
+        );
+        assert_eq!(result.exit_code, 0);
+
+        // A second request whose reply spans several `R` frames
+        // (>500 decoded bytes) resolves the same way.
+        let req = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"seq 1 400")
+            .expect("a second request");
+        assert_eq!(req.id(), 1);
+        drain_until(&mut manager, |m| !m.tabs()[1].inband.is_pending(1));
+        let result = req.wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.id, "1");
+        assert!(
+            result.output.windows(3).any(|w| w == b"400"),
+            "the chunked reply reassembled: {} bytes",
+            result.output.len()
+        );
+        assert_eq!(result.exit_code, 0);
+
+        // The decoded payload rendered nowhere — it only ever crossed
+        // the PTY hex-inside-OSC, and private OSCs never render. (The
+        // typed `__ait_run` lines themselves are grid text — us-23.)
+        let text = grid_text(&manager.tabs()[1].session);
+        assert!(text.contains("__ait_run 0"), "the request's trace: {text}");
+        assert!(
+            !text.lines().any(|line| line.trim() == "hi"),
+            "7701 output is invisible: {text}"
+        );
+    }
+
+    /// `OSC 7701` bytes on a session's output never reach the grid:
+    /// the emulator swallows private OSCs (the observer still decodes
+    /// them — resolution coverage lives in the tests above). Printed
+    /// mid-text, `PRE` and `POST` land contiguous.
+    #[test]
+    fn run_frames_never_render() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: sh_script(
+                    "printf 'PRE\\033]7701;A\\007\\033]7701;R;3;616263\\007\\033]7701;B\\007POST\\n'",
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("POST")
+        });
+
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(
+            text.contains("PREPOST"),
+            "the OSCs rendered nothing: {text}"
+        );
+        assert!(!text.contains("7701"), "{text}");
+        // `616263` decodes to `abc` — the payload is invisible too.
+        assert!(!text.contains("abc"), "{text}");
+    }
+
+    /// The real round-trip: injected bash defines `__ait_run`, so a
+    /// `run_in_shell` request executes inside the live shell — merged
+    /// output and exit code come back over `7701` while the typed
+    /// request line stays visible (us-23). The e2e-harness version of
+    /// this is T9's; this covers the tab-level seam end to end.
+    #[test]
+    fn injected_bash_executes_run_requests_in_band() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+
+        let req = manager
+            .active_mut()
+            .unwrap()
+            .run_in_shell(b"printf 'inband-ok\\n'; (exit 7)")
+            .expect("the integrated tab accepts");
+        assert_eq!(req.id(), 0);
+        drain_until(&mut manager, |m| !m.tabs()[0].inband.is_pending(0));
+
+        let result = req.wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(result.id, "0");
+        assert_eq!(result.exit_code, 7);
+        assert!(
+            String::from_utf8_lossy(&result.output).contains("inband-ok"),
+            "{result:?}"
+        );
+
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(
+            text.contains("__ait_run 0"),
+            "the request left a trace: {text}"
+        );
+        assert!(
+            !text.contains("inband-ok"),
+            "captured output stayed off the grid: {text}"
+        );
+    }
+
+    /// Real bash, injected for real: the `--rcfile` wrapper sources the
+    /// snippet, which emits `init_shell` — the tab reports `Integrated`
+    /// without a single dotfile touched (Spec R05 us-1).
+    #[test]
+    fn injected_bash_reports_integrated() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(80, 24),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+    }
+
+    /// Spec R05 us-20 regression: a scrollback cap's rotation must never
+    /// leave a block's range pointing at wrong-but-valid rows — the
+    /// anchor window either measures the rotation (the range stays true)
+    /// or reports itself lost and the block drops out. `Alt+B` can
+    /// therefore never copy stale rows.
+    #[test]
+    fn capped_scrollback_never_mis_selects() {
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    session: ait_term::SessionOptions {
+                        scrollback: 40,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fn emit(manager: &TabManager, bytes: &[u8]) {
+            manager.active().unwrap().session.send_bytes(bytes).unwrap();
+        }
+
+        // Fill scrollback to the cap BEFORE the marks — the window then
+        // exists to measure rotation (a first flood from empty scrollback
+        // is the discard case, exercised below).
+        emit(&manager, &flood_line(1, 50));
+        drain_until(&mut manager, |m| m.active().unwrap().scrollback() == 40);
+
+        // One real block via hand-emitted marks (each a separate drain).
+        emit(
+            &manager,
+            b"printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.3\n",
+        );
+        emit(&manager, b"printf 'echo ANCHOR'; sleep 0.3\n");
+        emit(&manager, b"printf '\\n\\033]133;C\\007'; sleep 0.3\n");
+        emit(&manager, b"printf 'ANCHORED-OUT\\n'; sleep 0.3\n");
+        emit(&manager, b"printf '\\033]133;D;0\\007'; sleep 0.3\n");
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().blocks().iter().any(|b| b.completed())
+        });
+
+        // ~25 rotations at the cap — inside the anchor window's reach:
+        // the block must stay anchored on its OWN rows, never on
+        // whatever slid into its recorded indices.
+        emit(&manager, &flood_line(100, 25));
+        // Wait on a marker only EXECUTION produces — a plain echo's
+        // input echo matches `grid_text` before the flood has run.
+        emit(&manager, b"echo FD$((100+24))\n");
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("FD124")
+        });
+
+        let tab = manager.active_mut().unwrap();
+        let blocks = tab.blocks();
+        let block = blocks.first().expect("a measured rotation keeps the block");
+        let range = block.range();
+        let scrollback = i32::try_from(tab.scrollback()).unwrap();
+        let text = crate::selection::extract(
+            &tab.grid(),
+            crate::selection::SelectionRange {
+                start: crate::selection::GridPoint::new(*range.start() as i32 - scrollback, 0),
+                end: crate::selection::GridPoint::new(*range.end() as i32 - scrollback, 39),
+            },
+        );
+        assert!(
+            text.contains("ANCHORED-OUT"),
+            "the range still covers its own output: {text:?}"
+        );
+        assert!(
+            !text.contains("FLOOD"),
+            "no flood rows leaked into the block: {text:?}"
+        );
+
+        // More bursts, each inside the window's reach but together
+        // rotating the block's own rows past the top: the range must
+        // slide with them and then fall out of the grid cleanly — a
+        // fully evicted block resolves to nothing, so `Alt+B` finds no
+        // stale rows to copy.
+        for _ in 0..4 {
+            emit(&manager, &flood_line(100, 25));
+        }
+        emit(&manager, b"echo GD$((2+3))\n");
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("GD5")
+        });
+        let tab = manager.active_mut().unwrap();
+        assert!(
+            tab.blocks().is_empty(),
+            "a rotated-out block resolves to nothing: {:?}",
+            tab.blocks().iter().map(|b| b.range()).collect::<Vec<_>>()
+        );
+        assert_eq!(tab.select_block(), None, "no stale rows to select");
     }
 }

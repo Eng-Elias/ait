@@ -29,6 +29,7 @@ dependencies = [
  "ait-agent",
  "ait-config",
  "ait-llm",
+ "ait-shell",
  "ait-term",
  "ait-testkit",
  "crossterm",
@@ -53,6 +54,7 @@ dependencies = [
 name = "ait-config"
 version = "0.1.0"
 dependencies = [
+ "ait-config",
  "keyring",
  "notify",
  "schemars",
@@ -81,6 +83,13 @@ dependencies = [
  "tiny_http",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "ait-shell"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

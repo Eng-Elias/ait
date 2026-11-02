@@ -73,12 +73,14 @@ fn terminal_only_document() {
         shell = "/bin/zsh"
         scrollback_lines = 5_000
         osc52 = true
+        shell_integration = false
         "#,
     )
     .unwrap();
     assert_eq!(settings.terminal.shell.as_deref(), Some("/bin/zsh"));
     assert_eq!(settings.terminal.scrollback_lines, Some(5_000));
     assert_eq!(settings.terminal.osc52, Some(true));
+    assert_eq!(settings.terminal.shell_integration, Some(false));
     assert!(settings.agents.custom_endpoints.is_empty());
 }
 
@@ -170,7 +172,7 @@ fn unknown_keys_at_every_level_are_rejected() {
         ),
         (
             "[terminal]\nshells = \"/bin/sh\"",
-            "terminal.shells: unknown field `shells`, expected one of `shell`, `scrollback_lines`, `osc52`",
+            "terminal.shells: unknown field `shells`, expected one of `shell`, `scrollback_lines`, `osc52`, `shell_integration`",
         ),
         (
             "[agents]\nbogus = 1",

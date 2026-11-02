@@ -1,0 +1,12 @@
+[package]
+name = "ait-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Shell integration: bash/zsh/fish rc snippets, the injection planner, and the OSC 7700-series hook/in-band-exec codec (REQUIREMENTS.md §5.5)."
+
+[dependencies]
+# Semver requirement; the resolved release is >=7 days old per the ADR-0002
+# supply-chain rule: serde_json 1.0.154 (2026-10-11) — hook payloads arrive
+# as hex-encoded JSON on OSC 7700 (§5.5, ADR-0008).
+serde_json = "1"

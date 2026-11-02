@@ -82,7 +82,7 @@ use crate::render::{
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
-use crate::status::{notification_text, status_text, Toast};
+use crate::status::{notification_text, status_text, StatusLine, Toast};
 use crate::suggest::{self, SuggestionPin};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
@@ -258,7 +258,7 @@ pub fn run() -> io::Result<ExitCode> {
     // status-line row are chrome outside the session grid (Spec R02).
     let mut tabs = TabManager::spawn_with(
         content_size(state.screen),
-        config::session_options(&state.config.settings().terminal),
+        config::session_template(&state.config.settings().terminal),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -386,10 +386,13 @@ pub fn run() -> io::Result<ExitCode> {
             offset: tab.scroll_offset(),
             selection: tab.selection_range(),
             status: status_text(
-                tab.cwd(),
-                tab.title(),
-                state.config.model(),
-                tab.exit_status(),
+                &StatusLine {
+                    cwd: tab.cwd(),
+                    shell: tab.title(),
+                    model: state.config.model(),
+                    block: tab.last_block_status(),
+                    exit: tab.exit_status(),
+                },
                 state.toast.as_ref(),
                 now,
             ),
@@ -526,6 +529,38 @@ fn handle_event<W: Write>(
                         AppAction::ScrollPageDown => tab.page_down(),
                         AppAction::ScrollTop => tab.scroll_to_top(),
                         AppAction::ScrollBottom => tab.snap_to_bottom(),
+                        // Spec R05 §5.5: block navigation scrolls like
+                        // the page bindings; `Alt+B` programs the
+                        // existing selection over the current block's
+                        // clamped range and copies it through the same
+                        // OSC-52 path a mouse release uses. On a tab
+                        // with NO blocks the chords are ordinary input
+                        // again — encoded to the PTY like PassThrough
+                        // (`ESC b`, `ESC [1;3A`, …) rather than eaten
+                        // inertly (§5.5 Out-of-Scope: no integration ⇒
+                        // no behavior change). The spec's readline
+                        // trade-off — `M-b` is backward-word — applies
+                        // only where blocks exist to act on.
+                        AppAction::PrevBlockStart
+                        | AppAction::NextBlockStart
+                        | AppAction::SelectBlock
+                            if !tab.has_blocks() =>
+                        {
+                            tab.snap_to_bottom();
+                            if tab.exit_status().is_none() {
+                                if let Some(key_event) = keys::translate(&key_event) {
+                                    tab.shadow.update(&key_event);
+                                    let _ = tab.session.send_key(key_event);
+                                }
+                            }
+                        }
+                        AppAction::PrevBlockStart => tab.prev_block_start(),
+                        AppAction::NextBlockStart => tab.next_block_start(),
+                        AppAction::SelectBlock => {
+                            if let Some(range) = tab.select_block() {
+                                copy_range(tab, range, state, host);
+                            }
+                        }
                         AppAction::Paste => {
                             // Paste ait's own copied selection (there is no
                             // host-clipboard read), bracketed iff the child
@@ -665,14 +700,7 @@ fn handle_event<W: Write>(
                     // Outside a drag `extend` is a no-op.
                     tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
                     if let Some(range) = tab.finish_selection() {
-                        let text = extract(&tab.grid(), range);
-                        if !text.is_empty() {
-                            state.copied_text = Some(text.clone());
-                            // OSC 52 silently no-ops where the host
-                            // denies it — never an error (Spec R02).
-                            let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
-                            let _ = host.flush();
-                        }
+                        copy_range(tab, range, state, host);
                     }
                 }
                 // Other buttons and motion aren't captured/used.
@@ -690,6 +718,27 @@ fn handle_event<W: Write>(
         _ => {}
     }
     Handled::Continue
+}
+
+/// The OSC-52 copy both selection paths share (Spec R02's mouse
+/// release, Spec R05's `Alt+B` block select): extract the range's
+/// text, keep it as ait's own clipboard for `Shift+Insert`, and offer
+/// it to the host — a silent no-op where the host denies OSC 52, never
+/// an error. An empty range copies nothing, same rule the drag path
+/// always applied.
+fn copy_range<W: Write>(
+    tab: &crate::tabs::Tab,
+    range: SelectionRange,
+    state: &mut AppState,
+    host: &mut W,
+) {
+    let text = extract(&tab.grid(), range);
+    if text.is_empty() {
+        return;
+    }
+    state.copied_text = Some(text.clone());
+    let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
+    let _ = host.flush();
 }
 
 /// Service the host input queue once: wait up to [`INPUT_POLL`] for the
@@ -750,7 +799,7 @@ fn drain_config_events(
     while let Ok(event) = receiver.try_recv() {
         match event {
             Ok(settings) => {
-                tabs.set_session_options(config::session_options(&settings.terminal));
+                tabs.set_session_template(config::session_template(&settings.terminal));
                 state.config = LiveSettings::adopt(settings, &NoSecrets);
             }
             Err(error) => {
@@ -865,6 +914,7 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
+    use crate::tabs::SessionTemplate;
     use ait_agent::SuggestEvent;
     use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
@@ -873,7 +923,7 @@ mod tests {
     use std::collections::VecDeque;
 
     fn manager() -> TabManager {
-        TabManager::spawn_with(Size::new(40, 10), LiveSessionOptions::default()).unwrap()
+        TabManager::spawn_with(Size::new(40, 10), SessionTemplate::default()).unwrap()
     }
 
     /// A manager on `/bin/sh` — deterministic tty echo for the trigger
@@ -883,8 +933,11 @@ mod tests {
     fn sh_manager() -> TabManager {
         TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(std::ffi::OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1105,8 +1158,19 @@ mod tests {
         // its own line. Wait for it, then find its grid line.
         // Same gate `run_line` uses: the first `send_bytes` must wait
         // for the prompt or the kernel echo races it onto the marker's
-        // row (deterministic failure on fast machines).
-        wait_until(&mut harness, |h| !logical(h).is_empty());
+        // row (deterministic failure on fast machines). `logical` is
+        // NOT the gate: a prompt that ends exactly at the right margin
+        // leaves the cursor on a fresh blank row below it, so the
+        // cursor's logical line stays empty even though the prompt
+        // already rendered — any non-empty row means the prompt landed.
+        wait_until(&mut harness, |h| {
+            h.tabs
+                .active()
+                .unwrap()
+                .grid()
+                .visible_rows()
+                .any(|row| !row.text().trim_end().is_empty())
+        });
         harness
             .tabs
             .active()
@@ -1189,6 +1253,149 @@ mod tests {
             tab.selection_range().is_some(),
             "a release never drops the highlight"
         );
+    }
+
+    /// A manager whose single `/bin/sh -c` tab emits two complete
+    /// `A B C D` quadruples with scrollback padding between them —
+    /// the block-UX dispatch tests' fixture (the same scripted-marks
+    /// seam `tabs::tests` drives).
+    fn block_manager() -> TabManager {
+        TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    args: vec![
+                        std::ffi::OsString::from("-c"),
+                        std::ffi::OsString::from(
+                            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                             printf 'first'; sleep 0.2; \
+                             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                             printf 'out1\\n'; sleep 0.2; \
+                             printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+                             i=0; while [ $i -lt 14 ]; do echo pad$i; i=$((i+1)); done; \
+                             sleep 0.2; \
+                             printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                             printf 'second'; sleep 0.2; \
+                             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                             printf 'out2\\n'; sleep 0.2; \
+                             printf '\\033]133;D;7\\007'; sleep 0.5",
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Wait until the fixture's two blocks completed and scrollback
+    /// exists to navigate.
+    fn wait_for_blocks(harness: &mut Harness) {
+        wait_until(harness, |h| {
+            let Some(tab) = h.tabs.active() else {
+                return false;
+            };
+            tab.blocks().iter().filter(|b| b.completed()).count() == 2 && tab.scrollback() > 0
+        });
+    }
+
+    /// Spec R05 / issue #74: `Alt+↑`/`Alt+↓` dispatch as per-tab
+    /// actions and scroll the viewport between block starts — up
+    /// lands on the newest start above the view's top row, down walks
+    /// back toward the live viewport.
+    #[test]
+    fn block_navigation_chords_scroll_to_block_starts() {
+        let mut harness = Harness::new(block_manager());
+        wait_for_blocks(&mut harness);
+
+        let tab = harness.tabs.active().unwrap();
+        let scrollback = tab.scrollback();
+        let starts: Vec<usize> = tab
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .collect();
+        let target = starts
+            .iter()
+            .copied()
+            .filter(|start| *start < scrollback)
+            .max()
+            .expect("the first block sits in scrollback");
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Up, KeyModifiers::ALT)),
+            Handled::Continue
+        );
+        assert_eq!(
+            harness.tabs.active().unwrap().scroll_offset(),
+            scrollback - target,
+            "Alt+Up tops the view on the previous block's start"
+        );
+
+        let next = starts
+            .iter()
+            .copied()
+            .filter(|start| *start > target)
+            .min()
+            .expect("the second block is below");
+        harness.handle(key(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(
+            harness.tabs.active().unwrap().scroll_offset(),
+            scrollback.saturating_sub(next),
+            "Alt+Down walks to the next block start"
+        );
+    }
+
+    /// `Alt+B` (Spec R05 us-17/18): the current block — the one the
+    /// view's bottom row sits in — becomes a real [`Selection`], and
+    /// its text copies through the same OSC-52 path a drag release
+    /// uses: `copied_text` set for `Shift+Insert`, the OSC 52 write on
+    /// the host stream. Scrolled up on the first block, that's the
+    /// block that gets selected.
+    #[test]
+    fn alt_b_selects_and_copies_the_current_block() {
+        let mut harness = Harness::new(block_manager());
+        wait_for_blocks(&mut harness);
+
+        // Park the view on the first block — "current" is then the
+        // block the view's bottom row sits in.
+        harness.handle(key(KeyCode::Up, KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('b'), KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        let range = tab
+            .selection_range()
+            .expect("Alt+B programs a real selection");
+        let first = &tab.blocks()[0];
+        let scrollback = i32::try_from(tab.scrollback()).unwrap();
+        assert_eq!(range.start.line, *first.range().start() as i32 - scrollback);
+        assert_eq!(range.end.line, *first.range().end() as i32 - scrollback);
+
+        let copied = harness.state.copied_text.as_deref().unwrap_or_default();
+        assert!(copied.contains("first"), "the echo row: {copied:?}");
+        assert!(copied.contains("out1"), "the output row: {copied:?}");
+        assert!(
+            harness.sink.windows(5).any(|w| w == b"\x1b]52;"),
+            "the copy went out via OSC 52"
+        );
+    }
+
+    /// No blocks → the chords are inert: nothing selected, nothing
+    /// copied, no panic (§5.5 graceful degrade).
+    #[test]
+    fn block_chords_are_inert_without_blocks() {
+        let mut harness = Harness::new(sh_manager());
+
+        harness.handle(key(KeyCode::Char('b'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Up, KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Down, KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.selection_range().is_none());
+        assert_eq!(tab.scroll_offset(), 0);
+        assert!(harness.state.copied_text.is_none());
     }
 
     /// The input seam: a `poll`/`read` pair that always fails reports
