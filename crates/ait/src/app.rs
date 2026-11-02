@@ -72,13 +72,14 @@ use crossterm::queue;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
+use crate::agent_panel::paint_agent_panel;
 use crate::backend::StyledBackend;
 use crate::config::{self, LiveSettings, NoSecrets};
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::render::{
     apply_selection, chrome_areas, content_size, grid_line, paint_session, paint_status_line,
-    paint_tab_bar, to_cursor_style, UnderlineOverlay,
+    paint_tab_bar, split_content, to_cursor_style, UnderlineOverlay,
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
@@ -196,6 +197,24 @@ struct Rendered {
     /// snapshot must carry enough to notice the cell changing under a
     /// stationary cursor (a spinner redrawing in place).
     cursor_cell: Option<Cell>,
+    /// What the active tab's agent panel showed — `None` while the
+    /// tab has none (Spec R06): a streamed `TextDelta` on an idle
+    /// shell produces no grid damage, so the panel's mutation counter
+    /// rides the snapshot to force its repaints.
+    panel: Option<PanelView>,
+}
+
+/// The painted agent panel's state for the [`Rendered`] snapshot:
+/// every change the paint can see bumps the panel's revision, so
+/// comparing it is comparing the whole panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelView {
+    /// Whether the split was open.
+    open: bool,
+    /// Whether the panel owned the keyboard.
+    focused: bool,
+    /// The panel's mutation counter.
+    revision: u64,
 }
 
 /// Run the TUI: spawn `$SHELL` in a tab and drive the tab set until the
@@ -358,6 +377,10 @@ pub fn run() -> io::Result<ExitCode> {
         state
             .suggestion
             .drain(state.suggester.events(), &tabs, &mut state.toast);
+        // Agent sessions on the same tick (Spec R06): `TextDelta`s
+        // stream into each tab's conversation and terminal events
+        // release its running state — a background tab keeps up.
+        tabs.drain_agent_events();
 
         // Standard 6: the last close already exits via `Handled::Quit`;
         // this guard is the belt for any path that could empty the set —
@@ -402,6 +425,11 @@ pub fn run() -> io::Result<ExitCode> {
                 i32::try_from(cursor.line).unwrap_or(i32::MAX),
                 cursor.column,
             ),
+            panel: tab.agent_panel().map(|panel| PanelView {
+                open: panel.is_open(),
+                focused: panel.is_focused(),
+                revision: panel.revision(),
+            }),
         };
         if damaged || rendered.as_ref() != Some(&view) {
             render_frame(
@@ -518,6 +546,20 @@ fn handle_event<W: Write>(
                         &mut state.toast,
                     );
                 }
+                // `Alt+A` (Spec R06 / issue #85): toggle the active
+                // tab's agent conversation panel — open focuses its
+                // input line, a second press while focused closes the
+                // split. Only THIS tab's winsize changes (panels are
+                // per-tab): `resize_active` re-derives it through the
+                // same session-resize path a window resize takes.
+                Resolution::Action(AppAction::AgentPanel) => {
+                    let Some(tab) = tabs.active_mut() else {
+                        return Handled::Continue;
+                    };
+                    tab.clear_selection();
+                    tab.toggle_agent_panel();
+                    tabs.resize_active();
+                }
                 // Per-active-tab viewport actions: scrollback + paste.
                 Resolution::Action(action) => {
                     let Some(tab) = tabs.active_mut() else {
@@ -593,7 +635,8 @@ fn handle_event<W: Write>(
                         | AppAction::NextTab
                         | AppAction::PrevTab
                         | AppAction::JumpToTab(_)
-                        | AppAction::SuggestCommand => {} // dispatched above
+                        | AppAction::SuggestCommand
+                        | AppAction::AgentPanel => {} // dispatched above
                     }
                 }
                 Resolution::PassThrough => {
@@ -615,6 +658,16 @@ fn handle_event<W: Write>(
                     };
                     // Any keypress drops the highlight — never stale state.
                     tab.clear_selection();
+                    // A focused agent panel owns the keystroke (Spec
+                    // R06): it edits the panel's input line, never
+                    // reaches the PTY, never updates the input shadow
+                    // and never snaps the terminal's view. The app
+                    // keymap already resolved above — its bindings
+                    // still win over panel focus (standard 7).
+                    if tab.agent_focused() {
+                        tab.agent_key(&key_event, state.config.settings(), &mut state.toast);
+                        return Handled::Continue;
+                    }
                     // Typing snaps the view back to the live viewport, then
                     // reaches the PTY encoded exactly as before.
                     tab.snap_to_bottom();
@@ -666,31 +719,51 @@ fn handle_event<W: Write>(
         }
         Event::Mouse(mouse_event) => {
             let content = chrome_areas(state.screen).content;
+            // The panel owns its rect: the wheel there scrolls the
+            // conversation, and a click there never starts a terminal
+            // selection (Spec R06 — clicks in the panel are the
+            // panel's, not the grid's).
+            let panel_open = tabs.active().is_some_and(|tab| tab.agent_panel_open());
+            let (terminal, panel) = split_content(content, panel_open);
+            let position = Position::new(mouse_event.column, mouse_event.row);
+            let in_panel = panel.is_some_and(|area| area.contains(position));
             let Some(tab) = tabs.active_mut() else {
                 return Handled::Continue;
             };
             match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    tab.clear_selection();
-                    tab.scroll_up(WHEEL_LINES);
+                    if in_panel {
+                        tab.agent_scroll_up(WHEEL_LINES);
+                    } else {
+                        tab.clear_selection();
+                        tab.scroll_up(WHEEL_LINES);
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    tab.clear_selection();
-                    tab.scroll_down(WHEEL_LINES);
+                    if in_panel {
+                        tab.agent_scroll_down(WHEEL_LINES);
+                    } else {
+                        tab.clear_selection();
+                        tab.scroll_down(WHEEL_LINES);
+                    }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Only a drag starting inside the session area
                     // selects; the chrome rows (tab bar, status line)
-                    // are inert.
-                    if content.contains(Position::new(mouse_event.column, mouse_event.row)) {
-                        tab.begin_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    // and the agent panel are inert.
+                    if terminal.contains(position) {
+                        tab.begin_selection(grid_point(
+                            &mouse_event,
+                            terminal,
+                            tab.scroll_offset(),
+                        ));
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     // An in-flight drag follows the pointer anywhere —
                     // past the top it selects into scrollback, the way
                     // the view would scroll.
-                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    tab.extend_selection(grid_point(&mouse_event, terminal, tab.scroll_offset()));
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
                     // Fold the release point into the range before
@@ -698,7 +771,7 @@ fn handle_event<W: Write>(
                     // last `Drag` can lag the cell the button released
                     // on — a fast flick would otherwise copy short.
                     // Outside a drag `extend` is a no-op.
-                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    tab.extend_selection(grid_point(&mouse_event, terminal, tab.scroll_offset()));
                     if let Some(range) = tab.finish_selection() {
                         copy_range(tab, range, state, host);
                     }
@@ -824,9 +897,12 @@ fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPo
 
 /// Draw one frame: the tab bar on top, the active tab's grid in the
 /// content band (shifted `scroll_offset` lines into scrollback, selected
-/// cells inverted), the status line at the bottom (`status`, reversed
-/// while it's a live toast), then the application-requested cursor
-/// shape and position.
+/// cells inverted) — or its terminal side when the tab's agent panel is
+/// open, the split's right side going to [`paint_agent_panel`] — the
+/// status line at the bottom (`status`, reversed while it's a live
+/// toast), then the application-requested cursor shape and position:
+/// the panel's input-line cursor while it owns the keyboard, the
+/// session's otherwise.
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     tabs: &TabManager,
@@ -839,7 +915,14 @@ fn render_frame(
         return Ok(());
     };
     let cursor = tab.cursor();
-    if let Some(style) = to_cursor_style(cursor.shape) {
+    // A focused panel's input line wants a bar cursor; the session's
+    // own shape governs everywhere else.
+    let shape = if tab.agent_focused() {
+        CursorShape::Beam
+    } else {
+        cursor.shape
+    };
+    if let Some(style) = to_cursor_style(shape) {
         if *last_cursor_shape != Some(style) {
             // Queued on the backend's writer; flushes with this draw.
             queue!(terminal.backend_mut().writer_mut(), style)?;
@@ -851,32 +934,49 @@ fn render_frame(
     let active = tabs.active_index();
     terminal.draw(|frame| {
         let areas = chrome_areas(frame.area());
+        // Spec R06's right-side split: the session paints in the
+        // terminal half, the agent conversation in the panel half —
+        // same `split_content` formula the winsize derivation uses.
+        let (terminal_area, panel_area) = split_content(areas.content, tab.agent_panel_open());
         let buf = frame.buffer_mut();
         {
             let mut overlay = underlines.borrow_mut();
             overlay.clear();
             paint_session(
                 buf,
-                areas.content,
+                terminal_area,
                 &tab.grid(),
                 &mut overlay,
                 tab.scroll_offset(),
             );
             if let Some(range) = tab.selection_range() {
-                apply_selection(buf, areas.content, &tab.grid(), range, tab.scroll_offset());
+                apply_selection(buf, terminal_area, &tab.grid(), range, tab.scroll_offset());
             }
+        }
+        if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
+            paint_agent_panel(buf, area, panel);
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
         paint_status_line(buf, areas.status, status, toast);
-        // The cursor's live line renders at `content.y + line + offset`;
-        // scrolled far enough up it leaves the band and stays hidden.
-        let y = usize::from(areas.content.y) + cursor.line + tab.scroll_offset();
-        if cursor.shape != CursorShape::Hidden && y < usize::from(areas.content.bottom()) {
-            let x = (areas.content.x + cursor.column as u16)
-                .min(areas.content.right().saturating_sub(1));
-            frame.set_cursor_position((x, y as u16));
+        if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
+            if panel.is_focused() {
+                // The input line owns the host cursor while the panel
+                // owns the keyboard.
+                let (x, y) = panel.cursor_position(area);
+                frame.set_cursor_position((x, y));
+            }
         }
-        // No position set → ratatui hides the cursor this frame.
+        if !tab.agent_focused() {
+            // The cursor's live line renders at `area.y + line + offset`;
+            // scrolled far enough up it leaves the band and stays hidden.
+            let y = usize::from(terminal_area.y) + cursor.line + tab.scroll_offset();
+            if cursor.shape != CursorShape::Hidden && y < usize::from(terminal_area.bottom()) {
+                let x = (terminal_area.x + cursor.column as u16)
+                    .min(terminal_area.right().saturating_sub(1));
+                frame.set_cursor_position((x, y as u16));
+            }
+            // No position set → ratatui hides the cursor this frame.
+        }
     })?;
     terminal.backend_mut().writer_mut().flush()?;
     Ok(())
@@ -1494,12 +1594,14 @@ mod tests {
         );
     }
 
-    /// Drain sessions and suggester events until `pred` holds, or fail
-    /// after a generous bound — mirrors `tabs::tests`' `drain_until`.
+    /// Drain sessions, suggester and agent events until `pred` holds,
+    /// or fail after a generous bound — mirrors `tabs::tests`'
+    /// `drain_until`.
     fn wait_until(harness: &mut Harness, pred: impl Fn(&Harness) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !pred(harness) {
             harness.tabs.drain_events();
+            harness.tabs.drain_agent_events();
             harness.state.suggestion.drain(
                 harness.state.suggester.events(),
                 &harness.tabs,
@@ -2183,6 +2285,310 @@ base_model = "key-1"
                 .text()
                 .ends_with("git undo"),
             "the shadow kept its line"
+        );
+    }
+
+    // ---- Spec R06 T2: the agent conversation panel (issue #85) ----
+    //
+    // The dispatch seam under test is `handle_event`: `Alt+A` toggles
+    // the split (and the tab's winsize through the resize path), a
+    // focused panel owns keystrokes before the PTY does, Enter submits
+    // or steers, and Esc cancels or unfocuses. A real `AgentSession`
+    // backs the panel — default `Settings` resolve no model, so the
+    // worker's terminal `Error` lands as a conversation status line.
+
+    /// The active tab's panel, staged or toggled live.
+    fn panel(harness: &Harness) -> &crate::agent_panel::AgentPanel {
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .agent_panel()
+            .expect("a panel exists")
+    }
+
+    /// `Alt+A` opens the split focused and shrinks the session through
+    /// the band→session derivation — the same math the resize path
+    /// uses (`Size::new(40, 10)` band → `24` session columns at the
+    /// two-fifths share).
+    #[test]
+    fn alt_a_opens_focused_and_shrinks_the_session() {
+        let mut harness = Harness::new(manager());
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(40, 10)
+        );
+
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.agent_panel_open() && tab.agent_focused());
+        assert_eq!(tab.session.size(), Size::new(24, 10));
+
+        // The focus cycle: Esc unfocuses while keeping the split,
+        // `Alt+A` refocuses, and a press while focused closes —
+        // restoring the whole band.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            harness.tabs.active().unwrap().agent_panel_open()
+                && !harness.tabs.active().unwrap().agent_focused(),
+            "idle Esc returns focus, split stays open"
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(
+            harness.tabs.active().unwrap().agent_focused(),
+            "Alt+A refocuses an unfocused panel"
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        let tab = harness.tabs.active().unwrap();
+        assert!(!tab.agent_panel_open() && !tab.agent_focused());
+        assert_eq!(
+            tab.session.size(),
+            Size::new(40, 10),
+            "closing restores the band"
+        );
+    }
+
+    /// A host resize while the panel is open re-derives the split —
+    /// the session keeps its terminal side, it never restores the
+    /// band under the panel.
+    #[test]
+    fn resize_re_derives_the_open_split() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        harness.handle(Event::Resize(100, 30));
+
+        // Content band 100×28 → session 60 (the panel's two fifths).
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(60, 28)
+        );
+    }
+
+    /// Focused keystrokes reach the input line and never the PTY:
+    /// type into the panel while the shell sits inside a byte-exact
+    /// `head -c` capture — the capture must hold ONLY the character
+    /// typed after focus returned. The input shadow stays empty too:
+    /// panel text is not shell input.
+    #[test]
+    fn focused_typing_reaches_the_panel_and_never_the_pty() {
+        let path = capture_path("panel-keys");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &mut harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        for c in "ab".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(panel(&harness).input(), "ab");
+        assert_eq!(
+            harness.tabs.active().unwrap().shadow.text(),
+            "",
+            "panel text is not shell input — the shadow never saw it"
+        );
+
+        // Idle Esc returns focus; the next char reaches the PTY —
+        // and the capture proves "ab" never did.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            wait_file(&mut harness, &path, 1),
+            b"c",
+            "only the post-Esc key reached the session"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Enter submits the input as a task: the conversation gains the
+    /// `Task` entry, the panel runs until the worker's terminal event
+    /// (the unconfigured model's `Error`) lands it as a status line.
+    #[test]
+    fn enter_submits_and_the_terminal_event_lands() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(panel(&harness).is_running());
+        assert_eq!(panel(&harness).input(), "", "submitted input clears");
+        assert_eq!(
+            panel(&harness).entries(),
+            &[crate::agent_panel::Entry::Task("fix it".into())]
+        );
+
+        wait_until(&mut harness, |h| !panel(h).is_running());
+        assert!(
+            matches!(
+                panel(&harness).entries().last(),
+                Some(crate::agent_panel::Entry::Status(s)) if s.contains("coding_model")
+            ),
+            "the worker's error became a conversation status line: {:?}",
+            panel(&harness).entries().last()
+        );
+    }
+
+    /// Text typed while a task runs queues as a steering message —
+    /// on the channel AND in the conversation.
+    #[test]
+    fn enter_during_a_run_steers_instead_of_submitting() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        for c in "use sudo".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            panel(&harness).entries().last(),
+            Some(&crate::agent_panel::Entry::Steering("use sudo".into())),
+            "mid-run input recorded as steering"
+        );
+        // Let the task die of its unconfigured model — the steering
+        // entry stays part of the conversation.
+        wait_until(&mut harness, |h| !panel(h).is_running());
+    }
+
+    /// Esc while a task runs cancels it — the in-flight request
+    /// stops — and focus stays for the next task; the terminal event
+    /// releases `running` and leaves the status line.
+    #[test]
+    fn esc_cancels_the_running_task() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            harness.tabs.active().unwrap().agent_focused(),
+            "cancelling keeps panel focus"
+        );
+        wait_until(&mut harness, |h| !panel(h).is_running());
+        assert!(
+            matches!(
+                panel(&harness).entries().last(),
+                Some(crate::agent_panel::Entry::Status(_))
+            ),
+            "a terminal status line closed the task: {:?}",
+            panel(&harness).entries().last()
+        );
+    }
+
+    /// Focused keys never reach the keymap's blind spot the other way
+    /// either: app bindings resolve BEFORE panel focus, so `Alt+T`
+    /// still spawns a tab while the panel owns typing.
+    #[test]
+    fn app_keymap_wins_over_panel_focus() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(harness.tabs.active().unwrap().agent_focused());
+
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(harness.tabs.len(), 2, "Alt+T spawned past panel focus");
+        assert!(
+            harness.tabs.active().unwrap().agent_panel().is_none(),
+            "a fresh tab owns no panel"
+        );
+        // And its session took the whole band, not a phantom split.
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(40, 10)
+        );
+
+        // The first tab kept its conversation and its split.
+        harness.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.agent_panel_open());
+        assert_eq!(tab.session.size(), Size::new(24, 10));
+    }
+
+    /// Closing the owning tab drops its agent — the `AgentSession`'s
+    /// Drop cancels and joins the worker even mid-task: no panic, no
+    /// orphan.
+    #[test]
+    fn closing_a_tab_drops_its_agent() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Handled::Continue
+        );
+        assert_eq!(harness.tabs.len(), 1);
+        assert!(
+            harness.tabs.active().unwrap().agent_panel().is_none(),
+            "the surviving tab owns no panel"
+        );
+    }
+
+    /// The wheel inside the panel's rect scrolls the conversation —
+    /// the terminal's scroll offset is untouched — while a click there
+    /// never starts a selection.
+    #[test]
+    fn the_wheel_and_clicks_stay_inside_the_split() {
+        let mut harness = Harness::new(manager());
+        harness.handle(Event::Resize(100, 30));
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        // Stage a conversation tall enough to scroll.
+        let tab = harness.tabs.active_mut().unwrap();
+        for n in 0..10 {
+            tab.agent
+                .as_mut()
+                .unwrap()
+                .apply(ait_agent::AgentEvent::TextDelta(format!("line{n}\n")));
+        }
+
+        // Band is 100×28 → terminal 60 cols, panel x ≥ 60.
+        let wheel_in_panel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 80,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        harness.handle(wheel_in_panel(MouseEventKind::ScrollUp));
+
+        let tab = harness.tabs.active().unwrap();
+        assert_eq!(tab.scroll_offset(), 0, "the terminal never scrolled");
+        assert!(
+            !panel(&harness).is_pinned(),
+            "the conversation took the scroll"
+        );
+
+        harness.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 80,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(
+            harness.tabs.active().unwrap().selection_range().is_none(),
+            "a click in the panel selects nothing"
         );
     }
 }

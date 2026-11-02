@@ -7,6 +7,7 @@
 //! terminal core lives in `ait-term`, the configuration model in
 //! `ait-config`.
 
+mod agent_panel;
 mod app;
 mod backend;
 mod blocks;
