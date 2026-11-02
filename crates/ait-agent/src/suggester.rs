@@ -29,13 +29,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ait_config::{ModelRole, OsKeyring, SecretStore, Settings};
-use ait_llm::{
-    anthropic_messages, openai_chat_completions, openai_responses, Endpoint, EndpointConfig,
-    EndpointRequest, EndpointSchema, EndpointStream, EndpointStreamEvent,
-};
+use ait_llm::{Endpoint, EndpointConfig, EndpointRequest, EndpointStream};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
 use crate::{assemble_request, ReplySanitizer, SuggestContext};
 
 /// The execution profile whose model roles command requests resolve
@@ -195,17 +193,6 @@ impl Drop for CommandSuggester {
     }
 }
 
-/// Lock the shared cancellation-token slot, recovering a poisoned
-/// guard — a poisoned `Option<CancellationToken>` is still sound to
-/// read (the token may simply be stale).
-fn slot(
-    mutex: &Mutex<Option<CancellationToken>>,
-) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// The worker thread: own the current-thread runtime and serve
 /// requests in order. A runtime that cannot be built degrades every
 /// request to an `Error` event rather than wedging the frontend (§6).
@@ -354,68 +341,4 @@ async fn stream_and_emit(
 /// into the void.
 fn emit(events: &Sender<SuggestEvent>, event: SuggestEvent) -> bool {
     events.send(event).is_ok()
-}
-
-/// What a schema-tagged [`EndpointStreamEvent`] means to the command
-/// path — text worth streaming, a provider-reported error worth
-/// toasting, or anything else (`Finish`, `ToolCallDelta`) a one-shot
-/// command request ignores.
-enum Extracted {
-    /// Assistant text — pushed through `ReplySanitizer`.
-    Text(String),
-    /// A provider-reported error event, rendered for the toast.
-    ProviderError(String),
-    /// Everything else.
-    Other,
-}
-
-/// Flatten the three per-schema event IRs (they stay distinct, §5.3 —
-/// the flattening happens here at the channel edge, not in the IRs).
-fn extract(event: EndpointStreamEvent) -> Extracted {
-    match event {
-        EndpointStreamEvent::OpenAiChatCompletions(event) => match event {
-            openai_chat_completions::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            openai_chat_completions::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-        EndpointStreamEvent::OpenAiResponses(event) => match event {
-            openai_responses::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            openai_responses::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-        EndpointStreamEvent::AnthropicMessages(event) => match event {
-            anthropic_messages::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            anthropic_messages::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-    }
-}
-
-/// A provider error event for the toast: the message, with the
-/// machine-readable code appended when the endpoint sent one.
-fn provider_error(message: String, code: Option<String>) -> String {
-    match code {
-        Some(code) => format!("{message} ({code})"),
-        None => message,
-    }
-}
-
-/// `ait-config`'s schema enum and `ait-llm`'s are deliberately separate
-/// types (the llm crate owns its wire vocabulary); bridge them here —
-/// the same seam `ait-llm`'s `chat` example uses. Two copies exist by
-/// design (ait-llm stays config-free); keep them in sync with
-/// `crates/ait-llm/examples/chat.rs`'s `llm_schema` when a fourth
-/// `EndpointSchema` variant lands.
-fn llm_schema(schema: ait_config::EndpointSchema) -> EndpointSchema {
-    match schema {
-        ait_config::EndpointSchema::OpenAiChatCompletions => EndpointSchema::OpenAiChatCompletions,
-        ait_config::EndpointSchema::OpenAiResponses => EndpointSchema::OpenAiResponses,
-        ait_config::EndpointSchema::AnthropicMessages => EndpointSchema::AnthropicMessages,
-    }
 }
