@@ -66,6 +66,10 @@ pub enum AppAction {
     /// Select the current block's range through the existing selection
     /// machinery (`Alt+B`; Spec R05 §5.5 — copy rides the OSC-52 path).
     SelectBlock,
+    /// Toggle the agent conversation panel — a right-side split on the
+    /// active tab (`Alt+A`; Spec R06 §5.6 / issue #85): open focuses
+    /// its input line, pressing it again while focused closes it.
+    AgentPanel,
 }
 
 /// The keymap's verdict for one key event.
@@ -248,6 +252,17 @@ const BINDINGS: &[Binding] = &[
         modifiers: ALT,
         enhanced_only: false,
         action: AppAction::SelectBlock,
+    },
+    // Spec R06 `Alt+A` agent-panel toggle — both tiers: `ESC a` vs `a`
+    // is byte-distinct under the legacy Alt-prefix and the kitty
+    // modifier report alike, and `M-a` is unbound in default readline,
+    // so the binding steals no shell input (the same trade the
+    // `Alt+Enter`/`Alt+B` comments record).
+    Binding {
+        code: KeyCode::Char('a'),
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::AgentPanel,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
@@ -485,6 +500,31 @@ mod tests {
             );
             assert_pass(
                 KeyCode::Char('b'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+                tier,
+            );
+        }
+    }
+
+    /// `Alt+A` is the Spec R06 agent-panel toggle (`AgentPanel`):
+    /// `ESC a` vs `a` is byte-distinct on every host — no tier gate —
+    /// and `M-a` is unbound in default readline, so binding it steals
+    /// no shell input. Plain `a` still passes through, and the exact-
+    /// modifier rule keeps `Alt+Shift+A`/`Ctrl+Alt+A` for the PTY.
+    #[test]
+    fn alt_a_binds_in_both_tiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_action(KeyCode::Char('a'), ALT, tier, AppAction::AgentPanel);
+            // Case-insensitive like every letter binding.
+            assert_action(KeyCode::Char('A'), ALT, tier, AppAction::AgentPanel);
+            assert_pass(KeyCode::Char('a'), KeyModifiers::NONE, tier);
+            assert_pass(
+                KeyCode::Char('a'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                tier,
+            );
+            assert_pass(
+                KeyCode::Char('a'),
                 KeyModifiers::ALT | KeyModifiers::CONTROL,
                 tier,
             );

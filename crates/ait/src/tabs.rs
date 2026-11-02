@@ -30,16 +30,22 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ait_agent::AgentRequest;
+use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
     SessionEvent, Size, SpawnError,
 };
+use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::agent_panel::{context_for, edit_input, AgentPanel};
 use crate::blocks::{row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus};
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
+use crate::render::session_size;
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
+use crate::status::Toast;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
@@ -180,6 +186,16 @@ pub struct Tab {
     /// shell or a materialize failure.
     #[allow(dead_code)] // held for its Drop alone
     materialized: Option<ait_shell::Materialized>,
+    /// This tab's agent conversation panel (Spec R06 / issue #85):
+    /// `None` until the first `Alt+A` creates it — lazily, so a tab
+    /// that never opens the panel never pays for the worker thread.
+    /// One conversation at most, bound to this tab: the `Tab` drop
+    /// drops the `AgentSession` inside, which is what cancels and
+    /// joins the agent worker when the tab closes (standard 14 — the
+    /// conversation's identity IS the tab's; no pin needed). Same
+    /// `pub(crate)` seam as `scroll`/`shadow` — tests stage a panel;
+    /// production drives it through the `agent_*` methods.
+    pub(crate) agent: Option<AgentPanel>,
 }
 
 impl Tab {
@@ -472,6 +488,94 @@ impl Tab {
         !self.blocks.is_empty()
     }
 
+    /// `Alt+A` (Spec R06 / issue #85): open the panel focused on a tab
+    /// that never had one, refocus it when open but unfocused (the
+    /// user Esc'd back to the shell), or close it when focused. The
+    /// conversation — and any running task — survives a close; only
+    /// the split goes away. The caller re-derives this tab's winsize
+    /// through [`TabManager::resize_active`].
+    pub fn toggle_agent_panel(&mut self) {
+        match self.agent.as_mut() {
+            Some(panel) => panel.toggle(),
+            None => self.agent = Some(AgentPanel::new()),
+        }
+    }
+
+    /// Whether the split is open on this tab — drives the layout and
+    /// this tab's per-tab winsize derivation.
+    pub fn agent_panel_open(&self) -> bool {
+        self.agent.as_ref().is_some_and(AgentPanel::is_open)
+    }
+
+    /// Whether keystrokes route to the panel's input line — the
+    /// `suggestion_here`-style gate `app`'s pass-through arm checks
+    /// before PTY input (Spec R06: focused keys never reach the PTY).
+    pub fn agent_focused(&self) -> bool {
+        self.agent.as_ref().is_some_and(AgentPanel::is_focused)
+    }
+
+    /// The panel, if this tab owns one — the paint path reads it.
+    pub fn agent_panel(&self) -> Option<&AgentPanel> {
+        self.agent.as_ref()
+    }
+
+    /// One keystroke while the panel is focused (Spec R06): plain Esc
+    /// cancels a running task or — while idle — returns focus to the
+    /// terminal; Enter submits the input as a task, or queues it as a
+    /// steering message while one runs; chars and Backspace edit the
+    /// input line. Every other key is swallowed — focused keys never
+    /// reach the PTY, never update the input shadow, and never snap
+    /// the terminal's view.
+    pub fn agent_key(&mut self, key: &KeyEvent, settings: &Settings, toast: &mut Option<Toast>) {
+        if !self.agent_focused() {
+            return;
+        }
+        let panel = self.agent.as_mut().expect("focused implies a panel");
+        match key.code {
+            KeyCode::Esc if key.modifiers.is_empty() => panel.escape(),
+            // Any Enter submits — `Alt+Enter` already dispatched to the
+            // suggester upstream, so no chord collides here.
+            KeyCode::Enter => {
+                let text = panel.take_input().trim_end().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                if panel.is_running() {
+                    panel.steer(text, toast);
+                } else {
+                    let request = AgentRequest {
+                        settings: settings.clone(),
+                        task: text,
+                        context: context_for(self),
+                    };
+                    self.agent
+                        .as_mut()
+                        .expect("focused implies a panel")
+                        .submit(request, toast);
+                }
+            }
+            _ => {
+                edit_input(panel, key);
+            }
+        }
+    }
+
+    /// The wheel inside the panel's rect scrolls its conversation
+    /// rather than the terminal's scrollback.
+    pub fn agent_scroll_up(&mut self, lines: usize) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.scroll_up(lines);
+        }
+    }
+
+    /// The wheel's other half — landing back on the tail re-pins the
+    /// conversation's follow mode.
+    pub fn agent_scroll_down(&mut self, lines: usize) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.scroll_down(lines);
+        }
+    }
+
     /// Feed the grid's current scrollback depth into the bookkeeping
     /// that keeps mark/block absolute lines anchored, returning the
     /// depth read. Called once per drained event so a mark recorded
@@ -755,6 +859,7 @@ impl TabManager {
             scrollback_cap,
             inband: InBandExec::new(),
             materialized,
+            agent: None,
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -871,16 +976,34 @@ impl TabManager {
     }
 
     /// Forward a host resize to EVERY tab's session, not just the
-    /// visible one (Spec R02 user story 17), and remember the size for
-    /// tabs spawned later. Reflow invalidates the grid coordinates a
-    /// selection range points at, so every tab's highlight is cleared.
-    /// PTY-write failures on a just-dead child are tolerated — the
-    /// session's `Exited` event carries that state.
+    /// visible one (Spec R02 user story 17), and remember the band
+    /// size for tabs spawned later. Each session gets the size its own
+    /// layout implies — a tab with an open agent panel keeps its
+    /// split, so `size` is the CONTENT BAND and [`session_size`]
+    /// derives the per-tab winsize (Spec R06). Reflow invalidates the
+    /// grid coordinates a selection range points at, so every tab's
+    /// highlight is cleared. PTY-write failures on a just-dead child
+    /// are tolerated — the session's `Exited` event carries that
+    /// state.
     pub fn resize_all(&mut self, size: Size) {
         self.size = size;
         for tab in &mut self.tabs {
             tab.clear_selection();
-            let _ = tab.session.resize(size);
+            let _ = tab
+                .session
+                .resize(session_size(size, tab.agent_panel_open()));
+        }
+    }
+
+    /// Re-derive the ACTIVE tab's PTY winsize from the stored band
+    /// size — `Alt+A` opens or closes one tab's panel, so only its
+    /// session shrinks or restores through the same [`session_size`]
+    /// derivation [`resize_all`](Self::resize_all) applies.
+    pub fn resize_active(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let _ = tab
+                .session
+                .resize(session_size(self.size, tab.agent_panel_open()));
         }
     }
 
@@ -971,6 +1094,18 @@ impl TabManager {
             tab.on_output();
         }
         events
+    }
+
+    /// Drain every tab's agent session once (Spec R06): `AgentEvent`s
+    /// land in each tab's conversation on the same tick the PTY
+    /// sessions drain — a background tab's task keeps streaming too.
+    /// Panels that were never opened cost nothing.
+    pub fn drain_agent_events(&mut self) {
+        for tab in &mut self.tabs {
+            if let Some(panel) = tab.agent.as_mut() {
+                panel.drain();
+            }
+        }
     }
 }
 
@@ -2293,5 +2428,83 @@ mod tests {
             tab.blocks().iter().map(|b| b.range()).collect::<Vec<_>>()
         );
         assert_eq!(tab.select_block(), None, "no stale rows to select");
+    }
+
+    /// Spec R06 / issue #85: `Alt+A`'s toggle and a host resize share
+    /// the band→session derivation — opening shrinks only THIS tab's
+    /// session to the terminal side of the split, a resize keeps the
+    /// split proportional, and closing restores the whole band.
+    #[test]
+    fn agent_panel_toggle_and_resize_share_the_split_math() {
+        let mut manager = manager(1, "/tmp");
+
+        manager.active_mut().unwrap().toggle_agent_panel();
+        manager.resize_active();
+        assert_eq!(
+            manager.active().unwrap().session.size(),
+            Size::new(24, 10),
+            "open panel: two fifths of the 40-column band goes to the panel"
+        );
+
+        // A host resize re-derives the same tab's split — the panel
+        // keeps its share rather than restoring full width.
+        manager.resize_all(Size::new(80, 20));
+        assert_eq!(manager.active().unwrap().session.size(), Size::new(48, 20));
+
+        manager.active_mut().unwrap().toggle_agent_panel();
+        manager.resize_active();
+        assert_eq!(
+            manager.active().unwrap().session.size(),
+            Size::new(80, 20),
+            "closed panel: the session owns the band again"
+        );
+    }
+
+    /// Per-tab ownership: the split belongs to the tab, a fresh tab
+    /// takes the whole band, and dropping the owning tab drops the
+    /// `AgentSession` inside — cancelling and joining the worker even
+    /// with a task queued (the Drop contract, not a special case).
+    #[test]
+    fn panels_are_per_tab_and_drop_with_the_tab() {
+        let mut manager = manager(2, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        assert!(manager.active().unwrap().agent_panel_open());
+        // Queue real work so the worker is mid-task at close.
+        let mut toast = None;
+        manager
+            .active_mut()
+            .unwrap()
+            .agent
+            .as_mut()
+            .unwrap()
+            .submit(
+                ait_agent::AgentRequest {
+                    settings: ait_config::Settings::default(),
+                    task: "fix it".to_string(),
+                    context: ait_agent::AgentContext {
+                        cwd: "/tmp".into(),
+                        shell: "sh".into(),
+                        os: "test".into(),
+                        output_lines: Vec::new(),
+                    },
+                },
+                &mut toast,
+            );
+
+        manager.spawn_tab(sh()).unwrap();
+        assert!(
+            !manager.active().unwrap().agent_panel_open(),
+            "a fresh tab owns no panel"
+        );
+
+        assert!(manager.close_active(), "the spawned tab closes");
+        assert_eq!(manager.len(), 2);
+        assert!(
+            manager.active().unwrap().agent_panel_open(),
+            "the surviving tab kept its conversation"
+        );
+        // Closing THE owning tab drops the worker mid-task — Drop
+        // cancels and joins; nothing to observe but the clean return.
+        assert!(manager.close_active(), "the owning tab closes");
     }
 }
