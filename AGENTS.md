@@ -48,10 +48,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-All three must pass before any push. CI runs the same three, plus
-`scripts/check-dep-comments.py` — every `crates/*/Cargo.toml`
-dependency documents its resolved version + release date in a comment
-(ADR-0002 procedure, `docs/adr/0002`).
+All three must pass before any push. `scripts/check.sh` runs the
+whole CI gate locally in one command — CI runs the same three, plus
+`scripts/check-dep-comments.py` (every `crates/*/Cargo.toml`
+dependency documents its resolved version + release date in a comment,
+ADR-0002 procedure) and `scripts/check-src-hygiene.sh`.
 `rust-toolchain.toml` pins the exact toolchain CI reads it from — bump
 it deliberately, one line per release.
 
