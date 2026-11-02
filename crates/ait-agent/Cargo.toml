@@ -3,7 +3,7 @@ name = "ait-agent"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; the tool registry, agent loop and permission engine arrive in later tickets."
+description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; Round 6 adds the §5.6 AgentSession channel handle and chat loop; the tool registry and permission engine arrive in later tickets."
 
 [dependencies]
 # Semver requirements; the resolved releases are >=7 days old per the
@@ -37,3 +37,6 @@ ait-llm = { path = "../ait-llm" }
 # `test-fixtures` — `ait_llm::testing`, one shared harness for every
 # crate's tests.
 ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }
+# Release >=7 days old per ADR-0002: tempfile 3.27.0 (2026-03-11) —
+# fixture cwd trees with AGENTS.md files for the AgentSession tests.
+tempfile = "3"

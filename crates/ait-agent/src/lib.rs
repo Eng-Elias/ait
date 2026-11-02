@@ -17,15 +17,29 @@
 //!   tokio-free, ADR-0004), streaming already-sanitized command text
 //!   (user stories 20–23, 25).
 //!
-//! The tool registry, agent loop and permission engine build on these
-//! in later tickets.
+//! Round 6 adds the §5.6 agent mode on the same precedent:
+//!
+//! - [`AgentSession`] — the synchronous channel handle whose worker
+//!   runs the model loop: `coding_model` resolution (§4.2), system
+//!   prompt assembly (cwd/OS/shell, nearest `AGENTS.md`, redacted
+//!   output tail), streamed `TextDelta`s, cancellation, steering and
+//!   the [`STEP_BUDGET`] model-turn cap. Tools land in a later ticket.
+//!
+//! The tool registry, tool-call loop mechanics and permission engine
+//! build on these in later tickets.
 
+mod agent_context;
 mod context;
+mod conversation;
+mod endpoint_bridge;
 mod redact;
 mod sanitize;
+mod session;
 mod suggester;
 
+pub use agent_context::AgentContext;
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
 pub use redact::redact;
 pub use sanitize::{sanitize_reply, ReplySanitizer};
+pub use session::{AgentError, AgentEvent, AgentRequest, AgentSession, STEP_BUDGET};
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
