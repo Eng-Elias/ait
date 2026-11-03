@@ -47,7 +47,7 @@ end
 # controls; strip remaining C0/DEL bytes — a sanitized command beats an
 # invalid payload (the grid B→C slice stays the fallback source).
 function __ait_json_escape -a s
-    set s (string replace -a '\' '\\' -- "$s")
+    set s (string replace -a '\\' '\\\\' -- "$s")
     set s (string replace -a '"' '\"' -- "$s")
     set s (string replace -a \b '\b' -- "$s")
     set s (string replace -a \f '\f' -- "$s")
