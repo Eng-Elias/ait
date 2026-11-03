@@ -319,9 +319,9 @@ fn approve_runs_run_command_in_the_shell_and_leaves_the_trace() {
 /// the grid stays clean — and the denial text is the tool result the
 /// model reads on the next request. The card's `✗` status is the
 /// user-visible half; the captured request body is the model-visible
-/// half. `nope` is typed as the deny reason first — it deliberately
-/// avoids the `a`/`t`/`d` verdict keys, which resolve the card while
-/// it parks.
+/// half. `d` opens the card's denial-reason mode — the reason is
+/// typed there (where the verdict letters are ordinary input) and
+/// Enter sends the `Deny`.
 #[test]
 fn denied_call_never_reaches_the_shell_and_the_reason_reaches_the_model() {
     let fixture = Fixture::serve(vec![
@@ -345,8 +345,9 @@ fn denied_call_never_reaches_the_shell_and_the_reason_reaches_the_model() {
     app.wait_for_screen("the parked approve card", |app| {
         app.screen_text().contains("approve run_command")
     });
-    app.type_text("nope"); // the deny reason — no a/t/d verdict chars
-    app.type_text("d"); // deny with the input line as the reason
+    app.type_text("d"); // open the denial-reason mode
+    app.type_text("nope"); // the reason — verdict letters type like any other
+    app.press("Enter"); // deny with the typed reason
 
     app.wait_for_screen("the denied card and the task's done status", |app| {
         app.screen_text().contains('✗') && panel_has_line(app, "done")

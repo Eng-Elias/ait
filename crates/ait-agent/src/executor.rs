@@ -27,13 +27,19 @@
 //!   the `7701` response frames resolve invisibly into the merged
 //!   output + exact exit code.
 //! - **`MarksOnly`** (R06-T5, us-13) — the command is typed at the
-//!   prompt via [`ShellBridge::send_bytes`]; completion is the next
-//!   `OSC 133;D` mark on the [`subscribe`](ShellBridge::subscribe)
-//!   feed. Output is the grid rows between the `B` and `D` marks —
-//!   half-open: `D` lands on the *next* prompt's row — resolved
-//!   through [`ShellBridge::grid_lines`]; the exit code is `D`'s
-//!   payload, and a payload-free `D` reports "unknown" — never a
-//!   guess (us-15).
+//!   prompt via [`ShellBridge::send_bytes`]; completion is the first
+//!   `OSC 133;D` mark after type-in on the
+//!   [`subscribe`](ShellBridge::subscribe) feed. Real shells emit
+//!   their marks in precmd order `D,A,B` (ait-shell's rc snippets) —
+//!   the `B` that opened this prompt landed at prompt draw, before
+//!   the subscription existed — so the span's start is pinned on the
+//!   cursor's absolute line at send time
+//!   ([`ShellBridge::cursor_line`]) and re-opened by any `B`/`C`
+//!   that does arrive post-typing. Output is the grid rows from that
+//!   anchor to `D`'s row — half-open: `D` lands on the *next*
+//!   prompt's row — resolved through [`ShellBridge::grid_lines`];
+//!   the exit code is `D`'s payload, and a payload-free `D` reports
+//!   "unknown" — never a guess (us-15).
 //! - **`Absent`** (R06-T5, us-14) — the command is typed wrapped in a
 //!   sentinel: `cmd; printf '__AIT_END_<id>=%d\n' $?`. Completion and
 //!   the exit code are scanned out of [`ShellBridge::output_tail`];
@@ -45,11 +51,11 @@
 //! grid — the trace guarantee (us-16) — and both are *best effort
 //! against the user's own typing*: a mark or a sentinel line the user
 //! produced is indistinguishable from the run's own (risk §8.2, the
-//! race `__ait_run` already accepts invisibly). Torn marks — a `D`
-//! with no `B` before it — and a sentinel that never prints are
-//! bounded failures ([`ExecutorError::TypedTorn`] /
-//! [`ExecutorError::TypedTimedOut`]), never hangs, panics or guessed
-//! results.
+//! race `__ait_run` already accepts invisibly). A completion signal
+//! that never arrives — a `D` the shell never emits or a sentinel
+//! that never prints — is a bounded failure
+//! ([`ExecutorError::TypedTimedOut`]), never a hang, panic or
+//! guessed result.
 //!
 //! Cancellation rides the executor's own [`CancellationToken`] — the
 //! same token the session's Esc path cancels — so a `run` parked on a
@@ -218,6 +224,14 @@ pub trait ShellBridge: Send {
     /// accumulator; subscribers see them too.
     fn subscribe(&self) -> Result<Receiver<BridgeEvent>, BridgeError>;
 
+    /// The cursor's row in the same **absolute line space**
+    /// [`BridgeEvent::PromptMark::line`] reports — the `MarksOnly`
+    /// tier's send-time anchor (R06-T5): real shells emit their marks
+    /// in precmd order `D,A,B`, so the `B` that opened this prompt
+    /// landed before the tier subscribed and the run's start row is
+    /// pinned here instead, before typing.
+    fn cursor_line(&self) -> Result<usize, BridgeError>;
+
     /// Grid text for rows `start..end` in the **absolute line space**
     /// [`BridgeEvent::PromptMark::line`] reports — the `MarksOnly`
     /// tier's output-capture surface (R06-T5): `grid_lines(b, d)`
@@ -265,9 +279,10 @@ pub enum ExecutorError {
     /// us-13/14): a bounded failure, never a hang.
     TypedTimedOut,
     /// A typed tier's completion arrived torn — a `133;D` with no
-    /// `B` recorded before it — so no trustworthy output span exists.
-    /// An error the model reports, never a guessed result (us-15's
-    /// "never invent" rule extended to capture).
+    /// trustworthy output span behind it. Reserved vocabulary: the
+    /// shipped `MarksOnly` tier anchors its span on the send-time
+    /// cursor line, so a `D` with no `B` in front of it — the normal
+    /// precmd ordering — completes rather than tearing.
     TypedTorn,
     /// The shell bridge refused or failed — carries the bridge's own
     /// detail (`NotIntegrated`, `SessionExited`, `Gone`, `Write`).
@@ -398,39 +413,55 @@ impl UserShellExecutor {
     }
 
     /// The `MarksOnly` tier (us-13): type the command — it stays in
-    /// the user's grid (us-16) — then pair the next `B` and `D`
-    /// marks on the subscription feed. Output is the half-open row
-    /// span `B..D` read through [`ShellBridge::grid_lines`]; the exit
-    /// code is `D`'s payload, `None`/garbage reporting "unknown"
-    /// rather than a guess (us-15). A `D` with no `B` before it is
-    /// [`TypedTorn`](ExecutorError::TypedTorn); a `D` that never
-    /// comes is [`TypedTimedOut`](ExecutorError::TypedTimedOut). A
-    /// second `B` re-opens the span at the newer mark — the
-    /// `RunAccumulator` tear-and-restart rule applied to marks.
+    /// the user's grid (us-16) — then take the first `D` after
+    /// type-in as completion, its payload as the exit code
+    /// (`None`/garbage reporting "unknown" rather than a guess,
+    /// us-15). Output is the half-open row span `start..D` read
+    /// through [`ShellBridge::grid_lines`].
+    ///
+    /// The span's `start` CANNOT be a paired `133;B`: real shells
+    /// emit their marks in precmd order `D,A,B` (ait-shell's rc
+    /// snippets), so the `B` that opened this prompt landed at
+    /// prompt draw — before the subscription existed — and the
+    /// post-typing feed is `C,D,A,B`. The start is therefore pinned
+    /// at send time on the cursor's absolute line
+    /// ([`ShellBridge::cursor_line`]) and re-opened by any `B`/`C`
+    /// that does arrive post-typing — `C` lands on the output's own
+    /// first row, `B` on the command's — the `RunAccumulator`
+    /// tear-and-restart rule applied to marks. A `D` with no mark in
+    /// front of it is the NORMAL completion, never a torn one; a `D`
+    /// that never comes is [`TypedTimedOut`](ExecutorError::TypedTimedOut).
     fn run_marks_only(&self, command: &str) -> Result<CommandResult, ExecutorError> {
         let events = self.bridge.subscribe()?;
+        // Pinned BEFORE typing: the anchor a post-typing `B`/`C` may
+        // still tighten, and the whole span's start when none arrives.
+        let mut start = self.bridge.cursor_line()?;
         self.bridge.send_bytes(typed_line(command).as_slice())?;
-        let mut start: Option<usize> = None;
         let mut deadline = self.fresh_deadline();
         loop {
             if self.cancel.is_cancelled() {
                 return Err(ExecutorError::Cancelled);
             }
             match events.recv_timeout(RUN_POLL) {
+                // A `B` or `C` after type-in re-opens the span at the
+                // newer mark — `C` is the tighter anchor, landing on
+                // the output's own first row.
                 Ok(BridgeEvent::PromptMark {
-                    kind: 'B', line, ..
+                    kind: 'B' | 'C',
+                    line,
+                    ..
                 }) => {
-                    start = Some(line);
+                    start = line;
                     deadline = self.fresh_deadline();
                 }
+                // The first `D` after type-in is the completion —
+                // the precmd order means it normally arrives with no
+                // `B` in front of it.
                 Ok(BridgeEvent::PromptMark {
                     kind: 'D',
                     payload,
                     line,
                 }) => {
-                    let Some(start) = start else {
-                        return Err(ExecutorError::TypedTorn);
-                    };
                     return Ok(CommandResult {
                         output: self.mark_span_text(start, line)?,
                         exit_code: payload.as_deref().and_then(|code| code.parse::<i32>().ok()),
@@ -511,12 +542,12 @@ impl UserShellExecutor {
         Instant::now() + self.typed_timeout
     }
 
-    /// The text of the rows a `B…D` span covers — `grid_lines` in
-    /// the marks' absolute line space, joined with `'\n'` after each
-    /// row's grid-padding blanks are trimmed (the block copy's own
-    /// rule). A `D` on or before `B`'s row yields no rows — the empty
-    /// half-open range — which the half-open read reports as empty
-    /// output rather than inventing lines.
+    /// The text of the rows a `start..D` span covers — `grid_lines`
+    /// in the marks' absolute line space, joined with `'\n'` after
+    /// each row's grid-padding blanks are trimmed (the block copy's
+    /// own rule). A `D` on or before `start`'s row yields no rows —
+    /// the empty half-open range — which the half-open read reports
+    /// as empty output rather than inventing lines.
     fn mark_span_text(&self, start: usize, end: usize) -> Result<Vec<u8>, ExecutorError> {
         let start = i32::try_from(start).unwrap_or(i32::MAX);
         let end = i32::try_from(end).unwrap_or(i32::MAX);

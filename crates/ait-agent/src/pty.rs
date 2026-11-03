@@ -240,7 +240,11 @@ impl AgentPty {
     /// cores cannot depend on the frontend for it (§9). A `None` plan
     /// or a failed materialize spawns the shell plain: §5.5's degrade
     /// rule — the tool still works, the session just is not
-    /// `Integrated`.
+    /// `Integrated`. The degrade is intentional, never an error: a
+    /// `write_to_pty` refusal on an unsupported shell would make the
+    /// tool unusable there, and the spec's "always Integrated" speaks
+    /// to the deterministic-settle path — which the plain spawn still
+    /// satisfies through the [`QUIET_WINDOW`] settle.
     fn spawn(&mut self, cwd: &Path) -> Result<(), String> {
         let mut options = LiveSessionOptions {
             program: self.program.clone(),

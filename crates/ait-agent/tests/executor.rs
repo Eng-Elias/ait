@@ -11,13 +11,15 @@
 //!
 //! - `UserShellExecutor` on an `Integrated` session returns the
 //!   command's merged stdout+stderr and exit code (Spec R06 us-12);
-//! - `MarksOnly` sessions capture the grid rows between `133;B` and
-//!   `133;D` and read the exit code from D's payload — a
-//!   payload-free D reports "exit unknown" (us-13/15);
+//! - `MarksOnly` sessions complete on the first `133;D` after
+//!   type-in — the real precmd order `D,A,B` means no `B` precedes
+//!   it — and capture the rows from the send-time cursor anchor (or
+//!   a post-typing `B`/`C`) to D's row; D's payload is the exit
+//!   code — a payload-free D reports "exit unknown" (us-13/15);
 //! - `Absent` sessions type the sentinel wrap and scan the raw tail
 //!   for `__AIT_END_<id>=<code>` — output and exit code both come
 //!   from the sentinel (us-14);
-//! - torn/missing marks and a sentinel that never prints fail
+//! - a missing `D`, and a sentinel that never prints, fail
 //!   boundedly — never a hang, a panic, or a guessed exit code;
 //! - an exited or gone session is a clean error, never a hang
 //!   (us-34);
@@ -84,6 +86,10 @@ struct Shares {
     commands: Arc<Mutex<Vec<Vec<u8>>>>,
     /// The event senders `subscribe` installed.
     subscribers: Arc<Mutex<Vec<Sender<BridgeEvent>>>>,
+    /// The scripted cursor row in mark-line coordinates —
+    /// `cursor_line` answers it; the `MarksOnly` tier pins it as the
+    /// send-time anchor.
+    cursor: Arc<Mutex<usize>>,
     /// The scripted grid in mark-line coordinates — `grid_lines`
     /// slices it for the `MarksOnly` tier's capture.
     grid: Arc<Mutex<Vec<String>>>,
@@ -140,6 +146,12 @@ impl Shares {
             assert!(std::time::Instant::now() < deadline, "nothing was typed");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// The scripted cursor row — the send-time anchor `cursor_line`
+    /// reports.
+    fn set_cursor(&self, line: usize) {
+        *self.cursor.lock().expect("cursor lock") = line;
     }
 
     /// Append raw output to the scripted tail — the bytes the
@@ -209,6 +221,10 @@ impl ShellBridge for ScriptedBridge {
         let (tx, rx) = channel();
         self.shares.subscribers.lock().expect("subs lock").push(tx);
         Ok(rx)
+    }
+
+    fn cursor_line(&self) -> Result<usize, BridgeError> {
+        Ok(*self.shares.cursor.lock().expect("cursor lock"))
     }
 
     fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError> {
@@ -281,17 +297,26 @@ fn sentinel_marker(typed: &[u8]) -> Vec<u8> {
 }
 
 /// A `MarksOnly` run types the command at the prompt — visible in the
-/// grid (us-13, us-16) — completes on `133;D`, captures the grid rows
-/// between B and D as output, and reads the exit code from D's
-/// payload.
+/// grid (us-13, us-16) — completes on the first `133;D` after
+/// type-in, captures the grid rows from the span's anchor to D's
+/// row as output, and reads the exit code from D's payload.
+///
+/// The script drives the REAL mark order ait-shell's rc snippets
+/// produce: `D,A,B` at precmd means this prompt's `B` landed before
+/// the subscription existed, and the post-typing feed is
+/// `C,D,A,B` — the `C` (output start) re-opens the span the
+/// send-time cursor line had pinned.
 #[test]
-fn marks_only_run_captures_rows_between_marks() {
+fn marks_only_run_captures_rows_under_the_real_mark_order() {
     let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
     shares
         .grid
         .lock()
         .expect("grid lock")
         .extend((0..30).map(|i| format!("row {i}")));
+    // The prompt the command is typed on sits at absolute row 10 —
+    // its `B` was emitted before the executor subscribed.
+    shares.set_cursor(10);
     let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
 
     let driver = std::thread::spawn({
@@ -299,11 +324,16 @@ fn marks_only_run_captures_rows_between_marks() {
         move || {
             let events = shares.subscriber();
             let _typed = shares.next_typed();
-            // The typed command runs: B opens the block at line 10,
-            // D closes it at 14 carrying the exit code.
-            events.send(mark('B', None, 10)).expect("B");
+            // Real order after Enter: preexec's `C` on the output's
+            // first row, precmd's `D` (with the exit code) on the
+            // next prompt's row, then that prompt's `A`/`B`.
+            events.send(mark('C', None, 11)).expect("C");
             std::thread::sleep(Duration::from_millis(10));
             events.send(mark('D', Some("7"), 14)).expect("D");
+            // The next prompt's marks may already race the
+            // resolved run — the receiver can be gone.
+            let _ = events.send(mark('A', None, 14));
+            let _ = events.send(mark('B', None, 14));
         }
     });
 
@@ -313,8 +343,8 @@ fn marks_only_run_captures_rows_between_marks() {
     assert_eq!(result.exit_code, Some(7));
     assert_eq!(
         result.output,
-        b"row 10\nrow 11\nrow 12\nrow 13".to_vec(),
-        "output is the rows between B and D — D's own prompt row excluded"
+        b"row 11\nrow 12\nrow 13".to_vec(),
+        "output is the rows from C to D — D's own prompt row excluded"
     );
     assert_eq!(
         shares.sent(),
@@ -324,6 +354,77 @@ fn marks_only_run_captures_rows_between_marks() {
     assert!(
         shares.commands().is_empty(),
         "a typed tier never touches the in-band channel"
+    );
+}
+
+/// A `133;D` arriving with NO mark in front of it — the normal
+/// completion under the precmd `D,A,B` order when a shell emits no
+/// `C` — still resolves: the send-time cursor line is the span's
+/// start (us-13's bounded-failure rule never invents a span, it
+/// pins one).
+#[test]
+fn marks_only_d_without_a_prior_mark_completes() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..30).map(|i| format!("row {i}")));
+    shares.set_cursor(5);
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('D', Some("0"), 9)).expect("D");
+        }
+    });
+
+    let result = executor
+        .run("echo hi")
+        .expect("a mark-free D is the normal completion");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        result.output,
+        b"row 5\nrow 6\nrow 7\nrow 8".to_vec(),
+        "the send-time cursor line anchored the span"
+    );
+}
+
+/// Shells whose `B` DOES ride post-typing (a precmd order unlike
+/// ait-shell's): the mark re-opens the send-time anchor at its own
+/// row — the paired-`B` capture still works.
+#[test]
+fn marks_only_a_post_typing_b_reanchors_the_span() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..30).map(|i| format!("row {i}")));
+    shares.set_cursor(9); // the anchor the post-typing `B` replaces
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('D', Some("3"), 14)).expect("D");
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the run resolves");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(3));
+    assert_eq!(
+        result.output,
+        b"row 10\nrow 11\nrow 12\nrow 13".to_vec(),
+        "output is the rows between the post-typing B and D"
     );
 }
 
@@ -344,7 +445,7 @@ fn marks_only_payload_free_d_reports_exit_unknown() {
         move || {
             let events = shares.subscriber();
             let _typed = shares.next_typed();
-            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('C', None, 10)).expect("C");
             events.send(mark('D', None, 12)).expect("D");
         }
     });
@@ -367,7 +468,7 @@ fn marks_only_garbage_d_payload_is_exit_unknown() {
         move || {
             let events = shares.subscriber();
             let _typed = shares.next_typed();
-            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('C', None, 10)).expect("C");
             events.send(mark('D', Some("bogus"), 11)).expect("D");
         }
     });
@@ -377,31 +478,8 @@ fn marks_only_garbage_d_payload_is_exit_unknown() {
     assert_eq!(result.exit_code, None);
 }
 
-/// A `133;D` with no `B` before it is a torn completion — a bounded
-/// error, never a guessed span or a panic (us-13's failure shape).
-#[test]
-fn marks_only_d_without_b_is_a_bounded_error() {
-    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
-    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
-
-    let driver = std::thread::spawn({
-        let shares = shares.clone();
-        move || {
-            let events = shares.subscriber();
-            let _typed = shares.next_typed();
-            events.send(mark('D', Some("0"), 9)).expect("D");
-        }
-    });
-
-    let error = executor
-        .run("echo hi")
-        .expect_err("a torn completion errors");
-    driver.join().expect("driver");
-    assert!(matches!(error, ExecutorError::TypedTorn), "{error:?}");
-}
-
-/// A `B` that is never followed by `D` — the shell's marks stopped —
-/// fails inside the typed bound instead of hanging (us-13's "never a
+/// A `D` that never arrives — the shell's marks stopped — fails
+/// inside the typed bound instead of hanging (us-13's "never a
 /// hang" half).
 #[test]
 fn marks_only_missing_d_times_out_boundedly() {
@@ -417,7 +495,7 @@ fn marks_only_missing_d_times_out_boundedly() {
         move || {
             let events = shares.subscriber();
             let _typed = shares.next_typed();
-            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('C', None, 10)).expect("C");
         }
     });
 
@@ -430,7 +508,7 @@ fn marks_only_missing_d_times_out_boundedly() {
 
 /// A second `B` mid-run re-opens the capture at the newer mark — the
 /// `RunAccumulator` tear-and-restart rule applied to marks: D pairs
-/// with the latest B, never the stale one.
+/// with the latest mark, never the stale one.
 #[test]
 fn marks_only_second_b_restarts_the_span() {
     let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
@@ -447,7 +525,7 @@ fn marks_only_second_b_restarts_the_span() {
             let events = shares.subscriber();
             let _typed = shares.next_typed();
             events.send(mark('B', None, 10)).expect("B1");
-            events.send(mark('B', None, 12)).expect("B2");
+            events.send(mark('C', None, 12)).expect("C");
             events.send(mark('D', Some("0"), 15)).expect("D");
         }
     });
@@ -457,7 +535,7 @@ fn marks_only_second_b_restarts_the_span() {
     assert_eq!(
         result.output,
         b"row 12\nrow 13\nrow 14".to_vec(),
-        "the span re-opened at the second B"
+        "the span re-opened at the later mark"
     );
 }
 

@@ -65,6 +65,10 @@ impl ShellBridge for TabBridge {
         self.ask(BridgeRequest::Subscribe)
     }
 
+    fn cursor_line(&self) -> Result<usize, BridgeError> {
+        self.ask(BridgeRequest::CursorLine)
+    }
+
     fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError> {
         self.ask(|reply| BridgeRequest::GridLines { start, end, reply })
     }
@@ -119,6 +123,11 @@ pub(crate) enum BridgeRequest {
     /// `subscribe` — install an event sender; the reply carries the
     /// subscription's receiver.
     Subscribe(Sender<Receiver<BridgeEvent>>),
+    /// `cursor_line` — the cursor's absolute line right now: the
+    /// `MarksOnly` tier's send-time anchor, pinned because this
+    /// prompt's `B` was emitted before the tier subscribed (precmd
+    /// order `D,A,B`).
+    CursorLine(Sender<usize>),
     /// `grid_lines` — row text in the marks' absolute line space
     /// (`PromptMark::line`'s coordinates): the service subtracts
     /// `dropped_lines` and the live scrollback depth to land on

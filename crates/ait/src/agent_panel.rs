@@ -144,6 +144,11 @@ struct PendingApproval {
     call_id: String,
     /// Its tool name — the card's title.
     name: String,
+    /// Whether `d` switched the input row into denial-reason mode:
+    /// every key then edits the reason (verdict letters type like any
+    /// other) and Enter answers `Deny` — the reason can hold `a`/`t`/
+    /// `d` ("don't" is typable, Spec R06 us-8).
+    denying: bool,
 }
 
 /// The ask card's parked state — which call the worker waits on an
@@ -190,8 +195,9 @@ pub(crate) struct AgentPanel {
     /// submits while `false`; Esc cancels while `true` and unfocuses
     /// while `false`.
     running: bool,
-    /// The call the gate is parked on, if any — `a`/`t`/`d` answer it
-    /// ([`decide`](Self::decide)) and the approve card row renders
+    /// The call the gate is parked on, if any — `a`/`t`/`d` on an
+    /// empty input answer it or open its denial-reason mode
+    /// ([`decide`](Self::decide)), and the approve card row renders
     /// above the input line.
     pending: Option<PendingApproval>,
     /// The call the ask card is parked on, if any — ↑/↓ + Enter
@@ -268,6 +274,31 @@ impl AgentPanel {
     /// reserves its row.
     pub(crate) fn awaiting_verdict(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Whether the parked approve card is in denial-reason mode —
+    /// every key edits the input (verdict letters type like any
+    /// other) and Enter answers `Deny` (us-8). Set by `d` on an
+    /// empty input ([`begin_deny_reason`](Self::begin_deny_reason)).
+    pub(crate) fn deny_reason_active(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.denying)
+    }
+
+    /// `d` on the approve card with an empty input: the input row
+    /// becomes the denial-reason prompt — the verdict keys stop
+    /// firing so the reason itself can contain them.
+    pub(crate) fn begin_deny_reason(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.denying = true;
+            self.revision += 1;
+        }
+    }
+
+    /// Whether the input line is empty — the verdict keys only fire
+    /// on an empty buffer, so typed text can never be mistaken for a
+    /// verdict and a verdict never swallows a draft.
+    pub(crate) fn input_is_empty(&self) -> bool {
+        self.input.is_empty()
     }
 
     /// Whether an `ask_user_question` card waits on an answer — the
@@ -522,6 +553,7 @@ impl AgentPanel {
                 self.pending = Some(PendingApproval {
                     call_id: call.id,
                     name: call.name,
+                    denying: false,
                 });
             }
             AgentEvent::ToolCall { call, summary } => {
@@ -731,10 +763,11 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
         Style::default(),
     );
     let prompt_text = if let Some(pending) = &panel.pending {
-        Some(format!(
-            " approve {} — a: once · t: task · d: deny ",
-            pending.name
-        ))
+        Some(if pending.denying {
+            format!(" deny {} — type a reason · enter: deny ", pending.name)
+        } else {
+            format!(" approve {} — a: once · t: task · d: deny ", pending.name)
+        })
     } else if panel.pending_ask.is_some() {
         Some(if panel.ask_has_choices() {
             " ask — ↑/↓ choose · enter: answer ".to_string()
