@@ -362,6 +362,14 @@ impl Tab {
                     .expect("a queued request implies a service");
                 let _ = reply.send(receiver);
             }
+            BridgeRequest::CursorLine(reply) => {
+                // The cursor's row in `PromptMark::line`'s absolute
+                // space — `dropped + scrollback + viewport row`, the
+                // same arithmetic the drain's publish applies.
+                let line =
+                    self.dropped_lines + self.grid().scrollback() + self.session.cursor().line;
+                let _ = reply.send(line);
+            }
             BridgeRequest::GridLines { start, end, reply } => {
                 // `start`/`end` arrive in the marks' absolute line
                 // space (Spec R06-T5) — the space `PromptMark::line`
@@ -622,12 +630,18 @@ impl Tab {
     /// reach the PTY, never update the input shadow, and never snap
     /// the terminal's view.
     ///
-    /// While the gate is parked on an approve card, `a`/`t`/`d` are
-    /// the verdict keys (Spec R06's three options): *allow once*,
-    /// *allow this tool for the rest of the task*, *deny* — `d`
-    /// carries the input line's text as the denial reason when any
-    /// was typed (us-8's deny-reason-optional), and every other key
-    /// keeps editing normally.
+    /// While the gate is parked on an approve card, `a`/`t`/`d` on an
+    /// EMPTY input are the verdict keys (Spec R06's three options):
+    /// *allow once*, *allow this tool for the rest of the task*, and
+    /// *deny* — `d` does not fire a verdict, it opens the
+    /// denial-reason mode (us-8): every key then edits the input, so
+    /// the reason itself can hold `a`/`t`/`d` ("don't" is typable),
+    /// and Enter answers `Deny` — an empty reason still falls back to
+    /// the worker's default denial text. On a non-empty input the
+    /// same letters type like any other, and Enter with text while
+    /// parked still steers (never a verdict). Esc cancels the task
+    /// from either state — the gate's own escape (us-9), reason mode
+    /// included.
     ///
     /// While an `ask_user_question` card waits (us-10 — gate-exempt,
     /// its card IS the ask), a choices ask navigates with ↑/↓ and
@@ -659,8 +673,23 @@ impl Tab {
                     }
                 }
             }
+            // Denial-reason mode (us-8): EVERY key edits the reason —
+            // the verdict letters type like any other, so "don't" is
+            // typable — and Enter answers `Deny` with the input as
+            // the reason (an empty one falls back to the worker's
+            // default text). Esc above still cancels the task.
+            _ if panel.deny_reason_active() => match key.code {
+                KeyCode::Enter => {
+                    let reason = panel.take_input();
+                    panel.decide(ApprovalVerdict::Deny(reason), toast)
+                }
+                _ => {
+                    edit_input(panel, key);
+                }
+            },
             // Any Enter submits — `Alt+Enter` already dispatched to the
-            // suggester upstream, so no chord collides here.
+            // suggester upstream, so no chord collides here. A parked
+            // gate does not change this: Enter with text steers.
             KeyCode::Enter => {
                 let text = panel.take_input().trim_end().to_string();
                 if text.is_empty() {
@@ -669,36 +698,22 @@ impl Tab {
                 if panel.is_running() {
                     panel.steer(text, toast);
                 } else {
-                    let request = AgentRequest {
-                        settings: settings.clone(),
-                        task: text,
-                        context: context_for(self),
-                        // The task's shell binding (Spec R06-T4): a
-                        // fresh handle into this tab's bridge service
-                        // — `None` only if the panel exists without
-                        // one (a staged test tab), where `run_command`
-                        // answers a clean tool error.
-                        bridge: self
-                            .bridge
-                            .as_ref()
-                            .map(|service| Box::new(service.handle()) as _),
-                    };
-                    self.agent
-                        .as_mut()
-                        .expect("focused implies a panel")
-                        .submit(request, toast);
+                    self.submit_agent_task(settings, text, toast);
                 }
             }
+            // The parked approve card: `a`/`t` answer at once, `d`
+            // opens the denial-reason mode — all only on an EMPTY
+            // input, so a typed draft is never mistaken for a verdict
+            // and a verdict never swallows a draft.
             _ if panel.awaiting_verdict() => match key.code {
-                KeyCode::Char('a') if key.modifiers.is_empty() => {
+                KeyCode::Char('a') if key.modifiers.is_empty() && panel.input_is_empty() => {
                     panel.decide(ApprovalVerdict::AllowOnce, toast)
                 }
-                KeyCode::Char('t') if key.modifiers.is_empty() => {
+                KeyCode::Char('t') if key.modifiers.is_empty() && panel.input_is_empty() => {
                     panel.decide(ApprovalVerdict::AllowForTask, toast)
                 }
-                KeyCode::Char('d') if key.modifiers.is_empty() => {
-                    let reason = panel.take_input();
-                    panel.decide(ApprovalVerdict::Deny(reason), toast)
+                KeyCode::Char('d') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                    panel.begin_deny_reason()
                 }
                 _ => {
                     edit_input(panel, key);
@@ -707,6 +722,28 @@ impl Tab {
             _ => {
                 edit_input(panel, key);
             }
+        }
+    }
+
+    /// Submit `task` as a fresh [`AgentRequest`] on this tab's panel —
+    /// `agent_key`'s Enter arm while idle. Its own method because the
+    /// request's context and shell binding read `self` fields the
+    /// panel borrow can't overlap. `bridge` is a fresh handle into
+    /// this tab's bridge service (Spec R06-T4) — `None` only when the
+    /// panel exists without one (a staged test tab), where
+    /// `run_command` answers a clean tool error.
+    fn submit_agent_task(&mut self, settings: &Settings, task: String, toast: &mut Option<Toast>) {
+        let request = AgentRequest {
+            settings: settings.clone(),
+            task,
+            context: context_for(self),
+            bridge: self
+                .bridge
+                .as_ref()
+                .map(|service| Box::new(service.handle()) as _),
+        };
+        if let Some(panel) = self.agent.as_mut() {
+            panel.submit(request, toast);
         }
     }
 
@@ -2939,10 +2976,12 @@ mod tests {
     }
 
     /// The approve card's keys (Spec R06): while the gate is parked,
-    /// `a`/`t`/`d` send the verdict and clear the wait — `d` carries
-    /// the input line as the denial reason — while every other key
-    /// keeps editing the input. With no card pending the same letters
-    /// are ordinary input.
+    /// `a`/`t`/`d` on an EMPTY input are the verdict keys — `d`
+    /// opens the denial-reason mode rather than firing a verdict —
+    /// and the same letters type like any other once the input holds
+    /// text. In reason mode every key edits (a reason can contain
+    /// `a`/`t`/`d`) and Enter answers `Deny`. With no card pending
+    /// the letters are ordinary input.
     #[test]
     fn approve_card_keys_answer_the_gate() {
         use crossterm::event::KeyEvent as CtKeyEvent;
@@ -2969,27 +3008,61 @@ mod tests {
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
         assert!(toast.is_none());
 
-        // `d` answers deny — typed input becomes the reason.
-        let panel = tab.agent.as_mut().unwrap();
-        panel.apply(staged("call_2"));
-        panel.push_input('n');
-        panel.push_input('o');
+        // `d` on an empty input opens reason mode — the card stays
+        // parked and the reason can contain the verdict letters.
+        tab.agent.as_mut().unwrap().apply(staged("call_2"));
         tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(
+                panel.awaiting_verdict(),
+                "d opened the reason, not a verdict"
+            );
+            assert!(panel.deny_reason_active());
+        }
+        for c in "don't allow".chars() {
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+        }
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert_eq!(panel.input(), "don't allow", "every key edited the reason");
+            assert!(panel.awaiting_verdict(), "the card still waits");
+        }
+        // Enter answers `Deny` with the reason — the wait clears.
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_verdict());
+            assert_eq!(panel.input(), "", "the reason was consumed");
+        }
+
+        // `d` again — reason mode — and Enter on an EMPTY reason
+        // still denies (the worker substitutes its default text).
+        tab.agent.as_mut().unwrap().apply(staged("call_3"));
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
-        // `x` while parked is ordinary input, not a verdict — `a`
-        // still resolves the card (the input survives an allow).
-        tab.agent.as_mut().unwrap().apply(staged("call_3"));
+        // With input held, the same letters are ordinary editing —
+        // `a`/`d` type rather than verdict; the card stays parked
+        // until the input is emptied and `a` pressed again.
+        tab.agent.as_mut().unwrap().apply(staged("call_4"));
         tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
-        let panel = tab.agent.as_ref().unwrap();
-        assert!(panel.awaiting_verdict());
-        assert_eq!(panel.input(), "x");
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
         tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(panel.awaiting_verdict(), "non-empty input = editing");
+            assert_eq!(panel.input(), "xda");
+        }
+        tab.agent.as_mut().unwrap().take_input();
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
         // And with nothing pending, `d` edits the input like any
         // other character.
         tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
-        assert_eq!(tab.agent.as_ref().unwrap().input(), "xd");
+        assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
     }
 
     /// The ask card's keys (Spec R06 us-10 / issue #91): a choices

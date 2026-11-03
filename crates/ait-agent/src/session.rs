@@ -238,25 +238,16 @@ impl std::fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
-/// A gate wait's outcome — what the worker does next.
-enum GateOutcome {
-    /// The frontend sent a verdict for the awaited call.
-    Verdict(ApprovalVerdict),
+/// A parked wait's outcome — the approve card's verdict wait and
+/// the ask card's answer wait share one shape: what the worker does
+/// next once a reply lands (or never can).
+enum ReplyOutcome<T> {
+    /// The frontend sent a reply for the awaited call.
+    Replied(T),
     /// Esc: the cancellation token fired mid-wait.
     Cancelled,
-    /// The verdict channel closed — the handle is gone; reporting
+    /// The reply channel closed — the handle is gone; reporting
     /// anything is pointless.
-    Gone,
-}
-
-/// An ask wait's outcome — [`GateOutcome`]'s sibling for the
-/// `ask_user_question` card.
-enum AskOutcome {
-    /// The frontend sent the user's answer for the awaited call.
-    Answered(String),
-    /// Esc: the cancellation token fired mid-wait.
-    Cancelled,
-    /// The answer channel closed — the handle is gone.
     Gone,
 }
 
@@ -717,12 +708,12 @@ fn gate_and_execute(
         return None;
     }
     if needs_verdict {
-        match await_verdict(verdicts, &call.id, cancel) {
-            GateOutcome::Verdict(ApprovalVerdict::AllowOnce) => {}
-            GateOutcome::Verdict(ApprovalVerdict::AllowForTask) => {
+        match await_reply(verdicts, &call.id, cancel) {
+            ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {}
+            ReplyOutcome::Replied(ApprovalVerdict::AllowForTask) => {
                 allowed_for_task.insert(call.name.clone());
             }
-            GateOutcome::Verdict(ApprovalVerdict::Deny(mut reason)) => {
+            ReplyOutcome::Replied(ApprovalVerdict::Deny(mut reason)) => {
                 if reason.is_empty() {
                     reason = DEFAULT_DENIAL.to_string();
                 }
@@ -738,11 +729,11 @@ fn gate_and_execute(
                 // model reads it and picks a different approach.
                 return Some(reason);
             }
-            GateOutcome::Cancelled => {
+            ReplyOutcome::Cancelled => {
                 emit(events, AgentEvent::Cancelled);
                 return None;
             }
-            GateOutcome::Gone => return None,
+            ReplyOutcome::Gone => return None,
         }
         if !emit(
             events,
@@ -836,8 +827,8 @@ fn ask_and_answer(
     ) {
         return None;
     }
-    match await_answer(answers, &call.id, cancel) {
-        AskOutcome::Answered(answer) => {
+    match await_reply(answers, &call.id, cancel) {
+        ReplyOutcome::Replied(answer) => {
             emit(
                 events,
                 AgentEvent::ToolUpdate {
@@ -848,57 +839,36 @@ fn ask_and_answer(
             );
             Some(answer)
         }
-        AskOutcome::Cancelled => {
+        ReplyOutcome::Cancelled => {
             emit(events, AgentEvent::Cancelled);
             None
         }
-        AskOutcome::Gone => None,
+        ReplyOutcome::Gone => None,
     }
 }
 
-/// Park on the answer channel until the reply for `call_id` arrives —
-/// indefinitely, on the [`GATE_POLL`] cadence, exactly like
-/// [`await_verdict`]: answers addressed to other calls drop, Esc's
-/// cancellation token resolves the wait, and a closed channel means
-/// the handle is gone.
-fn await_answer(
-    answers: &Receiver<(String, String)>,
-    call_id: &str,
-    cancel: &CancellationToken,
-) -> AskOutcome {
-    loop {
-        if cancel.is_cancelled() {
-            return AskOutcome::Cancelled;
-        }
-        match answers.recv_timeout(GATE_POLL) {
-            Ok((id, answer)) if id == call_id => return AskOutcome::Answered(answer),
-            Ok(_) => continue,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return AskOutcome::Gone,
-        }
-    }
-}
-
-/// Park on the verdict channel until the answer for `call_id`
-/// arrives — indefinitely (us-9: no timeout into a default verdict).
+/// Park on a reply channel until the answer for `call_id` arrives —
+/// indefinitely (us-9: no timeout into a default verdict or answer).
 /// The [`GATE_POLL`] cadence exists only to notice the cancellation
-/// token (Esc resolves a gate wait too) and stale verdicts — answers
-/// to calls the loop is not waiting on — drop rather than deciding
-/// the wrong call.
-fn await_verdict(
-    verdicts: &Receiver<(String, ApprovalVerdict)>,
+/// token (Esc resolves a parked wait too) and stale replies —
+/// answers to calls the loop is not waiting on — drop rather than
+/// deciding the wrong call. One wait serves both cards: the
+/// verdicts and the ask answers ride identical `(call_id, reply)`
+/// channels.
+fn await_reply<T>(
+    replies: &Receiver<(String, T)>,
     call_id: &str,
     cancel: &CancellationToken,
-) -> GateOutcome {
+) -> ReplyOutcome<T> {
     loop {
         if cancel.is_cancelled() {
-            return GateOutcome::Cancelled;
+            return ReplyOutcome::Cancelled;
         }
-        match verdicts.recv_timeout(GATE_POLL) {
-            Ok((id, verdict)) if id == call_id => return GateOutcome::Verdict(verdict),
+        match replies.recv_timeout(GATE_POLL) {
+            Ok((id, reply)) if id == call_id => return ReplyOutcome::Replied(reply),
             Ok(_) => continue,
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return GateOutcome::Gone,
+            Err(RecvTimeoutError::Disconnected) => return ReplyOutcome::Gone,
         }
     }
 }

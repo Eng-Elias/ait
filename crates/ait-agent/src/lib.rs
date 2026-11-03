@@ -41,15 +41,18 @@
 //!   spawned [`ait_term::LiveSession`] injected through `ait-shell`'s
 //!   planner, driven write↔settle-read from the worker thread for
 //!   REPLs, `ssh`, `sudo` and installers.
-//! - the §5.9 [`CommandExecutor`] seam and its first tier:
-//!   [`UserShellExecutor`] runs `run_command` in the user's live
-//!   shell through the [`ShellBridge`] the frontend implements per
-//!   tab — `Integrated` sessions ride §5.5.1's in-band `__ait_run`
-//!   channel; the typed tiers land in R06-T5 (issue #87).
+//! - the §5.9 [`CommandExecutor`] seam and the
+//!   [`UserShellExecutor`]: `run_command` in the user's live shell
+//!   through the [`ShellBridge`] the frontend implements per tab —
+//!   `Integrated` sessions ride §5.5.1's in-band `__ait_run`
+//!   channel; `MarksOnly`/`Absent` type the command at the prompt
+//!   and detect completion from `133;D` or the `__AIT_END` sentinel
+//!   (R06-T5).
 
 mod agent_context;
 mod context;
 mod conversation;
+mod diff;
 mod endpoint_bridge;
 mod executor;
 mod files;

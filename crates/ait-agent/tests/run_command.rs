@@ -106,6 +106,9 @@ struct Shares {
     /// The event senders `subscribe` installed — the test feeds the
     /// typed tiers' `133` marks through them.
     subscribers: Arc<Mutex<Vec<Sender<BridgeEvent>>>>,
+    /// The scripted cursor row in mark-line coordinates —
+    /// `cursor_line` answers it; the send-time anchor.
+    cursor: Arc<Mutex<usize>>,
     /// The scripted grid in mark-line coordinates — `grid_lines`
     /// slices it for the `MarksOnly` capture.
     grid: Arc<Mutex<Vec<String>>>,
@@ -148,6 +151,10 @@ impl ShellBridge for ScriptedBridge {
         let (tx, rx) = channel();
         self.shares.subscribers.lock().expect("subs lock").push(tx);
         Ok(rx)
+    }
+
+    fn cursor_line(&self) -> Result<usize, BridgeError> {
+        Ok(*self.shares.cursor.lock().expect("cursor lock"))
     }
 
     fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError> {
@@ -291,7 +298,10 @@ fn run_command_gates_then_result_reenters_as_tool_item() {
 
     let (id, name, summary) = next_approval(&session);
     assert_eq!(name, "run_command");
-    assert_eq!(summary, "echo hi", "the card shows the command text");
+    assert_eq!(
+        summary, "\"echo hi\"",
+        "the card shows the would-be-typed line, quoted and escaped"
+    );
     // The gate is parked — and nothing has reached the shell.
     assert!(!reached(), "no request bytes before approval");
 
@@ -376,8 +386,9 @@ fn denied_run_command_never_reaches_the_shell() {
 
 /// A `MarksOnly` session (Spec R06-T5, us-13): the approve card
 /// still gates — NOTHING is typed while it parks — then the command
-/// is typed at the prompt, the `133;B`→`133;D` pair completes the
-/// run, and the captured grid rows plus D's exit payload re-enter as
+/// is typed at the prompt, the first `133;D` after type-in completes
+/// the run (the real precmd order `C,D,A,B` — no `B` precedes D),
+/// and the captured grid rows plus D's exit payload re-enter as
 /// the tool result. The in-band channel sees nothing.
 #[test]
 fn marks_only_session_types_and_resolves_on_marks() {
@@ -411,13 +422,16 @@ fn marks_only_session_types_and_resolves_on_marks() {
             assert!(std::time::Instant::now() < deadline, "never typed");
             std::thread::sleep(Duration::from_millis(2));
         }
+        // Real mark order after Enter: `C` (output start) re-opens
+        // the span the send-time cursor line pinned, `D` completes
+        // it, and the next prompt's `A`/`B` simply close the run out.
         events
             .send(BridgeEvent::PromptMark {
-                kind: 'B',
+                kind: 'C',
                 payload: None,
                 line: 5,
             })
-            .expect("B");
+            .expect("C");
         events
             .send(BridgeEvent::PromptMark {
                 kind: 'D',
@@ -425,6 +439,20 @@ fn marks_only_session_types_and_resolves_on_marks() {
                 line: 9,
             })
             .expect("D");
+        events
+            .send(BridgeEvent::PromptMark {
+                kind: 'A',
+                payload: None,
+                line: 9,
+            })
+            .expect("A");
+        events
+            .send(BridgeEvent::PromptMark {
+                kind: 'B',
+                payload: None,
+                line: 9,
+            })
+            .expect("B");
     };
 
     let fixture = Fixture::serve(vec![
@@ -516,12 +544,12 @@ fn no_bound_shell_is_a_clean_tool_error() {
     );
 }
 
-/// The `cwd` argument can't be honored by the user-shell tier — the
-/// run happens in the live shell's own cwd — so it is refused
-/// explicitly (the model adjusts with `cd`) rather than silently
-/// dropped.
+/// A command carrying a newline — extra lines that would
+/// self-execute on the typed tiers (CODING_STANDARDS §13) — is a
+/// tool error on every tier: nothing reaches the shell, and the
+/// model reads the single-line contract.
 #[test]
-fn cwd_argument_is_refused_as_a_tool_error() {
+fn a_multiline_command_is_a_tool_error_before_the_shell() {
     let bridge = ScriptedBridge {
         state: ShellIntegration::Integrated,
         shares: Shares::default(),
@@ -531,7 +559,7 @@ fn cwd_argument_is_refused_as_a_tool_error() {
     let fixture = Fixture::serve(vec![
         sse(&run_command_turn(
             "call_1",
-            r#"{"command":"ls","cwd":"/var"}"#,
+            r#"{"command":"echo a\nrm -rf /"}"#,
         )),
         sse(&chat_text_turn("ok")),
     ]);
@@ -556,11 +584,16 @@ fn cwd_argument_is_refused_as_a_tool_error() {
         )
     }));
     assert!(
-        shares.commands.lock().expect("commands lock").is_empty(),
+        shares.commands.lock().expect("commands lock").is_empty()
+            && shares.sent.lock().expect("sent lock").is_empty(),
         "a refused call reached the shell"
     );
 
     fixture.captured();
     let second = fixture.captured();
-    assert!(second.body.contains("cwd"), "{}", second.body);
+    assert!(
+        second.body.contains("single line"),
+        "the model reads the contract: {}",
+        second.body
+    );
 }

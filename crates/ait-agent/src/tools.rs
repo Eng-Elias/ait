@@ -6,14 +6,13 @@
 //!
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
-//! `write_to_pty`). Round 6 ships the file tools' executors in
-//! [`files`](crate::files), `write_to_pty`'s agent-owned PTY in
-//! [`pty`](crate::pty) (R06-T7) and `run_command`'s through the
-//! task's [`CommandExecutor`](crate::CommandExecutor) (R06-T4); the
-//! rest declare their specs now so the model sees the whole
-//! vocabulary, and [`execute`] answers them with a tool error — the
-//! drop-in point their tickets replace, not a stub the model has to
-//! special-case.
+//! `write_to_pty`). Every declared tool executes: the file tools
+//! live in [`files`](crate::files), `write_to_pty`'s agent-owned
+//! PTY in [`pty`](crate::pty) (R06-T7), `run_command` runs through
+//! the task's [`CommandExecutor`](crate::CommandExecutor) (R06-T4/T5)
+//! and `ask_user_question` answers on its own card channel (us-10)
+//! — [`execute`] is the dispatcher; an unknown name is the only
+//! tool error left.
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
@@ -64,10 +63,6 @@ fn registry() -> &'static [ToolSpec] {
                         "command": {
                             "type": "string",
                             "description": "The command line to run."
-                        },
-                        "cwd": {
-                            "type": "string",
-                            "description": "Directory to run in. Defaults to the working directory."
                         }
                     },
                     "required": ["command"],
@@ -306,8 +301,11 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
         "run_command" => args
             .get("command")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+            // Debug-quoted like `write_to_pty`'s input: the card
+            // shows the would-be-typed line with control bytes made
+            // visible — never raw bytes rendering invisibly.
+            .map(|command| format!("{command:?}"))
+            .unwrap_or_default(),
         "read_files" => args
             .get("paths")
             .and_then(|v| v.as_array())
@@ -381,8 +379,11 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 /// file tools never notice which tier is bound; `cancel` lets a
 /// tool's bounded waits — the PTY settle — end early on Esc. Every
 /// failure mode is a [`ToolOutput`] error: a tool error is model
-/// input, never a task failure. The tickets owning the remaining
-/// tools replace their arms here — the dispatch IS the drop-in seam.
+/// input, never a task failure. This arm IS the dispatcher: the
+/// `edit_files` arm only serves callers that arrive unplanned (the
+/// gate applies its own pre-rendered plan, us-22) and
+/// `ask_user_question` never reaches here (its card answers on the
+/// ask channel, us-10).
 pub(crate) fn execute(
     call: &ToolCall,
     cwd: &ToolCwd,
@@ -430,14 +431,16 @@ fn run_command(args: &serde_json::Value, executor: &mut dyn CommandExecutor) -> 
     if command.trim().is_empty() {
         return ToolOutput::error(String::from("run_command: `command` is empty"));
     }
-    // `cwd` rides the schema for tiers that can honor it (a remote
-    // daemon can; the user's live shell runs in its own cwd — R06-T4).
-    // Refused explicitly rather than silently dropped, so the model
-    // learns to express it inside `command` (`cd … && …`).
-    if args.get("cwd").and_then(|v| v.as_str()).is_some() {
+    // CODING_STANDARDS §13: the typed tiers write `command` to the
+    // user's PTY verbatim — a newline would self-execute the extra
+    // lines and control bytes would reach the terminal raw. A single
+    // line is the contract on EVERY tier (`__ait_run` types one line
+    // too), so the refusal lives at validation, before the executor
+    // ever sees the text.
+    if command.chars().any(char::is_control) {
         return ToolOutput::error(String::from(
-            "run_command: `cwd` is not supported when running in the user's live \
-             shell — express it in `command` instead (`cd <dir> && …`)",
+            "run_command: `command` must be a single line with no control \
+             characters — chain steps with `&&` or `;` instead",
         ));
     }
     match executor.run(command) {
@@ -516,7 +519,12 @@ mod tests {
         };
         assert_eq!(
             summarize_args(&call("run_command", r#"{"command": "cargo test"}"#)),
-            "cargo test"
+            "\"cargo test\"",
+            "the would-be-typed line renders quoted — escapes stay visible"
+        );
+        assert_eq!(
+            summarize_args(&call("run_command", r#"{"command": "echo a && rm -rf /"}"#)),
+            "\"echo a && rm -rf /\""
         );
         assert_eq!(
             summarize_args(&call("read_files", r#"{"paths": ["a.rs", "b.rs"]}"#)),
@@ -588,11 +596,10 @@ mod tests {
         }
     }
 
-    /// Dispatch: the shipped tools execute (an unbound shell turns
-    /// `run_command` into a clean tool error), the declared-but-
-    /// unbuilt ones and unknown names answer tool errors, bad JSON
-    /// errors — and `write_to_pty`'s argument check fails before
-    /// any PTY spawns (R06-T7's lazy rule).
+    /// Dispatch: every shipped tool executes (an unbound shell turns
+    /// `run_command` into a clean tool error), unknown names answer
+    /// tool errors, bad JSON errors — and `write_to_pty`'s argument
+    /// check fails before any PTY spawns (R06-T7's lazy rule).
     #[test]
     fn execute_dispatches_and_errors_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -691,6 +698,43 @@ mod tests {
             &cancel,
         );
         assert!(out.is_error && out.text.contains("not valid JSON"));
+    }
+
+    /// `run_command` rejects any command carrying control bytes
+    /// (CODING_STANDARDS §13): a `\n` would self-execute extra lines
+    /// on the typed tiers and `\r`/escape/control bytes would reach
+    /// the terminal raw. The refusal is a tool error on every tier —
+    /// never bytes typed at the user's shell.
+    #[test]
+    fn run_command_rejects_control_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let mut pty = AgentPty::new();
+        let cancel = CancellationToken::new();
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: "run_command".into(),
+            arguments: args.into(),
+        };
+        let mut executor = crate::executor::DetachedExecutor;
+
+        for command in ["echo a\nrm -rf /", "echo \r", "\x03", "\x1b[2J", "a\tb"] {
+            let out = execute(
+                &call(&format!(
+                    "{{\"command\": {}}}",
+                    serde_json::to_string(command).expect("json literal")
+                )),
+                &cwd,
+                &mut pty,
+                &mut executor,
+                &cancel,
+            );
+            assert!(
+                out.is_error && out.text.contains("single line"),
+                "{command:?}: {:?}",
+                out.text
+            );
+        }
     }
 
     /// `run_command`'s result rendering: merged output first, then
