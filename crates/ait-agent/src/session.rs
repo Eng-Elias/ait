@@ -646,6 +646,7 @@ async fn run_loop(
 /// tool result carries — the executor's (redacted) output, or the
 /// denial text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
+#[allow(clippy::too_many_arguments)]
 fn gate_and_execute(
     call: &ToolCall,
     allowed_for_task: &mut HashSet<String>,
