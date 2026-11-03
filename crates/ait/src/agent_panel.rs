@@ -817,8 +817,11 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
 
 /// A tool card's display blocks (Spec R06 us-5): a status-marked
 /// header — `✓` done, `…` running, `?` awaiting approval, `✗` denied,
-/// `!` failed — then the detail (result preview, error or denial
-/// text) indented and dimmed when the update carried one.
+/// `!` failed — carrying `name summary` inline; a multi-line summary
+/// (`edit_files`' diff, us-22) instead explodes into one styled row
+/// per line under a name-only header. The detail (result preview,
+/// error or denial text) follows indented and dimmed when the
+/// update carried one.
 fn tool_card_lines(card: &ToolCard) -> Vec<(String, Style)> {
     let (mark, style) = match card.status {
         CardStatus::AwaitingApproval => (
@@ -832,12 +835,26 @@ fn tool_card_lines(card: &ToolCard) -> Vec<(String, Style)> {
         CardStatus::Denied => ("✗", Style::default().fg(RtColor::DarkGray)),
         CardStatus::Failed => ("!", Style::default().fg(RtColor::Red)),
     };
-    let summary = if card.summary.is_empty() {
-        card.name.clone()
+    let mut lines = Vec::new();
+    if card.summary.contains('\n') {
+        // A multi-line summary — `edit_files`' unified diff
+        // (Spec R06 us-22): the header carries the name alone and
+        // each diff line paints its own row so `+`/`-` color as
+        // additions/deletions instead of wrapping as one blob.
+        lines.push((format!("{mark} {}", card.name), style));
+        lines.extend(
+            card.summary
+                .lines()
+                .map(|line| (format!("  {line}"), diff_line_style(line))),
+        );
     } else {
-        format!("{} {}", card.name, card.summary)
-    };
-    let mut lines = vec![(format!("{mark} {summary}"), style)];
+        let summary = if card.summary.is_empty() {
+            card.name.clone()
+        } else {
+            format!("{} {}", card.name, card.summary)
+        };
+        lines.push((format!("{mark} {summary}"), style));
+    }
     if let Some(detail) = &card.detail {
         lines.push((
             format!("    {detail}"),
@@ -882,6 +899,26 @@ fn ask_card_lines(card: &AskCard) -> Vec<(String, Style)> {
             }
             lines
         }
+    }
+}
+
+/// Per-line styling for a unified-diff summary: `+` green, `-` red,
+/// `@@` cyan, the `\ No newline` marker dimmed. `---`/`+++` file
+/// headers stay dim rather than deletion-red/addition-green —
+/// they label files, not churn.
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("---") || line.starts_with("+++") {
+        Style::default().fg(RtColor::DarkGray)
+    } else if line.starts_with('+') {
+        Style::default().fg(RtColor::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(RtColor::Red)
+    } else if line.starts_with('@') {
+        Style::default().fg(RtColor::Cyan)
+    } else if line.starts_with('\\') {
+        Style::default().fg(RtColor::DarkGray)
+    } else {
+        Style::default()
     }
 }
 
@@ -1524,5 +1561,65 @@ mod tests {
             !input_row_above.contains("approve"),
             "the row released: {input_row_above:?}"
         );
+    }
+
+    /// An `edit_files` approve card renders its multi-line unified
+    /// diff one styled row per line — `+` green, `-` red, `@@` cyan,
+    /// file headers dim — under a name-only header (us-22).
+    #[test]
+    fn edit_files_card_renders_its_diff_per_line() {
+        let summary = "--- a/note.txt\n+++ b/note.txt\n@@ -1,2 +1,2 @@\n old\n-gone\n+new\n\\ No newline at end of file";
+        let card = ToolCard {
+            id: "call_1".into(),
+            name: "edit_files".into(),
+            summary: summary.into(),
+            status: CardStatus::AwaitingApproval,
+            detail: None,
+        };
+        let lines = tool_card_lines(&card);
+        assert_eq!(lines[0].0, "? edit_files");
+        // Each diff line is its own display row with its own style.
+        let rows: Vec<&str> = lines[1..].iter().map(|(t, _)| t.trim_start()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "--- a/note.txt",
+                "+++ b/note.txt",
+                "@@ -1,2 +1,2 @@",
+                "old",
+                "-gone",
+                "+new",
+                "\\ No newline at end of file"
+            ]
+        );
+        assert_eq!(
+            lines[3].1,
+            Style::default().fg(RtColor::Cyan),
+            "the @@ header"
+        );
+        assert_eq!(lines[5].1, Style::default().fg(RtColor::Red), "a - line");
+        assert_eq!(lines[6].1, Style::default().fg(RtColor::Green), "a + line");
+        assert_eq!(
+            lines[1].1,
+            Style::default().fg(RtColor::DarkGray),
+            "--- stays dim, not deletion-red"
+        );
+
+        // …and the painted card shows the diff rows verbatim.
+        let mut panel = panel();
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: call("call_1", "edit_files"),
+            summary: summary.into(),
+        });
+        // Twelve rows fit title + 8 card lines + approve row + input.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 40, 12), &panel);
+        let row: String = (1..40).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(row.trim_end(), "? edit_files");
+        let row: String = (1..40).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        assert_eq!(row.trim_end(), "  --- a/note.txt");
+        let row: String = (1..40).map(|x| buf[(x, 7)].symbol().to_string()).collect();
+        assert_eq!(row.trim_end(), "  +new");
+        assert_eq!(buf[(3, 7)].fg, RtColor::Green);
     }
 }

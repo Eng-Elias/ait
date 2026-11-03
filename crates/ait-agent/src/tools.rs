@@ -6,7 +6,7 @@
 //!
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
-//! `write_to_pty`). Round 6 ships the three read tools' executors in
+//! `write_to_pty`). Round 6 ships the file tools' executors in
 //! [`files`](crate::files); the rest declare their specs now so the
 //! model sees the whole vocabulary, and [`execute`] answers them
 //! with a tool error — the drop-in point their tickets replace, not
@@ -14,12 +14,15 @@
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
+//! `edit_files` goes further: [`plan_edit`] computes the call's
+//! [`EditPlan`] before the card so the unified diff the user
+//! approves IS the write that lands (us-22).
 
 use std::sync::LazyLock;
 
 use ait_llm::{anthropic_messages, openai_chat_completions, openai_responses, EndpointSchema};
 
-use crate::files::{ToolCwd, ToolOutput};
+use crate::files::{EditPlan, ToolCwd, ToolOutput};
 use crate::tool_call::ToolCall;
 
 /// The `ask_user_question` tool's registry name — [`gate_exempt`]
@@ -350,6 +353,19 @@ fn compact(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::from("{…}"))
 }
 
+/// `edit_files`' gate preparation (Spec R06 us-22/23): parse the
+/// arguments and plan the call against `cwd`. The plan's unified
+/// diff is the approve card's summary and the plan itself is what
+/// an allow verdict applies — planning once keeps the rendered
+/// diff byte-for-byte the applied change. A planning failure is a
+/// `String` the gate renders on the card AND replays as the tool
+/// result so the model reads why.
+pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments)
+        .map_err(|error| format!("edit_files: arguments are not valid JSON: {error}"))?;
+    cwd.plan_edits(&args)
+}
+
 /// Run `call` against `cwd` — the sequential executor the loop
 /// calls after the gate (or directly, for gate-exempt calls). Every
 /// failure mode is a [`ToolOutput`] error: a tool error is model
@@ -369,7 +385,8 @@ pub(crate) fn execute(call: &ToolCall, cwd: &ToolCwd) -> ToolOutput {
         "read_files" => cwd.read_files(&args),
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
-        "run_command" | "edit_files" | "write_to_pty" => ToolOutput::error(format!(
+        "edit_files" => cwd.edit_files(&args),
+        "run_command" | "write_to_pty" => ToolOutput::error(format!(
             "{} is not available yet — its executor lands in a later ticket",
             call.name
         )),
@@ -521,7 +538,16 @@ mod tests {
         let out = execute(&call("glob", r#"{"pattern": "*.rs"}"#), &cwd);
         assert!(!out.is_error);
 
-        for name in ["run_command", "edit_files", "write_to_pty"] {
+        // edit_files dispatches now — `{}` is a well-formed call
+        // with bad arguments, which is a tool error, not a stub.
+        let out = execute(&call("edit_files", "{}"), &cwd);
+        assert!(
+            out.is_error && out.text.contains("`files`"),
+            "{:?}",
+            out.text
+        );
+
+        for name in ["run_command", "write_to_pty"] {
             let out = execute(&call(name, "{}"), &cwd);
             assert!(
                 out.is_error && out.text.contains("not available yet"),

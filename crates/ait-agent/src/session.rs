@@ -73,7 +73,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext};
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
-use crate::files::ToolCwd;
+use crate::files::{ToolCwd, ToolOutput};
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
@@ -156,11 +156,12 @@ pub enum AgentEvent {
     /// frontend answers [`AgentSession::approve`] with an
     /// [`ApprovalVerdict`] for `call.id`. The panel renders the
     /// approve card — `summary` is the renderable argument summary
-    /// (command text, file paths; us-5).
+    /// (command text, file paths, the `edit_files` diff; us-5/22).
     ApprovalRequest {
         /// The complete call awaiting a verdict.
         call: ToolCall,
-        /// The call's renderable argument summary.
+        /// The call's renderable argument summary (command text,
+        /// file paths — the `edit_files` unified diff, us-22).
         summary: String,
     },
     /// A call began executing without a gate wait — an
@@ -648,7 +649,24 @@ fn gate_and_execute(
     if call.name == tools::ASK_USER_QUESTION {
         return ask_and_answer(call, answers, cancel, events);
     }
-    let summary = tools::summarize_args(call);
+    // `edit_files` plans BEFORE the card (Spec R06 us-22/23): the
+    // plan's unified diff is the summary the user approves, and the
+    // same plan is what an allow verdict writes — the rendered diff
+    // is byte-for-byte the applied change. A planning error still
+    // rides the card (the paths plus why) and replays as the tool
+    // result so the model reads what went wrong.
+    let plan = match call.name.as_str() {
+        "edit_files" => Some(tools::plan_edit(call, cwd)),
+        _ => None,
+    };
+    let summary = match &plan {
+        Some(Ok(plan)) => plan.summary(),
+        Some(Err(error)) => match tools::summarize_args(call).as_str() {
+            "" => format!("edit_files: {error}"),
+            paths => format!("{paths}\nedit_files: {error}"),
+        },
+        None => tools::summarize_args(call),
+    };
     let needs_verdict = !tools::gate_exempt(&call.name) && !allowed_for_task.contains(&call.name);
     let event = if needs_verdict {
         AgentEvent::ApprovalRequest {
@@ -703,7 +721,13 @@ fn gate_and_execute(
             return None;
         }
     }
-    let output = tools::execute(call, cwd);
+    // Apply the plan the card showed (edit_files); every other call
+    // dispatches through the executor.
+    let output = match plan {
+        Some(Ok(plan)) => plan.apply(),
+        Some(Err(error)) => ToolOutput::error(error),
+        None => tools::execute(call, cwd),
+    };
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
     // preview comes from the same redacted text.
