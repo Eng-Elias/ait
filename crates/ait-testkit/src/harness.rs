@@ -163,6 +163,13 @@ impl E2e {
                 OsString::from("XDG_CONFIG_HOME"),
                 cwd.path().join("xdg-config").into_os_string(),
             ),
+            // Debian-family global zshrcs run `compinit` unless this
+            // is set — and `compinit` parks interactively on
+            // "insecure directories" when the host's fpath holds
+            // group/other-writable entries (CI runners). A parked
+            // shell never draws a prompt, so integration tests time
+            // out for an environment reason, not a product one.
+            (OsString::from("skip_global_compinit"), OsString::from("1")),
         ];
         env.extend(config.env);
         let session = LiveSession::spawn(LiveSessionOptions {
