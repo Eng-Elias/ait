@@ -70,7 +70,7 @@ pub(crate) struct ToolOutput {
 
 impl ToolOutput {
     /// A successful result.
-    fn ok(text: String) -> Self {
+    pub(crate) fn ok(text: String) -> Self {
         Self {
             text,
             is_error: false,
@@ -102,6 +102,12 @@ impl ToolCwd {
         let path = Path::new(cwd);
         let root = fs::canonicalize(path).unwrap_or_else(|_| normalize(path));
         Self { root }
+    }
+
+    /// The bound working directory — the directory `write_to_pty`
+    /// spawns the agent's interactive session in (R06-T7).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     /// `read_files` — read each of the arguments' `paths`, with the

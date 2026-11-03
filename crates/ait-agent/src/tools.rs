@@ -7,8 +7,9 @@
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
 //! `write_to_pty`). Round 6 ships the file tools' executors in
-//! [`files`](crate::files); the rest declare their specs now so the
-//! model sees the whole vocabulary, and [`execute`] answers them
+//! [`files`](crate::files) and `write_to_pty`'s agent-owned PTY in
+//! [`pty`](crate::pty) (R06-T7); the rest declare their specs now so
+//! the model sees the whole vocabulary, and [`execute`] answers them
 //! with a tool error — the drop-in point their tickets replace, not
 //! a stub the model has to special-case.
 //!
@@ -22,7 +23,10 @@ use std::sync::LazyLock;
 
 use ait_llm::{anthropic_messages, openai_chat_completions, openai_responses, EndpointSchema};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::files::{EditPlan, ToolCwd, ToolOutput};
+use crate::pty::AgentPty;
 use crate::tool_call::ToolCall;
 
 /// The `ask_user_question` tool's registry name — [`gate_exempt`]
@@ -367,11 +371,19 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 }
 
 /// Run `call` against `cwd` — the sequential executor the loop
-/// calls after the gate (or directly, for gate-exempt calls). Every
-/// failure mode is a [`ToolOutput`] error: a tool error is model
-/// input, never a task failure. The tickets owning the remaining
-/// tools replace their arms here — the dispatch IS the drop-in seam.
-pub(crate) fn execute(call: &ToolCall, cwd: &ToolCwd) -> ToolOutput {
+/// calls after the gate (or directly, for gate-exempt calls). `pty`
+/// is the worker's lazily-spawned agent PTY (`write_to_pty`'s
+/// drop-in seam, R06-T7); `cancel` lets a tool's bounded waits —
+/// the PTY settle — end early on Esc. Every failure mode is a
+/// [`ToolOutput`] error: a tool error is model input, never a task
+/// failure. The tickets owning the remaining tools replace their
+/// arms here — the dispatch IS the drop-in seam.
+pub(crate) fn execute(
+    call: &ToolCall,
+    cwd: &ToolCwd,
+    pty: &mut AgentPty,
+    cancel: &CancellationToken,
+) -> ToolOutput {
     let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
         Ok(args) => args,
         Err(error) => {
@@ -386,7 +398,8 @@ pub(crate) fn execute(call: &ToolCall, cwd: &ToolCwd) -> ToolOutput {
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
         "edit_files" => cwd.edit_files(&args),
-        "run_command" | "write_to_pty" => ToolOutput::error(format!(
+        "write_to_pty" => pty.write(&args, cwd.root(), cancel),
+        "run_command" => ToolOutput::error(format!(
             "{} is not available yet — its executor lands in a later ticket",
             call.name
         )),
@@ -524,43 +537,58 @@ mod tests {
     }
 
     /// Dispatch: the shipped tools execute, the declared-but-unbuilt
-    /// ones and unknown names answer tool errors, bad JSON errors.
+    /// ones and unknown names answer tool errors, bad JSON errors —
+    /// and `write_to_pty`'s argument check fails before any PTY
+    /// spawns (R06-T7's lazy rule).
     #[test]
     fn execute_dispatches_and_errors_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let mut pty = AgentPty::new();
+        let cancel = CancellationToken::new();
         let call = |name: &str, args: &str| ToolCall {
             id: String::new(),
             name: name.into(),
             arguments: args.into(),
         };
 
-        let out = execute(&call("glob", r#"{"pattern": "*.rs"}"#), &cwd);
+        let out = execute(
+            &call("glob", r#"{"pattern": "*.rs"}"#),
+            &cwd,
+            &mut pty,
+            &cancel,
+        );
         assert!(!out.is_error);
 
         // edit_files dispatches now — `{}` is a well-formed call
         // with bad arguments, which is a tool error, not a stub.
-        let out = execute(&call("edit_files", "{}"), &cwd);
+        let out = execute(&call("edit_files", "{}"), &cwd, &mut pty, &cancel);
         assert!(
             out.is_error && out.text.contains("`files`"),
             "{:?}",
             out.text
         );
 
-        for name in ["run_command", "write_to_pty"] {
-            let out = execute(&call(name, "{}"), &cwd);
-            assert!(
-                out.is_error && out.text.contains("not available yet"),
-                "{name}"
-            );
-        }
+        let out = execute(&call("run_command", "{}"), &cwd, &mut pty, &cancel);
+        assert!(
+            out.is_error && out.text.contains("not available yet"),
+            "{:?}",
+            out.text
+        );
+        let out = execute(&call("write_to_pty", "{}"), &cwd, &mut pty, &cancel);
+        assert!(out.is_error && out.text.contains("input"), "{:?}", out.text);
         // `ask_user_question` answers on the ask channel — `execute`
         // is never its path, but errors cleanly if reached.
-        let out = execute(&call(ASK_USER_QUESTION, "{}"), &cwd);
+        let out = execute(&call(ASK_USER_QUESTION, "{}"), &cwd, &mut pty, &cancel);
         assert!(out.is_error && out.text.contains("ask card"));
-        let out = execute(&call("definitely_not_a_tool", "{}"), &cwd);
+        let out = execute(
+            &call("definitely_not_a_tool", "{}"),
+            &cwd,
+            &mut pty,
+            &cancel,
+        );
         assert!(out.is_error && out.text.contains("unknown tool"));
-        let out = execute(&call("read_files", "{oops"), &cwd);
+        let out = execute(&call("read_files", "{oops"), &cwd, &mut pty, &cancel);
         assert!(out.is_error && out.text.contains("not valid JSON"));
     }
 }

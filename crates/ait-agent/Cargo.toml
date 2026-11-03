@@ -34,6 +34,16 @@ ait-config = { path = "../ait-config", features = ["secrets"] }
 # schema-matched IR `Endpoint::stream` accepts — so T3's
 # `CommandSuggester` passes assembled requests through unchanged.
 ait-llm = { path = "../ait-llm" }
+# `write_to_pty`'s agent-owned PTY: `LiveSession::spawn` +
+# `send_bytes`/`drain_events` on the worker thread (Spec R06-T7; a
+# core→core edge is permitted — cores never depend on the frontend).
+ait-term = { path = "../ait-term" }
+# The injection planner the agent PTY spawns through: `plan` +
+# `Materialized`'s argv/env rewrite so the interactive session comes
+# up `Integrated` on supported shells (Spec R06-T7; the same rewrite
+# `ait::integration::inject` applies — cores can't call the
+# frontend's copy).
+ait-shell = { path = "../ait-shell" }
 
 [dev-dependencies]
 # The in-process HTTP fixture server for the CommandSuggester

@@ -74,6 +74,7 @@ use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext}
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
 use crate::files::{ToolCwd, ToolOutput};
+use crate::pty::AgentPty;
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
@@ -448,6 +449,13 @@ fn worker(
             return;
         }
     };
+    // The agent-owned PTY `write_to_pty` drives (Spec R06-T7): lazy —
+    // nothing spawns until a call reaches it — and shared across this
+    // conversation's tasks so an interactive session outlives the task
+    // that opened it. It drops when the worker exits, which is what
+    // makes a closing tab kill the spawned child: `AgentSession`'s
+    // Drop closes these channels and joins this thread.
+    let mut agent_pty = AgentPty::new();
     while let Ok(request) = requests.recv() {
         serve(
             &runtime,
@@ -458,6 +466,7 @@ fn worker(
             &events,
             &in_flight,
             store.as_ref(),
+            &mut agent_pty,
         );
     }
 }
@@ -476,6 +485,7 @@ fn serve(
     events: &Sender<AgentEvent>,
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
+    agent_pty: &mut AgentPty,
 ) {
     // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
     // store's `&dyn` reference flows straight through.
@@ -537,6 +547,7 @@ fn serve(
         verdicts,
         answers,
         &cwd,
+        agent_pty,
         token,
         events,
     ));
@@ -559,6 +570,7 @@ async fn run_loop(
     verdicts: &Receiver<(String, ApprovalVerdict)>,
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
+    agent_pty: &mut AgentPty,
     cancel: CancellationToken,
     events: &Sender<AgentEvent>,
 ) {
@@ -603,6 +615,7 @@ async fn run_loop(
                         verdicts,
                         answers,
                         cwd,
+                        agent_pty,
                         &cancel,
                         events,
                     ) {
@@ -634,12 +647,14 @@ async fn run_loop(
 /// tool result carries — the executor's (redacted) output, or the
 /// denial text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
+#[allow(clippy::too_many_arguments)]
 fn gate_and_execute(
     call: &ToolCall,
     allowed_for_task: &mut HashSet<String>,
     verdicts: &Receiver<(String, ApprovalVerdict)>,
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
+    agent_pty: &mut AgentPty,
     cancel: &CancellationToken,
     events: &Sender<AgentEvent>,
 ) -> Option<String> {
@@ -726,7 +741,7 @@ fn gate_and_execute(
     let output = match plan {
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
-        None => tools::execute(call, cwd),
+        None => tools::execute(call, cwd, agent_pty, cancel),
     };
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
@@ -741,7 +756,7 @@ fn gate_and_execute(
             } else {
                 ToolStatus::Done
             },
-            detail: Some(preview(&text)),
+            detail: Some(card_detail(&call.name, &text)),
         },
     );
     Some(text)
@@ -859,6 +874,38 @@ fn await_verdict(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return GateOutcome::Gone,
         }
+    }
+}
+
+/// A card's `detail` per tool: `write_to_pty` previews the output
+/// *tail* — its header already shows the bytes sent, so the card
+/// reads input → latest output (Spec R06 us-20). Everything else
+/// previews the first line.
+fn card_detail(name: &str, text: &str) -> String {
+    if name == "write_to_pty" {
+        tail_preview(text)
+    } else {
+        preview(text)
+    }
+}
+
+/// The last non-empty line of `text`, clipped to the preview width
+/// from the tail — `write_to_pty`'s card detail.
+fn tail_preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 120;
+    let last = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    if last.chars().count() > PREVIEW_CHARS {
+        let tail: String = last
+            .chars()
+            .skip(last.chars().count() - PREVIEW_CHARS)
+            .collect();
+        format!("…{tail}")
+    } else {
+        last.to_string()
     }
 }
 

@@ -1083,3 +1083,147 @@ fn edit_files_allow_for_task_suppresses_later_prompts() {
         "the ungated repeat still applied its plan"
     );
 }
+
+/// `write_to_pty` gates like every call — the approve card's summary
+/// is the input about to be sent — and on approval the agent's own
+/// PTY round-trips through call↔read: a `read` builtin parks the
+/// first call, the second call's bytes produce the response the
+/// model then sees in its context (Spec R06 us-17/18/20, issue #90).
+/// The worker resolves the user's shell — `/bin/sh` fallback or an
+/// injected bash/zsh/fish; `read`/`echo` are builtins on all of
+/// them, so the scenario needs no external program.
+#[test]
+fn write_to_pty_gates_then_round_trips_through_the_agent_pty() {
+    // Pin the worker's resolved shell to an injected one where it
+    // exists: the `OSC 133` prompt marks give the settle its
+    // deterministic path (a `133;A` after the write means the command
+    // finished — no output can straddle a quiet window). `/bin/bash`
+    // is the portable pick; this test binary spawns no other PTYs.
+    if std::path::Path::new("/bin/bash").exists() {
+        // Env mutation is process-global but safe here — no other
+        // test in this binary spawns a PTY.
+        std::env::set_var("SHELL", "/bin/bash");
+    }
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "write_to_pty",
+            r#"{"input":"read v; echo READ-$v\n"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "write_to_pty",
+            r#"{"input":"hello\n"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // The first call parks on the approve card — nothing is written
+    // (or spawned) until the verdict lands. The card's summary is
+    // the bytes queued for the PTY (us-20).
+    let (id, name, summary) = next_approval(&session);
+    assert_eq!(name, "write_to_pty");
+    assert!(summary.contains("read v"), "{summary}");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // Call 2's card appears only after call 1's write+settle ran.
+    let (id, name, summary) = until_approval(&session);
+    assert_eq!(name, "write_to_pty");
+    assert!(summary.contains("hello"), "{summary}");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    let events = collect(&session);
+    // Both cards ran to Done; the last line of the PTY output rode
+    // call_2's card detail (us-20's output tail).
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Done,
+                detail: Some(_),
+            } if call_id == "call_2"
+        )),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    fixture.captured();
+    fixture.captured();
+    // `READ-hello` is the shell's answer to the second call's input,
+    // not the echoed input line — proof the bytes reached a live
+    // interactive session and its output re-entered the conversation
+    // as the schema's tool-result item.
+    let third = fixture.captured();
+    assert!(third.body.contains("READ-hello"), "{}", third.body);
+    fixture.assert_no_more_requests();
+}
+
+/// A denied `write_to_pty` never reaches the PTY — the card goes
+/// `Denied` without ever running and the denial text is the tool's
+/// result (issue #90: approval resolves before any bytes are
+/// written).
+#[test]
+fn denied_write_to_pty_never_writes() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "write_to_pty",
+            r#"{"input":"cat\n"}"#,
+        )])),
+        sse(&chat_text_turn("understood")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::Deny("keep hands off".into()))
+        .expect("deny");
+
+    let events = collect(&session);
+    assert_eq!(
+        events[0],
+        AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ToolStatus::Denied,
+            detail: Some("keep hands off".into()),
+        }
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                status: ToolStatus::Running,
+                ..
+            }
+        )),
+        "a denied call never ran: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("keep hands off"), "{}", second.body);
+}
