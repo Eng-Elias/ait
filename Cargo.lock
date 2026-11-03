@@ -44,8 +44,12 @@ version = "0.1.0"
 dependencies = [
  "ait-config",
  "ait-llm",
+ "ait-shell",
+ "ait-term",
  "futures-util",
  "regex",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

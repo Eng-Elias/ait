@@ -30,16 +30,23 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ait_agent::{AgentRequest, ApprovalVerdict};
+use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
     SessionEvent, Size, SpawnError,
 };
+use crossterm::event::{KeyCode, KeyEvent};
 
+use crate::agent_panel::{context_for, edit_input, AgentPanel};
 use crate::blocks::{row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus};
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
+use crate::render::session_size;
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
+use crate::shell_bridge::{self, BridgeRequest, BridgeService};
+use crate::status::Toast;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
@@ -180,6 +187,24 @@ pub struct Tab {
     /// shell or a materialize failure.
     #[allow(dead_code)] // held for its Drop alone
     materialized: Option<ait_shell::Materialized>,
+    /// This tab's agent conversation panel (Spec R06 / issue #85):
+    /// `None` until the first `Alt+A` creates it — lazily, so a tab
+    /// that never opens the panel never pays for the worker thread.
+    /// One conversation at most, bound to this tab: the `Tab` drop
+    /// drops the `AgentSession` inside, which is what cancels and
+    /// joins the agent worker when the tab closes (standard 14 — the
+    /// conversation's identity IS the tab's; no pin needed). Same
+    /// `pub(crate)` seam as `scroll`/`shadow` — tests stage a panel;
+    /// production drives it through the `agent_*` methods.
+    pub(crate) agent: Option<AgentPanel>,
+    /// The service side of this tab's `ShellBridge` (Spec R06-T4):
+    /// created with the panel — `Alt+A` is the only thing that can
+    /// spawn a worker wanting to reach the shell — and answered by
+    /// `drain_events` every tick. `agent_key` clones its
+    /// [`TabBridge`](crate::shell_bridge::TabBridge) handle into each
+    /// submitted `AgentRequest`; `pub(crate)` so tests can attach a
+    /// service to a staged tab.
+    pub(crate) bridge: Option<BridgeService>,
 }
 
 impl Tab {
@@ -270,9 +295,8 @@ impl Tab {
     ///
     /// Refuses unless the tab is `Integrated` (a shell without the
     /// snippet can't answer, so nothing is typed) or already exited —
-    /// Round 6's `CommandExecutor` is the intended caller; only tests
-    /// drive it today.
-    #[allow(dead_code)]
+    /// Round 6's `ShellBridge` service calls it on behalf of the
+    /// agent's `UserShellExecutor` (Spec R06-T4).
     pub fn run_in_shell(&mut self, command: &[u8]) -> Result<RunRequest, InBandError> {
         if self.exit.is_some() {
             return Err(InBandError::SessionExited);
@@ -280,6 +304,95 @@ impl Tab {
         self.inband.request(self.integration, command, |bytes| {
             self.session.send_bytes(bytes)
         })
+    }
+
+    /// Answer every queued `ShellBridge` request — the `drain_events`
+    /// bookkeeping the agent worker's bridge calls land on (Spec
+    /// R06-T4). `run_in_band` delegates to
+    /// [`run_in_shell`](Self::run_in_shell) — the R05 seam's declared
+    /// first consumer — and its reply carries the pending run's
+    /// result channel straight back to the worker, which polls it on
+    /// its own thread while this drain keeps resolving it. Every
+    /// request is answered in place: the ~8 ms input tick bounds the
+    /// latency, and a `None` service answers nothing.
+    pub(crate) fn service_bridge(&mut self) {
+        loop {
+            let request = match &self.bridge {
+                Some(service) => match service.try_recv() {
+                    Some(request) => request,
+                    None => return,
+                },
+                None => return,
+            };
+            self.answer_bridge(request);
+        }
+    }
+
+    /// One bridge request serviced against this tab — the body of
+    /// [`service_bridge`](Self::service_bridge). Replies are sends on
+    /// a one-shot channel; a dead worker end (dropped reply receiver)
+    /// silently discards the answer.
+    fn answer_bridge(&mut self, request: BridgeRequest) {
+        match request {
+            BridgeRequest::State(reply) => {
+                let _ = reply.send(self.integration.into());
+            }
+            BridgeRequest::SendBytes { bytes, reply } => {
+                let result = if self.exit.is_some() {
+                    Err(ait_agent::BridgeError::SessionExited)
+                } else {
+                    self.session
+                        .send_bytes(&bytes)
+                        .map_err(ait_agent::BridgeError::Write)
+                };
+                let _ = reply.send(result);
+            }
+            BridgeRequest::RunInBand { command, reply } => {
+                let _ = reply.send(
+                    self.run_in_shell(&command)
+                        .map(RunRequest::into_receiver)
+                        .map_err(ait_agent::BridgeError::from),
+                );
+            }
+            BridgeRequest::Subscribe(reply) => {
+                let receiver = self
+                    .bridge
+                    .as_mut()
+                    .map(BridgeService::subscribe)
+                    .expect("a queued request implies a service");
+                let _ = reply.send(receiver);
+            }
+            BridgeRequest::CursorLine(reply) => {
+                // The cursor's row in `PromptMark::line`'s absolute
+                // space — `dropped + scrollback + viewport row`, the
+                // same arithmetic the drain's publish applies.
+                let line =
+                    self.dropped_lines + self.grid().scrollback() + self.session.cursor().line;
+                let _ = reply.send(line);
+            }
+            BridgeRequest::GridLines { start, end, reply } => {
+                // `start`/`end` arrive in the marks' absolute line
+                // space (Spec R06-T5) — the space `PromptMark::line`
+                // publishes: record-time index plus `dropped_lines`.
+                // Absolute → `GridView::line` subtracts the lines
+                // dropped so far and the live scrollback depth; rows
+                // that left the grid are absent from the answer.
+                let grid = self.grid();
+                let offset = self.dropped_lines as i64 + grid.scrollback() as i64;
+                let lines = (start..end)
+                    .filter_map(|index| {
+                        i32::try_from(i64::from(index) - offset)
+                            .ok()
+                            .and_then(|line| grid.line(line))
+                            .map(|row| row.text())
+                    })
+                    .collect();
+                let _ = reply.send(lines);
+            }
+            BridgeRequest::OutputTail(reply) => {
+                let _ = reply.send(self.session.output_tail().to_vec());
+            }
+        }
     }
 
     /// The `N:title` label for the tab at position `index` (0-based) —
@@ -470,6 +583,184 @@ impl Tab {
     /// Out-of-Scope: no integration ⇒ no behavior change).
     pub fn has_blocks(&self) -> bool {
         !self.blocks.is_empty()
+    }
+
+    /// `Alt+A` (Spec R06 / issue #85): open the panel focused on a tab
+    /// that never had one, refocus it when open but unfocused (the
+    /// user Esc'd back to the shell), or close it when focused. The
+    /// conversation — and any running task — survives a close; only
+    /// the split goes away. The caller re-derives this tab's winsize
+    /// through [`TabManager::resize_active`].
+    pub fn toggle_agent_panel(&mut self) {
+        match self.agent.as_mut() {
+            Some(panel) => panel.toggle(),
+            None => {
+                // The bridge service is born with the panel — it is
+                // the only thing that can spawn a worker wanting to
+                // reach this shell (Spec R06-T4).
+                self.bridge = Some(shell_bridge::pair().1);
+                self.agent = Some(AgentPanel::new());
+            }
+        }
+    }
+
+    /// Whether the split is open on this tab — drives the layout and
+    /// this tab's per-tab winsize derivation.
+    pub fn agent_panel_open(&self) -> bool {
+        self.agent.as_ref().is_some_and(AgentPanel::is_open)
+    }
+
+    /// Whether keystrokes route to the panel's input line — the
+    /// `suggestion_here`-style gate `app`'s pass-through arm checks
+    /// before PTY input (Spec R06: focused keys never reach the PTY).
+    pub fn agent_focused(&self) -> bool {
+        self.agent.as_ref().is_some_and(AgentPanel::is_focused)
+    }
+
+    /// The panel, if this tab owns one — the paint path reads it.
+    pub fn agent_panel(&self) -> Option<&AgentPanel> {
+        self.agent.as_ref()
+    }
+
+    /// One keystroke while the panel is focused (Spec R06): plain Esc
+    /// cancels a running task or — while idle — returns focus to the
+    /// terminal; Enter submits the input as a task, or queues it as a
+    /// steering message while one runs; chars and Backspace edit the
+    /// input line. Every other key is swallowed — focused keys never
+    /// reach the PTY, never update the input shadow, and never snap
+    /// the terminal's view.
+    ///
+    /// While the gate is parked on an approve card, `a`/`t`/`d` on an
+    /// EMPTY input are the verdict keys (Spec R06's three options):
+    /// *allow once*, *allow this tool for the rest of the task*, and
+    /// *deny* — `d` does not fire a verdict, it opens the
+    /// denial-reason mode (us-8): every key then edits the input, so
+    /// the reason itself can hold `a`/`t`/`d` ("don't" is typable),
+    /// and Enter answers `Deny` — an empty reason still falls back to
+    /// the worker's default denial text. On a non-empty input the
+    /// same letters type like any other, and Enter with text while
+    /// parked still steers (never a verdict). Esc cancels the task
+    /// from either state — the gate's own escape (us-9), reason mode
+    /// included.
+    ///
+    /// While an `ask_user_question` card waits (us-10 — gate-exempt,
+    /// its card IS the ask), a choices ask navigates with ↑/↓ and
+    /// Enter answers the highlighted option — every other key is
+    /// ignored, so typed text can never become a steering message
+    /// mid-ask; a free-text ask edits the input line and Enter sends
+    /// it as the answer. Esc still cancels the task from either card.
+    pub fn agent_key(&mut self, key: &KeyEvent, settings: &Settings, toast: &mut Option<Toast>) {
+        if !self.agent_focused() {
+            return;
+        }
+        let panel = self.agent.as_mut().expect("focused implies a panel");
+        match key.code {
+            KeyCode::Esc if key.modifiers.is_empty() => panel.escape(),
+            _ if panel.awaiting_answer() => {
+                if panel.ask_has_choices() {
+                    match key.code {
+                        KeyCode::Up if key.modifiers.is_empty() => panel.ask_prev(),
+                        KeyCode::Down if key.modifiers.is_empty() => panel.ask_next(),
+                        KeyCode::Enter => panel.submit_answer(toast),
+                        _ => {} // stray keys ignored while a choice waits
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Enter => panel.submit_answer(toast),
+                        _ => {
+                            edit_input(panel, key);
+                        }
+                    }
+                }
+            }
+            // Denial-reason mode (us-8): EVERY key edits the reason —
+            // the verdict letters type like any other, so "don't" is
+            // typable — and Enter answers `Deny` with the input as
+            // the reason (an empty one falls back to the worker's
+            // default text). Esc above still cancels the task.
+            _ if panel.deny_reason_active() => match key.code {
+                KeyCode::Enter => {
+                    let reason = panel.take_input();
+                    panel.decide(ApprovalVerdict::Deny(reason), toast)
+                }
+                _ => {
+                    edit_input(panel, key);
+                }
+            },
+            // Any Enter submits — `Alt+Enter` already dispatched to the
+            // suggester upstream, so no chord collides here. A parked
+            // gate does not change this: Enter with text steers.
+            KeyCode::Enter => {
+                let text = panel.take_input().trim_end().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                if panel.is_running() {
+                    panel.steer(text, toast);
+                } else {
+                    self.submit_agent_task(settings, text, toast);
+                }
+            }
+            // The parked approve card: `a`/`t` answer at once, `d`
+            // opens the denial-reason mode — all only on an EMPTY
+            // input, so a typed draft is never mistaken for a verdict
+            // and a verdict never swallows a draft.
+            _ if panel.awaiting_verdict() => match key.code {
+                KeyCode::Char('a') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                    panel.decide(ApprovalVerdict::AllowOnce, toast)
+                }
+                KeyCode::Char('t') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                    panel.decide(ApprovalVerdict::AllowForTask, toast)
+                }
+                KeyCode::Char('d') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                    panel.begin_deny_reason()
+                }
+                _ => {
+                    edit_input(panel, key);
+                }
+            },
+            _ => {
+                edit_input(panel, key);
+            }
+        }
+    }
+
+    /// Submit `task` as a fresh [`AgentRequest`] on this tab's panel —
+    /// `agent_key`'s Enter arm while idle. Its own method because the
+    /// request's context and shell binding read `self` fields the
+    /// panel borrow can't overlap. `bridge` is a fresh handle into
+    /// this tab's bridge service (Spec R06-T4) — `None` only when the
+    /// panel exists without one (a staged test tab), where
+    /// `run_command` answers a clean tool error.
+    fn submit_agent_task(&mut self, settings: &Settings, task: String, toast: &mut Option<Toast>) {
+        let request = AgentRequest {
+            settings: settings.clone(),
+            task,
+            context: context_for(self),
+            bridge: self
+                .bridge
+                .as_ref()
+                .map(|service| Box::new(service.handle()) as _),
+        };
+        if let Some(panel) = self.agent.as_mut() {
+            panel.submit(request, toast);
+        }
+    }
+
+    /// The wheel inside the panel's rect scrolls its conversation
+    /// rather than the terminal's scrollback.
+    pub fn agent_scroll_up(&mut self, lines: usize) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.scroll_up(lines);
+        }
+    }
+
+    /// The wheel's other half — landing back on the tail re-pins the
+    /// conversation's follow mode.
+    pub fn agent_scroll_down(&mut self, lines: usize) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.scroll_down(lines);
+        }
     }
 
     /// Feed the grid's current scrollback depth into the bookkeeping
@@ -755,6 +1046,8 @@ impl TabManager {
             scrollback_cap,
             inband: InBandExec::new(),
             materialized,
+            agent: None,
+            bridge: None,
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -871,16 +1164,34 @@ impl TabManager {
     }
 
     /// Forward a host resize to EVERY tab's session, not just the
-    /// visible one (Spec R02 user story 17), and remember the size for
-    /// tabs spawned later. Reflow invalidates the grid coordinates a
-    /// selection range points at, so every tab's highlight is cleared.
-    /// PTY-write failures on a just-dead child are tolerated — the
-    /// session's `Exited` event carries that state.
+    /// visible one (Spec R02 user story 17), and remember the band
+    /// size for tabs spawned later. Each session gets the size its own
+    /// layout implies — a tab with an open agent panel keeps its
+    /// split, so `size` is the CONTENT BAND and [`session_size`]
+    /// derives the per-tab winsize (Spec R06). Reflow invalidates the
+    /// grid coordinates a selection range points at, so every tab's
+    /// highlight is cleared. PTY-write failures on a just-dead child
+    /// are tolerated — the session's `Exited` event carries that
+    /// state.
     pub fn resize_all(&mut self, size: Size) {
         self.size = size;
         for tab in &mut self.tabs {
             tab.clear_selection();
-            let _ = tab.session.resize(size);
+            let _ = tab
+                .session
+                .resize(session_size(size, tab.agent_panel_open()));
+        }
+    }
+
+    /// Re-derive the ACTIVE tab's PTY winsize from the stored band
+    /// size — `Alt+A` opens or closes one tab's panel, so only its
+    /// session shrinks or restores through the same [`session_size`]
+    /// derivation [`resize_all`](Self::resize_all) applies.
+    pub fn resize_active(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let _ = tab
+                .session
+                .resize(session_size(self.size, tab.agent_panel_open()));
         }
     }
 
@@ -943,7 +1254,18 @@ impl TabManager {
                         }
                         tab.prompt_marks.push_back(mark);
                     }
-                    LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
+                    LiveEvent::Exited(status) => {
+                        tab.exit = Some(status.clone());
+                        // Spec R06-T4: a dead session answers no
+                        // `__ait_run` — every pending waiter's channel
+                        // disconnects so the executor fails cleanly
+                        // instead of hanging (us-34); bridge
+                        // subscribers see the exit too.
+                        tab.inband.fail_pending();
+                        if let Some(service) = tab.bridge.as_mut() {
+                            service.publish(ait_agent::BridgeEvent::Exited);
+                        }
+                    }
                     _ => {}
                 }
                 // Shell-integration bookkeeping (Spec R05): marks move
@@ -964,13 +1286,50 @@ impl TabManager {
                         // §5.5.1: `OSC 7701` frames resolve pending
                         // `__ait_run` requests by their payload id.
                         tab.inband.observe(shell_event);
+                        // R06-T4: bridge subscribers (the typed tiers'
+                        // feed) see the same decoded event.
+                        if let Some(service) = tab.bridge.as_mut() {
+                            service.publish(ait_agent::BridgeEvent::Shell(shell_event.clone()));
+                        }
+                    }
+                    // R06-T5's feed: prompt marks reach subscribers
+                    // with their ABSOLUTE line — the record-time
+                    // scrollback-then-viewport index plus the lines
+                    // dropped so far (the block assembler's own space,
+                    // `observe_mark_row`'s `line + dropped`) — so a `B`
+                    // recorded before a scroll still names its row
+                    // when `grid_lines` converts it back.
+                    if let (Some(service), SessionEvent::PromptMark { kind, payload }) =
+                        (tab.bridge.as_mut(), osc)
+                    {
+                        service.publish(ait_agent::BridgeEvent::PromptMark {
+                            kind: shell_bridge::mark_letter(*kind),
+                            payload: payload.clone(),
+                            line: scrollback + tab.session.cursor().line + tab.dropped_lines,
+                        });
                     }
                 }
                 events.push(TabEvent { tab: index, event });
             }
             tab.on_output();
+            // R06-T4: the ShellBridge's service queue — the agent
+            // worker's `run_in_band`/`send_bytes`/`subscribe` calls —
+            // answers on the same tick the PTY drains.
+            tab.service_bridge();
         }
         events
+    }
+
+    /// Drain every tab's agent session once (Spec R06): `AgentEvent`s
+    /// land in each tab's conversation on the same tick the PTY
+    /// sessions drain — a background tab's task keeps streaming too.
+    /// Panels that were never opened cost nothing.
+    pub fn drain_agent_events(&mut self) {
+        for tab in &mut self.tabs {
+            if let Some(panel) = tab.agent.as_mut() {
+                panel.drain();
+            }
+        }
     }
 }
 
@@ -2085,6 +2444,248 @@ mod tests {
         );
     }
 
+    /// Run one blocking `ShellBridge` call on a worker thread while
+    /// this thread keeps pumping `drain_events` — the same split the
+    /// production loop runs (the agent worker waits; the app tick
+    /// services). `f` takes the bridge so `FnOnce` closures over
+    /// `&TabManager` stay out of the thread.
+    fn bridge_call<T, F>(
+        manager: &mut TabManager,
+        bridge: &crate::shell_bridge::TabBridge,
+        f: F,
+    ) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(crate::shell_bridge::TabBridge) -> T + Send + 'static,
+    {
+        let handle = std::thread::spawn({
+            let bridge = bridge.clone();
+            move || f(bridge)
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        while !handle.is_finished() {
+            manager.drain_events();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bridge service"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.join().expect("bridge call panicked")
+    }
+
+    /// Attach a fresh bridge pair to `manager`'s active tab —
+    /// production creates it inside `toggle_agent_panel`; tests stage
+    /// it directly.
+    fn attach_bridge(manager: &mut TabManager) -> (crate::shell_bridge::TabBridge, &Tab) {
+        let (handle, service) = crate::shell_bridge::pair();
+        let tab = manager.active_mut().expect("an active tab");
+        tab.bridge = Some(service);
+        (handle, manager.active().unwrap())
+    }
+
+    /// Spec R06-T4 (issue #87) through a REAL injected bash: the
+    /// bridge's `run_in_band` request is serviced by `drain_events`,
+    /// the shell's `7701` reply resolves the returned channel, and
+    /// the typed `__ait_run` line stays visible while the merged
+    /// output never renders (us-12, us-23).
+    #[test]
+    fn bridge_run_in_band_round_trips_through_drain() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+        let (bridge, _) = attach_bridge(&mut manager);
+        use ait_agent::ShellBridge;
+
+        // The tier selector answers through the service too.
+        let state = bridge_call(&mut manager, &bridge, |b| {
+            b.integration_state().expect("state")
+        });
+        assert_eq!(state, ait_agent::ShellIntegration::Integrated);
+
+        // The in-band run: request serviced by the drain, result on
+        // the returned channel.
+        let receiver = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"printf 'agent-marker'")
+                .expect("run accepted")
+        });
+        drain_until(&mut manager, |m| !m.tabs()[0].inband.is_pending(0));
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the run resolved");
+        assert_eq!(result.output, b"agent-marker".to_vec());
+        assert_eq!(result.exit_code, 0);
+
+        // The trace guarantee (us-23): the typed request line is grid
+        // text; the 7701 output stays invisible.
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(text.contains("__ait_run"), "the request's trace: {text}");
+        assert!(
+            !text.contains("agent-marker"),
+            "7701 output is invisible: {text}"
+        );
+    }
+
+    /// Refusals and exits are clean `BridgeError`s, never hangs: an
+    /// `Absent` tab refuses `run_in_band` with nothing typed; an
+    /// exited session refuses both the run and raw `send_bytes`
+    /// (us-34).
+    #[test]
+    fn bridge_refusals_and_exited_sessions_error_cleanly() {
+        use ait_agent::{BridgeError, ShellBridge, ShellIntegration};
+        let mut manager = manager(1, "/tmp");
+        let (bridge, _) = attach_bridge(&mut manager);
+
+        // Absent: `run_in_band` refuses — the drain reports the live
+        // state, and no `__ait_run` is typed.
+        let state = bridge_call(&mut manager, &bridge, |b| {
+            b.integration_state().expect("state")
+        });
+        assert_eq!(state, ShellIntegration::Absent);
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"echo hi").expect_err("Absent refuses")
+        });
+        assert!(
+            matches!(error, BridgeError::NotIntegrated(ShellIntegration::Absent)),
+            "{error:?}"
+        );
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"echo refuse-marker\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("refuse-marker")
+        });
+        assert!(
+            !grid_text(&manager.tabs()[0].session).contains("__ait_run"),
+            "a refused request typed nothing"
+        );
+
+        // `send_bytes` still works on the live shell — the typed
+        // tiers' (R06-T5) primitive.
+        bridge_call(&mut manager, &bridge, |b| {
+            b.send_bytes(b"echo sent-marker\n").expect("send_bytes")
+        });
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("sent-marker")
+        });
+
+        // Exit the session: the drain's Exited handling marks the
+        // tab, drops pending waits, and later bridge calls refuse.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"exit\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().exit_status().is_some()
+        });
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"echo hi")
+                .expect_err("an exited session refuses")
+        });
+        assert!(matches!(error, BridgeError::SessionExited), "{error:?}");
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.send_bytes(b"x")
+                .expect_err("send_bytes on a dead session")
+        });
+        assert!(matches!(error, BridgeError::SessionExited), "{error:?}");
+    }
+
+    /// The subscription feed — R06-T5's typed-tier input: marks,
+    /// decoded `7700`-series events and the exit all arrive in drain
+    /// order; `grid_lines`/`output_tail` snapshot the capture
+    /// surfaces.
+    #[test]
+    fn bridge_subscription_forwards_marks_events_and_exit() {
+        use ait_agent::{BridgeEvent, ShellBridge};
+        let mut manager = manager(1, "/tmp");
+        let (bridge, _) = attach_bridge(&mut manager);
+
+        let events_rx = bridge_call(&mut manager, &bridge, |b| b.subscribe().expect("subscribe"));
+        let mut seen = Vec::new();
+
+        // An OSC 133 mark forwards as `PromptMark` with its payload
+        // and recorded line.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"printf '\\033]133;D;0\\007'\n")
+            .unwrap();
+        drain_until(&mut manager, |m| m.tabs()[0].prompt_marks().count() >= 1);
+        seen.extend(events_rx.try_iter());
+        let mark_line = seen
+            .iter()
+            .find_map(|event| match event {
+                BridgeEvent::PromptMark {
+                    kind: 'D',
+                    payload: Some(_),
+                    line,
+                } => Some(*line),
+                _ => None,
+            })
+            .expect("a 133;D mark reached the subscriber");
+
+        // The mark's published line is absolute — `grid_lines`
+        // resolves it through the frontend's dropped/scrollback
+        // offsets onto the very row the mark was recorded on.
+        let row = bridge_call(&mut manager, &bridge, move |b| {
+            b.grid_lines(mark_line as i32, mark_line as i32 + 1)
+                .expect("grid lines")
+        });
+        assert_eq!(row.len(), 1, "the mark's own row resolves: {row:?}");
+
+        // The capture surface answers a span of mark-space lines too.
+        let lines = bridge_call(&mut manager, &bridge, |b| {
+            b.grid_lines(0, 40).expect("grid lines")
+        });
+        assert!(!lines.is_empty());
+        let tail = bridge_call(&mut manager, &bridge, |b| {
+            b.output_tail().expect("output tail")
+        });
+        assert!(!tail.is_empty(), "the tail saw the session's output");
+
+        // The exit forwards — and closes pending run waits.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"exit\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().exit_status().is_some()
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            seen.extend(events_rx.try_iter());
+            if seen.iter().any(|e| matches!(e, BridgeEvent::Exited)) {
+                break;
+            }
+            manager.drain_events();
+            assert!(Instant::now() < deadline, "Exited never arrived: {seen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `OSC 7701` bytes on a session's output never reach the grid:
     /// the emulator swallows private OSCs (the observer still decodes
     /// them — resolution coverage lives in the tests above). Printed
@@ -2293,5 +2894,248 @@ mod tests {
             tab.blocks().iter().map(|b| b.range()).collect::<Vec<_>>()
         );
         assert_eq!(tab.select_block(), None, "no stale rows to select");
+    }
+
+    /// Spec R06 / issue #85: `Alt+A`'s toggle and a host resize share
+    /// the band→session derivation — opening shrinks only THIS tab's
+    /// session to the terminal side of the split, a resize keeps the
+    /// split proportional, and closing restores the whole band.
+    #[test]
+    fn agent_panel_toggle_and_resize_share_the_split_math() {
+        let mut manager = manager(1, "/tmp");
+
+        manager.active_mut().unwrap().toggle_agent_panel();
+        manager.resize_active();
+        assert_eq!(
+            manager.active().unwrap().session.size(),
+            Size::new(24, 10),
+            "open panel: two fifths of the 40-column band goes to the panel"
+        );
+
+        // A host resize re-derives the same tab's split — the panel
+        // keeps its share rather than restoring full width.
+        manager.resize_all(Size::new(80, 20));
+        assert_eq!(manager.active().unwrap().session.size(), Size::new(48, 20));
+
+        manager.active_mut().unwrap().toggle_agent_panel();
+        manager.resize_active();
+        assert_eq!(
+            manager.active().unwrap().session.size(),
+            Size::new(80, 20),
+            "closed panel: the session owns the band again"
+        );
+    }
+
+    /// Per-tab ownership: the split belongs to the tab, a fresh tab
+    /// takes the whole band, and dropping the owning tab drops the
+    /// `AgentSession` inside — cancelling and joining the worker even
+    /// with a task queued (the Drop contract, not a special case).
+    #[test]
+    fn panels_are_per_tab_and_drop_with_the_tab() {
+        let mut manager = manager(2, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        assert!(manager.active().unwrap().agent_panel_open());
+        // Queue real work so the worker is mid-task at close.
+        let mut toast = None;
+        manager
+            .active_mut()
+            .unwrap()
+            .agent
+            .as_mut()
+            .unwrap()
+            .submit(
+                ait_agent::AgentRequest {
+                    settings: ait_config::Settings::default(),
+                    task: "fix it".to_string(),
+                    context: ait_agent::AgentContext {
+                        cwd: "/tmp".into(),
+                        shell: "sh".into(),
+                        os: "test".into(),
+                        output_lines: Vec::new(),
+                    },
+                    bridge: None,
+                },
+                &mut toast,
+            );
+
+        manager.spawn_tab(sh()).unwrap();
+        assert!(
+            !manager.active().unwrap().agent_panel_open(),
+            "a fresh tab owns no panel"
+        );
+
+        assert!(manager.close_active(), "the spawned tab closes");
+        assert_eq!(manager.len(), 2);
+        assert!(
+            manager.active().unwrap().agent_panel_open(),
+            "the surviving tab kept its conversation"
+        );
+        // Closing THE owning tab drops the worker mid-task — Drop
+        // cancels and joins; nothing to observe but the clean return.
+        assert!(manager.close_active(), "the owning tab closes");
+    }
+
+    /// The approve card's keys (Spec R06): while the gate is parked,
+    /// `a`/`t`/`d` on an EMPTY input are the verdict keys — `d`
+    /// opens the denial-reason mode rather than firing a verdict —
+    /// and the same letters type like any other once the input holds
+    /// text. In reason mode every key edits (a reason can contain
+    /// `a`/`t`/`d`) and Enter answers `Deny`. With no card pending
+    /// the letters are ordinary input.
+    #[test]
+    fn approve_card_keys_answer_the_gate() {
+        use crossterm::event::KeyEvent as CtKeyEvent;
+        let mut manager = manager(1, "/tmp");
+        let mut toast = None;
+        let settings = Settings::default();
+        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let staged = |id: &str| ait_agent::AgentEvent::ApprovalRequest {
+            call: ait_agent::ToolCall {
+                id: id.into(),
+                name: "read_files".into(),
+                arguments: String::new(),
+            },
+            summary: "note.txt".into(),
+        };
+
+        let tab = manager.active_mut().unwrap();
+        tab.toggle_agent_panel();
+
+        // `a` answers allow-once — the wait clears.
+        tab.agent.as_mut().unwrap().apply(staged("call_1"));
+        assert!(tab.agent.as_ref().unwrap().awaiting_verdict());
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
+        assert!(toast.is_none());
+
+        // `d` on an empty input opens reason mode — the card stays
+        // parked and the reason can contain the verdict letters.
+        tab.agent.as_mut().unwrap().apply(staged("call_2"));
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(
+                panel.awaiting_verdict(),
+                "d opened the reason, not a verdict"
+            );
+            assert!(panel.deny_reason_active());
+        }
+        for c in "don't allow".chars() {
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+        }
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert_eq!(panel.input(), "don't allow", "every key edited the reason");
+            assert!(panel.awaiting_verdict(), "the card still waits");
+        }
+        // Enter answers `Deny` with the reason — the wait clears.
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_verdict());
+            assert_eq!(panel.input(), "", "the reason was consumed");
+        }
+
+        // `d` again — reason mode — and Enter on an EMPTY reason
+        // still denies (the worker substitutes its default text).
+        tab.agent.as_mut().unwrap().apply(staged("call_3"));
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
+
+        // With input held, the same letters are ordinary editing —
+        // `a`/`d` type rather than verdict; the card stays parked
+        // until the input is emptied and `a` pressed again.
+        tab.agent.as_mut().unwrap().apply(staged("call_4"));
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(panel.awaiting_verdict(), "non-empty input = editing");
+            assert_eq!(panel.input(), "xda");
+        }
+        tab.agent.as_mut().unwrap().take_input();
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
+
+        // And with nothing pending, `d` edits the input like any
+        // other character.
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
+    }
+
+    /// The ask card's keys (Spec R06 us-10 / issue #91): a choices
+    /// ask navigates with ↑/↓ and Enter answers the highlighted
+    /// option while stray keys are ignored — the typed input never
+    /// becomes a steering message mid-ask. A free-text ask instead
+    /// takes the input line on Enter.
+    #[test]
+    fn ask_card_keys_select_or_take_free_text() {
+        use crossterm::event::KeyEvent as CtKeyEvent;
+        let mut manager = manager(1, "/tmp");
+        let mut toast = None;
+        let settings = Settings::default();
+        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let ask = |id: &str, choices: &[&str]| ait_agent::AgentEvent::AskRequest {
+            call: ait_agent::ToolCall {
+                id: id.into(),
+                name: "ask_user_question".into(),
+                arguments: String::new(),
+            },
+            question: "Which?".into(),
+            choices: choices.iter().map(|c| c.to_string()).collect(),
+        };
+
+        let tab = manager.active_mut().unwrap();
+        tab.toggle_agent_panel();
+
+        // A choices ask: ↓ then Enter answers the second option —
+        // and stray keys move nothing.
+        let panel = tab.agent.as_mut().unwrap();
+        panel.apply(ask("call_1", &["a", "b"]));
+        assert!(panel.awaiting_answer());
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Left), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Backspace), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(panel.awaiting_answer(), "stray keys resolved nothing");
+            assert_eq!(panel.input(), "", "stray keys never reached the input");
+        }
+        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_answer());
+            assert!(matches!(
+                panel.entries().last(),
+                Some(crate::agent_panel::Entry::Ask(card))
+                    if card.answer.as_deref() == Some("b")
+            ));
+        }
+
+        // A free-text ask: chars edit the input, Enter sends them.
+        let panel = tab.agent.as_mut().unwrap();
+        panel.apply(ask("call_2", &[]));
+        assert!(!panel.ask_has_choices());
+        for c in "why not".chars() {
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+        }
+        // ↓ on a free-text ask navigates nothing — the card keeps
+        // waiting and the input is untouched.
+        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
+        assert!(tab.agent.as_ref().unwrap().awaiting_answer());
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_answer());
+            assert!(matches!(
+                panel.entries().last(),
+                Some(crate::agent_panel::Entry::Ask(card))
+                    if card.answer.as_deref() == Some("why not")
+            ));
+            assert_eq!(panel.input(), "", "the answer consumed the input");
+        }
     }
 }

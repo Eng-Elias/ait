@@ -270,8 +270,9 @@ pub fn recent_output_lines(grid: &GridView) -> Vec<String> {
 /// — a shell emitting nothing degrades exactly as before (§5.5's
 /// graceful-degrade clause). Both sources stay
 /// [`OUTPUT_LINE_BUDGET`]-bounded: "recent terminal output" is always
-/// a last-N answer.
-fn output_lines_for(tab: &Tab) -> Vec<String> {
+/// a last-N answer. `pub(crate)`: the agent panel's `AgentContext`
+/// assembly asks the same question (Spec R06 §5.6).
+pub(crate) fn output_lines_for(tab: &Tab) -> Vec<String> {
     let blocks = tab.blocks();
     if blocks.is_empty() {
         recent_output_lines(&tab.grid())
@@ -330,7 +331,8 @@ fn block_output_lines(grid: &GridView<'_>, blocks: &[Block]) -> Vec<String> {
 /// cwd there means the report was lost, not missing, and `/proc` can
 /// only describe the local child); the spawn cwd is the last resort on
 /// hosts without `/proc` (non-Linux) or a child already gone.
-fn cwd_for(tab: &Tab) -> String {
+/// `pub(crate)`: the agent panel reports the same cwd (Spec R06 §5.6).
+pub(crate) fn cwd_for(tab: &Tab) -> String {
     if reads_proc_cwd(tab.cwd_reported(), tab.integration_state()) {
         if let Some(pid) = tab.session.child_pid() {
             if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
