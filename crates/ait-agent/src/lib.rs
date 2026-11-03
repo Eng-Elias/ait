@@ -33,12 +33,17 @@
 //!   [`AgentEvent::ApprovalRequest`] until
 //!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
 //!   results, denials included, re-enter the conversation redacted.
+//! - `write_to_pty` and the agent-owned PTY (R06-T7): a lazily
+//!   spawned [`ait_term::LiveSession`] injected through `ait-shell`'s
+//!   planner, driven write↔settle-read from the worker thread for
+//!   REPLs, `ssh`, `sudo` and installers.
 
 mod agent_context;
 mod context;
 mod conversation;
 mod endpoint_bridge;
 mod files;
+mod pty;
 mod redact;
 mod sanitize;
 mod session;
