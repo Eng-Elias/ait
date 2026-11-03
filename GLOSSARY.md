@@ -37,6 +37,17 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   the PTY of an `Integrated` tab (§5.5.1); it stays visible in the grid while
   its merged output and exit code return over OSC 7701 frames.
 - **Agent-owned PTY** — a PTY the agent drives itself via `write_to_pty`.
+- **Agent conversation** — one per-tab agent session: the user's task, the
+  model's streamed replies, tool calls and their verdicts, steering
+  messages, and a terminal status (done, cancelled, budget reached, error).
+- **Tool card** — the conversation-panel entry rendering one tool call:
+  name, argument summary and status (awaiting approval, running, done,
+  denied, failed).
+- **Approve card** — the prompt a tool call parks on until the user picks
+  *allow once*, *allow this tool for the rest of the task*, or *deny* — the
+  interim ask-everything gate until Round 7's execution profiles land.
+- **Step budget** — the cap on model turns per task (`STEP_BUDGET`, 50);
+  tripping it ends the task with a `BudgetReached` status.
 - **Remote bootstrap** — injecting shell integration into a remote shell over
   SSH.
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
