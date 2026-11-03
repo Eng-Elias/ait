@@ -23,7 +23,8 @@ use crate::files::{ToolCwd, ToolOutput};
 use crate::tool_call::ToolCall;
 
 /// The `ask_user_question` tool's registry name — [`gate_exempt`]
-/// compares against it; its interactive card lands with its ticket.
+/// compares against it; the agent loop diverts it into the ask-card
+/// flow before [`execute`] is ever called.
 pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
 
 /// One tool, provider-neutrally: what the model sees, translated
@@ -195,11 +196,35 @@ fn registry() -> &'static [ToolSpec] {
 
 /// Whether the interim gate asks before `name` runs (Spec R06's
 /// ask-everything rule): every tool asks except
-/// `ask_user_question` — its own card IS the ask (us-10). The
-/// exemption point lives here even before that tool lands, so its
-/// ticket drops in without touching the gate.
+/// `ask_user_question` — its own card IS the ask (us-10).
 pub(crate) fn gate_exempt(name: &str) -> bool {
     name == ASK_USER_QUESTION
+}
+
+/// Parse an `ask_user_question` call's arguments into the card's
+/// pieces: the question to render and the offered choices — an empty
+/// list means the card takes a free-text answer. A missing or
+/// non-string `question` is the only failure: a `choices` member
+/// that is not a string or a `choices` that is not an array simply
+/// contributes nothing (the card must render for every call whose
+/// question is usable).
+pub(crate) fn parse_question(call: &ToolCall) -> Result<(String, Vec<String>), String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments)
+        .map_err(|error| format!("{}: arguments are not valid JSON: {error}", call.name))?;
+    let Some(question) = args.get("question").and_then(|v| v.as_str()) else {
+        return Err(format!("{}: `question` must be a string", call.name));
+    };
+    let choices = args
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((question.to_string(), choices))
 }
 
 /// The registry translated into `schema`'s own `Tool` IR — attached
@@ -344,12 +369,17 @@ pub(crate) fn execute(call: &ToolCall, cwd: &ToolCwd) -> ToolOutput {
         "read_files" => cwd.read_files(&args),
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
-        "run_command" | "edit_files" | "write_to_pty" | ASK_USER_QUESTION => {
-            ToolOutput::error(format!(
-                "{} is not available yet — its executor lands in a later ticket",
-                call.name
-            ))
-        }
+        "run_command" | "edit_files" | "write_to_pty" => ToolOutput::error(format!(
+            "{} is not available yet — its executor lands in a later ticket",
+            call.name
+        )),
+        // The ask card answers on the session's answer channel —
+        // `execute` is never its path; a call reaching here had no
+        // usable question (the loop's error arm already reported it).
+        ASK_USER_QUESTION => ToolOutput::error(format!(
+            "{} answers through the ask card, not the executor",
+            call.name
+        )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
     }
 }
@@ -442,6 +472,40 @@ mod tests {
         }
     }
 
+    /// The ask card's pure seam: `question` plus `choices` come out
+    /// of the call's arguments — absent choices mean free text —
+    /// and a missing or non-string question is the only error.
+    #[test]
+    fn parse_question_reads_the_card_pieces() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: ASK_USER_QUESTION.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":["a","b"]}"#)),
+            Ok(("Which?".to_string(), vec!["a".into(), "b".into()]))
+        );
+        // No `choices` — the free-text card.
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Why?"}"#)),
+            Ok(("Why?".to_string(), Vec::new()))
+        );
+        // Lenient on junk: a non-array `choices` and non-string
+        // members contribute nothing.
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":"all"}"#)),
+            Ok(("Which?".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":["a",1,true]}"#)),
+            Ok(("Which?".to_string(), vec!["a".into()]))
+        );
+        for args in [r#"{}"#, r#"{"question":42}"#, "{not json"] {
+            assert!(parse_question(&call(args)).is_err(), "{args}");
+        }
+    }
+
     /// Dispatch: the shipped tools execute, the declared-but-unbuilt
     /// ones and unknown names answer tool errors, bad JSON errors.
     #[test]
@@ -457,18 +521,17 @@ mod tests {
         let out = execute(&call("glob", r#"{"pattern": "*.rs"}"#), &cwd);
         assert!(!out.is_error);
 
-        for name in [
-            "run_command",
-            "edit_files",
-            "write_to_pty",
-            ASK_USER_QUESTION,
-        ] {
+        for name in ["run_command", "edit_files", "write_to_pty"] {
             let out = execute(&call(name, "{}"), &cwd);
             assert!(
                 out.is_error && out.text.contains("not available yet"),
                 "{name}"
             );
         }
+        // `ask_user_question` answers on the ask channel — `execute`
+        // is never its path, but errors cleanly if reached.
+        let out = execute(&call(ASK_USER_QUESTION, "{}"), &cwd);
+        assert!(out.is_error && out.text.contains("ask card"));
         let out = execute(&call("definitely_not_a_tool", "{}"), &cwd);
         assert!(out.is_error && out.text.contains("unknown tool"));
         let out = execute(&call("read_files", "{oops"), &cwd);

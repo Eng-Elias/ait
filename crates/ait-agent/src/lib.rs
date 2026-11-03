@@ -33,6 +33,9 @@
 //!   [`AgentEvent::ApprovalRequest`] until
 //!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
 //!   results, denials included, re-enter the conversation redacted.
+//!   `ask_user_question` is exempt by design (us-10): its
+//!   [`AgentEvent::AskRequest`] card IS the ask, answered through
+//!   [`AgentSession::answer`].
 
 mod agent_context;
 mod context;
