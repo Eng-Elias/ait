@@ -363,9 +363,21 @@ impl Tab {
                 let _ = reply.send(receiver);
             }
             BridgeRequest::GridLines { start, end, reply } => {
+                // `start`/`end` arrive in the marks' absolute line
+                // space (Spec R06-T5) — the space `PromptMark::line`
+                // publishes: record-time index plus `dropped_lines`.
+                // Absolute → `GridView::line` subtracts the lines
+                // dropped so far and the live scrollback depth; rows
+                // that left the grid are absent from the answer.
                 let grid = self.grid();
+                let offset = self.dropped_lines as i64 + grid.scrollback() as i64;
                 let lines = (start..end)
-                    .filter_map(|index| grid.line(index).map(|row| row.text()))
+                    .filter_map(|index| {
+                        i32::try_from(i64::from(index) - offset)
+                            .ok()
+                            .and_then(|line| grid.line(line))
+                            .map(|row| row.text())
+                    })
                     .collect();
                 let _ = reply.send(lines);
             }
@@ -1244,15 +1256,19 @@ impl TabManager {
                         }
                     }
                     // R06-T5's feed: prompt marks reach subscribers
-                    // with the scrollback-then-viewport line the drain
-                    // recorded them at.
+                    // with their ABSOLUTE line — the record-time
+                    // scrollback-then-viewport index plus the lines
+                    // dropped so far (the block assembler's own space,
+                    // `observe_mark_row`'s `line + dropped`) — so a `B`
+                    // recorded before a scroll still names its row
+                    // when `grid_lines` converts it back.
                     if let (Some(service), SessionEvent::PromptMark { kind, payload }) =
                         (tab.bridge.as_mut(), osc)
                     {
                         service.publish(ait_agent::BridgeEvent::PromptMark {
                             kind: shell_bridge::mark_letter(*kind),
                             payload: payload.clone(),
-                            line: scrollback + tab.session.cursor().line,
+                            line: scrollback + tab.session.cursor().line + tab.dropped_lines,
                         });
                     }
                 }
@@ -2580,19 +2596,28 @@ mod tests {
             .unwrap();
         drain_until(&mut manager, |m| m.tabs()[0].prompt_marks().count() >= 1);
         seen.extend(events_rx.try_iter());
-        assert!(
-            seen.iter().any(|event| matches!(
-                event,
+        let mark_line = seen
+            .iter()
+            .find_map(|event| match event {
                 BridgeEvent::PromptMark {
                     kind: 'D',
                     payload: Some(_),
-                    ..
-                }
-            )),
-            "a 133;D mark reached the subscriber: {seen:?}"
-        );
+                    line,
+                } => Some(*line),
+                _ => None,
+            })
+            .expect("a 133;D mark reached the subscriber");
 
-        // The capture surfaces answer too.
+        // The mark's published line is absolute — `grid_lines`
+        // resolves it through the frontend's dropped/scrollback
+        // offsets onto the very row the mark was recorded on.
+        let row = bridge_call(&mut manager, &bridge, move |b| {
+            b.grid_lines(mark_line as i32, mark_line as i32 + 1)
+                .expect("grid lines")
+        });
+        assert_eq!(row.len(), 1, "the mark's own row resolves: {row:?}");
+
+        // The capture surface answers a span of mark-space lines too.
         let lines = bridge_call(&mut manager, &bridge, |b| {
             b.grid_lines(0, 40).expect("grid lines")
         });
