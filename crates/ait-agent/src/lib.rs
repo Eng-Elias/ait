@@ -20,26 +20,38 @@
 //! Round 6 adds the §5.6 agent mode on the same precedent:
 //!
 //! - [`AgentSession`] — the synchronous channel handle whose worker
-//!   runs the model loop: `coding_model` resolution (§4.2), system
-//!   prompt assembly (cwd/OS/shell, nearest `AGENTS.md`, redacted
-//!   output tail), streamed `TextDelta`s, cancellation, steering and
-//!   the [`STEP_BUDGET`] model-turn cap. Tools land in a later ticket.
-//!
-//! The tool registry, tool-call loop mechanics and permission engine
-//! build on these in later tickets.
+//!   runs the model↔tools loop: `coding_model` resolution (§4.2),
+//!   system prompt assembly (cwd/OS/shell, nearest `AGENTS.md`,
+//!   redacted output tail), streamed `TextDelta`s, cancellation,
+//!   steering and the [`STEP_BUDGET`] model-turn cap.
+//! - the §5.6 tool pipeline: a neutral `ToolSpec` registry
+//!   translated per schema, streamed tool-call accumulation, and the
+//!   read-only tools (`read_files`, `grep`, `glob`) confined to the
+//!   bound session's cwd.
+//! - the interim permission gate (Spec R06's ask-everything rule):
+//!   every call suspends on an
+//!   [`AgentEvent::ApprovalRequest`] until
+//!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
+//!   results, denials included, re-enter the conversation redacted.
 
 mod agent_context;
 mod context;
 mod conversation;
 mod endpoint_bridge;
+mod files;
 mod redact;
 mod sanitize;
 mod session;
 mod suggester;
+mod tool_call;
+mod tools;
 
 pub use agent_context::AgentContext;
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
 pub use redact::redact;
 pub use sanitize::{sanitize_reply, ReplySanitizer};
-pub use session::{AgentError, AgentEvent, AgentRequest, AgentSession, STEP_BUDGET};
+pub use session::{
+    AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, STEP_BUDGET,
+};
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
+pub use tool_call::{ToolCall, ToolStatus};

@@ -8,10 +8,12 @@
 //!
 //! - the **conversation scrollback** ([`Entry`]) that
 //!   [`AgentEvent`]s accumulate into — `TextDelta`s append to the
-//!   newest assistant entry; `Done`/`Cancelled`/`BudgetReached`/
-//!   `Error` are terminal and leave a status line. The variant list
-//!   is the seam the tool-card ticket extends: each `Entry` owns its
-//!   display shape in [`display_lines`].
+//!   newest assistant entry; tool calls land as tool cards
+//!   ([`Entry::Tool`], status-transitioned by `ToolUpdate`); an
+//!   `ApprovalRequest` parks the gate on the approve card until
+//!   [`decide`](AgentPanel::decide) answers it;
+//!   `Done`/`Cancelled`/`BudgetReached`/`Error` are terminal and
+//!   leave a status line.
 //! - the **input line** typing lands in while the panel is focused —
 //!   a plain append/pop buffer whose cursor sits at the end. It is
 //!   app-side text, never PTY-bound, so no `InputShadow` and no
@@ -31,7 +33,9 @@
 use std::cell::Cell;
 use std::time::Instant;
 
-use ait_agent::{AgentContext, AgentEvent, AgentRequest, AgentSession};
+use ait_agent::{
+    AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, ToolStatus,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -51,10 +55,9 @@ const INPUT_PROMPT: &str = "› ";
 const PROMPT_WIDTH: usize = 2;
 
 /// One conversation entry — what the panel's scrollback is made of.
-/// The tool-card ticket extends this enum with the variants its new
-/// `AgentEvent`s carry (tool-call status, approval requests,
-/// `ask_user_question` prompts); each variant owns its display shape
-/// in [`display_lines`].
+/// Each variant owns its display shape in [`display_lines`]; the
+/// `ask_user_question` interactive card (a later ticket) extends the
+/// list the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Entry {
     /// A submitted task — the user's words, verbatim.
@@ -66,9 +69,58 @@ pub(crate) enum Entry {
     /// Assistant text — `TextDelta`s accumulate onto the newest entry
     /// of this kind; concatenating it yields one model turn's reply.
     Text(String),
+    /// A tool card (Spec R06 us-5): name, argument summary and the
+    /// status its `ToolUpdate`s transition through.
+    Tool(ToolCard),
     /// A terminal outcome line: the task finished, the user cancelled,
     /// the step budget tripped, or a failure message.
     Status(String),
+}
+
+/// A tool card's status — `ait_agent::ToolStatus` plus
+/// `AwaitingApproval`, the frontend-only state a gated call sits in
+/// between its `ApprovalRequest` and the verdict's `ToolUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardStatus {
+    /// Suspended on the approve card — no execution yet.
+    AwaitingApproval,
+    /// Executing (a fresh `ToolCall`, or an allow verdict landed).
+    Running,
+    /// Executed; `detail` previews the result.
+    Done,
+    /// The user denied it; `detail` is the denial text.
+    Denied,
+    /// The tool reported an error; `detail` is the error.
+    Failed,
+}
+
+/// One call's card in the scrollback — built from the event's
+/// `call`/`summary` (the panel never parses tool arguments, standard
+/// 9), transitioned by matching `ToolUpdate`s on `id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCard {
+    /// The provider call id `ToolUpdate`s address.
+    pub(crate) id: String,
+    /// The registry name.
+    pub(crate) name: String,
+    /// The renderable argument summary.
+    pub(crate) summary: String,
+    /// Where the call stands.
+    pub(crate) status: CardStatus,
+    /// The one-line result preview or error/denial text.
+    pub(crate) detail: Option<String>,
+}
+
+/// The approve card's state — which call waits on a verdict and what
+/// the card titles it. `ask_user_question`'s interactive card (a
+/// later ticket) will want its own state; the gate's verdict path is
+/// already shaped for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingApproval {
+    /// The call the worker is parked on.
+    call_id: String,
+    /// Its tool name — the card's title.
+    name: String,
 }
 
 /// A tab's agent conversation panel (Spec R06 us: per-tab ownership).
@@ -106,6 +158,10 @@ pub(crate) struct AgentPanel {
     /// submits while `false`; Esc cancels while `true` and unfocuses
     /// while `false`.
     running: bool,
+    /// The call the gate is parked on, if any — `a`/`t`/`d` answer it
+    /// ([`decide`](Self::decide)) and the approve card row renders
+    /// above the input line.
+    pending: Option<PendingApproval>,
     /// Whether the conversation view follows the tail — `false` once
     /// the user wheel-scrolls up; re-pinned by a wheel-down that
     /// lands on the bottom or by a fresh submit/steer.
@@ -143,6 +199,7 @@ impl AgentPanel {
             open: true,
             focused: true,
             running: false,
+            pending: None,
             pinned: true,
             top: Cell::new(0),
             painted: Cell::new((0, 0)),
@@ -167,6 +224,27 @@ impl AgentPanel {
     /// cancels vs. unfocuses, and the title row's hint reads it.
     pub(crate) fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Whether the gate is parked on a call — `a`/`t`/`d` verdicts
+    /// apply while `true` (the approve card shows), and the paint
+    /// reserves its row.
+    pub(crate) fn awaiting_verdict(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Answer the pending approval (Spec R06's three-way card):
+    /// `call_id` rides along so the worker ignores a verdict meant
+    /// for a call it already resolved. A dead worker toasts — the
+    /// task is ending anyway, so the card clears either way.
+    pub(crate) fn decide(&mut self, verdict: ApprovalVerdict, toast: &mut Option<Toast>) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if let Err(error) = self.session.approve(&pending.call_id, verdict) {
+            *toast = Some(Toast::new(format!("{error}"), Instant::now()));
+        }
+        self.revision += 1;
     }
 
     /// The mutation counter `app`'s frame snapshot compares.
@@ -283,29 +361,81 @@ impl AgentPanel {
 
     /// One event applied: a `TextDelta` accumulates onto the newest
     /// `Text` entry (a turn after a task or steering entry gets its
-    /// own), and every terminal event releases `running` and leaves a
-    /// `Status` line the user can read against the stream above it.
+    /// own); an `ApprovalRequest` opens an awaiting tool card and the
+    /// approve-card state; a `ToolCall` opens a running card; a
+    /// `ToolUpdate` transitions the card its `call_id` addresses and
+    /// resolves a matching wait; every terminal event releases
+    /// `running`, drops any pending approval and leaves a `Status`
+    /// line the user can read against the stream above it.
     pub(crate) fn apply(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::TextDelta(text) => match self.entries.last_mut() {
                 Some(Entry::Text(last)) => last.push_str(&text),
                 _ => self.entries.push(Entry::Text(text)),
             },
+            AgentEvent::ApprovalRequest { call, summary } => {
+                self.entries.push(Entry::Tool(ToolCard {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    summary,
+                    status: CardStatus::AwaitingApproval,
+                    detail: None,
+                }));
+                self.pending = Some(PendingApproval {
+                    call_id: call.id,
+                    name: call.name,
+                });
+            }
+            AgentEvent::ToolCall { call, summary } => {
+                self.entries.push(Entry::Tool(ToolCard {
+                    id: call.id,
+                    name: call.name,
+                    summary,
+                    status: CardStatus::Running,
+                    detail: None,
+                }));
+            }
+            AgentEvent::ToolUpdate {
+                call_id,
+                status,
+                detail,
+            } => {
+                // The newest card with the id wins — call ids are
+                // provider-unique but defensive all the same.
+                if let Some(card) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Tool(card) if card.id == call_id => Some(card),
+                    _ => None,
+                }) {
+                    card.status = card_status(status);
+                    card.detail = detail;
+                }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.call_id == call_id)
+                {
+                    self.pending = None;
+                }
+            }
             AgentEvent::Done => {
                 self.running = false;
+                self.pending = None;
                 self.entries.push(Entry::Status("done".to_string()));
             }
             AgentEvent::Cancelled => {
                 self.running = false;
+                self.pending = None;
                 self.entries.push(Entry::Status("cancelled".to_string()));
             }
             AgentEvent::BudgetReached => {
                 self.running = false;
+                self.pending = None;
                 self.entries
                     .push(Entry::Status("step budget reached".to_string()));
             }
             AgentEvent::Error(message) => {
                 self.running = false;
+                self.pending = None;
                 self.entries
                     .push(Entry::Status(format!("error: {message}")));
             }
@@ -352,6 +482,18 @@ impl AgentPanel {
     fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
         self.revision += 1;
+    }
+}
+
+/// `ait_agent::ToolStatus` → [`CardStatus`] — the worker's
+/// vocabulary mapped onto the card's (whose extra `AwaitingApproval`
+/// state never comes through a `ToolUpdate`).
+fn card_status(status: ToolStatus) -> CardStatus {
+    match status {
+        ToolStatus::Running => CardStatus::Running,
+        ToolStatus::Done => CardStatus::Done,
+        ToolStatus::Denied => CardStatus::Denied,
+        ToolStatus::Failed => CardStatus::Failed,
     }
 }
 
@@ -410,7 +552,9 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     }
     // The input line owns the last row: `› ` plus the tail of the
     // buffer (long input clips from the left — the cursor end is the
-    // half the user is editing).
+    // half the user is editing). The approve card takes the row just
+    // above while the gate waits — it is never hidden, and the
+    // conversation loses that row for the duration.
     let input_y = inner.bottom() - 1;
     reset_span(buf, input_y, inner.x..inner.right());
     let room = width.saturating_sub(PROMPT_WIDTH);
@@ -422,6 +566,22 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
         width,
         Style::default(),
     );
+    let approve_rows = if let (Some(pending), true) = (&panel.pending, input_y > inner.y + 1) {
+        let y = input_y - 1;
+        reset_span(buf, y, inner.x..inner.right());
+        buf.set_stringn(
+            inner.x,
+            y,
+            format!(" approve {} — a: once · t: task · d: deny ", pending.name),
+            width,
+            Style::default()
+                .fg(RtColor::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        1
+    } else {
+        0
+    };
     if inner.height < 3 {
         return;
     }
@@ -430,7 +590,7 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     // owns the scroll clamp: `top`/`painted` are what the wheel
     // handlers bound against.
     let conversation = display_lines(&panel.entries, width);
-    let height = usize::from(input_y - (inner.y + 1));
+    let height = usize::from(input_y - (inner.y + 1)).saturating_sub(approve_rows);
     let max_top = conversation.len().saturating_sub(height);
     let top = if panel.pinned {
         max_top
@@ -458,17 +618,52 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
         if index > 0 {
             lines.push((String::new(), Style::default()));
         }
-        let (text, style) = match entry {
-            Entry::Task(text) | Entry::Steering(text) => (
+        let blocks: Vec<(String, Style)> = match entry {
+            Entry::Task(text) | Entry::Steering(text) => vec![(
                 format!("{INPUT_PROMPT}{text}"),
                 Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Entry::Text(text) => (text.clone(), Style::default()),
-            Entry::Status(text) => (text.clone(), Style::default().fg(RtColor::DarkGray)),
+            )],
+            Entry::Text(text) => vec![(text.clone(), Style::default())],
+            Entry::Tool(card) => tool_card_lines(card),
+            Entry::Status(text) => vec![(text.clone(), Style::default().fg(RtColor::DarkGray))],
         };
-        for line in wrap(&text, width) {
-            lines.push((line, style));
+        for (text, style) in blocks {
+            for line in wrap(&text, width) {
+                lines.push((line, style));
+            }
         }
+    }
+    lines
+}
+
+/// A tool card's display blocks (Spec R06 us-5): a status-marked
+/// header — `✓` done, `…` running, `?` awaiting approval, `✗` denied,
+/// `!` failed — then the detail (result preview, error or denial
+/// text) indented and dimmed when the update carried one.
+fn tool_card_lines(card: &ToolCard) -> Vec<(String, Style)> {
+    let (mark, style) = match card.status {
+        CardStatus::AwaitingApproval => (
+            "?",
+            Style::default()
+                .fg(RtColor::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        CardStatus::Running => ("…", Style::default()),
+        CardStatus::Done => ("✓", Style::default().fg(RtColor::Green)),
+        CardStatus::Denied => ("✗", Style::default().fg(RtColor::DarkGray)),
+        CardStatus::Failed => ("!", Style::default().fg(RtColor::Red)),
+    };
+    let summary = if card.summary.is_empty() {
+        card.name.clone()
+    } else {
+        format!("{} {}", card.name, card.summary)
+    };
+    let mut lines = vec![(format!("{mark} {summary}"), style)];
+    if let Some(detail) = &card.detail {
+        lines.push((
+            format!("    {detail}"),
+            Style::default().fg(RtColor::DarkGray),
+        ));
     }
     lines
 }
@@ -819,5 +1014,150 @@ mod tests {
         panel.scroll_down(10);
         paint_agent_panel(&mut buf, area, &panel);
         assert!(panel.is_pinned(), "landing on the bottom re-pins");
+    }
+
+    /// A staged `ToolCall` for the card tests.
+    fn call(id: &str, name: &str) -> ait_agent::ToolCall {
+        ait_agent::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: String::new(),
+        }
+    }
+
+    /// An `ApprovalRequest` opens an awaiting tool card and parks the
+    /// gate; `decide` consumes the wait (the verdict travels the real
+    /// channel — the worker's end is the session tests' seam).
+    #[test]
+    fn approval_request_opens_a_card_and_decide_answers_it() {
+        let mut panel = panel();
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: call("call_1", "read_files"),
+            summary: "note.txt".into(),
+        });
+        assert!(panel.awaiting_verdict());
+        assert_eq!(
+            panel.entries().last(),
+            Some(&Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "read_files".into(),
+                summary: "note.txt".into(),
+                status: CardStatus::AwaitingApproval,
+                detail: None,
+            }))
+        );
+
+        let mut toast = None;
+        panel.decide(ApprovalVerdict::AllowOnce, &mut toast);
+        assert!(!panel.awaiting_verdict());
+        assert!(toast.is_none());
+    }
+
+    /// An ungated `ToolCall` opens a running card; `ToolUpdate`s
+    /// transition it and a matching update resolves a parked gate.
+    #[test]
+    fn tool_cards_transition_on_updates() {
+        let mut panel = panel();
+        panel.apply(AgentEvent::ToolCall {
+            call: call("call_1", "glob"),
+            summary: "\"*.rs\"".into(),
+        });
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Done,
+            detail: Some("a.rs".into()),
+        });
+        assert_eq!(
+            panel.entries().last(),
+            Some(&Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "glob".into(),
+                summary: "\"*.rs\"".into(),
+                status: CardStatus::Done,
+                detail: Some("a.rs".into()),
+            }))
+        );
+
+        // A denial resolves the pending wait and marks the card.
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: call("call_2", "read_files"),
+            summary: "b.rs".into(),
+        });
+        assert!(panel.awaiting_verdict());
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_2".into(),
+            status: ait_agent::ToolStatus::Denied,
+            detail: Some("not now".into()),
+        });
+        assert!(!panel.awaiting_verdict());
+        assert!(matches!(
+            panel.entries().last(),
+            Some(Entry::Tool(ToolCard {
+                status: CardStatus::Denied,
+                ..
+            }))
+        ));
+    }
+
+    /// A terminal event while the gate waits drops the approve card
+    /// — it can never outlive its task.
+    #[test]
+    fn terminal_events_clear_a_pending_approval() {
+        let mut panel = panel();
+        panel.entries.push(Entry::Task("fix it".into()));
+        panel.running = true;
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: call("call_1", "grep"),
+            summary: "\"x\"".into(),
+        });
+        assert!(panel.awaiting_verdict());
+        panel.apply(AgentEvent::Cancelled);
+        assert!(!panel.awaiting_verdict());
+    }
+
+    /// The approve card paints its row above the input line while the
+    /// gate waits — and the tool card renders mark + name + summary.
+    #[test]
+    fn paint_shows_tool_cards_and_the_approve_row() {
+        let mut panel = panel();
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: call("call_1", "read_files"),
+            summary: "note.txt".into(),
+        });
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 7));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 7), &panel);
+
+        // The tool card on the first conversation row.
+        let card_row: String = (1..25).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(card_row.trim_end(), "? read_files note.txt");
+        // The approve card on the row above the input line.
+        let approve_row: String = (1..60).map(|x| buf[(x, 5)].symbol().to_string()).collect();
+        assert!(
+            approve_row.contains("approve read_files"),
+            "{approve_row:?}"
+        );
+        assert!(approve_row.contains("d: deny"), "{approve_row:?}");
+        // The input line still owns the last row.
+        let input_row: String = (1..3).map(|x| buf[(x, 6)].symbol().to_string()).collect();
+        assert_eq!(input_row, "› ");
+
+        // Once resolved the card transitions and the row returns.
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Done,
+            detail: Some("note.txt: contents".into()),
+        });
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 7));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 7), &panel);
+        let card_row: String = (1..25).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(card_row.trim_end(), "✓ read_files note.txt");
+        let detail_row: String = (1..25).map(|x| buf[(x, 2)].symbol().to_string()).collect();
+        assert_eq!(detail_row.trim(), "note.txt: contents");
+        let input_row_above: String = (1..20).map(|x| buf[(x, 5)].symbol().to_string()).collect();
+        assert!(
+            !input_row_above.contains("approve"),
+            "the row released: {input_row_above:?}"
+        );
     }
 }

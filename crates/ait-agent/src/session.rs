@@ -22,14 +22,33 @@
 //! line, so the never-execute guarantee does not apply at this seam
 //! (CODING_STANDARDS §13 governs PTY-bound text only).
 //!
-//! No tools yet: the loop emits requests and streams replies until an
-//! end-of-turn with no steering queued, cancellation (the shared
-//! `CancellationToken`, the frontend's Esc path), or the
-//! [`STEP_BUDGET`] model-turn cap — tool calls, approvals and
-//! `ask_user_question` arrive with the registry ticket. A steering
-//! message queued mid-run ([`AgentSession::steer`]) is appended to the
-//! conversation as a user message and rides the next request; it never
-//! interrupts an in-flight stream.
+//! The agent loop: assemble → stream → accumulate streamed tool-call
+//! deltas → gate + execute sequentially → append per-schema result
+//! items → re-request. The **interim permission gate** (Spec R06's
+//! ask-everything rule, until Round 7's §5.7 profiles land): every
+//! tool call suspends the loop on an
+//! [`AgentEvent::ApprovalRequest`] — carrying the call and a
+//! renderable argument summary — until the frontend's
+//! [`AgentSession::approve`] answers with an [`ApprovalVerdict`]:
+//! *allow once*, *allow this tool for the rest of the task*, or
+//! *deny* (the denial text becomes the tool result). Prompts never
+//! time out (us-9); Esc still cancels the whole task, and
+//! `ask_user_question` is exempt by design — its own card is the ask
+//! (us-10; the exemption point exists in [`tools::gate_exempt`]
+//! before the tool does). The gate sits at the same consult-point
+//! §5.7's profile engine will drive — Round 7 swaps the policy, not
+//! the plumbing.
+//!
+//! Calls in one turn execute sequentially in model order (us-33),
+//! each gated. Every tool result passes [`redact`](crate::redact)
+//! before entering the conversation — §5.10.3's rule extends from
+//! terminal output to everything the agent touches. The run ends on
+//! a no-tool-calls end turn with no steering queued, cancellation
+//! (the shared `CancellationToken`, the frontend's Esc path), or the
+//! [`STEP_BUDGET`] model-turn cap. A steering message queued mid-run
+//! ([`AgentSession::steer`]) is appended to the conversation as a
+//! user message and rides the next request; it never interrupts an
+//! in-flight stream.
 //!
 //! Every failure mode (unconfigured model, resolution/transport/stream
 //! error, provider error event, cancelled request) maps to a terminal
@@ -37,10 +56,12 @@
 //! panics and never wedges — a poisoned task answers `Error`, then the
 //! next queued task is served.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use ait_config::{ModelRole, OsKeyring, SecretStore, Settings};
 use ait_llm::{Endpoint, EndpointConfig, EndpointRequest, EndpointStream, LlmError};
@@ -50,6 +71,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext};
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
+use crate::files::ToolCwd;
+use crate::redact::redact;
+use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
+use crate::tools;
 
 /// The execution profile whose model roles agent tasks resolve
 /// against (§4.2 — the only profile Round 6 wires; per-profile roles
@@ -60,8 +85,18 @@ const PROFILE: &str = "default";
 /// The step budget (Spec R06, glossary): at most this many model turns
 /// per task. Configurability is a later round's decision; the constant
 /// names the termination condition the agent loop checks before every
-/// request — including the tool-call turns the registry ticket adds.
+/// request — tool-call turns included.
 pub const STEP_BUDGET: usize = 50;
+
+/// How often a gate wait wakes to check the cancellation token — the
+/// only reason the wait is a poll at all (us-9: prompts never time
+/// out into a verdict; Esc answers them instead).
+const GATE_POLL: Duration = Duration::from_millis(100);
+
+/// The tool-result text when the user denies a call without typing a
+/// reason — the panel sends it, and the worker substitutes it for an
+/// empty `Deny`, so the model always reads a sentence.
+const DEFAULT_DENIAL: &str = "the user denied this call";
 
 /// One submitted task — the value the frontend sends on the session's
 /// request channel. It carries the task text verbatim plus the
@@ -79,8 +114,27 @@ pub struct AgentRequest {
     pub task: String,
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
-    /// [`assemble_system_prompt`].
+    /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
+    /// every path the agent reads or searches stays under it.
     pub context: AgentContext,
+}
+
+/// The user's answer to an [`AgentEvent::ApprovalRequest`] — the
+/// interim gate's whole vocabulary (Spec R06's three-way card).
+/// Round 7's profile engine will compute the same verdict itself;
+/// the channel shape survives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalVerdict {
+    /// Run this call once; ask again next time.
+    AllowOnce,
+    /// Run this call and every later call to the same tool for the
+    /// rest of the task — the suppression is per tool, never blanket
+    /// (us-7).
+    AllowForTask,
+    /// Refuse the call; the text becomes its tool result so the model
+    /// can pick a different approach (us-8). An empty reason reads as
+    /// [`DEFAULT_DENIAL`].
+    Deny(String),
 }
 
 /// One outcome of an [`AgentRequest`], drained with
@@ -96,11 +150,43 @@ pub enum AgentEvent {
     /// Concatenating every `TextDelta` of a task yields the full
     /// streamed reply.
     TextDelta(String),
+    /// The gate suspended on a call: nothing executes until the
+    /// frontend answers [`AgentSession::approve`] with an
+    /// [`ApprovalVerdict`] for `call.id`. The panel renders the
+    /// approve card — `summary` is the renderable argument summary
+    /// (command text, file paths; us-5).
+    ApprovalRequest {
+        /// The complete call awaiting a verdict.
+        call: ToolCall,
+        /// The call's renderable argument summary.
+        summary: String,
+    },
+    /// A call began executing without a gate wait — an
+    /// allow-for-task repeat or a gate-exempt tool. The panel opens
+    /// its tool card already `Running`.
+    ToolCall {
+        /// The call now executing.
+        call: ToolCall,
+        /// The call's renderable argument summary.
+        summary: String,
+    },
+    /// A tool card's status transition (us-5): `Running` after an
+    /// allow verdict, `Done`/`Failed` after execution (the card's
+    /// result preview or error rides in `detail`), `Denied` after a
+    /// deny verdict (the denial text in `detail`).
+    ToolUpdate {
+        /// The `call.id` this update applies to.
+        call_id: String,
+        /// The new status.
+        status: ToolStatus,
+        /// A one-line detail for the card — result preview or error.
+        detail: Option<String>,
+    },
     /// The task finished cleanly: the model ended its turn with no
     /// tool calls and no steering queued. Terminal.
     Done,
-    /// The user cancelled (Esc): the in-flight stream stopped and the
-    /// task ended. Terminal.
+    /// The user cancelled (Esc): the in-flight stream or gate wait
+    /// stopped and the task ended. Terminal.
     Cancelled,
     /// The [`STEP_BUDGET`] model-turn cap tripped before the task
     /// finished. Terminal.
@@ -111,9 +197,10 @@ pub enum AgentEvent {
     Error(String),
 }
 
-/// [`AgentSession::submit`] or [`AgentSession::steer`] could not queue
-/// the value — the worker thread is gone (the only failure mode, so
-/// the error is payload-free).
+/// [`AgentSession::submit`], [`AgentSession::steer`] or
+/// [`AgentSession::approve`] could not queue the value — the worker
+/// thread is gone (the only failure mode, so the error is
+/// payload-free).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentError;
 
@@ -125,6 +212,17 @@ impl std::fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// A gate wait's outcome — what the worker does next.
+enum GateOutcome {
+    /// The frontend sent a verdict for the awaited call.
+    Verdict(ApprovalVerdict),
+    /// Esc: the cancellation token fired mid-wait.
+    Cancelled,
+    /// The verdict channel closed — the handle is gone; reporting
+    /// anything is pointless.
+    Gone,
+}
+
 /// The synchronous handle the frontend holds — one agent conversation
 /// per `Tab` (Spec R06 us: per-tab ownership). One in-flight task at a
 /// time is the frontend's contract; queued tasks run in order on the
@@ -132,6 +230,11 @@ impl std::error::Error for AgentError {}
 pub struct AgentSession {
     requests: Option<Sender<AgentRequest>>,
     steering: Option<Sender<String>>,
+    /// Approve-card answers — `(call_id, verdict)` pairs; the worker
+    /// matches `call_id` so a stale verdict (answered after its card
+    /// was already resolved or its task ended) can never decide a
+    /// different call.
+    verdicts: Option<Sender<(String, ApprovalVerdict)>>,
     events: Receiver<AgentEvent>,
     /// The in-flight task's cancellation token — shared so
     /// [`cancel`](AgentSession::cancel) (the frontend's Esc) reaches
@@ -154,6 +257,7 @@ impl AgentSession {
     pub fn with_secret_store(store: impl SecretStore + Send + 'static) -> Self {
         let (requests_tx, requests_rx) = mpsc::channel::<AgentRequest>();
         let (steering_tx, steering_rx) = mpsc::channel::<String>();
+        let (verdicts_tx, verdicts_rx) = mpsc::channel::<(String, ApprovalVerdict)>();
         let (events_tx, events_rx) = mpsc::channel::<AgentEvent>();
         let in_flight = Arc::new(Mutex::new(None));
         let thread = thread::spawn({
@@ -162,6 +266,7 @@ impl AgentSession {
                 worker(
                     requests_rx,
                     steering_rx,
+                    verdicts_rx,
                     events_tx,
                     in_flight,
                     Box::new(store),
@@ -171,6 +276,7 @@ impl AgentSession {
         Self {
             requests: Some(requests_tx),
             steering: Some(steering_tx),
+            verdicts: Some(verdicts_tx),
             events: events_rx,
             in_flight,
             thread: Some(thread),
@@ -198,6 +304,21 @@ impl AgentSession {
         }
     }
 
+    /// Answer the pending [`AgentEvent::ApprovalRequest`] for `call_id`
+    /// (Spec R06's approve card — *allow once* / *allow this tool for
+    /// the rest of the task* / *deny*). The worker ignores a verdict
+    /// whose `call_id` is not the call it suspended on, so a stale
+    /// answer can never resolve a different call. Fails only if the
+    /// worker is gone.
+    pub fn approve(&self, call_id: &str, verdict: ApprovalVerdict) -> Result<(), AgentError> {
+        match &self.verdicts {
+            Some(sender) => sender
+                .send((call_id.to_string(), verdict))
+                .map_err(|_| AgentError),
+            None => Err(AgentError),
+        }
+    }
+
     /// The channel of agent events — drain with
     /// [`Receiver::try_recv`] once per tick, or block on
     /// [`Receiver::recv_timeout`] in tests.
@@ -207,9 +328,10 @@ impl AgentSession {
 
     /// Cancel the in-flight task — the Esc path. The worker's
     /// `Endpoint::stream` sees the token promptly, mid-stream and
-    /// mid-backoff; an [`AgentEvent::Cancelled`] follows on the event
-    /// channel. No-op while idle, and a queued-but-unstarted task
-    /// still runs.
+    /// mid-backoff, and a gate wait notices it within
+    /// [`GATE_POLL`]; an [`AgentEvent::Cancelled`] follows on the
+    /// event channel. No-op while idle, and a queued-but-unstarted
+    /// task still runs.
     pub fn cancel(&self) {
         if let Some(token) = slot(&self.in_flight).as_ref() {
             token.cancel();
@@ -233,12 +355,14 @@ impl std::fmt::Debug for AgentSession {
 
 impl Drop for AgentSession {
     fn drop(&mut self) {
-        // Cancel whatever is streaming so `block_on` unwinds promptly,
-        // then close both channels — the worker's `recv` ends and the
-        // thread exits; join so no worker outlives its handle.
+        // Cancel whatever is streaming or gated so `block_on` unwinds
+        // promptly, then close every channel — the worker's `recv`
+        // ends and the thread exits; join so no worker outlives its
+        // handle.
         self.cancel();
         self.requests.take();
         self.steering.take();
+        self.verdicts.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -251,6 +375,7 @@ impl Drop for AgentSession {
 fn worker(
     requests: Receiver<AgentRequest>,
     steering: Receiver<String>,
+    verdicts: Receiver<(String, ApprovalVerdict)>,
     events: Sender<AgentEvent>,
     in_flight: Arc<Mutex<Option<CancellationToken>>>,
     store: Box<dyn SecretStore + Send>,
@@ -275,6 +400,7 @@ fn worker(
             &runtime,
             request,
             &steering,
+            &verdicts,
             &events,
             &in_flight,
             store.as_ref(),
@@ -290,6 +416,7 @@ fn serve(
     runtime: &tokio::runtime::Runtime,
     request: AgentRequest,
     steering: &Receiver<String>,
+    verdicts: &Receiver<(String, ApprovalVerdict)>,
     events: &Sender<AgentEvent>,
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
@@ -340,6 +467,9 @@ fn serve(
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
     drain_steering(steering, &mut conversation);
+    // The task's file tools bind to the session's cwd — every path
+    // they touch stays under it (Spec R06's confinement rule).
+    let cwd = ToolCwd::new(&request.context.cwd);
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
@@ -348,27 +478,36 @@ fn serve(
         &mut conversation,
         &system,
         steering,
+        verdicts,
+        &cwd,
         token,
         events,
     ));
     slot(in_flight).take();
 }
 
-/// The agent loop without tools: request → stream → emit, until the
-/// model ends its turn with no steering queued (task `Done`), the
-/// [`STEP_BUDGET`] trips, the task is cancelled, or a failure maps to
+/// The agent loop (Spec R06): request → stream → accumulate tool
+/// calls → gate + execute sequentially in model order → append
+/// per-schema assistant-call and tool-result items → re-request.
+/// Terminates on a no-tool-calls end turn with no steering queued,
+/// the [`STEP_BUDGET`] tripping, cancellation, or a failure mapped to
 /// a terminal `Error`. Steering queued mid-run is drained into the
-/// conversation at each turn boundary — the seam where tool results
-/// will also be appended once the registry lands.
+/// conversation at each turn boundary — model turn or tool turn alike.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     endpoint: &Endpoint,
     conversation: &mut Conversation,
     system: &str,
     steering: &Receiver<String>,
+    verdicts: &Receiver<(String, ApprovalVerdict)>,
+    cwd: &ToolCwd,
     cancel: CancellationToken,
     events: &Sender<AgentEvent>,
 ) {
     let mut turns = 0usize;
+    // Tools the user allowed for the rest of the task — the interim
+    // gate's only memory; per name, never blanket (us-7).
+    let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
             emit(events, AgentEvent::BudgetReached);
@@ -376,17 +515,46 @@ async fn run_loop(
         }
         let request = conversation.request(&endpoint.config().model, system);
         match stream_turn(endpoint, request, cancel.clone(), events).await {
-            TurnOutcome::EndTurn(reply) => {
+            TurnOutcome::EndTurn { text, calls } => {
                 turns += 1;
-                conversation.push_assistant(reply);
-                // A steering message queued during the stream becomes
-                // a user message on the next request — the run
-                // continues instead of finishing.
-                if drain_steering(steering, conversation) {
-                    continue;
+                if calls.is_empty() {
+                    conversation.push_assistant(text);
+                    // A steering message queued during the stream
+                    // becomes a user message on the next request —
+                    // the run continues instead of finishing.
+                    if drain_steering(steering, conversation) {
+                        continue;
+                    }
+                    emit(events, AgentEvent::Done);
+                    return;
                 }
-                emit(events, AgentEvent::Done);
-                return;
+                // A tool turn: the assistant item lands first — the
+                // conversation records the calls regardless of the
+                // verdicts — then each call gates and executes in
+                // model order.
+                conversation.push_tool_calls(&text, &calls);
+                let mut results = Vec::with_capacity(calls.len());
+                for call in &calls {
+                    if cancel.is_cancelled() {
+                        emit(events, AgentEvent::Cancelled);
+                        return;
+                    }
+                    match gate_and_execute(
+                        call,
+                        &mut allowed_for_task,
+                        verdicts,
+                        cwd,
+                        &cancel,
+                        events,
+                    ) {
+                        Some(result) => results.push(result),
+                        None => return,
+                    }
+                }
+                conversation.push_tool_results(&calls, &results);
+                // Steering queued during the tool turn rides the next
+                // request beside the results.
+                drain_steering(steering, conversation);
             }
             TurnOutcome::Cancelled => {
                 emit(events, AgentEvent::Cancelled);
@@ -400,11 +568,142 @@ async fn run_loop(
     }
 }
 
+/// The interim permission gate plus one call's execution (Spec R06):
+/// emit the call's card event, suspend on an
+/// [`ApprovalVerdict`] when the tool is not exempt and was not
+/// allowed for the task, then run the executor. Returns the text the
+/// tool result carries — the executor's (redacted) output, or the
+/// denial text — and `None` when the run must end (cancelled, or the
+/// frontend's channels are gone).
+fn gate_and_execute(
+    call: &ToolCall,
+    allowed_for_task: &mut HashSet<String>,
+    verdicts: &Receiver<(String, ApprovalVerdict)>,
+    cwd: &ToolCwd,
+    cancel: &CancellationToken,
+    events: &Sender<AgentEvent>,
+) -> Option<String> {
+    let summary = tools::summarize_args(call);
+    let needs_verdict = !tools::gate_exempt(&call.name) && !allowed_for_task.contains(&call.name);
+    let event = if needs_verdict {
+        AgentEvent::ApprovalRequest {
+            call: call.clone(),
+            summary,
+        }
+    } else {
+        AgentEvent::ToolCall {
+            call: call.clone(),
+            summary,
+        }
+    };
+    if !emit(events, event) {
+        return None;
+    }
+    if needs_verdict {
+        match await_verdict(verdicts, &call.id, cancel) {
+            GateOutcome::Verdict(ApprovalVerdict::AllowOnce) => {}
+            GateOutcome::Verdict(ApprovalVerdict::AllowForTask) => {
+                allowed_for_task.insert(call.name.clone());
+            }
+            GateOutcome::Verdict(ApprovalVerdict::Deny(mut reason)) => {
+                if reason.is_empty() {
+                    reason = DEFAULT_DENIAL.to_string();
+                }
+                emit(
+                    events,
+                    AgentEvent::ToolUpdate {
+                        call_id: call.id.clone(),
+                        status: ToolStatus::Denied,
+                        detail: Some(reason.clone()),
+                    },
+                );
+                // The denial text IS the tool result (us-8) — the
+                // model reads it and picks a different approach.
+                return Some(reason);
+            }
+            GateOutcome::Cancelled => {
+                emit(events, AgentEvent::Cancelled);
+                return None;
+            }
+            GateOutcome::Gone => return None,
+        }
+        if !emit(
+            events,
+            AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Running,
+                detail: None,
+            },
+        ) {
+            return None;
+        }
+    }
+    let output = tools::execute(call, cwd);
+    // §5.10.3, extended to everything the agent touches: the result
+    // is redacted before it enters the conversation — and the card's
+    // preview comes from the same redacted text.
+    let text = redact(&output.text);
+    emit(
+        events,
+        AgentEvent::ToolUpdate {
+            call_id: call.id.clone(),
+            status: if output.is_error {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Done
+            },
+            detail: Some(preview(&text)),
+        },
+    );
+    Some(text)
+}
+
+/// Park on the verdict channel until the answer for `call_id`
+/// arrives — indefinitely (us-9: no timeout into a default verdict).
+/// The [`GATE_POLL`] cadence exists only to notice the cancellation
+/// token (Esc resolves a gate wait too) and stale verdicts — answers
+/// to calls the loop is not waiting on — drop rather than deciding
+/// the wrong call.
+fn await_verdict(
+    verdicts: &Receiver<(String, ApprovalVerdict)>,
+    call_id: &str,
+    cancel: &CancellationToken,
+) -> GateOutcome {
+    loop {
+        if cancel.is_cancelled() {
+            return GateOutcome::Cancelled;
+        }
+        match verdicts.recv_timeout(GATE_POLL) {
+            Ok((id, verdict)) if id == call_id => return GateOutcome::Verdict(verdict),
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return GateOutcome::Gone,
+        }
+    }
+}
+
+/// A card's `detail`: the first line of the (already redacted) tool
+/// result, clipped — enough to recognize what ran without turning
+/// the scrollback into the output itself.
+fn preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 120;
+    let first = text.lines().next().unwrap_or_default();
+    if first.chars().count() > PREVIEW_CHARS {
+        format!("{}…", first.chars().take(PREVIEW_CHARS).collect::<String>())
+    } else if text.lines().nth(1).is_some() {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    }
+}
+
 /// How one streamed model turn ended.
 enum TurnOutcome {
-    /// The stream ended cleanly; carries the reply's concatenated text
-    /// for the conversation.
-    EndTurn(String),
+    /// The stream ended cleanly; carries the reply's concatenated
+    /// text and the turn's accumulated tool calls (empty on a plain
+    /// end turn — the cross-schema "the model asked for tools"
+    /// signal is ≥1 accumulated call, not a `Finish` reason).
+    EndTurn { text: String, calls: Vec<ToolCall> },
     /// The cancellation token fired (in-flight or pre-flight).
     Cancelled,
     /// Terminal: an `Error` was emitted, or the frontend's receiver is
@@ -425,9 +724,10 @@ fn drain_steering(steering: &Receiver<String>, conversation: &mut Conversation) 
 
 /// Drive one request's stream and emit events: text fragments into
 /// [`AgentEvent::TextDelta`]s (and the turn's accumulated reply),
-/// provider error events and [`LlmError`]s into terminal `Error`s,
-/// cancellation into [`TurnOutcome::Cancelled`]. Sends stop early if the
-/// frontend's receiver is gone.
+/// tool-call fragments into the [`CallAccumulator`], provider error
+/// events and [`LlmError`]s into terminal `Error`s, cancellation into
+/// [`TurnOutcome::Cancelled`]. Sends stop early if the frontend's
+/// receiver is gone.
 async fn stream_turn(
     endpoint: &Endpoint,
     request: EndpointRequest,
@@ -443,6 +743,7 @@ async fn stream_turn(
         }
     };
     let mut reply = String::new();
+    let mut accumulator = CallAccumulator::new();
     while let Some(item) = stream.next().await {
         match item {
             Err(LlmError::Cancelled) => return TurnOutcome::Cancelled,
@@ -450,22 +751,28 @@ async fn stream_turn(
                 emit(events, AgentEvent::Error(format!("{error}")));
                 return TurnOutcome::Ended;
             }
-            Ok(event) => match extract(event) {
-                Extracted::Text(text) => {
-                    reply.push_str(&text);
-                    if !emit(events, AgentEvent::TextDelta(text)) {
+            Ok(event) => {
+                accumulator.push(&event);
+                match extract(event) {
+                    Extracted::Text(text) => {
+                        reply.push_str(&text);
+                        if !emit(events, AgentEvent::TextDelta(text)) {
+                            return TurnOutcome::Ended;
+                        }
+                    }
+                    Extracted::ProviderError(message) => {
+                        emit(events, AgentEvent::Error(message));
                         return TurnOutcome::Ended;
                     }
+                    Extracted::Other => {}
                 }
-                Extracted::ProviderError(message) => {
-                    emit(events, AgentEvent::Error(message));
-                    return TurnOutcome::Ended;
-                }
-                Extracted::Other => {}
-            },
+            }
         }
     }
-    TurnOutcome::EndTurn(reply)
+    TurnOutcome::EndTurn {
+        text: reply,
+        calls: accumulator.finish(),
+    }
 }
 
 /// Send one event; `false` when the frontend's receiver is gone — the
