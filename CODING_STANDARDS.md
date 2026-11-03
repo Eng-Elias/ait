@@ -25,3 +25,7 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
 14. In-flight async work pins a stable identity (`Tab::id`, a session
     token) — never a positional index or an OS handle that reorder or
     recycle underneath it (R04's `SuggestionPin`).
+15. Gate PTY/shell test waits on output only execution produces — never
+    the command's own echo: type `echo FD$((100+24))`, wait for `FD124`
+    (`docs/using-the-testkit.md`).
+

@@ -39,6 +39,22 @@ Other verbs: `text`, `bytes` (hex), `mouse = {event, col, row}`,
 `.jsonl` under `tests/recordings/` — regenerate with
 `AIT_E2E_RECORD=1 AIT_E2E_DRIVER=<cmd>`; replay needs no model).
 
+## Wait on execution, not echo
+
+`wait_text` and `expect_*` see everything the PTY renders — including
+the shell's echo of the command you just typed. Gate on a marker only
+a *running* command can produce, or the wait fires early and the test
+asserts on a screen from before the command ran:
+
+- `wait_text = "FLOOD-DONE"` after `text = "echo FLOOD-DONE\n"`
+  matches the echo, not the output. Use shell expansion to separate
+  them: send `echo FD$((100+24))`, wait for `FD124`.
+- The same trap lives in Rust-side waits (`drain_until`,
+  `wait_for_screen`) and in prompt detection itself: a wait that
+  matches the cursor's current row fires early when the prompt ends
+  exactly at the right margin — check for any rendered non-empty row
+  instead.
+
 ## Watch it run
 
 ```bash

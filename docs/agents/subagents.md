@@ -14,3 +14,11 @@ subagents.
   the implementer knows exactly what to re-check.
 - **Skill tool**: a subagent without a Skill tool reads the skill file
   directly — `.devin/skills/<name>/SKILL.md` — and follows it.
+- **Profiles**: `subagent_explore` is read-only — it returns notes in
+  its final report and the parent writes them to `ait-notes-<round>/`
+  itself. Dispatch note-writing explorers as `subagent_general`, or
+  plan to persist the report.
+- **Checkpoints**: implementers commit after each logical step, not
+  once at the end — a subagent that dies mid-task leaves its last
+  commit, not an uncommitted worktree.
+
