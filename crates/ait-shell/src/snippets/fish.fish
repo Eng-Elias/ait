@@ -9,7 +9,7 @@
 # normal config, never sees this file, and degrades cleanly instead of
 # double-hooking (Spec R05 us-27).
 if set -q __AIT_INTEGRATED_FISH; and functions -q __ait_emit
-    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":(__ait_sid)}}"
+    __ait_emit "{\"hook\":\"bootstrapped\",\"value\":{\"session_id\":$(__ait_sid)}}"
     return 0
 end
 
@@ -40,7 +40,7 @@ end
 
 # A named hook whose value is just the session id.
 function __ait_hook -a name
-    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":(__ait_sid)}}"
+    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":$(__ait_sid)}}"
 end
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -61,7 +61,7 @@ end
 # preexec carries the typed command text alongside the session id.
 function __ait_hook_preexec -a command
     set -l escaped (__ait_json_escape "$command")
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":(__ait_sid),\"command\":\"$escaped\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$(__ait_sid),\"command\":\"$escaped\"}}"
 end
 
 # --- §5.5.1 in-band exec ------------------------------------------------
@@ -125,5 +125,5 @@ end
 
 # --- install ------------------------------------------------------------
 
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":(__ait_sid),\"shell\":\"fish\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"fish\"}}"
 set -g __AIT_INTEGRATED_FISH 1
