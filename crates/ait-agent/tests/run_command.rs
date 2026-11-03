@@ -101,8 +101,14 @@ struct Shares {
     /// A waiter per `run_in_band` request, in order — the test sends
     /// each request's `RunResult` on its channel.
     runs: Arc<Mutex<Vec<Sender<RunResult>>>>,
-    /// Every raw `send_bytes` call — the in-band tier never uses it.
+    /// Every raw `send_bytes` call — the typed tiers' traffic.
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The event senders `subscribe` installed — the test feeds the
+    /// typed tiers' `133` marks through them.
+    subscribers: Arc<Mutex<Vec<Sender<BridgeEvent>>>>,
+    /// The scripted grid in mark-line coordinates — `grid_lines`
+    /// slices it for the `MarksOnly` capture.
+    grid: Arc<Mutex<Vec<String>>>,
 }
 
 /// The scripted bridge behind a task's `AgentRequest::bridge` —
@@ -139,11 +145,17 @@ impl ShellBridge for ScriptedBridge {
     }
 
     fn subscribe(&self) -> Result<Receiver<BridgeEvent>, BridgeError> {
-        Ok(channel().1)
+        let (tx, rx) = channel();
+        self.shares.subscribers.lock().expect("subs lock").push(tx);
+        Ok(rx)
     }
 
-    fn grid_lines(&self, _start: i32, _end: i32) -> Result<Vec<String>, BridgeError> {
-        Ok(Vec::new())
+    fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError> {
+        // Mark-line coordinates, like the executor passes.
+        let grid = self.shares.grid.lock().expect("grid lock");
+        let start = usize::try_from(start).unwrap_or(0).min(grid.len());
+        let end = usize::try_from(end).unwrap_or(0).min(grid.len()).max(start);
+        Ok(grid[start..end].to_vec())
     }
 
     fn output_tail(&self) -> Result<Vec<u8>, BridgeError> {
@@ -362,21 +374,62 @@ fn denied_run_command_never_reaches_the_shell() {
     assert!(second.body.contains("do not delete"), "{}", second.body);
 }
 
-/// A `MarksOnly` session: the typed-fallback tier is R06-T5's — until
-/// then the call answers a clean tool error the model can report,
-/// and the bridge still sees nothing (standard 1's degrade, us-34's
-/// clean-error rule applied to a state, not just an exit).
+/// A `MarksOnly` session (Spec R06-T5, us-13): the approve card
+/// still gates — NOTHING is typed while it parks — then the command
+/// is typed at the prompt, the `133;B`→`133;D` pair completes the
+/// run, and the captured grid rows plus D's exit payload re-enter as
+/// the tool result. The in-band channel sees nothing.
 #[test]
-fn marks_only_session_reports_a_clean_tool_error() {
+fn marks_only_session_types_and_resolves_on_marks() {
+    let shares = Shares::default();
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..20).map(|i| format!("row {i}")));
     let bridge = ScriptedBridge {
         state: ShellIntegration::MarksOnly,
-        shares: Shares::default(),
+        shares: shares.clone(),
     };
-    let shares = bridge.shares.clone();
+    let sent_probe = shares.sent.clone();
+    let commands_probe = shares.commands.clone();
+    let driver = move || {
+        // The executor subscribes, then types — answer its wait
+        // once both have landed.
+        let deadline = std::time::Instant::now() + BOUND;
+        let events = loop {
+            if let Some(sender) = shares.subscribers.lock().expect("subs lock").last() {
+                break sender.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "never subscribed");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        loop {
+            if !shares.sent.lock().expect("sent lock").is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never typed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        events
+            .send(BridgeEvent::PromptMark {
+                kind: 'B',
+                payload: None,
+                line: 5,
+            })
+            .expect("B");
+        events
+            .send(BridgeEvent::PromptMark {
+                kind: 'D',
+                payload: Some("0".into()),
+                line: 9,
+            })
+            .expect("D");
+    };
 
     let fixture = Fixture::serve(vec![
         sse(&run_command_turn("call_1", r#"{"command":"echo hi"}"#)),
-        sse(&chat_text_turn("noted")),
+        sse(&chat_text_turn("all done")),
     ]);
     let session = session();
     session
@@ -384,33 +437,42 @@ fn marks_only_session_reports_a_clean_tool_error() {
         .expect("submit");
 
     let (id, _, _) = next_approval(&session);
+    // The gate is parked — and nothing has been typed.
+    assert!(
+        sent_probe.lock().expect("sent lock").is_empty(),
+        "no request bytes before approval"
+    );
+
     session
         .approve(&id, ApprovalVerdict::AllowOnce)
         .expect("approve");
+    let driver = std::thread::spawn(driver);
 
     let events = collect(&session);
-    // The card reports `Failed` with a reason — never a hang.
-    let failed = events.iter().find(|event| {
-        matches!(
-            event,
-            AgentEvent::ToolUpdate {
-                status: ToolStatus::Failed,
-                ..
-            }
-        )
-    });
-    assert!(failed.is_some(), "{events:?}");
+    driver.join().expect("driver");
     assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The command was typed verbatim — the visible trace (us-16) —
+    // and the in-band channel saw nothing.
+    assert_eq!(
+        sent_probe.lock().expect("sent lock").clone(),
+        vec![b"echo hi\n".to_vec()],
+        "the typed command is the trace"
+    );
     assert!(
-        shares.commands.lock().expect("commands lock").is_empty(),
-        "a refused tier typed nothing"
+        commands_probe.lock().expect("commands lock").is_empty(),
+        "a typed tier never touches run_in_band"
     );
 
+    // The tool result carries the captured rows and the mark's exit
+    // code in the schema's own IR.
     fixture.captured();
     let second = fixture.captured();
+    assert!(second.body.contains("row 5"), "{}", second.body);
+    assert!(second.body.contains("row 8"), "{}", second.body);
     assert!(
-        second.body.contains("MarksOnly"),
-        "the model reads the state: {}",
+        second.body.contains("exit code: 0"),
+        "D's payload is the exit code: {}",
         second.body
     );
 }

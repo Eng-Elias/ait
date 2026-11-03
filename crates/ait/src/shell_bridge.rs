@@ -18,9 +18,11 @@
 //! through `InBandExec`'s shared `RunAccumulator` in the same drain,
 //! and the finished `RunResult`'s `Receiver` is handed back to the
 //! worker. `send_bytes`, `subscribe`, `grid_lines` and `output_tail`
-//! are the typed-fallback tiers' surface (R06-T5): subscribers get
-//! decoded `7700`-series events, `OSC 133` marks and the exit,
-//! forwarded from `drain_events` where they are already observed.
+//! are the typed tiers' surface (R06-T5): subscribers get decoded
+//! `7700`-series events, `OSC 133` marks — published with their
+//! absolute line, the coordinate `grid_lines` resolves — and the
+//! exit, forwarded from `drain_events` where they are already
+//! observed.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -117,11 +119,14 @@ pub(crate) enum BridgeRequest {
     /// `subscribe` — install an event sender; the reply carries the
     /// subscription's receiver.
     Subscribe(Sender<Receiver<BridgeEvent>>),
-    /// `grid_lines` — row text in `GridView::line` coordinates.
+    /// `grid_lines` — row text in the marks' absolute line space
+    /// (`PromptMark::line`'s coordinates): the service subtracts
+    /// `dropped_lines` and the live scrollback depth to land on
+    /// `GridView::line` rows.
     GridLines {
-        /// First row (`0..` = viewport, negatives into scrollback).
+        /// First absolute line.
         start: i32,
-        /// One past the last row.
+        /// One past the last absolute line.
         end: i32,
         /// The rows' text, in order, absent edges clamped away.
         reply: Sender<Vec<String>>,

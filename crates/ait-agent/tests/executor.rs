@@ -3,14 +3,22 @@
 //! PTY anywhere — that records the bytes offered to it and resolves
 //! `run_in_band` waits by feeding hand-built `7701` `A…R…B` frame
 //! streams through ait-shell's real [`RunAccumulator`]
-//! (`crates/ait/src/inband.rs` tests are the prior art).
+//! (`crates/ait/src/inband.rs` tests are the prior art). The typed
+//! tiers (R06-T5) are driven by hand-built `OSC 133` mark streams and
+//! a scripted raw-output tail carrying the `__AIT_END` sentinel.
 //!
 //! What these tests prove:
 //!
 //! - `UserShellExecutor` on an `Integrated` session returns the
 //!   command's merged stdout+stderr and exit code (Spec R06 us-12);
-//! - `MarksOnly`/`Absent` sessions refuse BEFORE any bytes are
-//!   offered to the bridge (their typed-fallback tiers are R06-T5's);
+//! - `MarksOnly` sessions capture the grid rows between `133;B` and
+//!   `133;D` and read the exit code from D's payload — a
+//!   payload-free D reports "exit unknown" (us-13/15);
+//! - `Absent` sessions type the sentinel wrap and scan the raw tail
+//!   for `__AIT_END_<id>=<code>` — output and exit code both come
+//!   from the sentinel (us-14);
+//! - torn/missing marks and a sentinel that never prints fail
+//!   boundedly — never a hang, a panic, or a guessed exit code;
 //! - an exited or gone session is a clean error, never a hang
 //!   (us-34);
 //! - cancellation (Esc) interrupts the wait promptly;
@@ -76,6 +84,12 @@ struct Shares {
     commands: Arc<Mutex<Vec<Vec<u8>>>>,
     /// The event senders `subscribe` installed.
     subscribers: Arc<Mutex<Vec<Sender<BridgeEvent>>>>,
+    /// The scripted grid in mark-line coordinates — `grid_lines`
+    /// slices it for the `MarksOnly` tier's capture.
+    grid: Arc<Mutex<Vec<String>>>,
+    /// The scripted raw-output tail — `output_tail` snapshots it for
+    /// the `Absent` tier's sentinel scan.
+    tail: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Shares {
@@ -96,6 +110,45 @@ impl Shares {
     /// Everything `send_bytes` was offered.
     fn sent(&self) -> Vec<Vec<u8>> {
         self.sent.lock().expect("sent lock").clone()
+    }
+
+    /// The newest installed subscription sender — the typed tiers
+    /// subscribe before typing, so one arrives inside [`BOUND`].
+    fn subscriber(&self) -> Sender<BridgeEvent> {
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            if let Some(sender) = self.subscribers.lock().expect("subs lock").last() {
+                return sender.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the executor never subscribed"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The next `send_bytes` — the typed tiers write exactly once
+    /// (the trace guarantee, us-16); the sentinel's id rides inside
+    /// it for `Absent`-tier responses.
+    fn next_typed(&self) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            if let Some(bytes) = self.sent.lock().expect("sent lock").last() {
+                return bytes.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "nothing was typed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Append raw output to the scripted tail — the bytes the
+    /// session emitted since the run began (echo included).
+    fn emit(&self, bytes: &[u8]) {
+        self.tail
+            .lock()
+            .expect("tail lock")
+            .extend_from_slice(bytes);
     }
 }
 
@@ -158,12 +211,18 @@ impl ShellBridge for ScriptedBridge {
         Ok(rx)
     }
 
-    fn grid_lines(&self, _start: i32, _end: i32) -> Result<Vec<String>, BridgeError> {
-        Ok(Vec::new())
+    fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError> {
+        // Mark-line coordinates — the executor passes the lines its
+        // `PromptMark` events carried; the script clips to what the
+        // grid holds (absent edges are dropped, like the real grid).
+        let grid = self.shares.grid.lock().expect("grid lock");
+        let start = usize::try_from(start).unwrap_or(0).min(grid.len());
+        let end = usize::try_from(end).unwrap_or(0).min(grid.len()).max(start);
+        Ok(grid[start..end].to_vec())
     }
 
     fn output_tail(&self) -> Result<Vec<u8>, BridgeError> {
-        Ok(Vec::new())
+        Ok(self.shares.tail.lock().expect("tail lock").clone())
     }
 }
 
@@ -197,27 +256,386 @@ fn integrated_run_returns_merged_output_and_exit_code() {
     );
 }
 
-/// `MarksOnly` and `Absent` sessions refuse BEFORE a byte is offered:
-/// their typed-fallback tiers are R06-T5's — until then the executor
-/// reports the state rather than typing a request a bare shell could
-/// never answer (Spec R06 us-13/14 shape; standard 1's degrade).
+/// An `OSC 133` prompt mark as a subscriber sees it — `line` is the
+/// mark's absolute grid line (scrollback-then-viewport index plus
+/// dropped rows), the coordinate `grid_lines` resolves.
+fn mark(kind: char, payload: Option<&str>, line: usize) -> BridgeEvent {
+    BridgeEvent::PromptMark {
+        kind,
+        payload: payload.map(str::to_owned),
+        line,
+    }
+}
+
+/// The `__AIT_END_<id>` marker the executor wove into the typed
+/// sentinel wrap — the `Absent` tier's completion token, fished out
+/// of the recorded bytes so the script can print its own result line.
+fn sentinel_marker(typed: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8(typed.to_vec()).expect("the typed line is text");
+    let at = text
+        .find("__AIT_END_")
+        .expect("the sentinel wrap was typed");
+    let rest = &text[at..];
+    let end = rest.find('=').expect("the sentinel carries `=`");
+    rest.as_bytes()[..end].to_vec()
+}
+
+/// A `MarksOnly` run types the command at the prompt — visible in the
+/// grid (us-13, us-16) — completes on `133;D`, captures the grid rows
+/// between B and D as output, and reads the exit code from D's
+/// payload.
 #[test]
-fn unintegrated_states_refuse_before_any_bytes() {
+fn marks_only_run_captures_rows_between_marks() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..30).map(|i| format!("row {i}")));
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            // The typed command runs: B opens the block at line 10,
+            // D closes it at 14 carrying the exit code.
+            events.send(mark('B', None, 10)).expect("B");
+            std::thread::sleep(Duration::from_millis(10));
+            events.send(mark('D', Some("7"), 14)).expect("D");
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the typed run resolves");
+    driver.join().expect("driver");
+
+    assert_eq!(result.exit_code, Some(7));
+    assert_eq!(
+        result.output,
+        b"row 10\nrow 11\nrow 12\nrow 13".to_vec(),
+        "output is the rows between B and D — D's own prompt row excluded"
+    );
+    assert_eq!(
+        shares.sent(),
+        vec![b"echo hi\n".to_vec()],
+        "the command was typed verbatim — the visible trace"
+    );
+    assert!(
+        shares.commands().is_empty(),
+        "a typed tier never touches the in-band channel"
+    );
+}
+
+/// A `133;D` with no payload reports "exit unknown" — the model is
+/// told honestly rather than handed a guessed code (us-15).
+#[test]
+fn marks_only_payload_free_d_reports_exit_unknown() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..30).map(|i| format!("row {i}")));
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('D', None, 12)).expect("D");
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the run still resolves");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, None, "payload-free D = exit unknown");
+    assert_eq!(result.output, b"row 10\nrow 11".to_vec());
+}
+
+/// An unparseable `133;D` payload is "exit unknown" too — never
+/// invented (us-15's rule covers garbage as well as absence).
+#[test]
+fn marks_only_garbage_d_payload_is_exit_unknown() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('B', None, 10)).expect("B");
+            events.send(mark('D', Some("bogus"), 11)).expect("D");
+        }
+    });
+
+    let result = executor.run("true").expect("the run resolves");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, None);
+}
+
+/// A `133;D` with no `B` before it is a torn completion — a bounded
+/// error, never a guessed span or a panic (us-13's failure shape).
+#[test]
+fn marks_only_d_without_b_is_a_bounded_error() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('D', Some("0"), 9)).expect("D");
+        }
+    });
+
+    let error = executor
+        .run("echo hi")
+        .expect_err("a torn completion errors");
+    driver.join().expect("driver");
+    assert!(matches!(error, ExecutorError::TypedTorn), "{error:?}");
+}
+
+/// A `B` that is never followed by `D` — the shell's marks stopped —
+/// fails inside the typed bound instead of hanging (us-13's "never a
+/// hang" half).
+#[test]
+fn marks_only_missing_d_times_out_boundedly() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    let mut executor = UserShellExecutor::with_typed_timeout(
+        Box::new(bridge),
+        CancellationToken::new(),
+        Duration::from_millis(150),
+    );
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('B', None, 10)).expect("B");
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = executor.run("sleep 3600").expect_err("no D means a bound");
+    driver.join().expect("driver");
+    assert!(matches!(error, ExecutorError::TypedTimedOut), "{error:?}");
+    assert!(started.elapsed() < BOUND, "the bound was actually bounded");
+}
+
+/// A second `B` mid-run re-opens the capture at the newer mark — the
+/// `RunAccumulator` tear-and-restart rule applied to marks: D pairs
+/// with the latest B, never the stale one.
+#[test]
+fn marks_only_second_b_restarts_the_span() {
+    let (bridge, shares) = scripted(ShellIntegration::MarksOnly);
+    shares
+        .grid
+        .lock()
+        .expect("grid lock")
+        .extend((0..30).map(|i| format!("row {i}")));
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let events = shares.subscriber();
+            let _typed = shares.next_typed();
+            events.send(mark('B', None, 10)).expect("B1");
+            events.send(mark('B', None, 12)).expect("B2");
+            events.send(mark('D', Some("0"), 15)).expect("D");
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the run resolves");
+    driver.join().expect("driver");
+    assert_eq!(
+        result.output,
+        b"row 12\nrow 13\nrow 14".to_vec(),
+        "the span re-opened at the second B"
+    );
+}
+
+/// An `Absent` run types `cmd; printf '__AIT_END_<id>=%d\n' $?` — the
+/// whole wrapped line stays visible in the grid (us-14/16) — then
+/// scans the raw tail for the sentinel: the bytes between the echoed
+/// type-in line and the sentinel line are the output, the sentinel's
+/// number is the exit code.
+#[test]
+fn absent_run_reads_sentinel_output_and_exit_code() {
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    shares
+        .tail
+        .lock()
+        .expect("tail lock")
+        .extend_from_slice(b"user@host:~$ ");
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            // The session echoes the typed line, runs it, prints the
+            // result line, then redraws the prompt — all raw bytes.
+            let mut stream = typed.clone();
+            // The PTY echoes `\n` as `\r\n`.
+            *stream.last_mut().expect("a typed line") = b'\r';
+            stream.extend_from_slice(b"\noutput line one\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=7\r\nuser@host:~$ ");
+            shares.emit(&stream);
+        }
+    });
+
+    let result = executor
+        .run("printf 'output line one\\n'")
+        .expect("the sentinel resolves the run");
+    driver.join().expect("driver");
+
+    assert_eq!(result.exit_code, Some(7));
+    assert_eq!(
+        result.output, b"output line one",
+        "output = bytes between the echoed type-in and the sentinel line"
+    );
+    let typed = &shares.sent()[0];
+    let text = String::from_utf8(typed.clone()).expect("typed is text");
+    assert!(
+        text.starts_with("printf 'output line one\\n'; printf '__AIT_END_"),
+        "the sentinel wrap was typed verbatim: {text:?}"
+    );
+    assert!(
+        text.ends_with("=%d\\n' $?\n"),
+        "the wrap ends with the $? print and the Enter: {text:?}"
+    );
+}
+
+/// A sentinel that never prints — the shell swallowed the line, died
+/// quietly, or isn't a shell at all — is a bounded failure, never a
+/// hang (us-14's failure shape). Tail activity (a chatty session)
+/// only postpones the bound while bytes keep arriving.
+#[test]
+fn absent_missing_sentinel_fails_boundedly() {
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    let mut executor = UserShellExecutor::with_typed_timeout(
+        Box::new(bridge),
+        CancellationToken::new(),
+        Duration::from_millis(150),
+    );
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let _typed = shares.next_typed();
+            // Noise, but no sentinel: echoes and other commands'
+            // output must not resolve the wait.
+            shares.emit(b"unrelated output\r\nmore noise\r\n");
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = executor.run("true").expect_err("no sentinel means a bound");
+    driver.join().expect("driver");
+    assert!(matches!(error, ExecutorError::TypedTimedOut), "{error:?}");
+    assert!(started.elapsed() < BOUND, "the bound was actually bounded");
+}
+
+/// A torn sentinel — the marker printed without its `=<code>` tail,
+/// or with garbage where the code belongs — resolves nothing; the
+/// wait ends at the bound rather than on a fabricated exit code.
+#[test]
+fn absent_torn_sentinel_never_resolves() {
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    let mut executor = UserShellExecutor::with_typed_timeout(
+        Box::new(bridge),
+        CancellationToken::new(),
+        Duration::from_millis(150),
+    );
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&marker);
+            stream.extend_from_slice(b"\r\n"); // no `=<code>` at all
+            stream.extend_from_slice(&marker);
+            stream.extend_from_slice(b"=notanumber\r\n");
+            shares.emit(&stream);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let error = executor
+        .run("echo hi")
+        .expect_err("a torn sentinel cannot resolve");
+    driver.join().expect("driver");
+    assert!(matches!(error, ExecutorError::TypedTimedOut), "{error:?}");
+    assert!(started.elapsed() < BOUND);
+}
+
+/// The session exiting mid-wait — on either typed tier — is
+/// `SessionLost` promptly (us-34), not a bound's-length wait for
+/// marks that can never arrive.
+#[test]
+fn exited_session_interrupts_typed_waits() {
     for state in [ShellIntegration::MarksOnly, ShellIntegration::Absent] {
         let (bridge, shares) = scripted(state);
         let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
 
+        let driver = std::thread::spawn({
+            let shares = shares.clone();
+            move || {
+                let events = shares.subscriber();
+                let _typed = shares.next_typed();
+                events.send(BridgeEvent::Exited).expect("Exited");
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let error = executor.run("sleep 60").expect_err("a dead session errors");
+        driver.join().expect("driver");
+        assert!(
+            matches!(error, ExecutorError::SessionLost),
+            "{state:?}: {error:?}"
+        );
+        assert!(started.elapsed() < BOUND, "the exit answered promptly");
+    }
+}
+
+/// Esc mid-typed-wait: cancellation interrupts the mark/sentinel
+/// poll exactly the way it interrupts the in-band wait.
+#[test]
+fn cancel_interrupts_typed_waits() {
+    for state in [ShellIntegration::MarksOnly, ShellIntegration::Absent] {
+        let (bridge, _shares) = scripted(state);
+        let token = CancellationToken::new();
+        let mut executor = UserShellExecutor::new(Box::new(bridge), token.clone());
+
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            token.cancel();
+        });
+
+        let started = std::time::Instant::now();
         let error = executor
-            .run("echo hi")
-            .expect_err("a non-integrated session refuses");
+            .run("sleep 60")
+            .expect_err("a cancelled run errors");
+        canceller.join().expect("canceller");
         assert!(
-            matches!(error, ExecutorError::Unsupported(s) if s == state),
-            "{error:?}"
+            matches!(error, ExecutorError::Cancelled),
+            "{state:?}: {error:?}"
         );
-        assert!(
-            shares.commands().is_empty() && shares.sent().is_empty(),
-            "a refused run offered nothing to the bridge"
-        );
+        assert!(started.elapsed() < BOUND, "cancellation was prompt");
     }
 }
 

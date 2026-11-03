@@ -26,15 +26,30 @@
 //!   the trace guarantee every agent action inherits (us-23) — while
 //!   the `7701` response frames resolve invisibly into the merged
 //!   output + exact exit code.
-//! - **`MarksOnly`/`Absent`** (R06-T5) — typed-fallback tiers: the
-//!   command is typed at the prompt via
-//!   [`ShellBridge::send_bytes`], completion is detected from the
-//!   `133;D` mark (output = grid rows between B and D, exit = D's
-//!   payload — `None` reads as "unknown", never a guess, us-15) or
-//!   from a sentinel scanned out of [`ShellBridge::output_tail`].
-//!   The bridge methods those tiers drive exist now; until they
-//!   land, a non-`Integrated` state is a clean tool error — the
-//!   agent degrades instead of typing noise into a bare shell.
+//! - **`MarksOnly`** (R06-T5, us-13) — the command is typed at the
+//!   prompt via [`ShellBridge::send_bytes`]; completion is the next
+//!   `OSC 133;D` mark on the [`subscribe`](ShellBridge::subscribe)
+//!   feed. Output is the grid rows between the `B` and `D` marks —
+//!   half-open: `D` lands on the *next* prompt's row — resolved
+//!   through [`ShellBridge::grid_lines`]; the exit code is `D`'s
+//!   payload, and a payload-free `D` reports "unknown" — never a
+//!   guess (us-15).
+//! - **`Absent`** (R06-T5, us-14) — the command is typed wrapped in a
+//!   sentinel: `cmd; printf '__AIT_END_<id>=%d\n' $?`. Completion and
+//!   the exit code are scanned out of [`ShellBridge::output_tail`];
+//!   the output is the tail between the echoed type-in line and the
+//!   sentinel's own line (raw bytes — escapes may survive; the grid
+//!   holds the clean trace).
+//!
+//! Both typed tiers leave everything they type visible in the user's
+//! grid — the trace guarantee (us-16) — and both are *best effort
+//! against the user's own typing*: a mark or a sentinel line the user
+//! produced is indistinguishable from the run's own (risk §8.2, the
+//! race `__ait_run` already accepts invisibly). Torn marks — a `D`
+//! with no `B` before it — and a sentinel that never prints are
+//! bounded failures ([`ExecutorError::TypedTorn`] /
+//! [`ExecutorError::TypedTimedOut`]), never hangs, panics or guessed
+//! results.
 //!
 //! Cancellation rides the executor's own [`CancellationToken`] — the
 //! same token the session's Esc path cancels — so a `run` parked on a
@@ -42,8 +57,9 @@
 
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ait_shell::RunResult;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +68,26 @@ use tokio_util::sync::CancellationToken;
 /// token — the `await_verdict` gate poll's precedent: the wait is a
 /// poll only so Esc can answer it.
 const RUN_POLL: Duration = Duration::from_millis(100);
+
+/// Bound on a typed tier's wait for its completion signal, measured
+/// from the last sign of life — a fresh mark, a `7700`-series event,
+/// output the tail gained. Long enough that a legitimately quiet
+/// command is unlikely to outlive it, finite so a shell that can
+/// never answer fails instead of hanging (risk §8.2's "bounded
+/// failure, never a hang"). Embedders and tests that need a shorter
+/// wait pass [`UserShellExecutor::with_typed_timeout`].
+pub const TYPED_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The sentinel the `Absent` tier wraps commands in: the shell prints
+/// `__AIT_END_<id>=<exit code>` when the command finishes. The
+/// `=<digit>` shape is what distinguishes the *result* line from the
+/// type-in line's echo, which carries the same marker text verbatim.
+const SENTINEL_PREFIX: &str = "__AIT_END_";
+
+/// Sentinel ids, unique per process — a stale `__AIT_END` line in the
+/// tail (a previous task's sentinel still in scrollback, the user
+/// re-running the printf) can never collide with a live wait's id.
+static NEXT_SENTINEL: AtomicU64 = AtomicU64::new(0);
 
 /// How much shell integration the bridged session reports (§5.5) —
 /// `UserShellExecutor`'s tier selector. The three names are the
@@ -85,9 +121,13 @@ pub enum BridgeEvent {
         kind: char,
         /// Everything after the kind, when the mark carried any.
         payload: Option<String>,
-        /// The scrollback-then-viewport line the mark was recorded
-        /// at — the typed tier's "output = grid rows between B and
-        /// D" coordinate (resolved via [`ShellBridge::grid_lines`]).
+        /// The mark's **absolute** line — the record-time
+        /// scrollback-then-viewport index plus the lines dropped
+        /// since the session started (the block assembler's own
+        /// coordinate space): invariant under scrolling and eviction,
+        /// so a `B` recorded before a long scroll still names its
+        /// row. Feed it to [`ShellBridge::grid_lines`], which does
+        /// the live-grid conversion the frontend tracks.
         line: usize,
     },
     /// The session's child exited — every pending run will never
@@ -178,12 +218,13 @@ pub trait ShellBridge: Send {
     /// accumulator; subscribers see them too.
     fn subscribe(&self) -> Result<Receiver<BridgeEvent>, BridgeError>;
 
-    /// Grid text for rows `start..end` in `GridView::line`
-    /// coordinates (`0..` = viewport top, negatives reach into
-    /// scrollback) — the `MarksOnly` tier's output-capture surface
-    /// (R06-T5). Rows past either edge are simply absent from the
-    /// result; a mark-recorded line converts with the scrollback
-    /// offset the frontend tracks.
+    /// Grid text for rows `start..end` in the **absolute line space**
+    /// [`BridgeEvent::PromptMark::line`] reports — the `MarksOnly`
+    /// tier's output-capture surface (R06-T5): `grid_lines(b, d)`
+    /// reads the rows between the marks, D's own prompt row excluded
+    /// by the half-open range. The frontend converts through the
+    /// dropped-line and scrollback offsets it tracks; rows that left
+    /// the grid are simply absent from the result.
     fn grid_lines(&self, start: i32, end: i32) -> Result<Vec<String>, BridgeError>;
 
     /// The session's most recent raw output (the frontend's bounded
@@ -215,9 +256,19 @@ pub enum ExecutorError {
     /// attached its `ShellBridge`.
     Unbound,
     /// The session's integration state can't serve `run_command` —
-    /// the typed-fallback tiers for `MarksOnly`/`Absent` land in
-    /// R06-T5.
+    /// kept for §5.9 vocabulary completeness; the shipped tiers cover
+    /// every `ShellIntegration`.
     Unsupported(ShellIntegration),
+    /// A typed tier's completion signal never arrived inside
+    /// [`TYPED_TIMEOUT`] of the last sign of life — the `133;D` that
+    /// never came or the sentinel that never printed (Spec R06
+    /// us-13/14): a bounded failure, never a hang.
+    TypedTimedOut,
+    /// A typed tier's completion arrived torn — a `133;D` with no
+    /// `B` recorded before it — so no trustworthy output span exists.
+    /// An error the model reports, never a guessed result (us-15's
+    /// "never invent" rule extended to capture).
+    TypedTorn,
     /// The shell bridge refused or failed — carries the bridge's own
     /// detail (`NotIntegrated`, `SessionExited`, `Gone`, `Write`).
     Bridge(BridgeError),
@@ -241,7 +292,15 @@ impl fmt::Display for ExecutorError {
             ),
             Self::Unsupported(state) => write!(
                 f,
-                "the session's shell integration is {state:?} — only an Integrated shell can run commands yet"
+                "the session's shell integration is {state:?} — no executor tier serves it"
+            ),
+            Self::TypedTimedOut => write!(
+                f,
+                "the shell never signaled the command's completion — no 133;D mark, no sentinel line — it may still be running"
+            ),
+            Self::TypedTorn => write!(
+                f,
+                "the shell's completion marks arrived torn — a 133;D with no 133;B before it — the command's output span is untrustworthy"
             ),
             Self::Bridge(error) => write!(f, "{error}"),
             Self::SessionLost => write!(
@@ -295,9 +354,10 @@ pub trait CommandExecutor: Send {
 
 /// The user-shell executor (Spec R06): `run_command` in the user's
 /// own live shell, tiered on the tab's live [`ShellIntegration`].
-/// Round 6 ships the `Integrated` tier — §5.5.1 in-band `__ait_run`
-/// through [`ShellBridge::run_in_band`]; `MarksOnly`/`Absent` type
-/// the command in R06-T5.
+/// `Integrated` runs §5.5.1 in-band `__ait_run` through
+/// [`ShellBridge::run_in_band`]; `MarksOnly` and `Absent` type the
+/// command at the prompt — the visible trace (us-16) — and detect
+/// completion from `133;D` or the `__AIT_END` sentinel.
 ///
 /// Requests on one session serialize on the wire — an interactive
 /// shell runs one prompt line at a time — and tool calls execute
@@ -309,31 +369,185 @@ pub struct UserShellExecutor {
     /// The task's cancellation token — the Esc path interrupts a
     /// parked wait, checked on the [`RUN_POLL`] cadence.
     cancel: CancellationToken,
+    /// The typed tiers' wait bound — [`TYPED_TIMEOUT`] unless the
+    /// caller asked otherwise. Measured from the last sign of life,
+    /// not from the type-in: a chatty session stays alive.
+    typed_timeout: Duration,
 }
 
 impl UserShellExecutor {
     /// An executor driving `bridge`, cancelled by `cancel` — the
     /// session hands it the same token its Esc path fires.
     pub fn new(bridge: Box<dyn ShellBridge>, cancel: CancellationToken) -> Self {
-        Self { bridge, cancel }
+        Self::with_typed_timeout(bridge, cancel, TYPED_TIMEOUT)
+    }
+
+    /// An executor whose typed tiers bound their completion wait at
+    /// `typed_timeout` of silence — embedders and tests that cannot
+    /// wait the default five minutes.
+    pub fn with_typed_timeout(
+        bridge: Box<dyn ShellBridge>,
+        cancel: CancellationToken,
+        typed_timeout: Duration,
+    ) -> Self {
+        Self {
+            bridge,
+            cancel,
+            typed_timeout,
+        }
+    }
+
+    /// The `MarksOnly` tier (us-13): type the command — it stays in
+    /// the user's grid (us-16) — then pair the next `B` and `D`
+    /// marks on the subscription feed. Output is the half-open row
+    /// span `B..D` read through [`ShellBridge::grid_lines`]; the exit
+    /// code is `D`'s payload, `None`/garbage reporting "unknown"
+    /// rather than a guess (us-15). A `D` with no `B` before it is
+    /// [`TypedTorn`](ExecutorError::TypedTorn); a `D` that never
+    /// comes is [`TypedTimedOut`](ExecutorError::TypedTimedOut). A
+    /// second `B` re-opens the span at the newer mark — the
+    /// `RunAccumulator` tear-and-restart rule applied to marks.
+    fn run_marks_only(&self, command: &str) -> Result<CommandResult, ExecutorError> {
+        let events = self.bridge.subscribe()?;
+        self.bridge.send_bytes(typed_line(command).as_slice())?;
+        let mut start: Option<usize> = None;
+        let mut deadline = self.fresh_deadline();
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(ExecutorError::Cancelled);
+            }
+            match events.recv_timeout(RUN_POLL) {
+                Ok(BridgeEvent::PromptMark {
+                    kind: 'B', line, ..
+                }) => {
+                    start = Some(line);
+                    deadline = self.fresh_deadline();
+                }
+                Ok(BridgeEvent::PromptMark {
+                    kind: 'D',
+                    payload,
+                    line,
+                }) => {
+                    let Some(start) = start else {
+                        return Err(ExecutorError::TypedTorn);
+                    };
+                    return Ok(CommandResult {
+                        output: self.mark_span_text(start, line)?,
+                        exit_code: payload.as_deref().and_then(|code| code.parse::<i32>().ok()),
+                    });
+                }
+                // The session died mid-run — no `D` is coming.
+                Ok(BridgeEvent::Exited) => return Err(ExecutorError::SessionLost),
+                // `A`/`C` marks and any decoded `7700`-series
+                // traffic are signs of life — the bound slides.
+                Ok(_) => deadline = self.fresh_deadline(),
+                // A dead feed means the service side is gone — the
+                // session can never answer again.
+                Err(RecvTimeoutError::Disconnected) => return Err(ExecutorError::SessionLost),
+                Err(RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        return Err(ExecutorError::TypedTimedOut);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `Absent` tier (us-14): type the command wrapped in a
+    /// sentinel — `cmd; printf '__AIT_END_<id>=%d\n' $?`, the whole
+    /// line visible in the grid (us-16) — then scan the raw output
+    /// tail for `__AIT_END_<id>=<digits>`. The result line's number
+    /// is the exit code; the output is the tail between the echoed
+    /// type-in line and the sentinel's own line. A sentinel that
+    /// never prints fails at the bound (us-14's "never a hang").
+    ///
+    /// The id is unique per run, so the whole tail can be scanned
+    /// directly: no stale `__AIT_END` line in scrollback — an earlier
+    /// task's sentinel, or a printf the user ran herself — can ever
+    /// carry a live wait's id.
+    fn run_absent(&self, command: &str) -> Result<CommandResult, ExecutorError> {
+        let events = self.bridge.subscribe()?;
+        let marker = format!("{SENTINEL_PREFIX}{}", next_sentinel_id());
+        // `;` after a trailing `;`/blank would be a syntax error in
+        // the user's shell — trim so the wrap always parses.
+        let command = command.trim_end_matches([';', ' ', '\t', '\n']);
+        let typed = format!("{command}; printf '{marker}=%d\\n' $?\n");
+        self.bridge.send_bytes(typed.as_bytes())?;
+
+        let mut deadline = self.fresh_deadline();
+        // Growth detector: fresh bytes shift the tail, which counts
+        // as a sign of life and re-arms the bound.
+        let mut last_tail = self.bridge.output_tail()?;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(ExecutorError::Cancelled);
+            }
+            match events.recv_timeout(RUN_POLL) {
+                Ok(BridgeEvent::Exited) => return Err(ExecutorError::SessionLost),
+                // Marks and `7700`-series traffic are signs of life.
+                Ok(_) => deadline = self.fresh_deadline(),
+                Err(RecvTimeoutError::Disconnected) => return Err(ExecutorError::SessionLost),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            let tail = self.bridge.output_tail()?;
+            if tail != last_tail {
+                deadline = self.fresh_deadline();
+                last_tail = tail.clone();
+            }
+            if let Some(result) = sentinel_result(&tail, &marker) {
+                return Ok(CommandResult {
+                    output: absent_output(&tail, result.line_start, &marker),
+                    exit_code: Some(result.exit_code),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(ExecutorError::TypedTimedOut);
+            }
+        }
+    }
+
+    /// `now + typed_timeout` — the completion wait's sliding bound.
+    fn fresh_deadline(&self) -> Instant {
+        Instant::now() + self.typed_timeout
+    }
+
+    /// The text of the rows a `B…D` span covers — `grid_lines` in
+    /// the marks' absolute line space, joined with `'\n'` after each
+    /// row's grid-padding blanks are trimmed (the block copy's own
+    /// rule). A `D` on or before `B`'s row yields no rows — the empty
+    /// half-open range — which the half-open read reports as empty
+    /// output rather than inventing lines.
+    fn mark_span_text(&self, start: usize, end: usize) -> Result<Vec<u8>, ExecutorError> {
+        let start = i32::try_from(start).unwrap_or(i32::MAX);
+        let end = i32::try_from(end).unwrap_or(i32::MAX);
+        let rows = self.bridge.grid_lines(start, end)?;
+        let mut output = Vec::new();
+        for row in rows {
+            if !output.is_empty() {
+                output.push(b'\n');
+            }
+            output.extend_from_slice(row.trim_end().as_bytes());
+        }
+        Ok(output)
     }
 }
 
 impl CommandExecutor for UserShellExecutor {
-    /// Run `command` in the user's live shell. The `Integrated` tier
-    /// asks the bridge for the in-band run — the request line's typed
-    /// trace stays in the grid — and parks on the result channel at
-    /// the [`RUN_POLL`] cadence so Esc still answers mid-command. A
-    /// non-`Integrated` state refuses before any bytes are offered
-    /// (R06-T5's typed tiers slot into the `match` arm this guard
-    /// currently is).
+    /// Run `command` in the user's live shell, on whichever tier the
+    /// tab's *live* state serves — read per call, never cached: a
+    /// vetted `exit_shell` hook can downgrade `Integrated` to
+    /// `Absent` mid-task. `Integrated` parks on the in-band result
+    /// channel; `MarksOnly`/`Absent` type the command and wait on
+    /// their completion signals. Every wait polls at the
+    /// [`RUN_POLL`] cadence so Esc still answers mid-command.
     fn run(&mut self, command: &str) -> Result<CommandResult, ExecutorError> {
         if self.cancel.is_cancelled() {
             return Err(ExecutorError::Cancelled);
         }
         match self.bridge.integration_state()? {
             ShellIntegration::Integrated => {}
-            other => return Err(ExecutorError::Unsupported(other)),
+            ShellIntegration::MarksOnly => return self.run_marks_only(command),
+            ShellIntegration::Absent => return self.run_absent(command),
         }
         let result = self.bridge.run_in_band(command.as_bytes())?;
         loop {
@@ -356,6 +570,108 @@ impl CommandExecutor for UserShellExecutor {
             }
         }
     }
+}
+
+/// The line a typed tier writes: `command` plus the Enter that runs
+/// it — verbatim, the same trust the user's own typing gets (`run`'s
+/// contract: sanitization is the shell's parsing).
+fn typed_line(command: &str) -> Vec<u8> {
+    let mut typed = command.as_bytes().to_vec();
+    typed.push(b'\n');
+    typed
+}
+
+/// A sentinel id unique per run — process id plus a global sequence
+/// so a live wait's marker never collides with a stale `__AIT_END`
+/// line the scrollback still holds (an earlier task's sentinel, or a
+/// printf the user ran herself).
+fn next_sentinel_id() -> String {
+    let seq = NEXT_SENTINEL.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{seq}", std::process::id())
+}
+
+/// Where the sentinel's result line begins in the tail, and what it
+/// reported.
+struct SentinelResult {
+    /// The result line's start offset — the byte after the previous
+    /// line break (the sentinel prints on its own line).
+    line_start: usize,
+    /// The parsed exit code.
+    exit_code: i32,
+}
+
+/// The sentinel's *result* line in `tail` — `<marker>=` followed by
+/// at least one digit (the type-in echo carries `=%d`, never a
+/// digit, so it can never match). The last valid match wins, so a
+/// repeated result still resolves.
+fn sentinel_result(tail: &[u8], marker: &str) -> Option<SentinelResult> {
+    let marker = marker.as_bytes();
+    let mut found = None;
+    let mut offset = 0usize;
+    let mut search = tail;
+    while let Some(at) = find_subslice(search, marker) {
+        let after = &search[at + marker.len()..];
+        if let Some(rest) = after.strip_prefix(b"=") {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            let parsed = std::str::from_utf8(&rest[..digits])
+                .ok()
+                .and_then(|code| code.parse::<i32>().ok());
+            if digits > 0 {
+                if let Some(exit_code) = parsed {
+                    let line_start = search[..at]
+                        .iter()
+                        .rposition(|b| *b == b'\n')
+                        .map(|p| offset + p + 1)
+                        .unwrap_or(offset);
+                    found = Some(SentinelResult {
+                        line_start,
+                        exit_code,
+                    });
+                }
+            }
+        }
+        offset += at + marker.len();
+        search = &search[at + marker.len()..];
+    }
+    found
+}
+
+/// The `Absent` run's output: the tail's bytes before the sentinel's
+/// line, minus the echoed type-in line — identified by the *first*
+/// occurrence of the marker text itself, which the type-in echo is
+/// guaranteed to carry (`$?` prints its digits only in the result;
+/// the id is unique to this run). If the echo got mangled past
+/// recognition — a redrawing prompt can interleave escapes — the
+/// whole region stands: noisy, but never invented. Exactly one
+/// trailing line break is dropped — it separated the output from
+/// the result line.
+fn absent_output(tail: &[u8], line_start: usize, marker: &str) -> Vec<u8> {
+    let region = &tail[..line_start];
+    let start = find_subslice(region, marker.as_bytes())
+        .and_then(|at| {
+            region[at + marker.len()..]
+                .iter()
+                .position(|b| *b == b'\n')
+                .map(|p| at + marker.len() + p + 1)
+        })
+        .unwrap_or(0);
+    let mut output = region[start..].to_vec();
+    if output.ends_with(b"\r\n") {
+        output.truncate(output.len() - 2);
+    } else if matches!(output.last(), Some(b'\n') | Some(b'\r')) {
+        output.pop();
+    }
+    output
+}
+
+/// `needle`'s first position in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// The §5.9 no-op tier, shipped: a task bound to no live shell —
