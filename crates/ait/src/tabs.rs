@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ait_agent::AgentRequest;
+use ait_agent::{AgentRequest, ApprovalVerdict};
 use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
@@ -526,6 +526,13 @@ impl Tab {
     /// input line. Every other key is swallowed — focused keys never
     /// reach the PTY, never update the input shadow, and never snap
     /// the terminal's view.
+    ///
+    /// While the gate is parked on an approve card, `a`/`t`/`d` are
+    /// the verdict keys (Spec R06's three options): *allow once*,
+    /// *allow this tool for the rest of the task*, *deny* — `d`
+    /// carries the input line's text as the denial reason when any
+    /// was typed (us-8's deny-reason-optional), and every other key
+    /// keeps editing normally.
     pub fn agent_key(&mut self, key: &KeyEvent, settings: &Settings, toast: &mut Option<Toast>) {
         if !self.agent_focused() {
             return;
@@ -554,6 +561,21 @@ impl Tab {
                         .submit(request, toast);
                 }
             }
+            _ if panel.awaiting_verdict() => match key.code {
+                KeyCode::Char('a') if key.modifiers.is_empty() => {
+                    panel.decide(ApprovalVerdict::AllowOnce, toast)
+                }
+                KeyCode::Char('t') if key.modifiers.is_empty() => {
+                    panel.decide(ApprovalVerdict::AllowForTask, toast)
+                }
+                KeyCode::Char('d') if key.modifiers.is_empty() => {
+                    let reason = panel.take_input();
+                    panel.decide(ApprovalVerdict::Deny(reason), toast)
+                }
+                _ => {
+                    edit_input(panel, key);
+                }
+            },
             _ => {
                 edit_input(panel, key);
             }
@@ -2506,5 +2528,59 @@ mod tests {
         // Closing THE owning tab drops the worker mid-task — Drop
         // cancels and joins; nothing to observe but the clean return.
         assert!(manager.close_active(), "the owning tab closes");
+    }
+
+    /// The approve card's keys (Spec R06): while the gate is parked,
+    /// `a`/`t`/`d` send the verdict and clear the wait — `d` carries
+    /// the input line as the denial reason — while every other key
+    /// keeps editing the input. With no card pending the same letters
+    /// are ordinary input.
+    #[test]
+    fn approve_card_keys_answer_the_gate() {
+        use crossterm::event::KeyEvent as CtKeyEvent;
+        let mut manager = manager(1, "/tmp");
+        let mut toast = None;
+        let settings = Settings::default();
+        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let staged = |id: &str| ait_agent::AgentEvent::ApprovalRequest {
+            call: ait_agent::ToolCall {
+                id: id.into(),
+                name: "read_files".into(),
+                arguments: String::new(),
+            },
+            summary: "note.txt".into(),
+        };
+
+        let tab = manager.active_mut().unwrap();
+        tab.toggle_agent_panel();
+
+        // `a` answers allow-once — the wait clears.
+        tab.agent.as_mut().unwrap().apply(staged("call_1"));
+        assert!(tab.agent.as_ref().unwrap().awaiting_verdict());
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
+        assert!(toast.is_none());
+
+        // `d` answers deny — typed input becomes the reason.
+        let panel = tab.agent.as_mut().unwrap();
+        panel.apply(staged("call_2"));
+        panel.push_input('n');
+        panel.push_input('o');
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
+
+        // `x` while parked is ordinary input, not a verdict — `a`
+        // still resolves the card (the input survives an allow).
+        tab.agent.as_mut().unwrap().apply(staged("call_3"));
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
+        let panel = tab.agent.as_ref().unwrap();
+        assert!(panel.awaiting_verdict());
+        assert_eq!(panel.input(), "x");
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+
+        // And with nothing pending, `d` edits the input like any
+        // other character.
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        assert_eq!(tab.agent.as_ref().unwrap().input(), "xd");
     }
 }

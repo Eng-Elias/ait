@@ -15,8 +15,12 @@ description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4
 # `ait`; the adapters' timers want the `time` driver); tokio-util
 # 0.7.20 (2026-10-09) — `sync::CancellationToken` for `Endpoint::stream`,
 # needs no feature flag and is NOT re-exported by ait-llm;
-# futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`.
+# futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`;
+# serde_json 1.0.154 (2026-10-11) — tool arguments stream as JSON
+# fragments and parse once complete, and `ToolSpec` parameter schemas
+# are `serde_json::Value` (Spec R06).
 regex = "1"
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
 tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
