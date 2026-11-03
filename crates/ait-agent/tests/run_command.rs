@@ -439,20 +439,18 @@ fn marks_only_session_types_and_resolves_on_marks() {
                 line: 9,
             })
             .expect("D");
-        events
-            .send(BridgeEvent::PromptMark {
-                kind: 'A',
-                payload: None,
-                line: 9,
-            })
-            .expect("A");
-        events
-            .send(BridgeEvent::PromptMark {
-                kind: 'B',
-                payload: None,
-                line: 9,
-            })
-            .expect("B");
+        // The next prompt's marks may already race the resolved run —
+        // the receiver can be gone.
+        let _ = events.send(BridgeEvent::PromptMark {
+            kind: 'A',
+            payload: None,
+            line: 9,
+        });
+        let _ = events.send(BridgeEvent::PromptMark {
+            kind: 'B',
+            payload: None,
+            line: 9,
+        });
     };
 
     let fixture = Fixture::serve(vec![

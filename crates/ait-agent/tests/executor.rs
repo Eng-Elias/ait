@@ -330,8 +330,10 @@ fn marks_only_run_captures_rows_under_the_real_mark_order() {
             events.send(mark('C', None, 11)).expect("C");
             std::thread::sleep(Duration::from_millis(10));
             events.send(mark('D', Some("7"), 14)).expect("D");
-            events.send(mark('A', None, 14)).expect("A");
-            events.send(mark('B', None, 14)).expect("B");
+            // The next prompt's marks may already race the
+            // resolved run — the receiver can be gone.
+            let _ = events.send(mark('A', None, 14));
+            let _ = events.send(mark('B', None, 14));
         }
     });
 
