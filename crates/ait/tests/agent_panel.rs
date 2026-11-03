@@ -232,6 +232,132 @@ fn pr_evidence_agent_loop_transcript() {
     println!("--- after approve: trace + done ---\n{}", app.screen_text());
 }
 
+/// The full-task PR-evidence generator: one scripted task exercises
+/// `run_command` (typed-sentinel trace on the pinned `Absent`
+/// shell), `edit_files` (the unified-diff approve card over a
+/// pre-seeded file in the spawn's temp cwd), `ask_user_question`
+/// (the gate-exempt option card) and `write_to_pty` twice (lazy
+/// spawn, then driving a real REPL). Prints the screen at each
+/// beat — same precedent as `pr_evidence_agent_loop_transcript`:
+///
+/// ```text
+/// cargo test -p ait --test agent_panel pr_evidence_full -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual evidence generator for PR bodies"]
+fn pr_evidence_full_task_transcript() {
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_1",
+            "run_command",
+            r#"{"command":"echo E2E-MARK"}"#,
+        )),
+        sse(&tool_turn(
+            "call_2",
+            "edit_files",
+            r#"{"files":[{"path":"note.txt","content":"line one\nline two\n"}]}"#,
+        )),
+        sse(&tool_turn(
+            "call_3",
+            "ask_user_question",
+            r#"{"question":"Ship it?","choices":["yes","no"]}"#,
+        )),
+        sse(&tool_turn(
+            "call_4",
+            "write_to_pty",
+            r#"{"input":"python3 -q\n"}"#,
+        )),
+        sse(&tool_turn(
+            "call_5",
+            "write_to_pty",
+            r#"{"input":"print('REPL-MARK')\n"}"#,
+        )),
+        sse(&chat_text_turn(
+            "command run, file edited, question answered, repl driven",
+        )),
+    ]);
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(dir.path(), &settings_with_fixture(&fixture.base_url));
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    wait_for_chrome(&mut app);
+    wait_fresh_prompt(&mut app, "the first prompt");
+
+    // `edit_files` previews a modify-diff: seed the file inside the
+    // spawn's temp cwd — where `ToolCwd` confines the write.
+    fs::write(app.cwd().join("note.txt"), "line one\n").expect("seed note.txt");
+
+    open_panel(&mut app);
+    submit_task(&mut app, "do all four");
+
+    app.wait_for_screen("the parked run_command approve card", |app| {
+        app.screen_text().contains("approve run_command")
+    });
+    println!(
+        "--- beat 1: run_command approve card ---\n{}",
+        app.screen_text()
+    );
+
+    app.type_text("a");
+    app.wait_for_screen("the sentinel trace in the grid", |app| {
+        app.screen_text().contains("__AIT_END_")
+            && app
+                .screen_text()
+                .lines()
+                .any(|row| terminal_half(row).contains("E2E-MARK"))
+    });
+    println!(
+        "--- beat 2: run_command trace in grid ---\n{}",
+        app.screen_text()
+    );
+
+    app.wait_for_screen("the edit_files diff card", |app| {
+        app.screen_text().contains("approve edit_files") && app.screen_text().contains("+line two")
+    });
+    println!(
+        "--- beat 3: edit_files diff-preview approve card ---\n{}",
+        app.screen_text()
+    );
+
+    app.type_text("a");
+    app.wait_for_screen("the ask card", |app| {
+        app.screen_text().contains("Ship it?") && app.screen_text().contains("▸")
+    });
+    println!(
+        "--- beat 4: ask_user_question card ---\n{}",
+        app.screen_text()
+    );
+
+    app.press("Down"); // pick "no" so the answered card shows a choice
+    app.press("Enter");
+
+    app.wait_for_screen("the first write_to_pty approve card", |app| {
+        app.screen_text().contains("approve write_to_pty")
+            && app.screen_text().contains("python3 -q")
+    });
+    println!(
+        "--- beat 5: write_to_pty approve card ---\n{}",
+        app.screen_text()
+    );
+
+    app.type_text("a");
+    app.wait_for_screen("the second write_to_pty approve card", |app| {
+        app.screen_text().contains("approve write_to_pty")
+            && app.screen_text().contains("print('REPL-")
+    });
+    println!(
+        "--- beat 6: REPL input approve card ---\n{}",
+        app.screen_text()
+    );
+
+    app.type_text("a");
+    app.wait_for_screen("the task's done status", |app| panel_has_line(app, "done"));
+    println!(
+        "--- beat 7: done — full conversation ---\n{}",
+        app.screen_text()
+    );
+}
+
 /// Spec R06's central e2e criterion (issue #92): the full loop —
 /// panel → task → approve card → `a` → `run_command`'s trace in the
 /// real grid → `done` — against a scripted endpoint. On the pinned
