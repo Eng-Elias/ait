@@ -19,6 +19,7 @@ mod keys;
 mod render;
 mod scroll;
 mod selection;
+mod shell_bridge;
 mod status;
 mod suggest;
 mod tabs;

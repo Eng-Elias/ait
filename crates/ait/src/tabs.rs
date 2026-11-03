@@ -45,6 +45,7 @@ use crate::integration::{self, IntegrationState};
 use crate::render::session_size;
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
+use crate::shell_bridge::{self, BridgeRequest, BridgeService};
 use crate::status::Toast;
 use crate::suggest::InputShadow;
 
@@ -196,6 +197,14 @@ pub struct Tab {
     /// `pub(crate)` seam as `scroll`/`shadow` — tests stage a panel;
     /// production drives it through the `agent_*` methods.
     pub(crate) agent: Option<AgentPanel>,
+    /// The service side of this tab's `ShellBridge` (Spec R06-T4):
+    /// created with the panel — `Alt+A` is the only thing that can
+    /// spawn a worker wanting to reach the shell — and answered by
+    /// `drain_events` every tick. `agent_key` clones its
+    /// [`TabBridge`](crate::shell_bridge::TabBridge) handle into each
+    /// submitted `AgentRequest`; `pub(crate)` so tests can attach a
+    /// service to a staged tab.
+    pub(crate) bridge: Option<BridgeService>,
 }
 
 impl Tab {
@@ -286,9 +295,8 @@ impl Tab {
     ///
     /// Refuses unless the tab is `Integrated` (a shell without the
     /// snippet can't answer, so nothing is typed) or already exited —
-    /// Round 6's `CommandExecutor` is the intended caller; only tests
-    /// drive it today.
-    #[allow(dead_code)]
+    /// Round 6's `ShellBridge` service calls it on behalf of the
+    /// agent's `UserShellExecutor` (Spec R06-T4).
     pub fn run_in_shell(&mut self, command: &[u8]) -> Result<RunRequest, InBandError> {
         if self.exit.is_some() {
             return Err(InBandError::SessionExited);
@@ -296,6 +304,75 @@ impl Tab {
         self.inband.request(self.integration, command, |bytes| {
             self.session.send_bytes(bytes)
         })
+    }
+
+    /// Answer every queued `ShellBridge` request — the `drain_events`
+    /// bookkeeping the agent worker's bridge calls land on (Spec
+    /// R06-T4). `run_in_band` delegates to
+    /// [`run_in_shell`](Self::run_in_shell) — the R05 seam's declared
+    /// first consumer — and its reply carries the pending run's
+    /// result channel straight back to the worker, which polls it on
+    /// its own thread while this drain keeps resolving it. Every
+    /// request is answered in place: the ~8 ms input tick bounds the
+    /// latency, and a `None` service answers nothing.
+    pub(crate) fn service_bridge(&mut self) {
+        loop {
+            let request = match &self.bridge {
+                Some(service) => match service.try_recv() {
+                    Some(request) => request,
+                    None => return,
+                },
+                None => return,
+            };
+            self.answer_bridge(request);
+        }
+    }
+
+    /// One bridge request serviced against this tab — the body of
+    /// [`service_bridge`](Self::service_bridge). Replies are sends on
+    /// a one-shot channel; a dead worker end (dropped reply receiver)
+    /// silently discards the answer.
+    fn answer_bridge(&mut self, request: BridgeRequest) {
+        match request {
+            BridgeRequest::State(reply) => {
+                let _ = reply.send(self.integration.into());
+            }
+            BridgeRequest::SendBytes { bytes, reply } => {
+                let result = if self.exit.is_some() {
+                    Err(ait_agent::BridgeError::SessionExited)
+                } else {
+                    self.session
+                        .send_bytes(&bytes)
+                        .map_err(ait_agent::BridgeError::Write)
+                };
+                let _ = reply.send(result);
+            }
+            BridgeRequest::RunInBand { command, reply } => {
+                let _ = reply.send(
+                    self.run_in_shell(&command)
+                        .map(RunRequest::into_receiver)
+                        .map_err(ait_agent::BridgeError::from),
+                );
+            }
+            BridgeRequest::Subscribe(reply) => {
+                let receiver = self
+                    .bridge
+                    .as_mut()
+                    .map(BridgeService::subscribe)
+                    .expect("a queued request implies a service");
+                let _ = reply.send(receiver);
+            }
+            BridgeRequest::GridLines { start, end, reply } => {
+                let grid = self.grid();
+                let lines = (start..end)
+                    .filter_map(|index| grid.line(index).map(|row| row.text()))
+                    .collect();
+                let _ = reply.send(lines);
+            }
+            BridgeRequest::OutputTail(reply) => {
+                let _ = reply.send(self.session.output_tail().to_vec());
+            }
+        }
     }
 
     /// The `N:title` label for the tab at position `index` (0-based) —
@@ -497,7 +574,13 @@ impl Tab {
     pub fn toggle_agent_panel(&mut self) {
         match self.agent.as_mut() {
             Some(panel) => panel.toggle(),
-            None => self.agent = Some(AgentPanel::new()),
+            None => {
+                // The bridge service is born with the panel — it is
+                // the only thing that can spawn a worker wanting to
+                // reach this shell (Spec R06-T4).
+                self.bridge = Some(shell_bridge::pair().1);
+                self.agent = Some(AgentPanel::new());
+            }
         }
     }
 
@@ -554,6 +637,15 @@ impl Tab {
                         settings: settings.clone(),
                         task: text,
                         context: context_for(self),
+                        // The task's shell binding (Spec R06-T4): a
+                        // fresh handle into this tab's bridge service
+                        // — `None` only if the panel exists without
+                        // one (a staged test tab), where `run_command`
+                        // answers a clean tool error.
+                        bridge: self
+                            .bridge
+                            .as_ref()
+                            .map(|service| Box::new(service.handle()) as _),
                     };
                     self.agent
                         .as_mut()
@@ -882,6 +974,7 @@ impl TabManager {
             inband: InBandExec::new(),
             materialized,
             agent: None,
+            bridge: None,
         });
         self.active = self.tabs.len() - 1;
         Ok(())
@@ -1088,7 +1181,18 @@ impl TabManager {
                         }
                         tab.prompt_marks.push_back(mark);
                     }
-                    LiveEvent::Exited(status) => tab.exit = Some(status.clone()),
+                    LiveEvent::Exited(status) => {
+                        tab.exit = Some(status.clone());
+                        // Spec R06-T4: a dead session answers no
+                        // `__ait_run` — every pending waiter's channel
+                        // disconnects so the executor fails cleanly
+                        // instead of hanging (us-34); bridge
+                        // subscribers see the exit too.
+                        tab.inband.fail_pending();
+                        if let Some(service) = tab.bridge.as_mut() {
+                            service.publish(ait_agent::BridgeEvent::Exited);
+                        }
+                    }
                     _ => {}
                 }
                 // Shell-integration bookkeeping (Spec R05): marks move
@@ -1109,11 +1213,32 @@ impl TabManager {
                         // §5.5.1: `OSC 7701` frames resolve pending
                         // `__ait_run` requests by their payload id.
                         tab.inband.observe(shell_event);
+                        // R06-T4: bridge subscribers (the typed tiers'
+                        // feed) see the same decoded event.
+                        if let Some(service) = tab.bridge.as_mut() {
+                            service.publish(ait_agent::BridgeEvent::Shell(shell_event.clone()));
+                        }
+                    }
+                    // R06-T5's feed: prompt marks reach subscribers
+                    // with the scrollback-then-viewport line the drain
+                    // recorded them at.
+                    if let (Some(service), SessionEvent::PromptMark { kind, payload }) =
+                        (tab.bridge.as_mut(), osc)
+                    {
+                        service.publish(ait_agent::BridgeEvent::PromptMark {
+                            kind: shell_bridge::mark_letter(*kind),
+                            payload: payload.clone(),
+                            line: scrollback + tab.session.cursor().line,
+                        });
                     }
                 }
                 events.push(TabEvent { tab: index, event });
             }
             tab.on_output();
+            // R06-T4: the ShellBridge's service queue — the agent
+            // worker's `run_in_band`/`send_bytes`/`subscribe` calls —
+            // answers on the same tick the PTY drains.
+            tab.service_bridge();
         }
         events
     }
@@ -2242,6 +2367,239 @@ mod tests {
         );
     }
 
+    /// Run one blocking `ShellBridge` call on a worker thread while
+    /// this thread keeps pumping `drain_events` — the same split the
+    /// production loop runs (the agent worker waits; the app tick
+    /// services). `f` takes the bridge so `FnOnce` closures over
+    /// `&TabManager` stay out of the thread.
+    fn bridge_call<T, F>(
+        manager: &mut TabManager,
+        bridge: &crate::shell_bridge::TabBridge,
+        f: F,
+    ) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(crate::shell_bridge::TabBridge) -> T + Send + 'static,
+    {
+        let handle = std::thread::spawn({
+            let bridge = bridge.clone();
+            move || f(bridge)
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        while !handle.is_finished() {
+            manager.drain_events();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bridge service"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.join().expect("bridge call panicked")
+    }
+
+    /// Attach a fresh bridge pair to `manager`'s active tab —
+    /// production creates it inside `toggle_agent_panel`; tests stage
+    /// it directly.
+    fn attach_bridge(manager: &mut TabManager) -> (crate::shell_bridge::TabBridge, &Tab) {
+        let (handle, service) = crate::shell_bridge::pair();
+        let tab = manager.active_mut().expect("an active tab");
+        tab.bridge = Some(service);
+        (handle, manager.active().unwrap())
+    }
+
+    /// Spec R06-T4 (issue #87) through a REAL injected bash: the
+    /// bridge's `run_in_band` request is serviced by `drain_events`,
+    /// the shell's `7701` reply resolves the returned channel, and
+    /// the typed `__ait_run` line stays visible while the merged
+    /// output never renders (us-12, us-23).
+    #[test]
+    fn bridge_run_in_band_round_trips_through_drain() {
+        if !Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/bash")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().integration_state() == IntegrationState::Integrated
+        });
+        let (bridge, _) = attach_bridge(&mut manager);
+        use ait_agent::ShellBridge;
+
+        // The tier selector answers through the service too.
+        let state = bridge_call(&mut manager, &bridge, |b| {
+            b.integration_state().expect("state")
+        });
+        assert_eq!(state, ait_agent::ShellIntegration::Integrated);
+
+        // The in-band run: request serviced by the drain, result on
+        // the returned channel.
+        let receiver = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"printf 'agent-marker'")
+                .expect("run accepted")
+        });
+        drain_until(&mut manager, |m| !m.tabs()[0].inband.is_pending(0));
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the run resolved");
+        assert_eq!(result.output, b"agent-marker".to_vec());
+        assert_eq!(result.exit_code, 0);
+
+        // The trace guarantee (us-23): the typed request line is grid
+        // text; the 7701 output stays invisible.
+        let text = grid_text(&manager.tabs()[0].session);
+        assert!(text.contains("__ait_run"), "the request's trace: {text}");
+        assert!(
+            !text.contains("agent-marker"),
+            "7701 output is invisible: {text}"
+        );
+    }
+
+    /// Refusals and exits are clean `BridgeError`s, never hangs: an
+    /// `Absent` tab refuses `run_in_band` with nothing typed; an
+    /// exited session refuses both the run and raw `send_bytes`
+    /// (us-34).
+    #[test]
+    fn bridge_refusals_and_exited_sessions_error_cleanly() {
+        use ait_agent::{BridgeError, ShellBridge, ShellIntegration};
+        let mut manager = manager(1, "/tmp");
+        let (bridge, _) = attach_bridge(&mut manager);
+
+        // Absent: `run_in_band` refuses — the drain reports the live
+        // state, and no `__ait_run` is typed.
+        let state = bridge_call(&mut manager, &bridge, |b| {
+            b.integration_state().expect("state")
+        });
+        assert_eq!(state, ShellIntegration::Absent);
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"echo hi").expect_err("Absent refuses")
+        });
+        assert!(
+            matches!(error, BridgeError::NotIntegrated(ShellIntegration::Absent)),
+            "{error:?}"
+        );
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"echo refuse-marker\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("refuse-marker")
+        });
+        assert!(
+            !grid_text(&manager.tabs()[0].session).contains("__ait_run"),
+            "a refused request typed nothing"
+        );
+
+        // `send_bytes` still works on the live shell — the typed
+        // tiers' (R06-T5) primitive.
+        bridge_call(&mut manager, &bridge, |b| {
+            b.send_bytes(b"echo sent-marker\n").expect("send_bytes")
+        });
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("sent-marker")
+        });
+
+        // Exit the session: the drain's Exited handling marks the
+        // tab, drops pending waits, and later bridge calls refuse.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"exit\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().exit_status().is_some()
+        });
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.run_in_band(b"echo hi")
+                .expect_err("an exited session refuses")
+        });
+        assert!(matches!(error, BridgeError::SessionExited), "{error:?}");
+        let error = bridge_call(&mut manager, &bridge, |b| {
+            b.send_bytes(b"x")
+                .expect_err("send_bytes on a dead session")
+        });
+        assert!(matches!(error, BridgeError::SessionExited), "{error:?}");
+    }
+
+    /// The subscription feed — R06-T5's typed-tier input: marks,
+    /// decoded `7700`-series events and the exit all arrive in drain
+    /// order; `grid_lines`/`output_tail` snapshot the capture
+    /// surfaces.
+    #[test]
+    fn bridge_subscription_forwards_marks_events_and_exit() {
+        use ait_agent::{BridgeEvent, ShellBridge};
+        let mut manager = manager(1, "/tmp");
+        let (bridge, _) = attach_bridge(&mut manager);
+
+        let events_rx = bridge_call(&mut manager, &bridge, |b| b.subscribe().expect("subscribe"));
+        let mut seen = Vec::new();
+
+        // An OSC 133 mark forwards as `PromptMark` with its payload
+        // and recorded line.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"printf '\\033]133;D;0\\007'\n")
+            .unwrap();
+        drain_until(&mut manager, |m| m.tabs()[0].prompt_marks().count() >= 1);
+        seen.extend(events_rx.try_iter());
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                BridgeEvent::PromptMark {
+                    kind: 'D',
+                    payload: Some(_),
+                    ..
+                }
+            )),
+            "a 133;D mark reached the subscriber: {seen:?}"
+        );
+
+        // The capture surfaces answer too.
+        let lines = bridge_call(&mut manager, &bridge, |b| {
+            b.grid_lines(0, 40).expect("grid lines")
+        });
+        assert!(!lines.is_empty());
+        let tail = bridge_call(&mut manager, &bridge, |b| {
+            b.output_tail().expect("output tail")
+        });
+        assert!(!tail.is_empty(), "the tail saw the session's output");
+
+        // The exit forwards — and closes pending run waits.
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"exit\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.active().unwrap().exit_status().is_some()
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            seen.extend(events_rx.try_iter());
+            if seen.iter().any(|e| matches!(e, BridgeEvent::Exited)) {
+                break;
+            }
+            manager.drain_events();
+            assert!(Instant::now() < deadline, "Exited never arrived: {seen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// `OSC 7701` bytes on a session's output never reach the grid:
     /// the emulator swallows private OSCs (the observer still decodes
     /// them — resolution coverage lives in the tests above). Printed
@@ -2509,6 +2867,7 @@ mod tests {
                         os: "test".into(),
                         output_lines: Vec::new(),
                     },
+                    bridge: None,
                 },
                 &mut toast,
             );

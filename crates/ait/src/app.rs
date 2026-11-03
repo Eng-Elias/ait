@@ -2591,4 +2591,147 @@ base_model = "key-1"
             "a click in the panel selects nothing"
         );
     }
+
+    // ---- Spec R06 T4: `run_command` through the ShellBridge (issue #87) ----
+
+    /// A `chat.completion.chunk` line carrying a tool-call fragment —
+    /// `id`/`name` on announce, bare `arguments` after (ait's tests
+    /// have no `serde_json` edge; the literals are hand-escaped).
+    fn tool_fragment(index: u32, announce: Option<(&str, &str)>, args: &str) -> String {
+        let call = match announce {
+            Some((id, name)) => format!(
+                "{{\"index\":{index},\"id\":\"{id}\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"{args}\"}}}}"
+            ),
+            None => format!("{{\"index\":{index},\"function\":{{\"arguments\":\"{args}\"}}}}"),
+        };
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}},\"finish_reason\":null}}]}}\n\n")
+    }
+
+    /// All text in a session's grid — the `tabs::tests` helper's
+    /// shape, for the trace assertions below.
+    fn grid_text(session: &ait_term::LiveSession) -> String {
+        let grid = session.grid();
+        grid.scrollback_rows()
+            .chain(grid.visible_rows())
+            .map(|row| row.text().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole e2e path (issue #87): a staged panel + bridge on a
+    /// REAL injected-bash tab, a fixture model calling `run_command`,
+    /// the approve card gating the request — no `__ait_run` bytes
+    /// before `a` — then the in-band run types its visible trace and
+    /// the merged result re-enters the conversation.
+    #[test]
+    fn run_command_e2e_gates_types_visibly_and_finishes() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let fixture = ait_llm::testing::Fixture::serve(vec![
+            ait_llm::testing::sse(&format!(
+                "{}{}{}",
+                tool_fragment(0, Some(("call_1", "run_command")), ""),
+                tool_fragment(
+                    0,
+                    None,
+                    "{\\\"command\\\":\\\"printf 'agent-marker'\\\"}"
+                ),
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            )),
+            ait_llm::testing::sse(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let mut harness = Harness::new(
+            TabManager::spawn_with(
+                Size::new(40, 10),
+                SessionTemplate {
+                    options: LiveSessionOptions {
+                        program: Some(std::ffi::OsString::from("/bin/bash")),
+                        cwd: Some(std::path::PathBuf::from("/tmp")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        wait_until(&mut harness, |h| {
+            h.tabs.active().unwrap().integration_state()
+                == crate::integration::IntegrationState::Integrated
+        });
+        // Point `coding_model` at the fixture.
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(&format!(
+                r#"
+[agents.custom_endpoints.local]
+name = "Fixture"
+base_url = "{}"
+schema = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name = "test-model"
+alias = "Test Model"
+config_key = "coding-key"
+
+[agents.execution_profiles.default]
+coding_model = "coding-key"
+"#,
+                fixture.base_url
+            ))
+            .expect("settings"),
+            &NoSecrets,
+        );
+        // Stage the panel + bridge service — `with_session` opens
+        // focused; the service is what `toggle_agent_panel` creates.
+        {
+            let tab = harness.tabs.active_mut().unwrap();
+            let (_handle, service) = crate::shell_bridge::pair();
+            tab.bridge = Some(service);
+            tab.agent = Some(crate::agent_panel::AgentPanel::with_session(
+                ait_agent::AgentSession::with_secret_store(NoSecrets),
+            ));
+        }
+
+        // Type the task and submit.
+        for c in "do it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        wait_until(&mut harness, |h| panel(h).awaiting_verdict());
+        // The gate is parked: no request line has been typed.
+        let grid_before = grid_text(&harness.tabs.active().unwrap().session);
+        assert!(
+            !grid_before.contains("__ait_run"),
+            "no request bytes before approval: {grid_before}"
+        );
+
+        // `a` — allow once — releases the in-band run.
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        wait_until(&mut harness, |h| !panel(h).is_running());
+
+        // The task finished; the typed `__ait_run` trace is in the
+        // grid (us-23) while the 7701 output never rendered (us-12).
+        let text = grid_text(&harness.tabs.active().unwrap().session);
+        assert!(text.contains("__ait_run"), "the request's trace: {text}");
+        assert!(
+            !text.contains("agent-marker"),
+            "7701 output is invisible: {text}"
+        );
+        let tool_card_done = panel(&harness).entries().iter().any(|entry| matches!(
+            entry,
+            crate::agent_panel::Entry::Tool(card)
+                if card.name == "run_command" && card.status == crate::agent_panel::CardStatus::Done
+        ));
+        assert!(tool_card_done, "{:?}", panel(&harness).entries());
+
+        // The result re-entered the conversation: the second request
+        // carries the merged output and the exit code.
+        fixture.captured();
+        let second = fixture.captured();
+        assert!(second.body.contains("agent-marker"), "{}", second.body);
+        assert!(second.body.contains("exit code"), "{}", second.body);
+    }
 }

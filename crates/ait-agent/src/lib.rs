@@ -33,11 +33,17 @@
 //!   [`AgentEvent::ApprovalRequest`] until
 //!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
 //!   results, denials included, re-enter the conversation redacted.
+//! - the §5.9 [`CommandExecutor`] seam and its first tier:
+//!   [`UserShellExecutor`] runs `run_command` in the user's live
+//!   shell through the [`ShellBridge`] the frontend implements per
+//!   tab — `Integrated` sessions ride §5.5.1's in-band `__ait_run`
+//!   channel; the typed tiers land in R06-T5 (issue #87).
 
 mod agent_context;
 mod context;
 mod conversation;
 mod endpoint_bridge;
+mod executor;
 mod files;
 mod redact;
 mod sanitize;
@@ -48,6 +54,10 @@ mod tools;
 
 pub use agent_context::AgentContext;
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
+pub use executor::{
+    BridgeError, BridgeEvent, CommandExecutor, CommandResult, DetachedExecutor, ExecutorError,
+    ShellBridge, ShellIntegration, UserShellExecutor,
+};
 pub use redact::redact;
 pub use sanitize::{sanitize_reply, ReplySanitizer};
 pub use session::{

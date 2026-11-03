@@ -34,6 +34,11 @@ ait-config = { path = "../ait-config", features = ["secrets"] }
 # schema-matched IR `Endpoint::stream` accepts — so T3's
 # `CommandSuggester` passes assembled requests through unchanged.
 ait-llm = { path = "../ait-llm" }
+# `run_command`'s user-shell executor (Spec R06-T4): the bridge's
+# in-band await is typed in ait-shell's `RunResult`, and bridge
+# subscriptions carry decoded `ShellEvent`s (7700 hooks / 7701
+# frames) — the same §5.5.1 codec vocabulary `ait` decodes.
+ait-shell = { path = "../ait-shell" }
 
 [dev-dependencies]
 # The in-process HTTP fixture server for the CommandSuggester
