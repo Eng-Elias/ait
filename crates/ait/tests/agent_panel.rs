@@ -112,11 +112,17 @@ fn open_panel(app: &mut E2e) {
 
 /// Type `task` on the panel's input line and submit it — the bytes
 /// order the keystrokes, so the gate on the rendered input is
-/// belt-and-braces rather than load-bearing.
+/// belt-and-braces rather than load-bearing. The input row
+/// tail-clips a task longer than the panel is wide, so the probe is
+/// the task's tail — the part that must be visible either way.
 fn submit_task(app: &mut E2e, task: &str) {
     app.type_text(task);
+    let probe: String = task
+        .chars()
+        .skip(task.chars().count().saturating_sub(16))
+        .collect();
     app.wait_for_screen("the task on the input line", |app| {
-        app.screen_text().contains(task)
+        app.screen_text().contains(&*probe)
     });
     app.press("Enter");
 }
