@@ -11,7 +11,10 @@
 //!   newest assistant entry; tool calls land as tool cards
 //!   ([`Entry::Tool`], status-transitioned by `ToolUpdate`); an
 //!   `ApprovalRequest` parks the gate on the approve card until
-//!   [`decide`](AgentPanel::decide) answers it;
+//!   [`decide`](AgentPanel::decide) answers it; an `AskRequest` —
+//!   `ask_user_question`, gate-exempt (us-10) — parks the ask card
+//!   until [`submit_answer`](AgentPanel::submit_answer) sends the
+//!   user's choice or free-text reply;
 //!   `Done`/`Cancelled`/`BudgetReached`/`Error` are terminal and
 //!   leave a status line.
 //! - the **input line** typing lands in while the panel is focused —
@@ -55,9 +58,7 @@ const INPUT_PROMPT: &str = "› ";
 const PROMPT_WIDTH: usize = 2;
 
 /// One conversation entry — what the panel's scrollback is made of.
-/// Each variant owns its display shape in [`display_lines`]; the
-/// `ask_user_question` interactive card (a later ticket) extends the
-/// list the same way.
+/// Each variant owns its display shape in [`display_lines`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Entry {
     /// A submitted task — the user's words, verbatim.
@@ -72,6 +73,10 @@ pub(crate) enum Entry {
     /// A tool card (Spec R06 us-5): name, argument summary and the
     /// status its `ToolUpdate`s transition through.
     Tool(ToolCard),
+    /// The `ask_user_question` card (us-10): question, choices and
+    /// the answer — its own interactive shape, exempt from the
+    /// approval gate because the card IS the ask.
+    Ask(AskCard),
     /// A terminal outcome line: the task finished, the user cancelled,
     /// the step budget tripped, or a failure message.
     Status(String),
@@ -111,16 +116,43 @@ pub(crate) struct ToolCard {
     pub(crate) detail: Option<String>,
 }
 
+/// The `ask_user_question` card — built from an
+/// [`AgentEvent::AskRequest`] (question plus choices-or-free-text,
+/// already parsed worker-side), resolved by
+/// [`submit_answer`](AgentPanel::submit_answer) which records the
+/// user's reply in `answer`. `selected` highlights the option the
+/// ↑/↓ keys move over while the card waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AskCard {
+    /// The provider call id `ToolUpdate`s address.
+    pub(crate) id: String,
+    /// The question the model asked.
+    pub(crate) question: String,
+    /// The offered choices; empty means a free-text answer.
+    pub(crate) choices: Vec<String>,
+    /// The highlighted choice while the card waits.
+    pub(crate) selected: usize,
+    /// The user's answer — `Some` once the card is resolved.
+    pub(crate) answer: Option<String>,
+}
+
 /// The approve card's state — which call waits on a verdict and what
-/// the card titles it. `ask_user_question`'s interactive card (a
-/// later ticket) will want its own state; the gate's verdict path is
-/// already shaped for it.
+/// the card titles it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingApproval {
     /// The call the worker is parked on.
     call_id: String,
     /// Its tool name — the card's title.
     name: String,
+}
+
+/// The ask card's parked state — which call the worker waits on an
+/// answer for. Everything else lives on the [`Entry::Ask`] card
+/// itself (question, choices, highlighted selection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAsk {
+    /// The call the worker is parked on.
+    call_id: String,
 }
 
 /// A tab's agent conversation panel (Spec R06 us: per-tab ownership).
@@ -162,6 +194,10 @@ pub(crate) struct AgentPanel {
     /// ([`decide`](Self::decide)) and the approve card row renders
     /// above the input line.
     pending: Option<PendingApproval>,
+    /// The call the ask card is parked on, if any — ↑/↓ + Enter
+    /// answer it ([`submit_answer`](Self::submit_answer)) and its
+    /// prompt row renders above the input line.
+    pending_ask: Option<PendingAsk>,
     /// Whether the conversation view follows the tail — `false` once
     /// the user wheel-scrolls up; re-pinned by a wheel-down that
     /// lands on the bottom or by a fresh submit/steer.
@@ -200,6 +236,7 @@ impl AgentPanel {
             focused: true,
             running: false,
             pending: None,
+            pending_ask: None,
             pinned: true,
             top: Cell::new(0),
             painted: Cell::new((0, 0)),
@@ -233,6 +270,20 @@ impl AgentPanel {
         self.pending.is_some()
     }
 
+    /// Whether an `ask_user_question` card waits on an answer — the
+    /// ask keys (↑/↓ + Enter for choices, typed input for free text)
+    /// apply while `true`, and the paint reserves its prompt row.
+    pub(crate) fn awaiting_answer(&self) -> bool {
+        self.pending_ask.is_some()
+    }
+
+    /// Whether the pending ask offers choices — `false` means the
+    /// card takes a free-text answer from the input line.
+    pub(crate) fn ask_has_choices(&self) -> bool {
+        self.pending_ask_card()
+            .is_some_and(|card| !card.choices.is_empty())
+    }
+
     /// Answer the pending approval (Spec R06's three-way card):
     /// `call_id` rides along so the worker ignores a verdict meant
     /// for a call it already resolved. A dead worker toasts — the
@@ -243,6 +294,93 @@ impl AgentPanel {
         };
         if let Err(error) = self.session.approve(&pending.call_id, verdict) {
             *toast = Some(Toast::new(format!("{error}"), Instant::now()));
+        }
+        self.revision += 1;
+    }
+
+    /// The ask card awaiting an answer, if any — the choices and the
+    /// highlighted selection live on the [`Entry::Ask`] itself.
+    fn pending_ask_card(&self) -> Option<&AskCard> {
+        let pending = self.pending_ask.as_ref()?;
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Ask(card) if card.id == pending.call_id => Some(card),
+            _ => None,
+        })
+    }
+
+    /// The mutable half of [`pending_ask_card`].
+    fn pending_ask_card_mut(&mut self) -> Option<&mut AskCard> {
+        let pending = self.pending_ask.as_ref()?;
+        self.entries.iter_mut().rev().find_map(|entry| match entry {
+            Entry::Ask(card) if card.id == pending.call_id => Some(card),
+            _ => None,
+        })
+    }
+
+    /// ↑ on a choices ask — the highlight wraps to the tail from the
+    /// top. A no-op with no card parked or nothing to choose.
+    pub(crate) fn ask_prev(&mut self) {
+        let Some(card) = self.pending_ask_card_mut() else {
+            return;
+        };
+        if card.choices.is_empty() {
+            return;
+        }
+        card.selected = card
+            .selected
+            .checked_sub(1)
+            .unwrap_or(card.choices.len() - 1);
+        self.revision += 1;
+    }
+
+    /// ↓ on a choices ask — the highlight wraps back to the top.
+    pub(crate) fn ask_next(&mut self) {
+        let Some(card) = self.pending_ask_card_mut() else {
+            return;
+        };
+        if card.choices.is_empty() {
+            return;
+        }
+        card.selected = (card.selected + 1) % card.choices.len();
+        self.revision += 1;
+    }
+
+    /// Answer the pending ask (Spec R06 us-10): the highlighted
+    /// choice, or — a free-text ask — the input line's text, sent on
+    /// [`AgentSession::answer`] so it becomes the call's tool result.
+    /// `call_id` rides along so the worker ignores an answer meant
+    /// for a call it already resolved. An empty free-text line is a
+    /// no-op — the card stays parked — and a dead worker toasts like
+    /// every other send.
+    pub(crate) fn submit_answer(&mut self, toast: &mut Option<Toast>) {
+        let Some(pending) = self.pending_ask.as_ref() else {
+            return;
+        };
+        let call_id = pending.call_id.clone();
+        let answer = match self.pending_ask_card() {
+            Some(card) if !card.choices.is_empty() => {
+                card.choices.get(card.selected).cloned().unwrap_or_default()
+            }
+            _ => {
+                let text = self.take_input().trim_end().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                text
+            }
+        };
+        self.pending_ask = None;
+        match self.session.answer(&call_id, answer.clone()) {
+            Ok(()) => {
+                self.pinned = true;
+                if let Some(card) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Ask(card) if card.id == call_id => Some(card),
+                    _ => None,
+                }) {
+                    card.answer = Some(answer);
+                }
+            }
+            Err(error) => *toast = Some(Toast::new(format!("{error}"), Instant::now())),
         }
         self.revision += 1;
     }
@@ -395,6 +533,20 @@ impl AgentPanel {
                     detail: None,
                 }));
             }
+            AgentEvent::AskRequest {
+                call,
+                question,
+                choices,
+            } => {
+                self.entries.push(Entry::Ask(AskCard {
+                    id: call.id.clone(),
+                    question,
+                    choices,
+                    selected: 0,
+                    answer: None,
+                }));
+                self.pending_ask = Some(PendingAsk { call_id: call.id });
+            }
             AgentEvent::ToolUpdate {
                 call_id,
                 status,
@@ -416,26 +568,37 @@ impl AgentPanel {
                 {
                     self.pending = None;
                 }
+                if self
+                    .pending_ask
+                    .as_ref()
+                    .is_some_and(|pending| pending.call_id == call_id)
+                {
+                    self.pending_ask = None;
+                }
             }
             AgentEvent::Done => {
                 self.running = false;
                 self.pending = None;
+                self.pending_ask = None;
                 self.entries.push(Entry::Status("done".to_string()));
             }
             AgentEvent::Cancelled => {
                 self.running = false;
                 self.pending = None;
+                self.pending_ask = None;
                 self.entries.push(Entry::Status("cancelled".to_string()));
             }
             AgentEvent::BudgetReached => {
                 self.running = false;
                 self.pending = None;
+                self.pending_ask = None;
                 self.entries
                     .push(Entry::Status("step budget reached".to_string()));
             }
             AgentEvent::Error(message) => {
                 self.running = false;
                 self.pending = None;
+                self.pending_ask = None;
                 self.entries
                     .push(Entry::Status(format!("error: {message}")));
             }
@@ -552,8 +715,9 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     }
     // The input line owns the last row: `› ` plus the tail of the
     // buffer (long input clips from the left — the cursor end is the
-    // half the user is editing). The approve card takes the row just
-    // above while the gate waits — it is never hidden, and the
+    // half the user is editing). A parked card takes the row just
+    // above — the approve card while the gate waits, the ask card's
+    // prompt while a question waits — it is never hidden, and the
     // conversation loses that row for the duration.
     let input_y = inner.bottom() - 1;
     reset_span(buf, input_y, inner.x..inner.right());
@@ -566,13 +730,27 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
         width,
         Style::default(),
     );
-    let approve_rows = if let (Some(pending), true) = (&panel.pending, input_y > inner.y + 1) {
+    let prompt_text = if let Some(pending) = &panel.pending {
+        Some(format!(
+            " approve {} — a: once · t: task · d: deny ",
+            pending.name
+        ))
+    } else if panel.pending_ask.is_some() {
+        Some(if panel.ask_has_choices() {
+            " ask — ↑/↓ choose · enter: answer ".to_string()
+        } else {
+            " ask — type your answer · enter: send ".to_string()
+        })
+    } else {
+        None
+    };
+    let prompt_rows = if let (Some(text), true) = (prompt_text, input_y > inner.y + 1) {
         let y = input_y - 1;
         reset_span(buf, y, inner.x..inner.right());
         buf.set_stringn(
             inner.x,
             y,
-            format!(" approve {} — a: once · t: task · d: deny ", pending.name),
+            text,
             width,
             Style::default()
                 .fg(RtColor::Yellow)
@@ -590,7 +768,7 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     // owns the scroll clamp: `top`/`painted` are what the wheel
     // handlers bound against.
     let conversation = display_lines(&panel.entries, width);
-    let height = usize::from(input_y - (inner.y + 1)).saturating_sub(approve_rows);
+    let height = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
     let max_top = conversation.len().saturating_sub(height);
     let top = if panel.pinned {
         max_top
@@ -625,6 +803,7 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
             )],
             Entry::Text(text) => vec![(text.clone(), Style::default())],
             Entry::Tool(card) => tool_card_lines(card),
+            Entry::Ask(card) => ask_card_lines(card),
             Entry::Status(text) => vec![(text.clone(), Style::default().fg(RtColor::DarkGray))],
         };
         for (text, style) in blocks {
@@ -666,6 +845,44 @@ fn tool_card_lines(card: &ToolCard) -> Vec<(String, Style)> {
         ));
     }
     lines
+}
+
+/// The ask card's display blocks (us-10): while it waits, `?` marks
+/// the question and each choice lists beneath — `▸` on the
+/// highlighted one; answered, `✓` marks the question and the answer
+/// indents dimmed like a tool result's detail.
+fn ask_card_lines(card: &AskCard) -> Vec<(String, Style)> {
+    match &card.answer {
+        Some(answer) => vec![
+            (
+                format!("✓ {}", card.question),
+                Style::default().fg(RtColor::Green),
+            ),
+            (
+                format!("    {answer}"),
+                Style::default().fg(RtColor::DarkGray),
+            ),
+        ],
+        None => {
+            let mut lines = vec![(
+                format!("? {}", card.question),
+                Style::default()
+                    .fg(RtColor::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            for (index, choice) in card.choices.iter().enumerate() {
+                lines.push(if index == card.selected {
+                    (
+                        format!("    ▸ {choice}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (format!("      {choice}"), Style::default())
+                });
+            }
+            lines
+        }
+    }
 }
 
 /// Char-wrap `text` to `width` columns honoring embedded newlines;
@@ -1113,6 +1330,154 @@ mod tests {
         assert!(panel.awaiting_verdict());
         panel.apply(AgentEvent::Cancelled);
         assert!(!panel.awaiting_verdict());
+    }
+
+    /// A staged `AskRequest` for the ask-card tests.
+    fn ask(id: &str, question: &str, choices: &[&str]) -> AgentEvent {
+        AgentEvent::AskRequest {
+            call: ait_agent::ToolCall {
+                id: id.into(),
+                name: "ask_user_question".into(),
+                arguments: String::new(),
+            },
+            question: question.into(),
+            choices: choices.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    /// An `AskRequest` opens its own card — question and choices in
+    /// the scrollback — and `submit_answer` records the highlighted
+    /// choice as the answer (the send travels the real channel; the
+    /// worker's end is the session tests' seam).
+    #[test]
+    fn ask_request_opens_a_card_and_submit_answer_resolves_it() {
+        let mut panel = panel();
+        panel.apply(ask("call_1", "Which approach?", &["rewrite", "patch"]));
+        assert!(panel.awaiting_answer());
+        assert!(panel.ask_has_choices());
+        assert_eq!(
+            panel.entries().last(),
+            Some(&Entry::Ask(AskCard {
+                id: "call_1".into(),
+                question: "Which approach?".into(),
+                choices: vec!["rewrite".into(), "patch".into()],
+                selected: 0,
+                answer: None,
+            }))
+        );
+
+        panel.ask_next();
+        let mut toast = None;
+        panel.submit_answer(&mut toast);
+        assert!(!panel.awaiting_answer());
+        assert!(toast.is_none());
+        assert!(matches!(
+            panel.entries().last(),
+            Some(Entry::Ask(card)) if card.answer.as_deref() == Some("patch")
+        ));
+    }
+
+    /// Navigation wraps at both ends of the choice list.
+    #[test]
+    fn ask_navigation_wraps() {
+        let mut panel = panel();
+        panel.apply(ask("call_1", "Pick", &["a", "b"]));
+
+        panel.ask_prev();
+        let Some(Entry::Ask(card)) = panel.entries().last() else {
+            panic!("ask card")
+        };
+        assert_eq!(card.selected, 1, "prev from the top wraps to the tail");
+        panel.ask_next();
+        let Some(Entry::Ask(card)) = panel.entries().last() else {
+            panic!("ask card")
+        };
+        assert_eq!(card.selected, 0, "next off the tail wraps to the top");
+    }
+
+    /// A free-text ask takes the input line: `submit_answer` consumes
+    /// the typed text as the answer. An empty line answers nothing —
+    /// the card stays parked.
+    #[test]
+    fn a_free_text_ask_answers_from_the_input_line() {
+        let mut panel = panel();
+        panel.apply(ask("call_1", "What should the command be?", &[]));
+        assert!(panel.awaiting_answer());
+        assert!(!panel.ask_has_choices());
+
+        let mut toast = None;
+        panel.submit_answer(&mut toast);
+        assert!(
+            panel.awaiting_answer(),
+            "an empty free-text answer is a no-op"
+        );
+
+        for c in "cargo clippy".chars() {
+            panel.push_input(c);
+        }
+        panel.submit_answer(&mut toast);
+        assert!(!panel.awaiting_answer());
+        assert_eq!(panel.input(), "");
+        assert!(matches!(
+            panel.entries().last(),
+            Some(Entry::Ask(card)) if card.answer.as_deref() == Some("cargo clippy")
+        ));
+    }
+
+    /// A terminal event while the ask waits drops the card's parked
+    /// state — the Esc path: `Cancelled` releases `running` and
+    /// leaves the card unanswered.
+    #[test]
+    fn terminal_events_clear_a_pending_ask() {
+        let mut panel = panel();
+        panel.entries.push(Entry::Task("set it up".into()));
+        panel.running = true;
+        panel.apply(ask("call_1", "Proceed?", &["yes", "no"]));
+        assert!(panel.awaiting_answer());
+
+        panel.apply(AgentEvent::Cancelled);
+        assert!(!panel.awaiting_answer());
+        assert!(!panel.running);
+        assert!(panel
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Ask(card) if card.answer.is_none())));
+    }
+
+    /// The ask card paints question and choices in the conversation —
+    /// the highlighted option marked — plus its prompt row above the
+    /// input line; once answered it renders `✓` + the answer.
+    #[test]
+    fn paint_shows_the_ask_card_and_its_prompt_row() {
+        let mut panel = panel();
+        panel.apply(ask("call_1", "Which approach?", &["rewrite", "patch"]));
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 8));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 8), &panel);
+
+        let row =
+            |y: u16| -> String { (1..60).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert_eq!(row(1).trim_end(), "? Which approach?");
+        assert_eq!(
+            row(2).trim_end(),
+            "    ▸ rewrite",
+            "the first option is selected"
+        );
+        assert_eq!(row(3).trim_end(), "      patch");
+        // The prompt row owns the line above the input row.
+        assert!(row(6).contains("enter"), "{:?}", row(6));
+        assert!(row(6).contains("choose"), "{:?}", row(6));
+
+        // Answered: the card transitions to `✓` + the answer text.
+        let mut toast = None;
+        panel.submit_answer(&mut toast);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 60, 8));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 8), &panel);
+        let row =
+            |y: u16| -> String { (1..60).map(|x| buf[(x, y)].symbol().to_string()).collect() };
+        assert_eq!(row(1).trim_end(), "✓ Which approach?");
+        assert_eq!(row(2).trim(), "rewrite");
+        assert!(!row(6).contains("choose"), "the prompt row released");
     }
 
     /// The approve card paints its row above the input line while the
