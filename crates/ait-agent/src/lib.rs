@@ -33,6 +33,9 @@
 //!   [`AgentEvent::ApprovalRequest`] until
 //!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
 //!   results, denials included, re-enter the conversation redacted.
+//!   `ask_user_question` is exempt by design (us-10): its
+//!   [`AgentEvent::AskRequest`] card IS the ask, answered through
+//!   [`AgentSession::answer`].
 //! - `write_to_pty` and the agent-owned PTY (R06-T7): a lazily
 //!   spawned [`ait_term::LiveSession`] injected through `ait-shell`'s
 //!   planner, driven write↔settle-read from the worker thread for
