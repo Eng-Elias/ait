@@ -171,6 +171,14 @@ fn fish_plan_injects_init_command_sourcing_the_snippet() {
 
     let files = injection.files(dir);
     assert!(files.iter().any(|(n, _)| *n == "snippet.fish"));
+
+    // fish ≥4's built-in `133;A` marks would abandon every open block
+    // before `D`; the startup feature flag is pinned via env.
+    assert!(env_has(
+        &injection.env(dir),
+        "fish_features",
+        "no-mark-prompt"
+    ));
 }
 
 #[test]

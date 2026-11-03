@@ -139,6 +139,17 @@ impl Injection {
                 env.push((OsString::from(ENV_ZDOTDIR_ORIG), orig.clone()));
             }
         }
+        // fish ≥4 ships built-in OSC 133 marking (`A;click_events=1`,
+        // `C;cmdline_url=…`): its mid-cycle `A` abandons our open block
+        // before `D` lands, so an integrated fish ≥4 renders no blocks.
+        // `mark-prompt` is a feature flag read once at fish startup —
+        // only an env import reaches it; the snippet itself is too late.
+        if self.kind == ShellKind::Fish {
+            env.push((
+                OsString::from("fish_features"),
+                OsString::from("no-mark-prompt"),
+            ));
+        }
         env
     }
 
