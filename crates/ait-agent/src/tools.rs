@@ -6,7 +6,7 @@
 //!
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
-//! `write_to_pty`). Round 6 ships the three read tools' executors in
+//! `write_to_pty`). Round 6 ships the file tools' executors in
 //! [`files`](crate::files) and `run_command`'s through the task's
 //! [`CommandExecutor`](crate::CommandExecutor) (R06-T4); the rest
 //! declare their specs now so the model sees the whole vocabulary,
@@ -16,17 +16,21 @@
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
+//! `edit_files` goes further: [`plan_edit`] computes the call's
+//! [`EditPlan`] before the card so the unified diff the user
+//! approves IS the write that lands (us-22).
 
 use std::sync::LazyLock;
 
 use ait_llm::{anthropic_messages, openai_chat_completions, openai_responses, EndpointSchema};
 
 use crate::executor::{CommandExecutor, CommandResult};
-use crate::files::{ToolCwd, ToolOutput};
+use crate::files::{EditPlan, ToolCwd, ToolOutput};
 use crate::tool_call::ToolCall;
 
 /// The `ask_user_question` tool's registry name — [`gate_exempt`]
-/// compares against it; its interactive card lands with its ticket.
+/// compares against it; the agent loop diverts it into the ask-card
+/// flow before [`execute`] is ever called.
 pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
 
 /// One tool, provider-neutrally: what the model sees, translated
@@ -198,11 +202,35 @@ fn registry() -> &'static [ToolSpec] {
 
 /// Whether the interim gate asks before `name` runs (Spec R06's
 /// ask-everything rule): every tool asks except
-/// `ask_user_question` — its own card IS the ask (us-10). The
-/// exemption point lives here even before that tool lands, so its
-/// ticket drops in without touching the gate.
+/// `ask_user_question` — its own card IS the ask (us-10).
 pub(crate) fn gate_exempt(name: &str) -> bool {
     name == ASK_USER_QUESTION
+}
+
+/// Parse an `ask_user_question` call's arguments into the card's
+/// pieces: the question to render and the offered choices — an empty
+/// list means the card takes a free-text answer. A missing or
+/// non-string `question` is the only failure: a `choices` member
+/// that is not a string or a `choices` that is not an array simply
+/// contributes nothing (the card must render for every call whose
+/// question is usable).
+pub(crate) fn parse_question(call: &ToolCall) -> Result<(String, Vec<String>), String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments)
+        .map_err(|error| format!("{}: arguments are not valid JSON: {error}", call.name))?;
+    let Some(question) = args.get("question").and_then(|v| v.as_str()) else {
+        return Err(format!("{}: `question` must be a string", call.name));
+    };
+    let choices = args
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((question.to_string(), choices))
 }
 
 /// The registry translated into `schema`'s own `Tool` IR — attached
@@ -328,6 +356,19 @@ fn compact(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| String::from("{…}"))
 }
 
+/// `edit_files`' gate preparation (Spec R06 us-22/23): parse the
+/// arguments and plan the call against `cwd`. The plan's unified
+/// diff is the approve card's summary and the plan itself is what
+/// an allow verdict applies — planning once keeps the rendered
+/// diff byte-for-byte the applied change. A planning failure is a
+/// `String` the gate renders on the card AND replays as the tool
+/// result so the model reads why.
+pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments)
+        .map_err(|error| format!("edit_files: arguments are not valid JSON: {error}"))?;
+    cwd.plan_edits(&args)
+}
+
 /// Run `call` against `cwd` and `executor` — the sequential
 /// dispatcher the loop calls after the gate (or directly, for
 /// gate-exempt calls). `executor` is the task's §5.9
@@ -354,9 +395,17 @@ pub(crate) fn execute(
         "read_files" => cwd.read_files(&args),
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
+        "edit_files" => cwd.edit_files(&args),
         "run_command" => run_command(&args, executor),
-        "edit_files" | "write_to_pty" | ASK_USER_QUESTION => ToolOutput::error(format!(
+        "write_to_pty" => ToolOutput::error(format!(
             "{} is not available yet — its executor lands in a later ticket",
+            call.name
+        )),
+        // The ask card answers on the session's answer channel —
+        // `execute` is never its path; a call reaching here had no
+        // usable question (the loop's error arm already reported it).
+        ASK_USER_QUESTION => ToolOutput::error(format!(
+            "{} answers through the ask card, not the executor",
             call.name
         )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
@@ -500,6 +549,40 @@ mod tests {
         }
     }
 
+    /// The ask card's pure seam: `question` plus `choices` come out
+    /// of the call's arguments — absent choices mean free text —
+    /// and a missing or non-string question is the only error.
+    #[test]
+    fn parse_question_reads_the_card_pieces() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: ASK_USER_QUESTION.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":["a","b"]}"#)),
+            Ok(("Which?".to_string(), vec!["a".into(), "b".into()]))
+        );
+        // No `choices` — the free-text card.
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Why?"}"#)),
+            Ok(("Why?".to_string(), Vec::new()))
+        );
+        // Lenient on junk: a non-array `choices` and non-string
+        // members contribute nothing.
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":"all"}"#)),
+            Ok(("Which?".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            parse_question(&call(r#"{"question":"Which?","choices":["a",1,true]}"#)),
+            Ok(("Which?".to_string(), vec!["a".into()]))
+        );
+        for args in [r#"{}"#, r#"{"question":42}"#, "{not json"] {
+            assert!(parse_question(&call(args)).is_err(), "{args}");
+        }
+    }
+
     /// Dispatch: the shipped tools execute (an unbound shell turns
     /// `run_command` into a clean tool error), the
     /// declared-but-unbuilt ones and unknown names answer tool
@@ -531,13 +614,22 @@ mod tests {
             out.text
         );
 
-        for name in ["edit_files", "write_to_pty", ASK_USER_QUESTION] {
-            let out = execute(&call(name, "{}"), &cwd, &mut executor);
-            assert!(
-                out.is_error && out.text.contains("not available yet"),
-                "{name}"
-            );
-        }
+        // edit_files dispatches now — `{}` is a well-formed call
+        // with bad arguments, which is a tool error, not a stub.
+        let out = execute(&call("edit_files", "{}"), &cwd, &mut executor);
+        assert!(
+            out.is_error && out.text.contains("`files`"),
+            "{:?}",
+            out.text
+        );
+
+        let out = execute(&call("write_to_pty", "{}"), &cwd, &mut executor);
+        assert!(out.is_error && out.text.contains("not available yet"));
+
+        // `ask_user_question` answers on the ask channel — `execute`
+        // is never its path, but errors cleanly if reached.
+        let out = execute(&call(ASK_USER_QUESTION, "{}"), &cwd, &mut executor);
+        assert!(out.is_error && out.text.contains("ask card"));
         let out = execute(&call("definitely_not_a_tool", "{}"), &cwd, &mut executor);
         assert!(out.is_error && out.text.contains("unknown tool"));
         let out = execute(&call("read_files", "{oops"), &cwd, &mut executor);

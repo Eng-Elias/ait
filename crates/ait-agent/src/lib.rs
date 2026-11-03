@@ -26,13 +26,17 @@
 //!   steering and the [`STEP_BUDGET`] model-turn cap.
 //! - the §5.6 tool pipeline: a neutral `ToolSpec` registry
 //!   translated per schema, streamed tool-call accumulation, and the
-//!   read-only tools (`read_files`, `grep`, `glob`) confined to the
-//!   bound session's cwd.
+//!   file tools (`read_files`, `grep`, `glob`, `edit_files` — the
+//!   last with an internal unified diff the approve card renders)
+//!   confined to the bound session's cwd.
 //! - the interim permission gate (Spec R06's ask-everything rule):
 //!   every call suspends on an
 //!   [`AgentEvent::ApprovalRequest`] until
 //!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
 //!   results, denials included, re-enter the conversation redacted.
+//!   `ask_user_question` is exempt by design (us-10): its
+//!   [`AgentEvent::AskRequest`] card IS the ask, answered through
+//!   [`AgentSession::answer`].
 //! - the §5.9 [`CommandExecutor`] seam and its first tier:
 //!   [`UserShellExecutor`] runs `run_command` in the user's live
 //!   shell through the [`ShellBridge`] the frontend implements per

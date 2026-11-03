@@ -34,10 +34,12 @@
 //! *deny* (the denial text becomes the tool result). Prompts never
 //! time out (us-9); Esc still cancels the whole task, and
 //! `ask_user_question` is exempt by design — its own card is the ask
-//! (us-10; the exemption point exists in [`tools::gate_exempt`]
-//! before the tool does). The gate sits at the same consult-point
-//! §5.7's profile engine will drive — Round 7 swaps the policy, not
-//! the plumbing.
+//! (us-10): a call to it suspends on an [`AgentEvent::AskRequest`] —
+//! carrying the question and its choices-or-free-text — until the
+//! frontend's [`AgentSession::answer`] replies, and the answer text
+//! becomes the call's tool result. The gate sits at the same
+//! consult-point §5.7's profile engine will drive — Round 7 swaps
+//! the policy, not the plumbing.
 //!
 //! Calls in one turn execute sequentially in model order (us-33),
 //! each gated. Every tool result passes [`redact`](crate::redact)
@@ -72,7 +74,7 @@ use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext}
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
 use crate::executor::{CommandExecutor, DetachedExecutor, ShellBridge, UserShellExecutor};
-use crate::files::ToolCwd;
+use crate::files::{ToolCwd, ToolOutput};
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
@@ -161,11 +163,12 @@ pub enum AgentEvent {
     /// frontend answers [`AgentSession::approve`] with an
     /// [`ApprovalVerdict`] for `call.id`. The panel renders the
     /// approve card — `summary` is the renderable argument summary
-    /// (command text, file paths; us-5).
+    /// (command text, file paths, the `edit_files` diff; us-5/22).
     ApprovalRequest {
         /// The complete call awaiting a verdict.
         call: ToolCall,
-        /// The call's renderable argument summary.
+        /// The call's renderable argument summary (command text,
+        /// file paths — the `edit_files` unified diff, us-22).
         summary: String,
     },
     /// A call began executing without a gate wait — an
@@ -176,6 +179,21 @@ pub enum AgentEvent {
         call: ToolCall,
         /// The call's renderable argument summary.
         summary: String,
+    },
+    /// `ask_user_question`'s own card (us-10 — gate-exempt because
+    /// the card IS the ask): the loop is suspended until the
+    /// frontend answers [`AgentSession::answer`] for `call.id`; the
+    /// answer text becomes the call's tool result. The panel renders
+    /// `question` plus `choices` — an empty list means the answer is
+    /// free-text.
+    AskRequest {
+        /// The complete call awaiting an answer.
+        call: ToolCall,
+        /// The question to render.
+        question: String,
+        /// The model's offered answer choices; empty means the user
+        /// answers in free text.
+        choices: Vec<String>,
     },
     /// A tool card's status transition (us-5): `Running` after an
     /// allow verdict, `Done`/`Failed` after execution (the card's
@@ -230,6 +248,17 @@ enum GateOutcome {
     Gone,
 }
 
+/// An ask wait's outcome — [`GateOutcome`]'s sibling for the
+/// `ask_user_question` card.
+enum AskOutcome {
+    /// The frontend sent the user's answer for the awaited call.
+    Answered(String),
+    /// Esc: the cancellation token fired mid-wait.
+    Cancelled,
+    /// The answer channel closed — the handle is gone.
+    Gone,
+}
+
 /// The synchronous handle the frontend holds — one agent conversation
 /// per `Tab` (Spec R06 us: per-tab ownership). One in-flight task at a
 /// time is the frontend's contract; queued tasks run in order on the
@@ -242,6 +271,9 @@ pub struct AgentSession {
     /// was already resolved or its task ended) can never decide a
     /// different call.
     verdicts: Option<Sender<(String, ApprovalVerdict)>>,
+    /// Ask-card answers — `(call_id, answer)` pairs, matched on
+    /// `call_id` the same way the verdicts are.
+    answers: Option<Sender<(String, String)>>,
     events: Receiver<AgentEvent>,
     /// The in-flight task's cancellation token — shared so
     /// [`cancel`](AgentSession::cancel) (the frontend's Esc) reaches
@@ -265,6 +297,7 @@ impl AgentSession {
         let (requests_tx, requests_rx) = mpsc::channel::<AgentRequest>();
         let (steering_tx, steering_rx) = mpsc::channel::<String>();
         let (verdicts_tx, verdicts_rx) = mpsc::channel::<(String, ApprovalVerdict)>();
+        let (answers_tx, answers_rx) = mpsc::channel::<(String, String)>();
         let (events_tx, events_rx) = mpsc::channel::<AgentEvent>();
         let in_flight = Arc::new(Mutex::new(None));
         let thread = thread::spawn({
@@ -274,6 +307,7 @@ impl AgentSession {
                     requests_rx,
                     steering_rx,
                     verdicts_rx,
+                    answers_rx,
                     events_tx,
                     in_flight,
                     Box::new(store),
@@ -284,6 +318,7 @@ impl AgentSession {
             requests: Some(requests_tx),
             steering: Some(steering_tx),
             verdicts: Some(verdicts_tx),
+            answers: Some(answers_tx),
             events: events_rx,
             in_flight,
             thread: Some(thread),
@@ -321,6 +356,22 @@ impl AgentSession {
         match &self.verdicts {
             Some(sender) => sender
                 .send((call_id.to_string(), verdict))
+                .map_err(|_| AgentError),
+            None => Err(AgentError),
+        }
+    }
+
+    /// Answer the pending [`AgentEvent::AskRequest`] for `call_id`
+    /// (Spec R06 us-10's ask card — a selected choice or the typed
+    /// free-text reply). `answer` travels verbatim and becomes the
+    /// call's tool result, like a denial reason. The worker ignores
+    /// an answer whose `call_id` is not the call it suspended on, so
+    /// a stale answer can never resolve a different ask. Fails only
+    /// if the worker is gone.
+    pub fn answer(&self, call_id: &str, answer: String) -> Result<(), AgentError> {
+        match &self.answers {
+            Some(sender) => sender
+                .send((call_id.to_string(), answer))
                 .map_err(|_| AgentError),
             None => Err(AgentError),
         }
@@ -370,6 +421,7 @@ impl Drop for AgentSession {
         self.requests.take();
         self.steering.take();
         self.verdicts.take();
+        self.answers.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -383,6 +435,7 @@ fn worker(
     requests: Receiver<AgentRequest>,
     steering: Receiver<String>,
     verdicts: Receiver<(String, ApprovalVerdict)>,
+    answers: Receiver<(String, String)>,
     events: Sender<AgentEvent>,
     in_flight: Arc<Mutex<Option<CancellationToken>>>,
     store: Box<dyn SecretStore + Send>,
@@ -408,6 +461,7 @@ fn worker(
             request,
             &steering,
             &verdicts,
+            &answers,
             &events,
             &in_flight,
             store.as_ref(),
@@ -419,11 +473,13 @@ fn worker(
 /// the system prompt and per-schema conversation → run the model
 /// loop. Every failure maps to a single terminal event; `Done` is
 /// emitted only when nothing failed.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     runtime: &tokio::runtime::Runtime,
     request: AgentRequest,
     steering: &Receiver<String>,
     verdicts: &Receiver<(String, ApprovalVerdict)>,
+    answers: &Receiver<(String, String)>,
     events: &Sender<AgentEvent>,
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
@@ -494,6 +550,7 @@ fn serve(
         &system,
         steering,
         verdicts,
+        answers,
         &cwd,
         executor.as_mut(),
         token,
@@ -516,6 +573,7 @@ async fn run_loop(
     system: &str,
     steering: &Receiver<String>,
     verdicts: &Receiver<(String, ApprovalVerdict)>,
+    answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
     executor: &mut dyn CommandExecutor,
     cancel: CancellationToken,
@@ -560,6 +618,7 @@ async fn run_loop(
                         call,
                         &mut allowed_for_task,
                         verdicts,
+                        answers,
                         cwd,
                         executor,
                         &cancel,
@@ -593,16 +652,41 @@ async fn run_loop(
 /// tool result carries — the executor's (redacted) output, or the
 /// denial text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
+#[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — Round 7 swaps the policy, not the plumbing
 fn gate_and_execute(
     call: &ToolCall,
     allowed_for_task: &mut HashSet<String>,
     verdicts: &Receiver<(String, ApprovalVerdict)>,
+    answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
     executor: &mut dyn CommandExecutor,
     cancel: &CancellationToken,
     events: &Sender<AgentEvent>,
 ) -> Option<String> {
-    let summary = tools::summarize_args(call);
+    // `ask_user_question` never gates and never executes — its own
+    // card IS the ask (us-10): it suspends on the answer channel and
+    // the reply becomes the call's tool result.
+    if call.name == tools::ASK_USER_QUESTION {
+        return ask_and_answer(call, answers, cancel, events);
+    }
+    // `edit_files` plans BEFORE the card (Spec R06 us-22/23): the
+    // plan's unified diff is the summary the user approves, and the
+    // same plan is what an allow verdict writes — the rendered diff
+    // is byte-for-byte the applied change. A planning error still
+    // rides the card (the paths plus why) and replays as the tool
+    // result so the model reads what went wrong.
+    let plan = match call.name.as_str() {
+        "edit_files" => Some(tools::plan_edit(call, cwd)),
+        _ => None,
+    };
+    let summary = match &plan {
+        Some(Ok(plan)) => plan.summary(),
+        Some(Err(error)) => match tools::summarize_args(call).as_str() {
+            "" => format!("edit_files: {error}"),
+            paths => format!("{paths}\nedit_files: {error}"),
+        },
+        None => tools::summarize_args(call),
+    };
     let needs_verdict = !tools::gate_exempt(&call.name) && !allowed_for_task.contains(&call.name);
     let event = if needs_verdict {
         AgentEvent::ApprovalRequest {
@@ -657,7 +741,13 @@ fn gate_and_execute(
             return None;
         }
     }
-    let output = tools::execute(call, cwd, executor);
+    // Apply the plan the card showed (edit_files); every other call
+    // dispatches through the executor.
+    let output = match plan {
+        Some(Ok(plan)) => plan.apply(),
+        Some(Err(error)) => ToolOutput::error(error),
+        None => tools::execute(call, cwd, executor),
+    };
     // A run cut short by Esc reports its own tool error — but the
     // task is over: emit `Cancelled` rather than re-entering the loop
     // for one more doomed request.
@@ -682,6 +772,97 @@ fn gate_and_execute(
         },
     );
     Some(text)
+}
+
+/// The `ask_user_question` flow (us-10): emit the call's own card —
+/// [`AgentEvent::AskRequest`] carrying the parsed question and
+/// choices-or-free-text — and suspend on the answer channel; the
+/// user's reply becomes the call's tool result verbatim (the user's
+/// own words, like a denial reason, so no `redact` applies). A call
+/// whose arguments carry no usable question degrades to a tool error
+/// — model input, never a parked card the frontend cannot answer.
+/// Returns `None` when the run must end (cancelled, or the
+/// frontend's channels are gone).
+fn ask_and_answer(
+    call: &ToolCall,
+    answers: &Receiver<(String, String)>,
+    cancel: &CancellationToken,
+    events: &Sender<AgentEvent>,
+) -> Option<String> {
+    let (question, choices) = match tools::parse_question(call) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if !emit(
+                events,
+                AgentEvent::ToolCall {
+                    call: call.clone(),
+                    summary: tools::summarize_args(call),
+                },
+            ) {
+                return None;
+            }
+            emit(
+                events,
+                AgentEvent::ToolUpdate {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Failed,
+                    detail: Some(error.clone()),
+                },
+            );
+            return Some(error);
+        }
+    };
+    if !emit(
+        events,
+        AgentEvent::AskRequest {
+            call: call.clone(),
+            question,
+            choices,
+        },
+    ) {
+        return None;
+    }
+    match await_answer(answers, &call.id, cancel) {
+        AskOutcome::Answered(answer) => {
+            emit(
+                events,
+                AgentEvent::ToolUpdate {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Done,
+                    detail: Some(preview(&answer)),
+                },
+            );
+            Some(answer)
+        }
+        AskOutcome::Cancelled => {
+            emit(events, AgentEvent::Cancelled);
+            None
+        }
+        AskOutcome::Gone => None,
+    }
+}
+
+/// Park on the answer channel until the reply for `call_id` arrives —
+/// indefinitely, on the [`GATE_POLL`] cadence, exactly like
+/// [`await_verdict`]: answers addressed to other calls drop, Esc's
+/// cancellation token resolves the wait, and a closed channel means
+/// the handle is gone.
+fn await_answer(
+    answers: &Receiver<(String, String)>,
+    call_id: &str,
+    cancel: &CancellationToken,
+) -> AskOutcome {
+    loop {
+        if cancel.is_cancelled() {
+            return AskOutcome::Cancelled;
+        }
+        match answers.recv_timeout(GATE_POLL) {
+            Ok((id, answer)) if id == call_id => return AskOutcome::Answered(answer),
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return AskOutcome::Gone,
+        }
+    }
 }
 
 /// Park on the verdict channel until the answer for `call_id`

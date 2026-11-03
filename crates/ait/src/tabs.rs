@@ -616,6 +616,13 @@ impl Tab {
     /// carries the input line's text as the denial reason when any
     /// was typed (us-8's deny-reason-optional), and every other key
     /// keeps editing normally.
+    ///
+    /// While an `ask_user_question` card waits (us-10 — gate-exempt,
+    /// its card IS the ask), a choices ask navigates with ↑/↓ and
+    /// Enter answers the highlighted option — every other key is
+    /// ignored, so typed text can never become a steering message
+    /// mid-ask; a free-text ask edits the input line and Enter sends
+    /// it as the answer. Esc still cancels the task from either card.
     pub fn agent_key(&mut self, key: &KeyEvent, settings: &Settings, toast: &mut Option<Toast>) {
         if !self.agent_focused() {
             return;
@@ -623,6 +630,23 @@ impl Tab {
         let panel = self.agent.as_mut().expect("focused implies a panel");
         match key.code {
             KeyCode::Esc if key.modifiers.is_empty() => panel.escape(),
+            _ if panel.awaiting_answer() => {
+                if panel.ask_has_choices() {
+                    match key.code {
+                        KeyCode::Up if key.modifiers.is_empty() => panel.ask_prev(),
+                        KeyCode::Down if key.modifiers.is_empty() => panel.ask_next(),
+                        KeyCode::Enter => panel.submit_answer(toast),
+                        _ => {} // stray keys ignored while a choice waits
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Enter => panel.submit_answer(toast),
+                        _ => {
+                            edit_input(panel, key);
+                        }
+                    }
+                }
+            }
             // Any Enter submits — `Alt+Enter` already dispatched to the
             // suggester upstream, so no chord collides here.
             KeyCode::Enter => {
@@ -2941,5 +2965,79 @@ mod tests {
         // other character.
         tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
         assert_eq!(tab.agent.as_ref().unwrap().input(), "xd");
+    }
+
+    /// The ask card's keys (Spec R06 us-10 / issue #91): a choices
+    /// ask navigates with ↑/↓ and Enter answers the highlighted
+    /// option while stray keys are ignored — the typed input never
+    /// becomes a steering message mid-ask. A free-text ask instead
+    /// takes the input line on Enter.
+    #[test]
+    fn ask_card_keys_select_or_take_free_text() {
+        use crossterm::event::KeyEvent as CtKeyEvent;
+        let mut manager = manager(1, "/tmp");
+        let mut toast = None;
+        let settings = Settings::default();
+        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let ask = |id: &str, choices: &[&str]| ait_agent::AgentEvent::AskRequest {
+            call: ait_agent::ToolCall {
+                id: id.into(),
+                name: "ask_user_question".into(),
+                arguments: String::new(),
+            },
+            question: "Which?".into(),
+            choices: choices.iter().map(|c| c.to_string()).collect(),
+        };
+
+        let tab = manager.active_mut().unwrap();
+        tab.toggle_agent_panel();
+
+        // A choices ask: ↓ then Enter answers the second option —
+        // and stray keys move nothing.
+        let panel = tab.agent.as_mut().unwrap();
+        panel.apply(ask("call_1", &["a", "b"]));
+        assert!(panel.awaiting_answer());
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Left), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Backspace), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(panel.awaiting_answer(), "stray keys resolved nothing");
+            assert_eq!(panel.input(), "", "stray keys never reached the input");
+        }
+        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_answer());
+            assert!(matches!(
+                panel.entries().last(),
+                Some(crate::agent_panel::Entry::Ask(card))
+                    if card.answer.as_deref() == Some("b")
+            ));
+        }
+
+        // A free-text ask: chars edit the input, Enter sends them.
+        let panel = tab.agent.as_mut().unwrap();
+        panel.apply(ask("call_2", &[]));
+        assert!(!panel.ask_has_choices());
+        for c in "why not".chars() {
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+        }
+        // ↓ on a free-text ask navigates nothing — the card keeps
+        // waiting and the input is untouched.
+        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
+        assert!(tab.agent.as_ref().unwrap().awaiting_answer());
+        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        {
+            let panel = tab.agent.as_ref().unwrap();
+            assert!(!panel.awaiting_answer());
+            assert!(matches!(
+                panel.entries().last(),
+                Some(crate::agent_panel::Entry::Ask(card))
+                    if card.answer.as_deref() == Some("why not")
+            ));
+            assert_eq!(panel.input(), "", "the answer consumed the input");
+        }
     }
 }

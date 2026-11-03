@@ -856,3 +856,231 @@ fn anthropic_schema_tool_result_items() {
     );
     assert!(second.body.contains("NOTE-CONTENTS"), "{}", second.body);
 }
+
+/// `edit_files`' approve card carries the unified diff — `a`/`b`
+/// labels, `-`/`+` lines — and an allow writes `content`
+/// byte-for-byte (Spec R06 us-22: the rendered diff IS the change).
+#[test]
+fn edit_files_approve_writes_exactly_what_the_diff_showed() {
+    let dir = project(); // note.txt holds "NOTE-CONTENTS"
+    let content = "REWRITTEN line\n";
+    let args = format!(
+        r#"{{"files":[{{"path":"note.txt","content":{}}}]}}"#,
+        json_string(content)
+    );
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(0, "call_1", "edit_files", &args)])),
+        sse(&chat_text_turn("edited")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let (id, name, summary) = next_approval(&session);
+    assert_eq!(name, "edit_files");
+    assert!(summary.contains("--- a/note.txt"), "{summary}");
+    assert!(summary.contains("+++ b/note.txt"), "{summary}");
+    assert!(summary.contains("-NOTE-CONTENTS"), "{summary}");
+    assert!(summary.contains("+REWRITTEN line"), "{summary}");
+
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    assert_eq!(
+        std::fs::read(dir.path().join("note.txt")).expect("read"),
+        content.as_bytes(),
+        "what the diff showed is byte-for-byte what landed"
+    );
+
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("wrote note.txt"), "{}", second.body);
+}
+
+/// A denied `edit_files` call writes nothing — the file keeps its
+/// bytes and the denial text is the tool result the model reads.
+#[test]
+fn edit_files_deny_writes_nothing() {
+    let dir = project();
+    let args = r#"{"files":[{"path":"note.txt","content":"SHOULD NOT LAND"}]}"#;
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(0, "call_1", "edit_files", args)])),
+        sse(&chat_text_turn("ok")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::Deny("leave it alone".into()))
+        .expect("deny");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("note.txt")).expect("read"),
+        "NOTE-CONTENTS"
+    );
+
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("leave it alone"), "{}", second.body);
+}
+
+/// A new file previews `--- /dev/null` and lands on approve; a
+/// missing parent directory and a `..` escape are tool errors the
+/// model reads — never silent mkdirs or outside writes (us-23/24).
+#[test]
+fn edit_files_new_file_missing_parent_and_escape() {
+    let dir = project();
+    let new_args = r#"{"files":[{"path":"sub/new.txt","content":"FRESH\n"}]}"#;
+    std::fs::create_dir_all(dir.path().join("sub")).expect("sub");
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(0, "call_1", "edit_files", new_args)])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "edit_files",
+            r#"{"files":[{"path":"nope/new.txt","content":"x"}]}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "edit_files",
+            &format!(
+                r#"{{"files":[{{"path":"../escape-{}.txt","content":"x"}}]}}"#,
+                std::process::id()
+            ),
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // New file: /dev/null diff on the card, file written on allow.
+    let (id, _, summary) = next_approval(&session);
+    assert!(summary.contains("--- /dev/null"), "{summary}");
+    assert!(summary.contains("+++ b/sub/new.txt"), "{summary}");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // Missing parent: the card carries the error and allowing it
+    // fails as a tool result — no directory was created. Its
+    // prompt arriving also proves call_1's write landed.
+    let (id, _, summary) = until_approval(&session);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sub/new.txt")).expect("read"),
+        "FRESH\n"
+    );
+    assert!(summary.contains("parent"), "{summary}");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    assert!(!dir.path().join("nope").exists());
+
+    // Escape: same shape — the error asks, the allow fails.
+    let (id, _, summary) = until_approval(&session);
+    assert!(
+        summary.contains("outside the working directory"),
+        "{summary}"
+    );
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    // The escaped path got no write — assert on a unique name, the
+    // tempdir parent is shared across tests.
+    assert!(!dir
+        .path()
+        .join(format!("../escape-{}.txt", std::process::id()))
+        .exists());
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    // The failures re-entered as Failed card transitions and tool
+    // results the model reads in later request bodies.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolUpdate {
+            status: ToolStatus::Failed,
+            ..
+        }
+    )));
+    fixture.captured();
+    fixture.captured();
+    let third = fixture.captured();
+    assert!(third.body.contains("parent"), "{}", third.body);
+    let fourth = fixture.captured();
+    assert!(
+        fourth.body.contains("outside the working directory"),
+        "{}",
+        fourth.body
+    );
+}
+
+/// The interim gate treats `edit_files` like every other tool —
+/// *allow for task* suppresses its later prompts while the writes
+/// still land ungated (us-7).
+#[test]
+fn edit_files_allow_for_task_suppresses_later_prompts() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "edit_files",
+            r#"{"files":[{"path":"note.txt","content":"ONE\n"}]}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "edit_files",
+            r#"{"files":[{"path":"note.txt","content":"TWO\n"}]}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "openai_chat_completions"),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::AllowForTask)
+        .expect("approve");
+
+    // call_2 runs WITHOUT asking — a ToolCall event, and its write
+    // lands with no verdict ever sent.
+    assert_eq!(until_tool_call(&session), "call_2");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })),
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("note.txt")).expect("read"),
+        "TWO\n",
+        "the ungated repeat still applied its plan"
+    );
+}
