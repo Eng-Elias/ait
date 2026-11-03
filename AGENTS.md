@@ -92,7 +92,7 @@ it deliberately, one line per release.
 
 ### Issue tracker
 
-Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md` — prefer `gh api`: `gh issue view` and `gh pr edit` fail on a Projects-classic deprecation.
 
 ### Triage labels
 

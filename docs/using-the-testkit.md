@@ -104,3 +104,16 @@ fix the product code. Never weaken an assertion to silence drift. (4) Keep
 running until green and commit.
 ```
 
+
+## Flaky tests
+
+Timing-bound tests (real PTYs, settle windows, parallel load) flake;
+the fix ladder is ordered. (1) Deterministic seam first — gate waits
+on output only execution produces (standard 15) and on protocol marks
+in a real emitter's order (standard 16); a scripted-but-fictional
+order is a test bug, not coverage. (2) Bound, not guess — a settle
+window or deadline is the last resort, sized for the slowest CI box
+and named as a constant the next ticket can tighten. (3) Retry is the
+honest last resort — mark the retry in the test name or comment so
+flakes surface in the dump instead of hiding; never weaken an
+assertion to silence drift.
