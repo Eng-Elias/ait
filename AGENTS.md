@@ -52,10 +52,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-All three must pass before any push. CI runs the same three, plus
-`scripts/check-dep-comments.py` — every `crates/*/Cargo.toml`
-dependency documents its resolved version + release date in a comment
-(ADR-0002 procedure, `docs/adr/0002`).
+All three must pass before any push. `scripts/check.sh` runs the
+whole CI gate locally in one command — CI runs the same three, plus
+`scripts/check-dep-comments.py` (every `crates/*/Cargo.toml`
+dependency documents its resolved version + release date in a comment,
+ADR-0002 procedure) and `scripts/check-src-hygiene.sh`.
 `rust-toolchain.toml` pins the exact toolchain CI reads it from — bump
 it deliberately, one line per release.
 
@@ -91,7 +92,7 @@ it deliberately, one line per release.
 
 ### Issue tracker
 
-Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md` — prefer `gh api`: `gh issue view` and `gh pr edit` fail on a Projects-classic deprecation.
 
 ### Triage labels
 
