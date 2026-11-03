@@ -1097,6 +1097,7 @@ mod tests {
                     os: "test".into(),
                     output_lines: Vec::new(),
                 },
+                bridge: None,
             },
             &mut toast,
         );

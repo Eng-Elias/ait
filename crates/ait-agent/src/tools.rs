@@ -7,11 +7,13 @@
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
 //! `write_to_pty`). Round 6 ships the file tools' executors in
-//! [`files`](crate::files) and `write_to_pty`'s agent-owned PTY in
-//! [`pty`](crate::pty) (R06-T7); the rest declare their specs now so
-//! the model sees the whole vocabulary, and [`execute`] answers them
-//! with a tool error — the drop-in point their tickets replace, not
-//! a stub the model has to special-case.
+//! [`files`](crate::files), `write_to_pty`'s agent-owned PTY in
+//! [`pty`](crate::pty) (R06-T7) and `run_command`'s through the
+//! task's [`CommandExecutor`](crate::CommandExecutor) (R06-T4); the
+//! rest declare their specs now so the model sees the whole
+//! vocabulary, and [`execute`] answers them with a tool error — the
+//! drop-in point their tickets replace, not a stub the model has to
+//! special-case.
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
@@ -25,6 +27,7 @@ use ait_llm::{anthropic_messages, openai_chat_completions, openai_responses, End
 
 use tokio_util::sync::CancellationToken;
 
+use crate::executor::{CommandExecutor, CommandResult};
 use crate::files::{EditPlan, ToolCwd, ToolOutput};
 use crate::pty::AgentPty;
 use crate::tool_call::ToolCall;
@@ -373,15 +376,18 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 /// Run `call` against `cwd` — the sequential executor the loop
 /// calls after the gate (or directly, for gate-exempt calls). `pty`
 /// is the worker's lazily-spawned agent PTY (`write_to_pty`'s
-/// drop-in seam, R06-T7); `cancel` lets a tool's bounded waits —
-/// the PTY settle — end early on Esc. Every failure mode is a
-/// [`ToolOutput`] error: a tool error is model input, never a task
-/// failure. The tickets owning the remaining tools replace their
-/// arms here — the dispatch IS the drop-in seam.
+/// drop-in seam, R06-T7); `executor` is the task's §5.9
+/// [`CommandExecutor`] — only `run_command` consumes it, so the
+/// file tools never notice which tier is bound; `cancel` lets a
+/// tool's bounded waits — the PTY settle — end early on Esc. Every
+/// failure mode is a [`ToolOutput`] error: a tool error is model
+/// input, never a task failure. The tickets owning the remaining
+/// tools replace their arms here — the dispatch IS the drop-in seam.
 pub(crate) fn execute(
     call: &ToolCall,
     cwd: &ToolCwd,
     pty: &mut AgentPty,
+    executor: &mut dyn CommandExecutor,
     cancel: &CancellationToken,
 ) -> ToolOutput {
     let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
@@ -398,11 +404,8 @@ pub(crate) fn execute(
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
         "edit_files" => cwd.edit_files(&args),
+        "run_command" => run_command(&args, executor),
         "write_to_pty" => pty.write(&args, cwd.root(), cancel),
-        "run_command" => ToolOutput::error(format!(
-            "{} is not available yet — its executor lands in a later ticket",
-            call.name
-        )),
         // The ask card answers on the session's answer channel —
         // `execute` is never its path; a call reaching here had no
         // usable question (the loop's error arm already reported it).
@@ -411,6 +414,55 @@ pub(crate) fn execute(
             call.name
         )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
+    }
+}
+
+/// `run_command` (Spec R06-T4): validate the arguments, run the
+/// command through the task's [`CommandExecutor`] — which is where
+/// the shell is actually reached — and render the §5.9 `{merged
+/// output, exit code}` as result text. Every executor failure mode
+/// is already a clean [`ExecutorError`](crate::ExecutorError), so
+/// this arm only translates.
+fn run_command(args: &serde_json::Value, executor: &mut dyn CommandExecutor) -> ToolOutput {
+    let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
+        return ToolOutput::error(String::from("run_command: `command` must be a string"));
+    };
+    if command.trim().is_empty() {
+        return ToolOutput::error(String::from("run_command: `command` is empty"));
+    }
+    // `cwd` rides the schema for tiers that can honor it (a remote
+    // daemon can; the user's live shell runs in its own cwd — R06-T4).
+    // Refused explicitly rather than silently dropped, so the model
+    // learns to express it inside `command` (`cd … && …`).
+    if args.get("cwd").and_then(|v| v.as_str()).is_some() {
+        return ToolOutput::error(String::from(
+            "run_command: `cwd` is not supported when running in the user's live \
+             shell — express it in `command` instead (`cd <dir> && …`)",
+        ));
+    }
+    match executor.run(command) {
+        Ok(result) => ToolOutput::ok(render_run_result(&result)),
+        Err(error) => ToolOutput::error(format!("run_command: {error}")),
+    }
+}
+
+/// The result text for one finished run: the merged stdout+stderr,
+/// then the exit status on its own line — `unknown` when the shell
+/// reported completion without a payload (us-15: never a guessed
+/// code). The trailer is newline-separated so it can never glue
+/// itself onto the last output byte.
+fn render_run_result(result: &CommandResult) -> String {
+    let output = String::from_utf8_lossy(&result.output);
+    let status = match result.exit_code {
+        Some(code) => format!("exit code: {code}"),
+        None => String::from("exit code: unknown"),
+    };
+    if output.is_empty() {
+        status
+    } else if output.ends_with('\n') {
+        format!("{output}{status}")
+    } else {
+        format!("{output}\n{status}")
     }
 }
 
@@ -536,10 +588,11 @@ mod tests {
         }
     }
 
-    /// Dispatch: the shipped tools execute, the declared-but-unbuilt
-    /// ones and unknown names answer tool errors, bad JSON errors —
-    /// and `write_to_pty`'s argument check fails before any PTY
-    /// spawns (R06-T7's lazy rule).
+    /// Dispatch: the shipped tools execute (an unbound shell turns
+    /// `run_command` into a clean tool error), the declared-but-
+    /// unbuilt ones and unknown names answer tool errors, bad JSON
+    /// errors — and `write_to_pty`'s argument check fails before
+    /// any PTY spawns (R06-T7's lazy rule).
     #[test]
     fn execute_dispatches_and_errors_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -551,44 +604,119 @@ mod tests {
             name: name.into(),
             arguments: args.into(),
         };
+        let mut executor = crate::executor::DetachedExecutor;
 
         let out = execute(
             &call("glob", r#"{"pattern": "*.rs"}"#),
             &cwd,
             &mut pty,
+            &mut executor,
             &cancel,
         );
         assert!(!out.is_error);
 
+        // `run_command` executes now — but a task bound to no shell
+        // (the `DetachedExecutor`) answers a clean error, not a hang.
+        let out = execute(
+            &call("run_command", r#"{"command": "echo hi"}"#),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
+        assert!(
+            out.is_error && out.text.contains("no live shell"),
+            "{:?}",
+            out.text
+        );
+
         // edit_files dispatches now — `{}` is a well-formed call
         // with bad arguments, which is a tool error, not a stub.
-        let out = execute(&call("edit_files", "{}"), &cwd, &mut pty, &cancel);
+        let out = execute(
+            &call("edit_files", "{}"),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
         assert!(
             out.is_error && out.text.contains("`files`"),
             "{:?}",
             out.text
         );
 
-        let out = execute(&call("run_command", "{}"), &cwd, &mut pty, &cancel);
+        let out = execute(
+            &call("run_command", "{}"),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
         assert!(
-            out.is_error && out.text.contains("not available yet"),
+            out.is_error && out.text.contains("`command` must be a string"),
             "{:?}",
             out.text
         );
-        let out = execute(&call("write_to_pty", "{}"), &cwd, &mut pty, &cancel);
+        let out = execute(
+            &call("write_to_pty", "{}"),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
         assert!(out.is_error && out.text.contains("input"), "{:?}", out.text);
         // `ask_user_question` answers on the ask channel — `execute`
         // is never its path, but errors cleanly if reached.
-        let out = execute(&call(ASK_USER_QUESTION, "{}"), &cwd, &mut pty, &cancel);
+        let out = execute(
+            &call(ASK_USER_QUESTION, "{}"),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
         assert!(out.is_error && out.text.contains("ask card"));
         let out = execute(
             &call("definitely_not_a_tool", "{}"),
             &cwd,
             &mut pty,
+            &mut executor,
             &cancel,
         );
         assert!(out.is_error && out.text.contains("unknown tool"));
-        let out = execute(&call("read_files", "{oops"), &cwd, &mut pty, &cancel);
+        let out = execute(
+            &call("read_files", "{oops"),
+            &cwd,
+            &mut pty,
+            &mut executor,
+            &cancel,
+        );
         assert!(out.is_error && out.text.contains("not valid JSON"));
+    }
+
+    /// `run_command`'s result rendering: merged output first, then
+    /// the exit status — `unknown` stands in for a missing payload,
+    /// never a guessed code (us-15).
+    #[test]
+    fn render_run_result_formats_output_then_status() {
+        let result = CommandResult {
+            output: b"hello\n".to_vec(),
+            exit_code: Some(0),
+        };
+        assert_eq!(render_run_result(&result), "hello\nexit code: 0");
+
+        // No trailing newline in the output: the status still lands
+        // on its own line.
+        let result = CommandResult {
+            output: b"tail".to_vec(),
+            exit_code: Some(3),
+        };
+        assert_eq!(render_run_result(&result), "tail\nexit code: 3");
+
+        // Empty output and an absent code both render honestly.
+        let result = CommandResult {
+            output: Vec::new(),
+            exit_code: None,
+        };
+        assert_eq!(render_run_result(&result), "exit code: unknown");
     }
 }

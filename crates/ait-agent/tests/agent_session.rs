@@ -87,6 +87,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
                 String::from("test result: FAILED"),
             ],
         },
+        bridge: None,
     }
 }
 

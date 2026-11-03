@@ -33,8 +33,10 @@
 //! (`recv_timeout` bounds the wait by the step budget) or forwards
 //! onto its own channel. Requests on one tab serialize on the wire —
 //! an interactive shell runs one prompt line at a time — but several
-//! may pend at once; each resolves by id. Nothing in the product calls
-//! this yet: tests are the only consumers this round.
+//! may pend at once; each resolves by id. The `ShellBridge` service
+//! (Spec R06-T4) is the first production caller: it hands the
+//! request's result channel back to the agent worker, which polls it
+//! alongside its cancellation token.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -78,8 +80,6 @@ impl InBandExec {
     /// and the id pends until [`observe`](Self::observe) resolves it.
     /// A failed `send` burns the id — a gap in the sequence is
     /// harmless — but leaves nothing pending.
-    #[allow(dead_code)] // Round 6's CommandExecutor is the caller (Spec R05);
-                        // only Tab::run_in_shell + tests reach it today.
     pub fn request(
         &mut self,
         state: IntegrationState,
@@ -125,6 +125,14 @@ impl InBandExec {
     pub fn is_pending(&self, id: u64) -> bool {
         self.pending.contains_key(&id.to_string())
     }
+
+    /// The session died — drop every pending waiter so each
+    /// `Receiver` reports `Disconnected` and its caller fails cleanly
+    /// (a mid-run exit must be a tool error, never a hang — Spec R06
+    /// us-34). `drain_events` calls it on `LiveEvent::Exited`.
+    pub fn fail_pending(&mut self) {
+        self.pending.clear();
+    }
 }
 
 /// A `__ait_run` request in flight — the handle its [`RunResult`]
@@ -136,21 +144,32 @@ pub struct RunRequest {
     result: Receiver<RunResult>,
 }
 
-#[allow(dead_code)] // the whole handle is the Round 6 executor's await
-                    // seam — only tests drive it today (issue #75).
 impl RunRequest {
     /// The request's id — the `<id>` in `__ait_run <id> <hex>`.
+    #[allow(dead_code)] // tests assert id allocation; the bridge's reply
+                        // carries the receiver only.
     pub fn id(&self) -> u64 {
         self.id
     }
 
     /// The channel the resolved [`RunResult`] arrives on: `recv` /
     /// `recv_timeout` per the caller's budget.
+    #[allow(dead_code)] // the executor awaits through `into_receiver`.
     pub fn receiver(&self) -> &Receiver<RunResult> {
         &self.result
     }
 
+    /// Consume the request into its result channel — the
+    /// `ShellBridge` service's hand-off: the worker awaits the
+    /// [`RunResult`] on its own thread while the frontend's drain
+    /// keeps resolving it.
+    pub fn into_receiver(self) -> Receiver<RunResult> {
+        self.result
+    }
+
     /// Block up to `timeout` for the response — the test-facing await.
+    #[allow(dead_code)] // the executor awaits through `into_receiver`;
+                        // tests keep the simpler handle.
     pub fn wait(&self, timeout: Duration) -> Result<RunResult, RecvTimeoutError> {
         self.result.recv_timeout(timeout)
     }
@@ -160,8 +179,6 @@ impl RunRequest {
 /// could answer it.
 #[derive(Debug)]
 #[non_exhaustive]
-#[allow(dead_code)] // produced only by the not-yet-called request path —
-                    // Round 6's CommandExecutor surfaces it in tool errors (issue #75).
 pub enum InBandError {
     /// The tab's shell isn't `Integrated` — integration absent or only
     /// `OSC 133` marks reported. No request bytes were written.

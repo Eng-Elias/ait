@@ -73,6 +73,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext};
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
+use crate::executor::{CommandExecutor, DetachedExecutor, ShellBridge, UserShellExecutor};
 use crate::files::{ToolCwd, ToolOutput};
 use crate::pty::AgentPty;
 use crate::redact::redact;
@@ -120,6 +121,12 @@ pub struct AgentRequest {
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
     /// every path the agent reads or searches stays under it.
     pub context: AgentContext,
+    /// The shell binding `run_command` executes against (Spec R06-T4):
+    /// the frontend hands each task the `ShellBridge` its `Tab`
+    /// services. `None` means the task has no live shell — tests and
+    /// detached conversations — and `run_command` answers a clean
+    /// tool error rather than failing the task.
+    pub bridge: Option<Box<dyn ShellBridge>>,
 }
 
 /// The user's answer to an [`AgentEvent::ApprovalRequest`] — the
@@ -539,6 +546,14 @@ fn serve(
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
+    // `run_command`'s §5.9 executor (Spec R06-T4): bound to the task's
+    // `ShellBridge` when the frontend attached one — the
+    // `UserShellExecutor`, tiered on the tab's live integration state —
+    // or to the no-op tier when it didn't.
+    let mut executor: Box<dyn CommandExecutor> = match request.bridge {
+        Some(bridge) => Box::new(UserShellExecutor::new(bridge, token.clone())),
+        None => Box::new(DetachedExecutor),
+    };
     runtime.block_on(run_loop(
         &endpoint,
         &mut conversation,
@@ -548,6 +563,7 @@ fn serve(
         answers,
         &cwd,
         agent_pty,
+        executor.as_mut(),
         token,
         events,
     ));
@@ -571,6 +587,7 @@ async fn run_loop(
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
     agent_pty: &mut AgentPty,
+    executor: &mut dyn CommandExecutor,
     cancel: CancellationToken,
     events: &Sender<AgentEvent>,
 ) {
@@ -616,6 +633,7 @@ async fn run_loop(
                         answers,
                         cwd,
                         agent_pty,
+                        executor,
                         &cancel,
                         events,
                     ) {
@@ -647,7 +665,7 @@ async fn run_loop(
 /// tool result carries — the executor's (redacted) output, or the
 /// denial text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — Round 7 swaps the policy, not the plumbing
 fn gate_and_execute(
     call: &ToolCall,
     allowed_for_task: &mut HashSet<String>,
@@ -655,6 +673,7 @@ fn gate_and_execute(
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
     agent_pty: &mut AgentPty,
+    executor: &mut dyn CommandExecutor,
     cancel: &CancellationToken,
     events: &Sender<AgentEvent>,
 ) -> Option<String> {
@@ -741,8 +760,15 @@ fn gate_and_execute(
     let output = match plan {
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
-        None => tools::execute(call, cwd, agent_pty, cancel),
+        None => tools::execute(call, cwd, agent_pty, executor, cancel),
     };
+    // A run cut short by Esc reports its own tool error — but the
+    // task is over: emit `Cancelled` rather than re-entering the loop
+    // for one more doomed request.
+    if cancel.is_cancelled() {
+        emit(events, AgentEvent::Cancelled);
+        return None;
+    }
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
     // preview comes from the same redacted text.

@@ -74,6 +74,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
             os: String::from("linux"),
             output_lines: Vec::new(),
         },
+        bridge: None,
     }
 }
 
