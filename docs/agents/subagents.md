@@ -21,6 +21,18 @@ subagents.
 - **Checkpoints**: implementers commit after each logical step, not
   once at the end — a subagent that dies mid-task leaves its last
   commit, not an uncommitted worktree.
+- **Toolchain**: a subagent shell may lack `cargo` on PATH — the
+  rustup shim lives at `$HOME/.cargo/bin`. When the sandbox denies a
+  subagent's cargo entirely, the parent runs `scripts/check.sh` in
+  that worktree itself; a ticket that never gated doesn't merge.
+- **Shared target dir**: per-worktree `target/` dirs cost tens of GB
+  across a round's parallel tickets; point `CARGO_TARGET_DIR` at one
+  shared directory for sibling-worktree gate runs — dependencies
+  build once and incremental clippy drops to seconds.
+- **Gate output**: run the gate teed to a log —
+  `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
+  `tail` keeps the tail but discards the failure detail a diagnosis
+  then has to rebuild.
 
 ## Prompt skeletons
 

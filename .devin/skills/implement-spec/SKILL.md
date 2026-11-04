@@ -8,6 +8,8 @@ You have been provided a spec. This spec should have tickets associated with it,
 
 The issue tracker should have been provided to you. If not, tell the user to run `/setup-matt-pocock-skills`.
 
+Run all tracker reads/writes through the tracker's documented operations — this repo: `docs/agents/issue-tracker.md`. `gh issue view`/`gh pr edit` hit a Projects-classic deprecation there, and a draft's `draft` flag isn't PATCHable.
+
 The goal is the entire spec implemented on a single **integration branch**, with every ticket resolved the way the issue tracker closes work.
 
 The tickets are not a list of steps. They are a **task graph** with blocking relationships between them. This means there is always a **frontier** of tickets which are ready to be grabbed.
@@ -29,12 +31,12 @@ Communication to and from subagents should be sparse. Communicate primarily thro
    - calls the Skill tool with `tdd` to build the ticket;
    - merges the integration branch tip into its own branch before reporting done
 
-5. Once an **implementer subagent** completes, merge its work to the integration branch with a **merger subagent**.
+5. Once an **implementer subagent** completes, merge its work to the integration branch with a **merger subagent**. When parallel tickets share a seam file, merge-backs conflict on it — resolve by extracting each ticket's additions, not by picking sides inside the conflict markers.
 
 6. If this changes the **frontier** of available tickets, kick off more **implementer subagents** to work on the new tickets. This allows for maximum concurrency.
 
 7. Once all tickets are complete, call the Skill tool with `code-review` on the integration branch. Fix all issues raised by the code review in a single **implementer subagent**.
 
-8. If a draft PR exists, mark it ready for review. Otherwise, resolve each ticket the way the issue tracker closes work, and report the integration branch.
+8. If a draft PR exists, refresh its body so it describes the landed round — the draft opened after the first merge describes only that merge — then mark it ready for review (this repo: `gh pr ready` or the `markPullRequestReadyForReview` mutation). Otherwise, resolve each ticket the way the issue tracker closes work, and report the integration branch.
 
 9. Clean up all **implementer subagent** worktrees.

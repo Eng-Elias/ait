@@ -94,6 +94,9 @@ it deliberately, one line per release.
 
 ## Agent skills
 
+Skills live in `.devin/skills/<name>/SKILL.md` — when the Skill tool
+doesn't list the one a prompt names, read the file directly.
+
 ### Issue tracker
 
 Issues are tracked as GitHub issues on `Eng-Elias/ait`, via the `gh` CLI. See `docs/agents/issue-tracker.md` — prefer `gh api`: `gh issue view` and `gh pr edit` fail on a Projects-classic deprecation.

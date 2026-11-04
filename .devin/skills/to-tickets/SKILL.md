@@ -37,6 +37,8 @@ Break the work into **tracer bullet** tickets.
 
 Give each ticket its **blocking edges**: the other tickets that must complete before it can start. A ticket with no blockers can start immediately.
 
+When parallel tickets would touch the same seam — a shared file both must edit, a behavior both redefine — either sequence them behind a blocking edge or name one the contract owner in the ticket text. Concurrent edits to a single seam are how a round accumulates merge-back conflicts and acceptance pins that contradict each other.
+
 **Wide refactors are the exception to vertical slicing.** A **wide refactor** is one mechanical change (rename a column, retype a shared symbol) whose **blast radius** fans across the whole codebase, so a single edit breaks thousands of call sites at once and no vertical slice can land green. Don't force it into a tracer bullet; sequence it as **expand–contract**. First expand: add the new form beside the old so nothing breaks. Then migrate the call sites over in batches sized by blast radius (per package, per directory), each batch its own ticket blocked by the expand, keeping CI green batch to batch because the old form still exists. Finally contract: delete the old form once no caller remains, in a ticket blocked by every migrate batch. When even the batches can't stay green alone, keep the sequence but let them share an integration branch that all block a final integrate-and-verify ticket; green is promised only there.
 
 ### 4. Quiz the user

@@ -26,7 +26,10 @@ use std::fs;
 use std::path::Path;
 
 use ait_llm::testing::{assert_post, sse, Fixture};
-use ait_testkit::{ait_bin, E2e, Size, SpawnConfig};
+use ait_testkit::{
+    ait_bin, json_string, panel_has_line, sentinel_result, terminal_half, wait_fresh_prompt, E2e,
+    Size, SpawnConfig,
+};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line; an open panel
 /// takes two fifths of the content band — the terminal keeps 48
@@ -89,17 +92,6 @@ fn wait_for_chrome(app: &mut E2e) {
     });
 }
 
-/// A line *ending* in `$`/`%`/`>` is a fresh, empty prompt — the
-/// gate before any typing, so keystrokes can never interleave with an
-/// unrendered prompt (the `-sh` race the R05 tests name).
-fn wait_fresh_prompt(app: &mut E2e, description: &str) {
-    app.wait_for_screen(description, |app| {
-        app.screen_text()
-            .lines()
-            .any(|line| line.ends_with('$') || line.ends_with('%') || line.ends_with('>'))
-    });
-}
-
 /// `Alt+A` opens the split focused: the `│` separator renders and the
 /// title row reads `│ agent` (rows are `trim_end`'ed, so the probe
 /// carries no trailing space).
@@ -119,42 +111,6 @@ fn submit_task(app: &mut E2e, task: &str) {
         app.screen_text().contains(task)
     });
     app.press("Enter");
-}
-
-/// The terminal half of one screen row — everything left of the
-/// panel's `│` separator. The panel never reaches these columns, so
-/// probes here can only be the session's own grid.
-fn terminal_half(row: &str) -> &str {
-    row.split('│').next().unwrap_or(row)
-}
-
-/// Whether any screen row's *panel* half trims to exactly `text` —
-/// how a conversation status line (`done`, `cancelled`) is found
-/// without colliding with terminal-side text.
-fn panel_has_line(app: &E2e, text: &str) -> bool {
-    app.screen_text().lines().any(|row| {
-        row.split('│')
-            .nth(1)
-            .is_some_and(|half| half.trim() == text)
-    })
-}
-
-/// A JSON string literal (`"…"`) for hand-built chunk bodies — the
-/// same escaping the R04 e2e transcripts use.
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// One `chat.completion.chunk` `data:` frame carrying a content
@@ -300,11 +256,11 @@ fn pr_evidence_full_task_transcript() {
 
     app.type_text("a");
     app.wait_for_screen("the sentinel trace in the grid", |app| {
-        app.screen_text().contains("__AIT_END_")
+        app.screen_text().lines().any(sentinel_result)
             && app
                 .screen_text()
                 .lines()
-                .any(|row| terminal_half(row).contains("E2E-MARK"))
+                .any(|row| terminal_half(row).trim() == "E2E-MARK")
     });
     println!(
         "--- beat 2: run_command trace in grid ---\n{}",
@@ -404,14 +360,15 @@ fn approve_runs_run_command_in_the_shell_and_leaves_the_trace() {
     app.type_text("a"); // allow once
 
     // The executor typed `echo E2E-MARK; printf '__AIT_END_…=%d\n'
-    // $?` at the prompt — the whole line is the visible trace — and
-    // the shell printed the marker plus the sentinel's result.
+    // $?` at the prompt — gate on the sentinel's RESULT row (`=<digit>`,
+    // never the echo's `=%d`) and a trimmed `E2E-MARK` output row, so
+    // the wait can't pass on the echoed type-in alone (standard 15).
     app.wait_for_screen("the typed sentinel trace in the grid", |app| {
-        app.screen_text().contains("__AIT_END_")
+        app.screen_text().lines().any(sentinel_result)
             && app
                 .screen_text()
                 .lines()
-                .any(|row| terminal_half(row).contains("E2E-MARK"))
+                .any(|row| terminal_half(row).trim() == "E2E-MARK")
     });
     app.wait_for_screen("the task's done status", |app| {
         panel_has_line(app, "done") && app.screen_text().contains("the marker is on screen")

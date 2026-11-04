@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use ait_llm::testing::{sse, Fixture, Script};
-use ait_testkit::{ait_bin, E2e, Size, SpawnConfig};
+use ait_testkit::{ait_bin, json_string, E2e, Size, SpawnConfig};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line.
 const SIZE: Size = Size {
@@ -456,25 +456,6 @@ fn existing_tabs_keep_spawn_time_scrollback_after_reload() {
 // fixture — one scripted response per incoming request, on a daemon
 // thread.
 // ---------------------------------------------------------------------------
-
-/// A JSON string literal (`"…"`) for the chunk body — the same
-/// hand-rolled escaping ait-agent's suggester tests use; the transcripts
-/// here are built inline.
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
 
 /// One `chat.completion.chunk` `data:` frame carrying a content delta —
 /// the wire shape the `openai_chat_completions` adapter decodes (fields
