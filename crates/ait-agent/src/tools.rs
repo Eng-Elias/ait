@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn execute_dispatches_and_errors_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
         let mut pty = AgentPty::new();
         let cancel = CancellationToken::new();
         let call = |name: &str, args: &str| ToolCall {
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn run_command_rejects_control_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
         let mut pty = AgentPty::new();
         let cancel = CancellationToken::new();
         let call = |args: &str| ToolCall {

@@ -128,7 +128,9 @@ pub struct AgentRequest {
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
-    /// every path the agent reads or searches stays under it.
+    /// every path the agent reads or searches stays under it —
+    /// plus under any `directory_allowlist` root the active profile
+    /// declares (§5.7, R07-T4).
     pub context: AgentContext,
     /// The shell binding `run_command` executes against (Spec R06-T4):
     /// the frontend hands each task the `ShellBridge` its `Tab`
@@ -542,14 +544,21 @@ fn serve(
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
     drain_steering(steering, &mut conversation);
-    // The task's file tools bind to the session's cwd — every path
-    // they touch stays under it (Spec R06's confinement rule).
-    let cwd = ToolCwd::new(&request.context.cwd);
     // The §5.7 stance the permission engine consults on every tool
     // call — a `default` profile missing, renamed or never declared
     // resolves to `None`, and the engine's fail-safe asks for every
     // call (the Round 6 interim gate verbatim).
     let profile = request.settings.agents.execution_profiles.get(PROFILE);
+    // The task's file tools bind to the session's cwd ∪ the active
+    // profile's normalized `directory_allowlist` roots (§5.7,
+    // R07-T4): a missing profile or an empty list confines to cwd
+    // exactly (Spec R06's confinement rule). The union only widens
+    // what the tools may touch — the engine's verdicts, cards and
+    // diffs are unaffected.
+    let allowlist: &[String] = profile
+        .map(|profile| profile.directory_allowlist.as_slice())
+        .unwrap_or_default();
+    let cwd = ToolCwd::new(&request.context.cwd, allowlist);
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());

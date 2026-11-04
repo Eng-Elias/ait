@@ -10,10 +10,12 @@
 //! `ask_user_question` special case (any non-`never` level behaves
 //! as before — its own card IS the ask). `agent_decides` and
 //! `ask_on_first_write` degrade to `always_ask` until the safety
-//! flag (T2) and the first-write memory (T5) land; the command and
-//! directory allow/deny lists stay parsed-but-unconsumed (T3/T4);
-//! `mcp_*` fields and `context_window_limit` stay inert (Rounds
-//! 10/8).
+//! flag (T2) and the first-write memory (T5) land; the command
+//! allow/deny lists stay parsed-but-unconsumed (T3) while the
+//! `directory_allowlist` (T4) widens confinement at the `ToolCwd`
+//! seam, not here — an allowlist expands what file tools may
+//! touch, never a verdict; `mcp_*` fields and
+//! `context_window_limit` stay inert (Rounds 10/8).
 
 use std::collections::HashSet;
 
@@ -296,11 +298,13 @@ mod tests {
         );
     }
 
-    /// The command/directory lists and the `mcp_*`/`context_window_limit`
-    /// fields stay parsed-but-unconsumed (T3/T4, Rounds 10/8): a
-    /// populated allowlist does not relax a call, a populated denylist
-    /// does not tighten one, and `mcp_permissions = "never"` forbids
-    /// nothing the registry declares today.
+    /// The command lists and the `mcp_*`/`context_window_limit`
+    /// fields stay parsed-but-unconsumed here (T3, Rounds 10/8) —
+    /// and the `directory_allowlist` (T4) widens `ToolCwd`
+    /// confinement, never this verdict: a populated allowlist does
+    /// not relax a call, a populated denylist does not tighten one,
+    /// and `mcp_permissions = "never"` forbids nothing the registry
+    /// declares today.
     #[test]
     fn lists_and_inert_fields_stay_unconsumed() {
         let profile = ExecutionProfile {
