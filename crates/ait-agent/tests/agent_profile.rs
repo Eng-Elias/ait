@@ -14,7 +14,7 @@ use ait_agent::{
     AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, ToolStatus,
 };
 use ait_config::{SecretStore, Settings};
-use ait_llm::testing::{assert_post, sse, Fixture};
+use ait_llm::testing::{assert_post, sse, Fixture, Script};
 
 /// Tests never touch a real keyring — a missing secret is `None`, so
 /// fixture requests go out with no `Authorization` header.
@@ -39,12 +39,18 @@ fn session() -> AgentSession {
 /// `[agents.execution_profiles.default]` table — the T1 knob the
 /// tests turn.
 fn settings(base_url: &str, profile_fields: &str) -> Settings {
+    settings_on_schema(base_url, "openai_chat_completions", profile_fields)
+}
+
+/// [`settings`] against an explicit wire schema — the `safety`
+/// injection must hold under all three endpoint IRs (R07-T2).
+fn settings_on_schema(base_url: &str, schema: &str, profile_fields: &str) -> Settings {
     Settings::from_toml(&format!(
         r#"
 [agents.custom_endpoints.local]
 name = "Fixture"
 base_url = "{base_url}"
-schema = "openai_chat_completions"
+schema = "{schema}"
 
 [[agents.custom_endpoints.local.models]]
 name = "test-model"
@@ -146,6 +152,85 @@ fn chat_text_turn(text: &str) -> String {
         "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
         json_string(text)
     )
+}
+
+/// An `openai_responses` transcript announcing one `function_call`
+/// item then streaming its arguments.
+fn responses_tool_turn(item_id: &str, call_id: &str, name: &str, args: &str) -> String {
+    let mut body = format!(
+        "event: response.output_item.added\ndata: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"id\":{item},\"type\":\"function_call\",\"call_id\":{call},\"name\":{name},\"arguments\":\"\",\"status\":\"in_progress\"}}}}\n\n",
+        item = json_string(item_id),
+        call = json_string(call_id),
+        name = json_string(name),
+    );
+    body.push_str(&format!(
+        "event: response.function_call_arguments.delta\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"item_id\":{},\"delta\":{}}}\n\n",
+        json_string(item_id),
+        json_string(args)
+    ));
+    body.push_str(
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    );
+    body
+}
+
+/// A plain `openai_responses` end turn.
+fn responses_text_turn(text: &str) -> String {
+    let mut body = format!(
+        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":{}}}\n\n",
+        json_string(text)
+    );
+    body.push_str(
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    );
+    body
+}
+
+/// An `anthropic_messages` transcript opening one `tool_use` block
+/// and streaming `partial_json` fragments.
+fn anthropic_tool_turn(index: u32, id: &str, name: &str, args: &str) -> String {
+    let mut body = format!(
+        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"tool_use\",\"id\":{id},\"name\":{name},\"input\":{{}}}}}}\n\n",
+        id = json_string(id),
+        name = json_string(name),
+    );
+    body.push_str(&format!(
+        "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{}}}}}\n\n",
+        json_string(args)
+    ));
+    body.push_str(&format!(
+        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    ));
+    body
+}
+
+/// A plain `anthropic_messages` end turn.
+fn anthropic_text_turn(text: &str) -> String {
+    format!(
+        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+        json_string(text)
+    )
+}
+
+/// One tool turn followed by a text end turn, in `schema`'s wire
+/// dialect — the two-request script the `safety`-schema tests run
+/// per endpoint IR.
+fn tool_then_text(schema: &str, call: (u32, &str, &str, &str), text: &str) -> Vec<Script> {
+    let (index, id, name, args) = call;
+    match schema {
+        "openai_responses" => vec![
+            sse(&responses_tool_turn("fc_1", id, name, args)),
+            sse(&responses_text_turn(text)),
+        ],
+        "anthropic_messages" => vec![
+            sse(&anthropic_tool_turn(index, id, name, args)),
+            sse(&anthropic_text_turn(text)),
+        ],
+        _ => vec![
+            sse(&chat_tool_turn(&[(index, id, name, args)])),
+            sse(&chat_text_turn(text)),
+        ],
+    }
 }
 
 /// The next event, or panic — every wait carries the bound.
@@ -515,11 +600,12 @@ fn ask_user_question_keeps_its_own_card_at_a_non_never_level() {
     assert!(second.body.contains("patch"), "{}", second.body);
 }
 
-/// `agent_decides` and `ask_on_first_write` degrade to `always_ask`
-/// in T1 — an unflagged call is an unsafe call, and the first-write
-/// memory lands in T5. Both calls park on the approve card.
+/// `agent_decides` is real now (T2): a `"safe"`-flagged `read_files`
+/// runs with no approve card at all, while `ask_on_first_write`
+/// still degrades to `always_ask` — its first-write memory lands in
+/// T5, so the `write_to_pty` call parks.
 #[test]
-fn agent_decides_and_ask_on_first_write_ask_every_call() {
+fn agent_decides_safe_runs_while_ask_on_first_write_still_asks() {
     let dir = project();
     let fixture = Fixture::serve(vec![
         sse(&chat_tool_turn(&[(
@@ -547,14 +633,11 @@ fn agent_decides_and_ask_on_first_write_ask_every_call() {
         ))
         .expect("submit");
 
-    // Even a self-flagged "safe" call asks — the flag is T2's.
-    let (id, name, _) = next_approval(&session);
-    assert_eq!((id.as_str(), name.as_str()), ("call_1", "read_files"));
-    session
-        .approve(&id, ApprovalVerdict::AllowOnce)
-        .expect("approve");
+    // The self-flagged "safe" call runs — a `ToolCall` event (card
+    // straight to running), never an `ApprovalRequest`.
+    assert_eq!(until_tool_call(&session), "call_1");
 
-    // `ask_on_first_write` asks too — deny it so no PTY spawns.
+    // `ask_on_first_write` asks — deny it so no PTY spawns.
     let (id, name, _) = until_approval(&session);
     assert_eq!((id.as_str(), name.as_str()), ("call_2", "write_to_pty"));
     session
@@ -574,6 +657,292 @@ fn agent_decides_and_ask_on_first_write_ask_every_call() {
         "{events:?}"
     );
     assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The flag rode the call's own arguments verbatim into the
+    // recorded assistant-call item — the self-assessment is auditable
+    // in the transcript (us-10).
+    fixture.captured();
+    let second = fixture.captured();
+    let body: serde_json::Value = serde_json::from_str(&second.body).expect("request body");
+    let arguments = body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find_map(|m| {
+            serde_json::from_str::<serde_json::Value>(
+                m["tool_calls"][0]["function"]["arguments"].as_str()?,
+            )
+            .ok()
+        })
+        .expect("the recorded read_files call");
+    assert_eq!(arguments["safety"], "safe");
+    assert_eq!(arguments["paths"][0], "note.txt");
+}
+
+/// `agent_decides`'s flag is opt-in, never opt-out: `"unsafe"`, an
+/// absent flag and a non-string flag all park on the unchanged
+/// three-option approve card.
+#[test]
+fn agent_decides_unsafe_absent_and_malformed_flags_ask() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "read_files",
+            r#"{"paths":["note.txt"],"safety":"unsafe"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "read_files",
+            r#"{"paths":["note.txt"]}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "read_files",
+            r#"{"paths":["note.txt"],"safety":true}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "read_files = \"agent_decides\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    for call_id in ["call_1", "call_2", "call_3"] {
+        let (id, name, _) = until_approval(&session);
+        assert_eq!((id.as_str(), name.as_str()), (call_id, "read_files"));
+        session
+            .approve(&id, ApprovalVerdict::AllowOnce)
+            .expect("approve");
+    }
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
+/// `agent_decides` works on every field the level maps to: a
+/// `"safe"`-flagged `edit_files` writes ungated under
+/// `apply_code_diffs`, and a `"safe"`-flagged `run_command` under
+/// `execute_commands` reaches the executor without asking — the
+/// detached tier answers its clean "no live shell" tool error,
+/// proving the call ran rather than parking.
+#[test]
+fn agent_decides_governs_every_mapped_field() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "edit_files",
+            r#"{"files":[{"path":"made.txt","content":"MADE"}],"safety":"safe"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "run_command",
+            r#"{"command":"echo hi","safety":"safe"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "apply_code_diffs = \"agent_decides\"\nexecute_commands = \"agent_decides\"",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    assert_eq!(until_tool_call(&session), "call_1");
+    assert_eq!(until_tool_call(&session), "call_2");
+    let events = collect(&session);
+    assert!(
+        no_approval(&events),
+        "safe-flagged calls never ask: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The edit actually landed — ungated.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("made.txt")).expect("made.txt"),
+        "MADE"
+    );
+    // And `run_command` reached the (detached) executor — its clean
+    // "no live shell" error re-entered as the tool result.
+    fixture.captured();
+    fixture.captured();
+    let third = fixture.captured();
+    assert!(third.body.contains("no live shell"), "{}", third.body);
+}
+
+/// The injected `safety` schema rides only `agent_decides` tools —
+/// under all three wire schemas the governed tools declare it
+/// required while the others ship unchanged — and the flag the model
+/// sends back is recorded verbatim in the assistant-call item.
+#[test]
+fn safety_schema_ships_only_on_agent_decides_tools_per_schema() {
+    let governed = ["read_files", "grep", "glob"];
+    for schema in [
+        "openai_chat_completions",
+        "openai_responses",
+        "anthropic_messages",
+    ] {
+        let dir = project();
+        let fixture = Fixture::serve(tool_then_text(
+            schema,
+            (
+                0,
+                "call_1",
+                "read_files",
+                r#"{"paths":["note.txt"],"safety":"safe"}"#,
+            ),
+            "done",
+        ));
+        let session = session();
+        session
+            .submit(task(
+                settings_on_schema(&fixture.base_url, schema, "read_files = \"agent_decides\""),
+                dir.path().to_str().expect("utf-8 tempdir"),
+            ))
+            .expect("submit");
+
+        // The safe-flagged call runs ungated under every wire schema.
+        assert_eq!(until_tool_call(&session), "call_1", "{schema}");
+        let events = collect(&session);
+        assert_eq!(events.last(), Some(&AgentEvent::Done), "{schema}");
+
+        // Request 1: the declared tool schemas — `safety` is a
+        // required enum on exactly the governed tools.
+        let first = fixture.captured();
+        let body: serde_json::Value = serde_json::from_str(&first.body).expect("request body");
+        for tool in body["tools"].as_array().expect("tools") {
+            // `openai_chat_completions` nests name/description/
+            // parameters under `function`; `anthropic_messages`
+            // calls the parameter schema `input_schema`.
+            let (name, parameters) = match tool.get("function") {
+                Some(function) => (
+                    function["name"].as_str().expect("name"),
+                    &function["parameters"],
+                ),
+                None => (
+                    tool["name"].as_str().expect("name"),
+                    tool.get("input_schema").unwrap_or(&tool["parameters"]),
+                ),
+            };
+            if governed.contains(&name) {
+                assert_eq!(
+                    parameters["properties"]["safety"]["enum"],
+                    serde_json::json!(["safe", "unsafe"]),
+                    "{schema}/{name}"
+                );
+                assert!(
+                    parameters["required"]
+                        .as_array()
+                        .expect("required")
+                        .contains(&serde_json::json!("safety")),
+                    "{schema}/{name}"
+                );
+            } else {
+                assert_eq!(
+                    parameters["properties"]["safety"],
+                    serde_json::Value::Null,
+                    "{schema}/{name} must not gain the flag"
+                );
+            }
+        }
+
+        // Request 2: the recorded assistant-call item carries the
+        // flag verbatim inside the call's own arguments — auditable
+        // in the transcript (us-10).
+        let second = fixture.captured();
+        let recorded = recorded_safety(schema, &second.body);
+        assert_eq!(recorded.as_deref(), Some("safe"), "{schema}");
+        fixture.assert_no_more_requests();
+    }
+}
+
+/// The `safety` flag inside the recorded assistant-call item, per
+/// wire schema — `arguments` is a nested JSON string on the OpenAI
+/// IRs, a decoded `input` object on `anthropic_messages`.
+fn recorded_safety(schema: &str, body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).expect("request body");
+    let flag = |arguments: &serde_json::Value| arguments["safety"].as_str().map(str::to_owned);
+    match schema {
+        "openai_responses" => body["input"].as_array()?.iter().find_map(|item| {
+            if item["type"] != "function_call" {
+                return None;
+            }
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(item["arguments"].as_str()?).ok()?;
+            flag(&arguments)
+        }),
+        "anthropic_messages" => body["messages"].as_array()?.iter().find_map(|message| {
+            message["content"].as_array()?.iter().find_map(|block| {
+                if block["type"] != "tool_use" {
+                    return None;
+                }
+                flag(&block["input"])
+            })
+        }),
+        _ => body["messages"].as_array()?.iter().find_map(|message| {
+            message["tool_calls"].as_array()?.iter().find_map(|call| {
+                let arguments = serde_json::from_str::<serde_json::Value>(
+                    call["function"]["arguments"].as_str()?,
+                )
+                .ok()?;
+                flag(&arguments)
+            })
+        }),
+    }
+}
+
+/// A profile with no `agent_decides` fields ships the same
+/// declarations the registry always wrote — no tool gains a
+/// `safety` property or the contract sentence.
+#[test]
+fn a_profile_without_agent_decides_ships_identical_declarations() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![sse(&chat_text_turn("done"))]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "read_files = \"always_allow\"\nexecute_commands = \"always_ask\"",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    let captured = fixture.captured();
+    let body: serde_json::Value = serde_json::from_str(&captured.body).expect("request body");
+    for tool in body["tools"].as_array().expect("tools") {
+        let function = &tool["function"];
+        assert_eq!(
+            function["parameters"]["properties"]["safety"],
+            serde_json::Value::Null,
+            "{}",
+            function["name"]
+        );
+        assert!(
+            !function["description"]
+                .as_str()
+                .expect("description")
+                .contains("self-assessment"),
+            "{}",
+            function["name"]
+        );
+    }
 }
 
 /// Zero declared profiles — a `default` that was never written or
