@@ -1502,9 +1502,19 @@ impl TabManager {
             let conversation = match tab.conversation {
                 Some(id) => Some(id),
                 None => {
+                    // The title reads the batch's first task, falling
+                    // back through the panel's whole transcript — a
+                    // post-detach batch can start mid-conversation,
+                    // and the detached row's first task still names
+                    // the same conversation (Spec R08 us-5).
+                    let history = tab
+                        .agent
+                        .as_ref()
+                        .map(|panel| panel.transcript_items())
+                        .unwrap_or(&[]);
                     let id = store.conversation_started(
                         toast,
-                        &crate::transcript::conversation_title(&items),
+                        &crate::transcript::conversation_title(&items, history),
                         &tab.cwd,
                     );
                     if let Some(id) = id {
