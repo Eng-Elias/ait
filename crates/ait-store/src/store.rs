@@ -12,8 +12,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::path::store_path;
 use crate::{
-    Block, Conversation, NewBlock, NewConversation, NewTranscriptItem, StoreError, TerminalSession,
-    TranscriptItem,
+    Block, Conversation, ListedConversation, NewBlock, NewConversation, NewTranscriptItem,
+    StoreError, TerminalSession, TranscriptItem,
 };
 
 /// `PRAGMA busy_timeout` — a second `ait` instance (or a stale WAL
@@ -167,6 +167,35 @@ impl Store {
                 updated_at: ms_to_system(row.get(3)?),
                 cwd: row.get(4)?,
                 status: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every conversation, newest-mutation first, each paired with
+    /// its `transcript_items` count — the conversation picker's rows
+    /// (Spec R08-T6, user story 5: "title, age, item count"). Same
+    /// ordering as [`list_conversations`](Self::list_conversations);
+    /// the count is a per-row subquery, not a join the caller
+    /// reassembles.
+    pub fn list_conversations_with_counts(&self) -> Result<Vec<ListedConversation>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.title, c.created_at, c.updated_at, c.cwd, c.status,
+                    (SELECT COUNT(*) FROM transcript_items t
+                     WHERE t.conversation_id = c.id)
+             FROM conversations c ORDER BY c.updated_at DESC, c.id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ListedConversation {
+                conversation: Conversation {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    created_at: ms_to_system(row.get(2)?),
+                    updated_at: ms_to_system(row.get(3)?),
+                    cwd: row.get(4)?,
+                    status: row.get(5)?,
+                },
+                items: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

@@ -157,6 +157,56 @@ fn list_conversations_is_newest_mutation_first() {
     assert_eq!(listed, vec![ids[2], ids[1], ids[0]]);
 }
 
+/// Spec R08-T6 / us-5: the picker's list — the same newest-mutation
+/// order `list_conversations` yields, each row paired with its
+/// `transcript_items` count (zero for a conversation none landed on).
+#[test]
+fn list_conversations_with_counts_pairs_each_row_with_its_item_count() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).unwrap();
+    let first = store
+        .create_conversation(NewConversation {
+            title: "first",
+            cwd: "/w",
+            status: "open",
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(2));
+    let second = store
+        .create_conversation(NewConversation {
+            title: "second",
+            cwd: "/w",
+            status: "open",
+        })
+        .unwrap();
+    store
+        .append_transcript_items(
+            first.id,
+            &[
+                item("task", "{}"),
+                item("status", "{}"),
+                item("status", "{}"),
+            ],
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(2));
+    // An append bumps `updated_at`, so `first` is now the newest row.
+    store
+        .append_transcript_items(second.id, &[item("task", "{}")])
+        .unwrap();
+
+    let listed = store.list_conversations_with_counts().unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|l| (l.conversation.id, l.items))
+            .collect::<Vec<_>>(),
+        vec![(second.id, 1), (first.id, 3)],
+        "newest-mutation first, counts beside their rows"
+    );
+    assert_eq!(listed[0].conversation.title, "second");
+}
+
 #[test]
 fn mutation_bumps_updated_at_and_reorders_the_list() {
     let (_dir, path) = temp_db();

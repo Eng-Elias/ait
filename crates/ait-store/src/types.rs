@@ -27,6 +27,21 @@ pub struct Conversation {
     pub updated_at: SystemTime,
 }
 
+/// A listed conversation plus its `transcript_items` count — the
+/// picker's "title, age, item count" row data (Spec R08-T6, user
+/// story 5). [`Store::list_conversations_with_counts`] returns them
+/// newest-mutation first like [`Store::list_conversations`].
+///
+/// [`Store::list_conversations_with_counts`]: crate::Store::list_conversations_with_counts
+/// [`Store::list_conversations`]: crate::Store::list_conversations
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListedConversation {
+    /// The `conversations` row.
+    pub conversation: Conversation,
+    /// How many `transcript_items` rows it holds.
+    pub items: i64,
+}
+
 /// A conversation to create — what
 /// [`Store::create_conversation`](crate::Store::create_conversation)
 /// takes; `id` and the timestamps are the store's to assign.

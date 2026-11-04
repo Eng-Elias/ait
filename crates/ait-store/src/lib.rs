@@ -36,6 +36,6 @@ pub use error::StoreError;
 pub use path::store_path;
 pub use store::Store;
 pub use types::{
-    Block, Conversation, NewBlock, NewConversation, NewTranscriptItem, TerminalSession,
-    TranscriptItem,
+    Block, Conversation, ListedConversation, NewBlock, NewConversation, NewTranscriptItem,
+    TerminalSession, TranscriptItem,
 };

@@ -76,6 +76,12 @@ pub enum AppAction {
     /// switch to — and a second press while the picker is open
     /// dismisses it.
     SwitchProfile,
+    /// Open the conversation picker over the store's rows (`Alt+R`;
+    /// Spec R08 §5.8, ticket R08-T6): newest-first, Enter resumes
+    /// into the active tab's panel, `Ctrl+D` deletes behind a
+    /// one-key confirm — and a second press while the picker is
+    /// open dismisses it.
+    Conversations,
 }
 
 /// The keymap's verdict for one key event.
@@ -280,6 +286,18 @@ const BINDINGS: &[Binding] = &[
         modifiers: ALT,
         enhanced_only: false,
         action: AppAction::SwitchProfile,
+    },
+    // Spec R08 §5.8 `Alt+R` conversation picker — both tiers:
+    // `ESC r` vs `r` is byte-distinct under the legacy Alt-prefix
+    // and the kitty modifier report alike. `M-r` IS bound in
+    // default readline (revert-line) — the same sanctioned trade
+    // `Alt+B` makes with `M-b` (backward-word): the app-level
+    // feature wins the chord where it applies.
+    Binding {
+        code: KeyCode::Char('r'),
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::Conversations,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
@@ -567,6 +585,30 @@ mod tests {
             );
             assert_pass(
                 KeyCode::Char('p'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+                tier,
+            );
+        }
+    }
+
+    /// `Alt+R` is the Spec R08 conversation picker (`Conversations`):
+    /// `ESC r` vs `r` is byte-distinct on every host — no tier gate.
+    /// `M-r` is bound in default readline (revert-line) — the same
+    /// sanctioned trade `Alt+B`/`M-b` makes — and the exact-modifier
+    /// rule keeps `Alt+Shift+R`/`Ctrl+Alt+R` for the PTY.
+    #[test]
+    fn alt_r_binds_in_both_tiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_action(KeyCode::Char('r'), ALT, tier, AppAction::Conversations);
+            assert_action(KeyCode::Char('R'), ALT, tier, AppAction::Conversations);
+            assert_pass(KeyCode::Char('r'), KeyModifiers::NONE, tier);
+            assert_pass(
+                KeyCode::Char('r'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                tier,
+            );
+            assert_pass(
+                KeyCode::Char('r'),
                 KeyModifiers::ALT | KeyModifiers::CONTROL,
                 tier,
             );

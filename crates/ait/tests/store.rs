@@ -593,3 +593,130 @@ fn update_plan_pins_the_block_and_upserts_the_latest_snapshot() {
         "plan items mirror in event order: {kinds:?}"
     );
 }
+
+// ─── R08-T6: Alt+R picker — list, resume, delete ───────────────────
+
+/// Spec R08-T6 + ticket: scripted `update_plan` task → `Alt+Q` →
+/// relaunch on the same data dir → `Alt+R` lists the conversation
+/// newest-first (title, age, item count) → Enter rebuilds the panel
+/// — task/text/status entries plus the pinned plan — and the next
+/// task's captured request carries the replayed transcript →
+/// `Ctrl+D` twice deletes the row for good.
+#[test]
+fn alt_r_lists_resumes_across_restart_and_ctrl_d_deletes() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    let fixture = Fixture::serve(vec![
+        // Task one: the plan call, then the closing turn — two
+        // requests. The resumed task takes the third.
+        sse(&tool_turn(
+            "call_1",
+            "update_plan",
+            r#"{"todos":[
+                {"content":"reproduce it","status":"done"},
+                {"content":"fix it","status":"in_progress"}
+            ]}"#,
+        )),
+        sse(&chat_text_turn("planned")),
+        sse(&chat_text_turn("continued")),
+    ]);
+    let cfg = tempfile::tempdir().expect("config fixture tempdir");
+    let data = tempfile::tempdir().expect("data fixture tempdir");
+    write_agent_settings(cfg.path(), &agent_settings_with_fixture(&fixture.base_url));
+
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the tab bar and status line", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+    open_panel(&mut app);
+    submit_task(&mut app, "plan the fix");
+    app.wait_for_screen("task one's done + pinned plan", |app| {
+        done_lines(app) == 1 && panel_has_line(app, "▸ fix it")
+    });
+    app.press("Alt+Q");
+    assert!(app.wait_for_exit().success(), "the first run exits cleanly");
+
+    // Relaunch on the SAME data dir — the conversation outlived the
+    // app (us-7).
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the relaunched chrome", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the relaunched prompt");
+
+    // `Alt+R` lists it newest-first — title, age bucket, item count.
+    app.press("Alt+R");
+    app.wait_for_screen("the picker row", |app| {
+        app.screen_text().contains("plan the fix")
+            && app.screen_text().contains("items")
+            && app.screen_text().contains("enter: resume")
+    });
+
+    // Enter resumes: the panel opens with the rebuilt scrollback —
+    // the task entry, the reply, the `done` status — and the pinned
+    // plan block restored from the `plans` row.
+    app.press("Enter");
+    app.wait_for_screen("the resumed panel", |app| {
+        panel_has_line(app, "› plan the fix")
+            && panel_has_line(app, "planned")
+            && panel_has_line(app, "done")
+            && panel_has_line(app, "✓ reproduce it")
+            && panel_has_line(app, "▸ fix it")
+    });
+
+    // The next task continues the SAME conversation — its request
+    // replays the stored transcript (the third captured request is
+    // the resumed task's first).
+    submit_task(&mut app, "continue the work");
+    app.wait_for_screen("the continued task's done", |app| done_lines(app) == 2);
+    fixture.captured();
+    fixture.captured();
+    let third = fixture.captured();
+    assert!(
+        third.body.contains("plan the fix"),
+        "the prior transcript replayed into the request: {}",
+        third.body
+    );
+    assert!(
+        third.body.contains("reproduce it"),
+        "the persisted plan rode the replay: {}",
+        third.body
+    );
+
+    // `Ctrl+D` once arms — nothing deletes — a second confirms and
+    // the row (items + plan, cascaded) is gone for good.
+    app.press("Alt+R");
+    app.wait_for_screen("the picker again", |app| {
+        app.screen_text().contains("plan the fix")
+    });
+    app.press("Ctrl+D");
+    app.wait_for_screen("the armed confirm", |app| {
+        app.screen_text().contains("ctrl+d again deletes")
+    });
+    let store = open_store(data.path());
+    assert_eq!(
+        store.list_conversations().unwrap().len(),
+        1,
+        "the first Ctrl+D only armed"
+    );
+    drop(store);
+    app.press("Ctrl+D");
+    app.wait_for_screen("the picker emptied and closed", |app| {
+        !app.screen_text().contains("items")
+    });
+    // A reopened picker finds nothing left to list.
+    app.press("Alt+R");
+    app.wait_for_screen("the empty-store toast", |app| {
+        app.line(STATUS_ROW).contains("no stored conversations")
+    });
+    app.press("Alt+Q");
+    assert!(app.wait_for_exit().success());
+
+    let store = open_store(data.path());
+    assert!(
+        store.list_conversations().unwrap().is_empty(),
+        "the row deleted for good"
+    );
+}
