@@ -602,7 +602,11 @@ async fn run_loop(
 ) {
     let mut turns = 0usize;
     // Tools the user allowed for the rest of the task — the gate's
-    // per-task memory; per name, never blanket (us-7).
+    // per-task memory; per name, never blanket (us-7). *Allow this
+    // tool for the rest of the task* always records; under
+    // `ask_on_first_write` so does *allow once* — the first write's
+    // consent IS the interactive session's (us-11/12). Fresh per
+    // task, so a new task asks on first write again.
     let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
