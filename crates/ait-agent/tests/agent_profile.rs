@@ -879,30 +879,28 @@ fn recorded_safety(schema: &str, body: &str) -> Option<String> {
     let flag = |arguments: &serde_json::Value| arguments["safety"].as_str().map(str::to_owned);
     match schema {
         "openai_responses" => body["input"].as_array()?.iter().find_map(|item| {
-            (item["type"] == "function_call")
-                .then(|| {
-                    serde_json::from_str::<serde_json::Value>(item["arguments"].as_str()?)
-                        .ok()
-                })
-                .flatten()
-                .as_ref()
-                .and_then(flag)
+            if item["type"] != "function_call" {
+                return None;
+            }
+            let arguments =
+                serde_json::from_str::<serde_json::Value>(item["arguments"].as_str()?).ok()?;
+            flag(&arguments)
         }),
         "anthropic_messages" => body["messages"].as_array()?.iter().find_map(|message| {
             message["content"].as_array()?.iter().find_map(|block| {
-                (block["type"] == "tool_use")
-                    .then(|| flag(&block["input"]))
-                    .flatten()
+                if block["type"] != "tool_use" {
+                    return None;
+                }
+                flag(&block["input"])
             })
         }),
         _ => body["messages"].as_array()?.iter().find_map(|message| {
             message["tool_calls"].as_array()?.iter().find_map(|call| {
-                serde_json::from_str::<serde_json::Value>(
+                let arguments = serde_json::from_str::<serde_json::Value>(
                     call["function"]["arguments"].as_str()?,
                 )
-                .ok()
-                .as_ref()
-                .and_then(flag)
+                .ok()?;
+                flag(&arguments)
             })
         }),
     }
