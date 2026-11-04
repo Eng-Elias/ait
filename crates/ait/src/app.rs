@@ -56,7 +56,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ait_agent::CommandSuggester;
 use ait_config::{ConfigError, Settings};
@@ -66,21 +66,24 @@ use ait_term::{
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::queue;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
-use crate::agent_panel::paint_agent_panel;
+use crate::agent_panel::{paint_agent_panel, AgentPanel};
 use crate::backend::StyledBackend;
 use crate::config::{self, LiveSettings};
+use crate::conversations::ConversationPicker;
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::profile::{self, ProfilePicker};
 use crate::render::{
-    apply_selection, chrome_areas, content_size, grid_line, paint_profile_picker, paint_session,
-    paint_status_line, paint_tab_bar, split_content, to_cursor_style, UnderlineOverlay,
+    apply_selection, chrome_areas, content_size, grid_line, paint_conversation_picker,
+    paint_profile_picker, paint_session, paint_status_line, paint_tab_bar, split_content,
+    to_cursor_style, UnderlineOverlay,
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
@@ -190,6 +193,12 @@ struct AppState {
     /// failures degrade to a toast plus an unpersisted run — the
     /// terminal works either way.
     store: StoreHandle,
+    /// The open conversation picker, if any (`Alt+R`; Spec R08-T6):
+    /// the store's rows newest-first — Enter resumes into the active
+    /// tab's panel, `Ctrl+D` deletes behind a one-key confirm. Held
+    /// app-global like the profile picker; a second `Alt+R` toggles
+    /// it closed, and opening one picker drops the other.
+    conversations: Option<ConversationPicker>,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -229,6 +238,9 @@ struct Rendered {
     /// own — opening, moving the highlight and closing must all show
     /// up in the snapshot to repaint.
     picker: Option<ProfilePicker>,
+    /// The conversation picker's painted state (Spec R08-T6) —
+    /// same no-damage-of-its-own rule as `picker`.
+    conversations: Option<ConversationPicker>,
 }
 
 /// The painted agent panel's state for the [`Rendered`] snapshot:
@@ -317,6 +329,7 @@ pub fn run() -> io::Result<ExitCode> {
         profile: profile::DEFAULT_PROFILE.to_string(),
         picker: None,
         store,
+        conversations: None,
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
@@ -500,6 +513,7 @@ pub fn run() -> io::Result<ExitCode> {
                 revision: panel.revision(),
             }),
             picker: state.picker.clone(),
+            conversations: state.conversations.clone(),
         };
         if damaged || rendered.as_ref() != Some(&view) {
             render_frame(
@@ -507,7 +521,10 @@ pub fn run() -> io::Result<ExitCode> {
                 &tabs,
                 &view.status,
                 view.toast,
-                state.picker.as_ref(),
+                Overlays {
+                    profile: state.picker.as_ref(),
+                    conversations: state.conversations.as_ref(),
+                },
                 &underlines,
                 &mut last_cursor_shape,
             )?;
@@ -694,6 +711,37 @@ fn handle_event<W: Write>(
                         }
                     }
                 }
+                // `Alt+R` (Spec R08 §5.8, ticket R08-T6): the
+                // conversation picker over the store's rows —
+                // newest-first, Enter resumes into the active tab's
+                // panel, `Ctrl+D` deletes behind a one-key confirm,
+                // Esc closes. A second `Alt+R` toggles it closed, and
+                // opening it drops the profile picker — one overlay
+                // at a time. The list is a snapshot taken here; an
+                // empty store toasts instead of opening nothing.
+                Resolution::Action(AppAction::Conversations) => {
+                    if state.conversations.take().is_some() {
+                        // Toggled closed — the highlight is dropped.
+                    } else {
+                        state.picker = None;
+                        match state.store.conversations() {
+                            Ok(listed) if listed.is_empty() => {
+                                state.toast =
+                                    Some(Toast::new("no stored conversations", Instant::now()));
+                            }
+                            Ok(listed) => {
+                                state.conversations =
+                                    Some(ConversationPicker::new(&listed, SystemTime::now()));
+                            }
+                            Err(error) => {
+                                state.toast = Some(Toast::new(
+                                    format!("conversations list failed: {error}"),
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Per-active-tab viewport actions: scrollback + paste.
                 Resolution::Action(action) => {
                     let Some(tab) = tabs.active_mut() else {
@@ -771,7 +819,8 @@ fn handle_event<W: Write>(
                         | AppAction::JumpToTab(_)
                         | AppAction::SuggestCommand
                         | AppAction::AgentPanel
-                        | AppAction::SwitchProfile => {} // dispatched above
+                        | AppAction::SwitchProfile
+                        | AppAction::Conversations => {} // dispatched above
                     }
                 }
                 Resolution::PassThrough => {
@@ -784,6 +833,17 @@ fn handle_event<W: Write>(
                     // `Alt+A` closes the focused panel.
                     if state.picker.is_some() {
                         picker_key(&key_event, state);
+                        return Handled::Continue;
+                    }
+                    // The open conversation picker owns unbound keys
+                    // the same way (Spec R08-T6): ↑/↓ move the
+                    // highlight, Enter resumes, `Ctrl+D` deletes
+                    // behind its confirm, plain Esc dismisses, and
+                    // everything else is swallowed — nothing leaks
+                    // to the PTY mid-pick. Bound chords already ran
+                    // above (`Alt+R` itself toggles it closed).
+                    if state.conversations.is_some() {
+                        conversation_key(&key_event, tabs, state);
                         return Handled::Continue;
                     }
                     // The active tab's index BEFORE the mutable borrow —
@@ -1078,12 +1138,22 @@ fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPo
 /// toast), then the application-requested cursor shape and position:
 /// the panel's input-line cursor while it owns the keyboard, the
 /// session's otherwise.
+/// The overlay pickers one frame can paint (Spec R07 §5.7, R08-T6):
+/// dispatch keeps them mutually exclusive — either may be open,
+/// never both.
+struct Overlays<'a> {
+    /// The `Alt+P` profile switcher.
+    profile: Option<&'a ProfilePicker>,
+    /// The `Alt+R` conversation picker.
+    conversations: Option<&'a ConversationPicker>,
+}
+
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     tabs: &TabManager,
     status: &str,
     toast: bool,
-    picker: Option<&ProfilePicker>,
+    overlays: Overlays<'_>,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
 ) -> io::Result<()> {
@@ -1134,11 +1204,16 @@ fn render_frame(
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
         paint_status_line(buf, areas.status, status, toast);
-        // The profile switcher is an overlay (Spec R07 §5.7): it
-        // paints last over the content band's bottom rows so nothing
-        // underneath decides its hit-testing.
-        if let Some(picker) = picker {
+        // The profile switcher and the conversation picker are
+        // overlays (Spec R07 §5.7, R08-T6): they paint last over the
+        // content band's bottom rows so nothing underneath decides
+        // their hit-testing. Dispatch keeps them mutually exclusive
+        // — opening one drops the other.
+        if let Some(picker) = overlays.profile {
             paint_profile_picker(buf, areas.content, picker);
+        }
+        if let Some(picker) = overlays.conversations {
+            paint_conversation_picker(buf, areas.content, picker);
         }
         if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
             if panel.is_focused() {
@@ -1225,6 +1300,131 @@ fn activate_profile(state: &mut AppState, name: String) {
         Instant::now(),
     ));
     state.profile = name;
+}
+
+/// One key while the conversation picker is open (Spec R08-T6,
+/// us-5/11): ↑/↓ move the highlight, Enter resumes the highlighted
+/// row into the active tab's panel, `Ctrl+D` arms then confirms the
+/// delete (one gesture, never an accident — any other key disarms),
+/// plain Esc dismisses. `state.conversations` is `Some` on entry —
+/// the caller already routed.
+fn conversation_key(key: &KeyEvent, tabs: &mut TabManager, state: &mut AppState) {
+    enum Outcome {
+        /// Nothing happened — key consumed.
+        None,
+        /// Close the picker.
+        Close,
+        /// Resume `id` into the active tab's panel.
+        Resume(i64),
+        /// The armed confirm fired: delete `id`.
+        Delete(i64),
+    }
+    let outcome = {
+        let Some(picker) = state.conversations.as_mut() else {
+            return;
+        };
+        // `Ctrl+D` is the one-key confirm's whole vocabulary: the
+        // first press arms, the second deletes. Anything else first
+        // disarms, then does its usual thing — a stray key can never
+        // sneak a delete past the user (us-11).
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            if picker.confirming() {
+                match picker.selected_row() {
+                    Some(row) => Outcome::Delete(row.id),
+                    None => Outcome::Close,
+                }
+            } else {
+                picker.arm_delete();
+                Outcome::None
+            }
+        } else {
+            picker.disarm_delete();
+            match key.code {
+                KeyCode::Up => {
+                    picker.prev();
+                    Outcome::None
+                }
+                KeyCode::Down => {
+                    picker.next();
+                    Outcome::None
+                }
+                KeyCode::Enter => match picker.selected_row() {
+                    Some(row) => Outcome::Resume(row.id),
+                    None => Outcome::Close,
+                },
+                KeyCode::Esc if key.modifiers.is_empty() => Outcome::Close,
+                _ => Outcome::None,
+            }
+        }
+    };
+    match outcome {
+        Outcome::None => {}
+        Outcome::Close => state.conversations = None,
+        Outcome::Resume(id) => {
+            state.conversations = None;
+            resume_conversation(id, tabs, state);
+        }
+        Outcome::Delete(id) => {
+            if state.store.delete_conversation(&mut state.toast, id) {
+                // The row is gone — every tab bound to it must open
+                // a new row rather than append to a deleted one.
+                tabs.detach_conversation(id);
+                if let Some(picker) = state.conversations.as_mut() {
+                    picker.remove_selected();
+                    if picker.rows().is_empty() {
+                        state.conversations = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Enter` on a picker row: load the conversation and swap the
+/// active tab's panel to it (Spec R08-T6, us-6/10). Refused with a
+/// toast while the tab's task runs — a live run is never clobbered.
+/// The reads land BEFORE the swap so a failed load changes nothing;
+/// the row binds so every later flush appends to it.
+fn resume_conversation(id: i64, tabs: &mut TabManager, state: &mut AppState) {
+    let running = tabs
+        .active()
+        .and_then(|tab| tab.agent_panel())
+        .is_some_and(AgentPanel::is_running);
+    if running {
+        state.toast = Some(Toast::new(
+            "a task is still running — resume refused",
+            Instant::now(),
+        ));
+        return;
+    }
+    let items = match state.store.load_transcript(id) {
+        Ok(items) => items,
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("transcript load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    let plan = match state.store.load_plan(id) {
+        Ok(Some(ait_agent::TranscriptItem::Plan { todos })) => Some(todos),
+        Ok(_) => None,
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("plan load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    if let Some(tab) = tabs.active_mut() {
+        tab.resume_conversation(id, items, plan);
+        state.toast = Some(Toast::new("conversation resumed", Instant::now()));
+    }
+    // The panel may have opened on a tab that never had one —
+    // re-derive its winsize through the same path `Alt+A` takes.
+    tabs.resize_active();
 }
 
 /// The last closed tab's exit status as the process exit code.
@@ -1331,6 +1531,7 @@ mod tests {
                     profile: profile::DEFAULT_PROFILE.to_string(),
                     picker: None,
                     store: StoreHandle::disabled(),
+                    conversations: None,
                 },
                 sink: Vec::new(),
             }
@@ -3209,5 +3410,232 @@ coding_model = "coding-key"
         let second = fixture.captured();
         assert!(second.body.contains("agent-marker"), "{}", second.body);
         assert!(second.body.contains("exit code"), "{}", second.body);
+    }
+
+    // ---- Spec R08-T6: the Alt+R conversation picker ----
+
+    /// Seed a tempdir store with `title` + `items`, wrapped in the
+    /// handle the app's picker reads through.
+    fn store_with(
+        items: &[(&str, &[ait_agent::TranscriptItem])],
+    ) -> (tempfile::TempDir, StoreHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ait_store::Store::open(dir.path().join("store.db")).unwrap();
+        for (title, items) in items {
+            let conversation = store
+                .create_conversation(ait_store::NewConversation {
+                    title,
+                    cwd: "/w",
+                    status: "open",
+                })
+                .unwrap();
+            let payloads: Vec<String> = items
+                .iter()
+                .map(|item| serde_json::to_string(item).unwrap())
+                .collect();
+            let rows: Vec<ait_store::NewTranscriptItem> = items
+                .iter()
+                .zip(&payloads)
+                .map(|(item, payload)| ait_store::NewTranscriptItem {
+                    kind: item.kind(),
+                    payload_json: payload,
+                })
+                .collect();
+            store
+                .append_transcript_items(conversation.id, &rows)
+                .unwrap();
+        }
+        (dir, StoreHandle::from_store(store))
+    }
+
+    /// `Alt+R` on a store with no conversations toasts instead of
+    /// opening an empty list — and `Alt+R` on a disabled store reads
+    /// the same (us-25's unpersisted run).
+    #[test]
+    fn alt_r_toasts_when_there_is_nothing_to_list() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(harness.state.conversations.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the empty store toasts");
+        assert!(
+            toast.text().contains("no stored conversations"),
+            "the toast says why: {}",
+            toast.text()
+        );
+    }
+
+    /// `Alt+R` opens the picker over the store's rows newest-first;
+    /// Enter resumes the highlighted row — the tab binds the
+    /// conversation id and the panel rebuilds from its items, open
+    /// and focused. `Alt+R` again toggles the picker closed.
+    #[test]
+    fn alt_r_opens_and_enter_resumes_into_the_panel() {
+        let mut harness = Harness::new(manager());
+        let items = vec![
+            ait_agent::TranscriptItem::Task {
+                text: "fix the tests".into(),
+            },
+            ait_agent::TranscriptItem::AssistantText {
+                text: "on it".into(),
+            },
+            ait_agent::TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        let id = handle.conversations().unwrap()[0].conversation.id;
+        harness.state.store = handle;
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        let picker = harness
+            .state
+            .conversations
+            .as_ref()
+            .expect("Alt+R opened the picker");
+        assert_eq!(picker.rows().len(), 1);
+        assert_eq!(picker.rows()[0].title, "fix the tests");
+        assert_eq!(picker.rows()[0].items, 3);
+
+        // A stray key is swallowed mid-pick (never reaches the PTY).
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_some());
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_none(), "Enter closed");
+        let tab = harness.tabs.active().unwrap();
+        assert_eq!(tab.conversation(), Some(id), "the row bound");
+        let panel = tab.agent_panel().expect("the resume built a panel");
+        assert!(panel.is_open() && tab.agent_focused());
+        use crate::agent_panel::Entry;
+        assert_eq!(
+            panel.entries(),
+            &[
+                Entry::Task("fix the tests".into()),
+                Entry::Text("on it".into()),
+                Entry::Status("done".into()),
+            ],
+            "the scrollback rebuilt from the transcript"
+        );
+        assert!(harness.state.toast.is_some(), "the resume confirms itself");
+    }
+
+    /// us-10: Enter while the tab's task runs toasts and changes
+    /// nothing — the live run is never clobbered.
+    #[test]
+    fn enter_while_a_task_runs_refuses_the_resume() {
+        let mut harness = Harness::new(manager());
+        let items = vec![ait_agent::TranscriptItem::Task {
+            text: "fix the tests".into(),
+        }];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        harness.state.store = handle;
+        // A submitted task holds `running` until its terminal event —
+        // nothing drains it here (the unconfigured worker's Error
+        // sits queued, unread).
+        harness.tabs.active_mut().unwrap().toggle_agent_panel();
+        let panel = harness.tabs.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(
+            ait_agent::AgentRequest {
+                settings: Settings::default(),
+                profile: "default".to_string(),
+                task: "busy".to_string(),
+                context: ait_agent::AgentContext {
+                    cwd: "/tmp".into(),
+                    shell: "sh".into(),
+                    os: "test".into(),
+                    output_lines: Vec::new(),
+                },
+                prior: Vec::new(),
+                bridge: None,
+            },
+            &mut harness.state.toast,
+        );
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let toast = harness.state.toast.as_ref().expect("the refusal toasts");
+        assert!(
+            toast.text().contains("still running"),
+            "the toast says why: {}",
+            toast.text()
+        );
+        assert!(
+            harness.tabs.active().unwrap().conversation().is_none(),
+            "nothing bound — the live run stands"
+        );
+        assert!(
+            harness
+                .tabs
+                .active()
+                .unwrap()
+                .agent_panel()
+                .unwrap()
+                .is_running(),
+            "the task still runs"
+        );
+    }
+
+    /// us-11: `Ctrl+D` once arms the confirm — nothing deletes — a
+    /// second `Ctrl+D` drops the row from the picker AND the store,
+    /// and a tab bound to it detaches so its next task opens a new
+    /// row. Esc dismisses the picker; `Alt+R` toggles it closed.
+    #[test]
+    fn ctrl_d_deletes_after_the_one_key_confirm() {
+        let mut harness = Harness::new(manager());
+        let items = vec![ait_agent::TranscriptItem::Task {
+            text: "fix the tests".into(),
+        }];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        let id = handle.conversations().unwrap()[0].conversation.id;
+        harness.state.store = handle;
+        // The tab is bound to the doomed row — the delete must
+        // detach it rather than leave a dangling append target.
+        harness.tabs.active_mut().unwrap().set_conversation(id);
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            harness.state.conversations.as_ref().unwrap().confirming(),
+            "the first Ctrl+D only arms"
+        );
+        assert!(
+            !harness.state.store.conversations().unwrap().is_empty(),
+            "nothing deleted yet"
+        );
+
+        // A stray key disarms instead of deleting.
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!harness.state.conversations.as_ref().unwrap().confirming());
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            harness.state.conversations.is_none(),
+            "the emptied picker closed"
+        );
+        assert!(
+            harness.state.store.conversations().unwrap().is_empty(),
+            "the row deleted"
+        );
+        assert_eq!(
+            harness.tabs.active().unwrap().conversation(),
+            None,
+            "the bound tab detached"
+        );
+
+        // Esc dismisses; Alt+R toggles closed — both leave the list.
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_none());
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(
+            harness.state.conversations.is_none(),
+            "Alt+R toggled the picker away"
+        );
     }
 }

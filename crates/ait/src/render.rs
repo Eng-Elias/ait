@@ -18,6 +18,7 @@ use std::ops::Range;
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
 
+use crate::conversations::ConversationPicker;
 use crate::profile::ProfilePicker;
 use crate::selection::SelectionRange;
 use ratatui::buffer::Buffer;
@@ -324,6 +325,72 @@ pub fn paint_profile_picker(buf: &mut Buffer, area: Rect, picker: &ProfilePicker
         let width = usize::from(area.right() - area.x);
         buf.set_stringn(area.x, y, text, width, style);
     }
+}
+
+/// Paint the `Alt+R` conversation picker (Spec R08 §5.8, ticket
+/// R08-T6): the stored rows newest-first over `area`'s bottom rows —
+/// `▸ title  age · N items` bolded on the highlight — and a bottom
+/// hint row that doubles as `Ctrl+D`'s one-key confirm prompt. The
+/// highlight scrolls the window when a long list outgrows the band;
+/// each row is reset before its text like every overlay painter.
+pub fn paint_conversation_picker(buf: &mut Buffer, area: Rect, picker: &ConversationPicker) {
+    if area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.right() - area.x);
+    let rows = picker.rows();
+    // The hint owns the bottom row; the list anchors above it and
+    // windows so the highlight always shows.
+    let list_height = usize::from(area.height - 1);
+    let shown = rows.len().min(list_height);
+    let start = picker
+        .selected()
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(rows.len().saturating_sub(shown));
+    let top = area.bottom().saturating_sub(1 + shown as u16);
+    for (offset, row) in rows.iter().skip(start).take(shown).enumerate() {
+        let index = start + offset;
+        let y = top + offset as u16;
+        reset_span(buf, y, area.x..area.right());
+        let (mark, style) = if index == picker.selected() {
+            (
+                "▸",
+                ratatui::style::Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (" ", ratatui::style::Style::default())
+        };
+        buf.set_stringn(
+            area.x,
+            y,
+            format!("{mark} {}  {} · {} items", row.title, row.age, row.items),
+            width,
+            style,
+        );
+    }
+    // The bottom row is the keys hint — and `Ctrl+D`'s armed state
+    // replaces it with the confirm prompt (us-11).
+    let hint_y = area.bottom() - 1;
+    reset_span(buf, hint_y, area.x..area.right());
+    let (text, style) = if picker.confirming() {
+        let title = picker
+            .selected_row()
+            .map(|row| row.title.as_str())
+            .unwrap_or_default();
+        (
+            format!(" ctrl+d again deletes \"{title}\""),
+            ratatui::style::Style::default()
+                .fg(RtColor::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            " enter: resume · ctrl+d: delete · esc: close".to_string(),
+            ratatui::style::Style::default().fg(RtColor::DarkGray),
+        )
+    };
+    buf.set_stringn(area.x, hint_y, text, width, style);
 }
 
 /// `ait_term` color → ratatui color. Beware the naming trap: ratatui's
