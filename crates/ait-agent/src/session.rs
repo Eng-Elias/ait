@@ -617,7 +617,11 @@ async fn run_loop(
 ) {
     let mut turns = 0usize;
     // Tools the user allowed for the rest of the task — the gate's
-    // per-task memory; per name, never blanket (us-7).
+    // per-task memory; per name, never blanket (us-7). *Allow this
+    // tool for the rest of the task* always records; under
+    // `ask_on_first_write` so does *allow once* — the first write's
+    // consent IS the interactive session's (us-11/12). Fresh per
+    // task, so a new task asks on first write again.
     let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
@@ -739,7 +743,7 @@ fn gate_and_execute(
     // `Deny` open an ungated card — `Deny`'s `Denied` update flips
     // it immediately after.
     let event = match &verdict {
-        Verdict::Ask => AgentEvent::ApprovalRequest {
+        Verdict::Ask { .. } => AgentEvent::ApprovalRequest {
             call: call.clone(),
             summary,
         },
@@ -767,9 +771,18 @@ fn gate_and_execute(
             );
             return Some(reason);
         }
-        Verdict::Ask => {
+        Verdict::Ask { first_write } => {
             match await_reply(verdicts, &call.id, cancel) {
-                ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {}
+                // `ask_on_first_write` (us-11/12): under it *allow
+                // once* is the interactive session's consent — the
+                // first write's allow covers the tool for the rest
+                // of the task, recorded in the same per-tool memory
+                // *allow for task* uses.
+                ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {
+                    if first_write {
+                        allowed_for_task.insert(call.name.clone());
+                    }
+                }
                 ReplyOutcome::Replied(ApprovalVerdict::AllowForTask) => {
                     allowed_for_task.insert(call.name.clone());
                 }
