@@ -88,6 +88,177 @@ __ait_run() {
     printf '\033]7701;B\007'
 }
 
+# --- §5.9 ssh integration -------------------------------------------------
+#
+# When the [ssh] policy env is armed at spawn (`AIT_SSH_*`), `ssh`
+# becomes a function: an interactive ssh to an allowed host is rewritten
+# to `ssh -t <args> '<remote bootstrap>'`, bracketed by the ssh_begin /
+# ssh_end hooks, with ControlMaster options attached when no user socket
+# already multiplexes the host. Every other shape — `ssh host cmd`,
+# denied hosts, `AIT_SSH_OFF=1`, control/config operations — is a plain
+# `command ssh` passthrough, and `command ssh` typed directly always
+# bypasses the wrapper.
+
+# Match the destination token $1 against the newline-separated glob list
+# $2 — OpenSSH Host-pattern semantics: `*`/`?` globs, a leading `!`
+# negates. Exit 0 when a non-negated entry matched (last match wins).
+__ait_ssh_match() {
+    local dest=$1 pattern
+    local matched=1
+    while IFS= read -r pattern; do
+        [[ -z $pattern ]] && continue
+        if [[ $pattern == \!* ]]; then
+            [[ $dest == ${pattern#!} ]] && return 1
+        elif [[ $dest == $pattern ]]; then
+            matched=0
+        fi
+    done <<< "$2"
+    return "$matched"
+}
+
+# The armed allow/deny decision for one destination token — deny beats
+# allow (§5.7's rule); an empty allowlist is open.
+__ait_ssh_allowed() {
+    if __ait_ssh_match "$1" "${AIT_SSH_DENY:-}"; then
+        return 1
+    fi
+    if [[ -n ${AIT_SSH_ALLOW:-} ]] && ! __ait_ssh_match "$1" "$AIT_SSH_ALLOW"; then
+        return 1
+    fi
+    return 0
+}
+
+# Print the destination token of a plain interactive `ssh` argv —
+# `ssh [opts] dest` — and exit 0. Anything that is not a bare
+# interactive login exits 1, which the wrapper reads as "passthrough":
+# a remote command (tokens after the destination), a missing
+# destination, or an option the rewrite must not touch
+# (-G -N -T -n -f -M -O -V).
+__ait_ssh_dest() {
+    local -a argv=("$@")
+    local i arg expects=0
+    for ((i = 0; i < ${#argv[@]}; i++)); do
+        arg=${argv[i]}
+        if ((expects)); then
+            expects=0
+            continue
+        fi
+        case $arg in
+            # Control/config/proxy shapes never get a remote shell.
+            -G|-N|-T|-n|-f|-M|-V|-O|-O*)
+                return 1 ;;
+            # Options whose argument is the NEXT token.
+            -[bBcDEeFIiJLlmopQRSWw])
+                expects=1 ;;
+            # Bundled-argument options (-p22, -oKey=val, …).
+            -[bBcDEeFIiJLlmopQRSWw]*)
+                ;;
+            --)
+                ;; # end-of-options: the destination follows
+            -*)
+                ;; # a flag option (-t -v -4 …)
+            *)
+                # First non-option token: the destination. Anything
+                # after it is the remote command → not interactive.
+                if ((i + 1 < ${#argv[@]})); then
+                    return 1
+                fi
+                printf '%s' "$arg"
+                return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Does the user's own ssh config already multiplex `dest`? `ssh -G`
+# answers with a real ControlPath and a multiplexing ControlMaster —
+# reuse_existing_control_master=1 then adds nothing (the user's socket
+# is reused, so no second authentication ever happens).
+__ait_ssh_user_master() {
+    local conf master path
+    conf=$(command ssh -G "$1" 2>/dev/null) || return 1
+    master=$(printf '%s\n' "$conf" | sed -n 's/^controlmaster //p' | head -n1)
+    path=$(printf '%s\n' "$conf" | sed -n 's/^controlpath //p' | head -n1)
+    case $master in
+        auto|autoask|yes|ask|true|1)
+            [[ -n $path && $path != none ]] ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+# ssh_begin: session id, the typed destination, whether a bootstrap is
+# sent and the negotiated ControlPath pattern.
+__ait_ssh_begin() {
+    local bootstrapped=false cp=""
+    [[ -n ${AIT_SSH_BOOTSTRAP:-} ]] && bootstrapped=true
+    [[ -n $2 ]] && cp=",\"control_path\":\"$(__ait_json_escape "$2")\""
+    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\",\"bootstrapped\":$bootstrapped$cp}}"
+}
+
+# ssh_end: the local `ssh` returned — the remote session is over
+# (cleanly or by a dropped connection).
+__ait_ssh_end() {
+    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\"}}"
+}
+
+# The remote command: re-export AIT_SSH_BOOTSTRAP into the remote
+# session (single-quoted, the only self-reference the protocol needs —
+# a nested ssh() sends the same script one hop further), then run it.
+__ait_ssh_remote_cmd() {
+    local quoted=${AIT_SSH_BOOTSTRAP//"'"/"'\\''"}
+    printf '%s' "export AIT_SSH_BOOTSTRAP='$quoted'
+$AIT_SSH_BOOTSTRAP"
+}
+
+ssh() {
+    # Opt-outs first: `AIT_SSH_OFF=1` per session, the armed-off policy —
+    # the wrapper must never change what the user asked for.
+    if [[ -n ${AIT_SSH_OFF:-} || ${AIT_SSH_ENABLED:-1} != 1 ]]; then
+        command ssh "$@"
+        return
+    fi
+    local dest
+    if ! dest=$(__ait_ssh_dest "$@"); then
+        command ssh "$@"
+        return
+    fi
+    if ! __ait_ssh_allowed "$dest"; then
+        command ssh "$@"
+        return
+    fi
+    # ControlMaster attach: reuse the user's own multiplexed socket when
+    # their config manages one and policy honors it (no second auth);
+    # otherwise point ControlPath at the ait control dir.
+    local -a extra=()
+    if [[ ${AIT_SSH_REUSE_CM:-1} == 1 ]] && __ait_ssh_user_master "$dest"; then
+        :
+    elif [[ -n ${AIT_SSH_CONTROL_DIR:-} ]]; then
+        extra=(-o "ControlMaster=auto"
+               -o "ControlPath=${AIT_SSH_CONTROL_DIR}/%C"
+               -o "ControlPersist=${AIT_SSH_CONTROL_PERSIST:-10m}")
+    fi
+    # The ControlPath the attach lands on — `ssh -G` resolves the user
+    # config plus our -o adds; reported on ssh_begin for the executor
+    # tiers and teardown.
+    local control_path
+    control_path=$(command ssh -G "${extra[@]}" "$dest" 2>/dev/null \
+        | sed -n 's/^controlpath //p' | head -n1)
+    __ait_ssh_begin "$dest" "$control_path"
+    if [[ -n ${AIT_SSH_BOOTSTRAP:-} ]]; then
+        command ssh -t "${extra[@]}" "$@" "$(__ait_ssh_remote_cmd)"
+    else
+        command ssh -t "${extra[@]}" "$@"
+    fi
+    local status=$?
+    __ait_ssh_end "$dest"
+    # The remote session demoted this tab when its exit_shell landed
+    # (or a drop killed it); the local shell is back at the prompt —
+    # re-integrate it.
+    __ait_hook bootstrapped
+    return "$status"
+}
+
 # --- prompt/command hooks -----------------------------------------------
 
 # precmd: close the previous block (133;D;<exit>), report cwd (OSC 7),
@@ -139,6 +310,9 @@ fi
 PROMPT_COMMAND=__ait_precmd
 trap '__ait_preexec' DEBUG
 trap '__ait_exit_shell' EXIT
+# Spec R09-T2: `exit_shell` on a hangup too — a dropped connection
+# (or a remote sshd dying) lands here, not at EXIT.
+trap '__ait_exit_shell; exit' HUP
 
 __ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"bash\"}}"
 __AIT_INTEGRATED_BASH=1

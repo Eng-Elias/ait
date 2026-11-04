@@ -59,7 +59,7 @@ pub enum ShellEvent {
     },
 }
 
-/// The five hook names the snippets emit, plus a forward-compatible
+/// The seven hook names the snippets emit, plus a forward-compatible
 /// unknown bucket (a newer snippet on an older ait still decodes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookName {
@@ -74,6 +74,15 @@ pub enum HookName {
     Preexec,
     /// The integrated shell is exiting.
     ExitShell,
+    /// The `ssh()` wrapper is about to exec an integrated `ssh`
+    /// (Spec R09 §5.9) — `value` names the destination and the
+    /// negotiated ControlPath; the frontend opens the tab's remote
+    /// context.
+    SshBegin,
+    /// The wrapped `ssh` returned — the remote session ended (cleanly
+    /// or by a dropped connection); the frontend closes the remote
+    /// context and retires the control socket.
+    SshEnd,
     /// A hook name this version doesn't know.
     Unknown(String),
 }
@@ -87,6 +96,8 @@ impl HookName {
             "precmd" => Self::Precmd,
             "preexec" => Self::Preexec,
             "exit_shell" => Self::ExitShell,
+            "ssh_begin" => Self::SshBegin,
+            "ssh_end" => Self::SshEnd,
             other => Self::Unknown(other.to_owned()),
         }
     }

@@ -66,13 +66,15 @@ __ait_json_escape() {
 # concatenated R payload is `<id>;<merged stdout+stderr>;<exit_code>`.
 __ait_run() {
     local id=$1 hexcmd=$2
-    local cmd capture out status hex hlen frag
+    # `status` is zsh's read-only $? alias — `local` on it aborts the
+    # function; `code` carries the exit instead.
+    local cmd capture out code hex hlen frag
     local pos=1
     cmd=$(printf '%b' "$(printf '%s' "$hexcmd" | sed 's/\(..\)/\\x\1/g')")
     capture=$(eval "$cmd" 2>&1; printf ':%d\n' "$?")
-    status=${capture##*:}
+    code=${capture##*:}
     out=${capture%:*}
-    hex=$(printf '%s' "$id;$out;$status" | __ait_hex)
+    hex=$(printf '%s' "$id;$out;$code" | __ait_hex)
     printf '\033]7701;A\007'
     hlen=${#hex}
     while (( pos <= hlen )); do
@@ -81,6 +83,152 @@ __ait_run() {
         (( pos += 1000 ))
     done
     printf '\033]7701;B\007'
+}
+
+# --- §5.9 ssh integration -------------------------------------------------
+#
+# The same wrapper bash carries (Spec R09-T3): an interactive ssh to an
+# allowed host is rewritten to `ssh -t <args> '<remote bootstrap>'`,
+# bracketed by ssh_begin/ssh_end, with ControlMaster options attached
+# when no user socket already multiplexes the host. Every other shape —
+# `ssh host cmd`, denied hosts, `AIT_SSH_OFF`, control/config
+# operations — is a plain `command ssh` passthrough.
+
+# $1 = destination token, $2 = newline-separated glob list — OpenSSH
+# Host-pattern semantics: `*`/`?` globs (via ${~pattern}), a leading
+# `!` negates. Exit 0 when a non-negated entry matched.
+__ait_ssh_match() {
+    local dest=$1 pattern negated
+    local matched=1
+    while IFS= read -r pattern; do
+        [[ -z $pattern ]] && continue
+        if [[ $pattern == \!* ]]; then
+            negated=${pattern#!}
+            [[ $dest == ${~negated} ]] && return 1
+        elif [[ $dest == ${~pattern} ]]; then
+            matched=0
+        fi
+    done <<< "$2"
+    return "$matched"
+}
+
+# Deny beats allow (§5.7's rule); an empty allowlist is open.
+__ait_ssh_allowed() {
+    if __ait_ssh_match "$1" "${AIT_SSH_DENY:-}"; then
+        return 1
+    fi
+    if [[ -n ${AIT_SSH_ALLOW:-} ]] && ! __ait_ssh_match "$1" "$AIT_SSH_ALLOW"; then
+        return 1
+    fi
+    return 0
+}
+
+# Print the destination token of a plain interactive `ssh` argv —
+# `ssh [opts] dest` — and exit 0. Anything that is not a bare
+# interactive login exits 1: a remote command (a second positional),
+# a missing destination, or an option the rewrite must not touch.
+__ait_ssh_dest() {
+    local dest="" arg expects=0
+    for arg in "$@"; do
+        if (( expects )); then
+            expects=0
+            continue
+        fi
+        case $arg in
+            # Control/config/proxy shapes never get a remote shell.
+            -G|-N|-T|-n|-f|-M|-V|-O|-O*)
+                return 1 ;;
+            # Options whose argument is the NEXT token.
+            -[bBcDEeFIiJLlmopQRSWw])
+                expects=1 ;;
+            --|-*)
+                ;; # a flag option or end-of-options
+            *)
+                # A second positional is the remote command → not
+                # interactive.
+                [[ -n $dest ]] && return 1
+                dest=$arg ;;
+        esac
+    done
+    [[ -z $dest ]] && return 1
+    printf '%s' "$dest"
+}
+
+# Does the user's own ssh config already multiplex `dest`? `ssh -G`
+# answers with a real ControlPath and a multiplexing ControlMaster —
+# reuse_existing_control_master=1 then adds nothing.
+__ait_ssh_user_master() {
+    local conf master path
+    conf=$(command ssh -G "$1" 2>/dev/null) || return 1
+    master=$(printf '%s\n' "$conf" | sed -n 's/^controlmaster //p' | head -n1)
+    path=$(printf '%s\n' "$conf" | sed -n 's/^controlpath //p' | head -n1)
+    case $master in
+        auto|autoask|yes|ask|true|1)
+            [[ -n $path && $path != none ]] ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+__ait_ssh_begin() {
+    local bootstrapped=false cp=""
+    [[ -n ${AIT_SSH_BOOTSTRAP:-} ]] && bootstrapped=true
+    [[ -n $2 ]] && cp=",\"control_path\":\"$(__ait_json_escape "$2")\""
+    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\",\"bootstrapped\":$bootstrapped$cp}}"
+}
+
+__ait_ssh_end() {
+    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\"}}"
+}
+
+# The remote command: re-export AIT_SSH_BOOTSTRAP into the remote
+# session (a nested ssh() sends the same script one hop further),
+# then run it.
+__ait_ssh_remote_cmd() {
+    local quoted=${AIT_SSH_BOOTSTRAP//"'"/"'\\''"}
+    printf '%s' "export AIT_SSH_BOOTSTRAP='$quoted'
+$AIT_SSH_BOOTSTRAP"
+}
+
+ssh() {
+    if [[ -n ${AIT_SSH_OFF:-} || ${AIT_SSH_ENABLED:-1} != 1 ]]; then
+        command ssh "$@"
+        return
+    fi
+    local dest
+    if ! dest=$(__ait_ssh_dest "$@"); then
+        command ssh "$@"
+        return
+    fi
+    if ! __ait_ssh_allowed "$dest"; then
+        command ssh "$@"
+        return
+    fi
+    local -a extra=()
+    if [[ ${AIT_SSH_REUSE_CM:-1} == 1 ]] && __ait_ssh_user_master "$dest"; then
+        :
+    elif [[ -n ${AIT_SSH_CONTROL_DIR:-} ]]; then
+        extra=(-o "ControlMaster=auto"
+               -o "ControlPath=${AIT_SSH_CONTROL_DIR}/%C"
+               -o "ControlPersist=${AIT_SSH_CONTROL_PERSIST:-10m}")
+    fi
+    local control_path
+    control_path=$(command ssh -G "${extra[@]}" "$dest" 2>/dev/null \
+        | sed -n 's/^controlpath //p' | head -n1)
+    __ait_ssh_begin "$dest" "$control_path"
+    if [[ -n ${AIT_SSH_BOOTSTRAP:-} ]]; then
+        command ssh -t "${extra[@]}" "$@" "$(__ait_ssh_remote_cmd)"
+    else
+        command ssh -t "${extra[@]}" "$@"
+    fi
+    # `status` is zsh's read-only $? alias — `local` on it aborts the
+    # function mid-wrap; `rc` preserves the ssh exit instead.
+    local rc=$?
+    __ait_ssh_end "$dest"
+    # The remote session demoted this tab when its exit_shell landed;
+    # the local shell is back — re-integrate it.
+    __ait_hook bootstrapped
+    return "$rc"
 }
 
 # --- prompt/command hooks -----------------------------------------------
@@ -126,6 +274,9 @@ autoload -Uz add-zsh-hook
 add-zsh-hook precmd __ait_zsh_precmd
 add-zsh-hook preexec __ait_zsh_preexec
 add-zsh-hook zshexit __ait_zsh_exit
+# Spec R09-T3: `exit_shell` on a hangup too — a dropped connection
+# lands at HUP, not zshexit.
+trap '__ait_zsh_exit; exit' HUP
 # Front of the hook array sees the true $? (see __ait_zsh_precmd).
 precmd_functions=(__ait_zsh_precmd ${precmd_functions:#__ait_zsh_precmd})
 
