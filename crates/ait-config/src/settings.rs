@@ -104,10 +104,7 @@ impl Settings {
         ] {
             for (index, pattern) in entries.iter().enumerate() {
                 if let Err(detail) = validate_host_pattern(pattern) {
-                    return Err(ConfigError::at(
-                        format!("ssh.{list}[{index}]"),
-                        detail,
-                    ));
+                    return Err(ConfigError::at(format!("ssh.{list}[{index}]"), detail));
                 }
             }
         }

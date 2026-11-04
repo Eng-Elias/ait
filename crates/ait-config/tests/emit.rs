@@ -154,5 +154,8 @@ fn template_documents_the_ssh_section() {
     ] {
         assert!(template.contains(key), "template missing [ssh] key {key}");
     }
-    assert!(template.contains("# [ssh]"), "the [ssh] block stays commented");
+    assert!(
+        template.contains("# [ssh]"),
+        "the [ssh] block stays commented"
+    );
 }

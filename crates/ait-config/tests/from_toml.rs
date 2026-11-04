@@ -501,10 +501,7 @@ fn ssh_section_parses_and_defaults_apply() {
 #[test]
 fn a_malformed_host_pattern_names_the_entry() {
     let cases: &[(&str, &str)] = &[
-        (
-            "[ssh]\nhosts_denylist = [\"\"]",
-            "ssh.hosts_denylist[0]:",
-        ),
+        ("[ssh]\nhosts_denylist = [\"\"]", "ssh.hosts_denylist[0]:"),
         (
             "[ssh]\nhosts_allowlist = [\"!\"]",
             "ssh.hosts_allowlist[0]:",
