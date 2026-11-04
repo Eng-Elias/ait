@@ -215,11 +215,7 @@ fn anthropic_text_turn(text: &str) -> String {
 /// One tool turn followed by a text end turn, in `schema`'s wire
 /// dialect — the two-request script the `safety`-schema tests run
 /// per endpoint IR.
-fn tool_then_text(
-    schema: &str,
-    call: (u32, &str, &str, &str),
-    text: &str,
-) -> Vec<Script> {
+fn tool_then_text(schema: &str, call: (u32, &str, &str, &str), text: &str) -> Vec<Script> {
     let (index, id, name, args) = call;
     match schema {
         "openai_responses" => vec![
@@ -801,17 +797,18 @@ fn safety_schema_ships_only_on_agent_decides_tools_per_schema() {
         let dir = project();
         let fixture = Fixture::serve(tool_then_text(
             schema,
-            (0, "call_1", "read_files", r#"{"paths":["note.txt"],"safety":"safe"}"#),
+            (
+                0,
+                "call_1",
+                "read_files",
+                r#"{"paths":["note.txt"],"safety":"safe"}"#,
+            ),
             "done",
         ));
         let session = session();
         session
             .submit(task(
-                settings_on_schema(
-                    &fixture.base_url,
-                    schema,
-                    "read_files = \"agent_decides\"",
-                ),
+                settings_on_schema(&fixture.base_url, schema, "read_files = \"agent_decides\""),
                 dir.path().to_str().expect("utf-8 tempdir"),
             ))
             .expect("submit");

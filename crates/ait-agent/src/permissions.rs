@@ -312,7 +312,12 @@ mod tests {
         for tool in ["read_files", "grep", "glob"] {
             assert!(is_agent_decided(Some(&profile), tool), "{tool}");
         }
-        for tool in ["run_command", "edit_files", "write_to_pty", ASK_USER_QUESTION] {
+        for tool in [
+            "run_command",
+            "edit_files",
+            "write_to_pty",
+            ASK_USER_QUESTION,
+        ] {
             assert!(!is_agent_decided(Some(&profile), tool), "{tool}");
         }
         assert!(!is_agent_decided(None, "read_files"));

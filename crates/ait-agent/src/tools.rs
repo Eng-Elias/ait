@@ -635,7 +635,10 @@ mod tests {
             .expect("required")
             .contains(&serde_json::json!("safety")));
         let run = tools.iter().find(|t| t.name == "run_command").unwrap();
-        assert_eq!(run.parameters["properties"]["safety"], serde_json::Value::Null);
+        assert_eq!(
+            run.parameters["properties"]["safety"],
+            serde_json::Value::Null
+        );
 
         let decls = declare(EndpointSchema::AnthropicMessages, Some(&profile));
         let ToolDecls::Anthropic(tools) = decls else {
@@ -650,11 +653,11 @@ mod tests {
             .as_array()
             .expect("required")
             .contains(&serde_json::json!("safety")));
-        let ask = tools
-            .iter()
-            .find(|t| t.name == ASK_USER_QUESTION)
-            .unwrap();
-        assert_eq!(ask.input_schema["properties"]["safety"], serde_json::Value::Null);
+        let ask = tools.iter().find(|t| t.name == ASK_USER_QUESTION).unwrap();
+        assert_eq!(
+            ask.input_schema["properties"]["safety"],
+            serde_json::Value::Null
+        );
     }
 
     /// `(name, description, parameters)` per declared tool — one
@@ -677,7 +680,13 @@ mod tests {
                 .collect(),
             ToolDecls::Anthropic(tools) => tools
                 .iter()
-                .map(|t| (t.name.clone(), t.description.clone(), t.input_schema.clone()))
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        t.description.clone(),
+                        t.input_schema.clone(),
+                    )
+                })
                 .collect(),
         }
     }
