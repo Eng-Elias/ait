@@ -264,7 +264,12 @@ fn always_allow_runs_the_read_tools_without_asking() {
             "grep",
             r#"{"pattern":"NOTE","path":"."}"#,
         )])),
-        sse(&chat_tool_turn(&[(0, "call_3", "glob", r#"{"pattern":"*.txt"}"#)])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "glob",
+            r#"{"pattern":"*.txt"}"#,
+        )])),
         sse(&chat_text_turn("done")),
     ]);
     let session = session();
@@ -281,7 +286,10 @@ fn always_allow_runs_the_read_tools_without_asking() {
     assert_eq!(until_tool_call(&session), "call_2");
     assert_eq!(until_tool_call(&session), "call_3");
     let events = collect(&session);
-    assert!(no_approval(&events), "always_allow must never ask: {events:?}");
+    assert!(
+        no_approval(&events),
+        "always_allow must never ask: {events:?}"
+    );
     assert_eq!(events.last(), Some(&AgentEvent::Done));
 
     // Each result reached the model in the next request body.
@@ -319,7 +327,10 @@ fn always_ask_parks_on_the_approve_card() {
         .expect("submit");
 
     let (id, name, summary) = next_approval(&session);
-    assert_eq!((name.as_str(), summary.as_str()), ("read_files", "note.txt"));
+    assert_eq!(
+        (name.as_str(), summary.as_str()),
+        ("read_files", "note.txt")
+    );
     session
         .approve(&id, ApprovalVerdict::AllowOnce)
         .expect("approve");
@@ -359,7 +370,10 @@ fn never_denies_the_call_and_the_denial_reaches_the_model() {
     // opens a plain card…
     match next(&session) {
         AgentEvent::ToolCall { call, .. } => {
-            assert_eq!((call.id.as_str(), call.name.as_str()), ("call_1", "run_command"))
+            assert_eq!(
+                (call.id.as_str(), call.name.as_str()),
+                ("call_1", "run_command")
+            )
         }
         other => panic!("expected the denied call's card, got {other:?}"),
     }
@@ -514,7 +528,12 @@ fn agent_decides_and_ask_on_first_write_ask_every_call() {
             "read_files",
             r#"{"paths":["note.txt"],"safety":"safe"}"#,
         )])),
-        sse(&chat_tool_turn(&[(0, "call_2", "write_to_pty", r#"{"input":"q"}"#)])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "write_to_pty",
+            r#"{"input":"q"}"#,
+        )])),
         sse(&chat_text_turn("done")),
     ]);
     let session = session();
@@ -570,7 +589,12 @@ fn a_missing_profile_asks_everything() {
             "read_files",
             r#"{"paths":["note.txt"]}"#,
         )])),
-        sse(&chat_tool_turn(&[(0, "call_2", "glob", r#"{"pattern":"*.txt"}"#)])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "glob",
+            r#"{"pattern":"*.txt"}"#,
+        )])),
         sse(&chat_text_turn("done")),
     ]);
     let session = session();

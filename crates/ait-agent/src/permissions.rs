@@ -208,7 +208,12 @@ mod tests {
     fn never_denies_naming_the_profile() {
         let profile = profile_with("run_command", Some(PermissionLevel::Never));
         assert_eq!(
-            evaluate(Some(&profile), "locked", &call("run_command"), &HashSet::new()),
+            evaluate(
+                Some(&profile),
+                "locked",
+                &call("run_command"),
+                &HashSet::new()
+            ),
             Verdict::Deny(String::from("denied by execution profile locked"))
         );
     }
