@@ -162,6 +162,23 @@ fn terminal_half(row: &str) -> &str {
     row.split('│').next().unwrap_or(row)
 }
 
+/// `true` when `row`'s terminal half carries a sentinel *result*
+/// line — `__AIT_END_<id>=<exit>` — which only the run's `printf`
+/// produces. The echoed type-in line carries the same `__AIT_END_`
+/// prefix verbatim but `=%d`, never `=<digit>`, so a bare
+/// `contains("__AIT_END_")` would pass on echo alone — the exact
+/// wait CODING_STANDARDS §15 forbids.
+fn sentinel_result(row: &str) -> bool {
+    let half = terminal_half(row);
+    let Some(start) = half.find("__AIT_END_") else {
+        return false;
+    };
+    half[start..]
+        .split('=')
+        .nth(1)
+        .is_some_and(|tail| tail.starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
 /// Whether any screen row's *panel* half trims to exactly `text` —
 /// how a conversation status line (`done`, `cancelled`) is found
 /// without colliding with terminal-side text.
@@ -327,12 +344,16 @@ fn a_restrictive_profile_parks_run_command_and_an_approve_runs_it() {
 
     app.type_text("a"); // allow once
 
-    app.wait_for_screen("the typed sentinel trace in the grid", |app| {
-        app.screen_text().contains("__AIT_END_")
+    // Gate on output only execution produces (standard 15): the
+    // sentinel's `__AIT_END_<id>=<exit>` RESULT line — the echoed
+    // type-in carries `=%d`, never `=<digit>` — and a trimmed
+    // `E2E-MARK` row, the echo's output rather than its input.
+    app.wait_for_screen("the sentinel result and marker in the grid", |app| {
+        app.screen_text().lines().any(sentinel_result)
             && app
                 .screen_text()
                 .lines()
-                .any(|row| terminal_half(row).contains("E2E-MARK"))
+                .any(|row| terminal_half(row).trim() == "E2E-MARK")
     });
     app.wait_for_screen("the task's done status", |app| {
         panel_has_line(app, "done") && app.screen_text().contains("the command ran")
