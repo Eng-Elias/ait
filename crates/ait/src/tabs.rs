@@ -49,6 +49,7 @@ use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
 use crate::shell_bridge::{self, BridgeRequest, BridgeService};
 use crate::status::Toast;
+use crate::store::StoreHandle;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
@@ -199,6 +200,13 @@ pub struct Tab {
     /// `None` while the store is off or its insert failed: the sealed-
     /// block queue still drains so an unpersisted tab never grows it.
     store_session: Option<i64>,
+    /// The `conversations` row this tab's transcript appends to
+    /// (Spec R08-T3) — created by the first transcript flush, which
+    /// is the first task: every later task in the same tab appends to
+    /// the SAME row. `None` while the store is off or no task ran —
+    /// the transcript queue still drains so an unpersisted tab never
+    /// grows it.
+    conversation: Option<i64>,
     /// This tab's agent conversation panel (Spec R06 / issue #85):
     /// `None` until the first `Alt+A` creates it — lazily, so a tab
     /// that never opens the panel never pays for the worker thread.
@@ -536,6 +544,20 @@ impl Tab {
     /// session — called once, right after the spawn insert lands.
     pub(crate) fn set_store_session(&mut self, id: i64) {
         self.store_session = Some(id);
+    }
+
+    /// This tab's `conversations` row id, if a transcript flush has
+    /// created one (Spec R08-T3) — what `transcript_items` rows and
+    /// `plans` upserts key on.
+    #[allow(dead_code)] // T6's picker reads it; the flush writes it
+    pub fn conversation(&self) -> Option<i64> {
+        self.conversation
+    }
+
+    /// Bind the `conversations` row the first transcript flush
+    /// created — the same row every later task in this tab appends to.
+    pub(crate) fn set_conversation(&mut self, id: i64) {
+        self.conversation = Some(id);
     }
 
     /// The blocks sealed since the last call, as `blocks`-row-shaped
@@ -1108,6 +1130,7 @@ impl TabManager {
             inband: InBandExec::new(),
             materialized,
             store_session: None,
+            conversation: None,
             agent: None,
             bridge: None,
         });
@@ -1407,6 +1430,43 @@ impl TabManager {
         for tab in &mut self.tabs {
             if let Some(panel) = tab.agent.as_mut() {
                 panel.drain();
+            }
+        }
+    }
+
+    /// Flush every tab's accumulated transcript items into the store
+    /// (Spec R08-T3, user story 28): the first flush creates the
+    /// tab's `conversations` row — titled from its first task — and
+    /// every later flush appends to the SAME row, so task two in a
+    /// tab continues task one's transcript. Each append is the
+    /// store's own transaction; every write goes through the degrade
+    /// rule, so a disabled store just drops the items — the panel's
+    /// in-memory transcript keeps them regardless (T4's `prior`).
+    pub fn drain_transcripts(&mut self, store: &mut StoreHandle, toast: &mut Option<Toast>) {
+        for tab in &mut self.tabs {
+            let items = match tab.agent.as_mut() {
+                Some(panel) => panel.take_transcript_items(),
+                None => continue,
+            };
+            if items.is_empty() {
+                continue;
+            }
+            let conversation = match tab.conversation {
+                Some(id) => Some(id),
+                None => {
+                    let id = store.conversation_started(
+                        toast,
+                        &crate::transcript::conversation_title(&items),
+                        &tab.cwd,
+                    );
+                    if let Some(id) = id {
+                        tab.set_conversation(id);
+                    }
+                    id
+                }
+            };
+            if let Some(id) = conversation {
+                store.append_transcript(toast, id, &items);
             }
         }
     }
@@ -1814,6 +1874,110 @@ mod tests {
         // afterwards can't resurrect it.
         manager.active_mut().unwrap().set_store_session(9);
         assert!(manager.take_persisted_blocks().is_empty());
+    }
+
+    /// A minimal `AgentRequest` for the transcript tests — the send
+    /// succeeds (the channel is real); the unconfigured model's
+    /// `Error` just sits in the event queue, undrained.
+    fn agent_request(task: &str) -> ait_agent::AgentRequest {
+        ait_agent::AgentRequest {
+            settings: ait_config::Settings::default(),
+            profile: "default".to_string(),
+            task: task.to_string(),
+            context: ait_agent::AgentContext {
+                cwd: "/tmp".into(),
+                shell: "sh".into(),
+                os: "test".into(),
+                output_lines: Vec::new(),
+            },
+            bridge: None,
+        }
+    }
+
+    /// Spec R08-T3: the first transcript flush creates the tab's
+    /// `conversations` row titled from its first task; every later
+    /// flush — a second task in the same tab — appends to the SAME
+    /// row, seqs continuing contiguously (us-4's in-tab continuity
+    /// unit persisted).
+    #[test]
+    fn drain_transcripts_creates_one_row_and_appends_the_next_task() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let mut handle = StoreHandle::from_store(ait_store::Store::open(&db).unwrap());
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fix the tests"), &mut toast);
+        panel.apply(ait_agent::AgentEvent::TextDelta("on it".into()));
+        panel.apply(ait_agent::AgentEvent::Done);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        // A second connection reads what the handle committed —
+        // the same WAL-sharing rule the e2e relies on.
+        let store = ait_store::Store::open(&db).unwrap();
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 1, "the first task created the row");
+        assert_eq!(rows[0].title, "fix the tests", "titled from the task");
+        let items = store.load_transcript(rows[0].id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "assistant_text", "status"],
+            "send-side then drained items, in order"
+        );
+
+        // Task two in the same tab appends to the SAME row.
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("and the lint"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 1, "no second conversation row");
+        let items = store.load_transcript(rows[0].id).unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "seqs continue across flushes"
+        );
+        assert_eq!(items[3].kind, "task");
+        // The tab bound the row — resume/delete address it (T6).
+        assert_eq!(manager.active().unwrap().conversation(), Some(rows[0].id));
+    }
+
+    /// An unpersisted run (disabled handle) still drains every tab's
+    /// accumulated items — the transcript queue can't grow behind a
+    /// dead store, and the panel keeps the whole thing in memory
+    /// regardless (T4's `prior` source).
+    #[test]
+    fn drain_transcripts_on_a_disabled_store_drops_and_moves_on() {
+        let mut handle = StoreHandle::disabled();
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fix the tests"), &mut toast);
+
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a disabled store is a silent no-op");
+        assert_eq!(
+            manager.active().unwrap().conversation(),
+            None,
+            "no row ever bound"
+        );
+        assert!(
+            manager
+                .active_mut()
+                .unwrap()
+                .agent
+                .as_mut()
+                .unwrap()
+                .take_transcript_items()
+                .is_empty(),
+            "the batch drained rather than queueing"
+        );
     }
 
     /// Resize reaches every tab's session, not just the visible one.

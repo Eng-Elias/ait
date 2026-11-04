@@ -225,6 +225,13 @@ pub enum AgentEvent {
         status: ToolStatus,
         /// A one-line detail for the card — result preview or error.
         detail: Option<String>,
+        /// The call's full result text — `Some` on the terminal
+        /// updates (`Done`/`Failed`/`Denied`), carrying verbatim what
+        /// entered the model's conversation (already redacted): the
+        /// transcript mirror (Spec R08) persists it while the card
+        /// keeps `detail`'s clipped preview. `None` on `Running`,
+        /// a card transition rather than a result.
+        result: Option<String>,
     },
     /// The task finished cleanly: the model ended its turn with no
     /// tool calls and no steering queued. Terminal.
@@ -778,6 +785,7 @@ fn gate_and_execute(
                     call_id: call.id.clone(),
                     status: ToolStatus::Denied,
                     detail: Some(reason.clone()),
+                    result: Some(reason.clone()),
                 },
             );
             return Some(reason);
@@ -807,6 +815,7 @@ fn gate_and_execute(
                             call_id: call.id.clone(),
                             status: ToolStatus::Denied,
                             detail: Some(reason.clone()),
+                            result: Some(reason.clone()),
                         },
                     );
                     // The denial text IS the tool result (us-8) — the
@@ -825,6 +834,7 @@ fn gate_and_execute(
                     call_id: call.id.clone(),
                     status: ToolStatus::Running,
                     detail: None,
+                    result: None,
                 },
             ) {
                 return None;
@@ -860,6 +870,7 @@ fn gate_and_execute(
                 ToolStatus::Done
             },
             detail: Some(card_detail(&call.name, &text)),
+            result: Some(text.clone()),
         },
     );
     Some(text)
@@ -898,6 +909,7 @@ fn ask_and_answer(
                     call_id: call.id.clone(),
                     status: ToolStatus::Failed,
                     detail: Some(error.clone()),
+                    result: Some(error.clone()),
                 },
             );
             return Some(error);
@@ -921,6 +933,7 @@ fn ask_and_answer(
                     call_id: call.id.clone(),
                     status: ToolStatus::Done,
                     detail: Some(preview(&answer)),
+                    result: Some(answer.clone()),
                 },
             );
             Some(answer)

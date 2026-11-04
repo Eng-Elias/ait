@@ -436,6 +436,10 @@ pub fn run() -> io::Result<ExitCode> {
         // stream into each tab's conversation and terminal events
         // release its running state — a background tab keeps up.
         tabs.drain_agent_events();
+        // The transcript mirror on the same tick (Spec R08-T3):
+        // whatever the drain just folded lands in `transcript_items`
+        // — each tab's batch one transaction — beside the block rows.
+        tabs.drain_transcripts(&mut state.store, &mut state.toast);
         // Block metadata on the same tick (Spec R08): every block the
         // PTY drain just sealed lands in ONE transaction, here in the
         // drain half of the loop — never on the render path.

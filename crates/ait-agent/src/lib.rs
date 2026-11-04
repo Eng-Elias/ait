@@ -68,6 +68,7 @@ mod session;
 mod suggester;
 mod tool_call;
 mod tools;
+mod transcript;
 
 pub use agent_context::AgentContext;
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
@@ -82,3 +83,4 @@ pub use session::{
 };
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
 pub use tool_call::{ToolCall, ToolStatus};
+pub use transcript::{PlanTodo, PlanTodoStatus, TranscriptItem};

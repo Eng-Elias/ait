@@ -36,6 +36,7 @@ dependencies = [
  "crossterm",
  "insta",
  "ratatui",
+ "serde_json",
  "tempfile",
 ]
 
@@ -49,6 +50,7 @@ dependencies = [
  "ait-term",
  "futures-util",
  "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
