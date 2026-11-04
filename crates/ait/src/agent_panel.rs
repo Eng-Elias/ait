@@ -37,7 +37,9 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use ait_agent::{
-    AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, ToolStatus,
+    ask_replay_id, result_preview, AgentContext, AgentEvent, AgentRequest, AgentSession,
+    ApprovalVerdict, PlanTodo, PlanTodoStatus, ToolStatus, TranscriptItem, INTERRUPTED_RESULT,
+    STATUS_BUDGET, STATUS_CANCELLED, STATUS_DONE,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -47,6 +49,7 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 use crate::status::Toast;
 use crate::suggest;
 use crate::tabs::Tab;
+use crate::transcript::Transcript;
 
 /// The input line's prompt marker — user text (a submitted task and a
 /// mid-run steering message alike) carries the same marker in the
@@ -56,6 +59,12 @@ const INPUT_PROMPT: &str = "› ";
 /// [`INPUT_PROMPT`]'s cell width — `›` is three bytes but one column;
 /// input-line math works in cells, never `str::len`.
 const PROMPT_WIDTH: usize = 2;
+
+/// The pinned plan block's row cap — header, visible todos and the
+/// trailing separator together (Spec R08-T5). A longer plan folds
+/// into a `… N more` row rather than crowding the scrollback out of
+/// the panel.
+const PLAN_BLOCK_MAX: usize = 10;
 
 /// One conversation entry — what the panel's scrollback is made of.
 /// Each variant owns its display shape in [`display_lines`].
@@ -221,6 +230,15 @@ pub(crate) struct AgentPanel {
     /// change the paint can see — an edit, an event, a focus change —
     /// bumps it, so a stale frame can never survive one.
     revision: u64,
+    /// The persisted-vocabulary mirror (Spec R08-T3): every applied
+    /// event and every successful send folds into the accumulated
+    /// [`TranscriptItem`](ait_agent::TranscriptItem)s — the store's
+    /// append source and the `prior` continuity record alike.
+    transcript: Transcript,
+    /// The newest `update_plan` snapshot (Spec R08-T5, us-14) — what
+    /// the pinned block under the title renders. Each `PlanUpdated`
+    /// replaces it wholesale; an empty list clears the block.
+    plan: Vec<PlanTodo>,
 }
 
 impl AgentPanel {
@@ -228,6 +246,21 @@ impl AgentPanel {
     /// on a tab that had none.
     pub(crate) fn new() -> Self {
         Self::with_session(AgentSession::new())
+    }
+
+    /// The transcript items accumulated since the last take — the
+    /// store's per-drain batch (Spec R08-T3; the
+    /// [`take_persisted_blocks`](Tab::take_persisted_blocks)
+    /// precedent: the take drains regardless of a live store).
+    pub(crate) fn take_transcript_items(&mut self) -> Vec<ait_agent::TranscriptItem> {
+        self.transcript.take_new()
+    }
+
+    /// The whole accumulated transcript — the items a resumed tab's
+    /// next `AgentRequest.prior` hands the worker for in-tab
+    /// continuity (R08-T4).
+    pub(crate) fn transcript_items(&self) -> &[ait_agent::TranscriptItem] {
+        self.transcript.items()
     }
 
     /// [`new`](Self::new) over a caller's session — the seam tests
@@ -247,7 +280,16 @@ impl AgentPanel {
             top: Cell::new(0),
             painted: Cell::new((0, 0)),
             revision: 0,
+            transcript: Transcript::default(),
+            plan: Vec::new(),
         }
+    }
+
+    /// The current plan snapshot — what the pinned block paints
+    /// (Spec R08-T5); empty while no `update_plan` has landed.
+    #[allow(dead_code)] // the paint path + tests and T6's restore read this
+    pub(crate) fn plan(&self) -> &[PlanTodo] {
+        &self.plan
     }
 
     /// Whether the split is open — drives the layout and the tab's
@@ -404,6 +446,7 @@ impl AgentPanel {
         match self.session.answer(&call_id, answer.clone()) {
             Ok(()) => {
                 self.pinned = true;
+                self.transcript.answer(&answer);
                 if let Some(card) = self.entries.iter_mut().rev().find_map(|entry| match entry {
                     Entry::Ask(card) if card.id == call_id => Some(card),
                     _ => None,
@@ -498,6 +541,7 @@ impl AgentPanel {
             Ok(()) => {
                 self.running = true;
                 self.pinned = true;
+                self.transcript.task(&task);
                 self.push(Entry::Task(task));
             }
             Err(error) => *toast = Some(Toast::new(format!("{error}"), Instant::now())),
@@ -512,6 +556,7 @@ impl AgentPanel {
         match self.session.steer(message.clone()) {
             Ok(()) => {
                 self.pinned = true;
+                self.transcript.steering(&message);
                 self.push(Entry::Steering(message));
             }
             Err(error) => *toast = Some(Toast::new(format!("{error}"), Instant::now())),
@@ -535,8 +580,11 @@ impl AgentPanel {
     /// `ToolUpdate` transitions the card its `call_id` addresses and
     /// resolves a matching wait; every terminal event releases
     /// `running`, drops any pending approval and leaves a `Status`
-    /// line the user can read against the stream above it.
+    /// line the user can read against the stream above it. Every
+    /// event also folds into the persisted-vocabulary mirror (Spec
+    /// R08-T3) — staged `apply` tests exercise it too.
     pub(crate) fn apply(&mut self, event: AgentEvent) {
+        self.transcript.apply(&event);
         match event {
             AgentEvent::TextDelta(text) => match self.entries.last_mut() {
                 Some(Entry::Text(last)) => last.push_str(&text),
@@ -583,6 +631,7 @@ impl AgentPanel {
                 call_id,
                 status,
                 detail,
+                ..
             } => {
                 // The newest card with the id wins — call ids are
                 // provider-unique but defensive all the same.
@@ -608,24 +657,39 @@ impl AgentPanel {
                     self.pending_ask = None;
                 }
             }
+            AgentEvent::PlanUpdated { todos } => {
+                // The pinned block's whole content — replace
+                // semantics (us-14): each call's snapshot IS the
+                // plan; an empty list clears the block.
+                self.plan = todos;
+            }
+            AgentEvent::Summarized { .. } => {
+                // The worker rewrote the conversation's oldest half
+                // into a summary marker (us-22): the status entry
+                // makes the rewrite visible — never silent. The
+                // transcript fold already recorded the `summary`
+                // item; the task keeps running.
+                self.entries
+                    .push(Entry::Status("conversation summarized".to_string()));
+            }
             AgentEvent::Done => {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries.push(Entry::Status("done".to_string()));
+                self.entries.push(Entry::Status(STATUS_DONE.to_string()));
             }
             AgentEvent::Cancelled => {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries.push(Entry::Status("cancelled".to_string()));
+                self.entries
+                    .push(Entry::Status(STATUS_CANCELLED.to_string()));
             }
             AgentEvent::BudgetReached => {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries
-                    .push(Entry::Status("step budget reached".to_string()));
+                self.entries.push(Entry::Status(STATUS_BUDGET.to_string()));
             }
             AgentEvent::Error(message) => {
                 self.running = false;
@@ -672,12 +736,131 @@ impl AgentPanel {
         (x.min(area.right().saturating_sub(1)), area.bottom() - 1)
     }
 
+    /// Swap the panel to a stored conversation (Spec R08-T6, us-6):
+    /// the scrollback rebuilds from the loaded transcript items, the
+    /// pinned block restores the conversation's latest plan, and the
+    /// transcript mirror adopts the items already-flushed — they ARE
+    /// the store's rows, so nothing re-appends on the next drain and
+    /// the next task's `prior` IS this transcript. The split opens
+    /// focused: picking a conversation means picking it up. The
+    /// conversation this replaces is already on disk — the swap
+    /// loses nothing (us-12).
+    pub(crate) fn restore(&mut self, items: Vec<TranscriptItem>, plan: Option<Vec<PlanTodo>>) {
+        self.entries = entries_from(&items);
+        self.transcript = Transcript::restored(items);
+        self.plan = plan.unwrap_or_default();
+        self.pending = None;
+        self.pending_ask = None;
+        self.running = false;
+        self.pinned = true;
+        self.top.set(0);
+        self.open = true;
+        self.focused = true;
+        self.revision += 1;
+    }
+
     /// Push one entry and bump the revision — the single write point
     /// the scrollback has.
     fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
         self.revision += 1;
     }
+}
+
+// `ait_agent::INTERRUPTED_RESULT` is the rebuilt card's `detail`
+// for an `interrupted` close (Spec R08 us-9): a call that never got
+// its result is a run that died mid-call — replay closes it with a
+// synthetic "interrupted" result, so its card closes the same way
+// rather than waiting forever. `ait_agent::result_preview` clips a
+// stored `tool_result`'s full text the same way the live
+// `ToolUpdate` did (the worker's own preview fn).
+
+/// `transcript_items` → panel `Entry`s — resume's scrollback
+/// rebuild (Spec R08-T6): the inverse of [`Transcript::apply`]'s
+/// fold. Item kinds map onto their entry shapes:
+///
+/// - `task`/`steering`/`assistant_text`/`status` → their direct
+///   entries;
+/// - `tool_call`/`tool_result` → a [`ToolCard`] opened `Running`
+///   then transitioned by its result's status (the `AwaitingApproval`
+///   distinction is frontend state the transcript never kept — a
+///   call parked at exit reads interrupted, not awaiting);
+/// - `ask`/`answer` → an [`AskCard`] plus its recorded answer — the
+///   stored `ask` carries no call id (the card IS the record), so
+///   the synthetic `ask_replay_N` id mirrors replay's convention;
+/// - `summary` → the "conversation summarized" status line the
+///   live event pushes (T7's marker);
+/// - `plan` → no entry: the pinned block restores from the `plans`
+///   row, and the calls' tool cards already carry the audit trail
+///   (us-15).
+///
+/// A `tool_call` still `Running` at the end never got its result —
+/// the run died mid-call — so it closes `INTERRUPTED_RESULT`
+/// rather than rendering `…` forever.
+fn entries_from(items: &[TranscriptItem]) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut asks = 0usize;
+    for item in items {
+        match item {
+            TranscriptItem::Task { text } => entries.push(Entry::Task(text.clone())),
+            TranscriptItem::Steering { text } => entries.push(Entry::Steering(text.clone())),
+            TranscriptItem::AssistantText { text } => entries.push(Entry::Text(text.clone())),
+            TranscriptItem::ToolCall {
+                id, name, summary, ..
+            } => entries.push(Entry::Tool(ToolCard {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                status: CardStatus::Running,
+                detail: None,
+            })),
+            TranscriptItem::ToolResult { id, text, status } => {
+                // The newest card with the id wins — the same rule
+                // the live `ToolUpdate` applies.
+                if let Some(card) = entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Tool(card) if card.id == *id => Some(card),
+                    _ => None,
+                }) {
+                    card.status = card_status(*status);
+                    card.detail = Some(result_preview(text));
+                }
+            }
+            TranscriptItem::Ask { question, choices } => {
+                asks += 1;
+                entries.push(Entry::Ask(AskCard {
+                    id: ask_replay_id(asks),
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    selected: 0,
+                    answer: None,
+                }));
+            }
+            TranscriptItem::Answer { text } => {
+                // The answer IS its ask's result — the newest
+                // unresolved ask card takes it.
+                if let Some(card) = entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Ask(card) if card.answer.is_none() => Some(card),
+                    _ => None,
+                }) {
+                    card.answer = Some(text.clone());
+                }
+            }
+            TranscriptItem::Status { text } => entries.push(Entry::Status(text.clone())),
+            TranscriptItem::Summary { .. } => {
+                entries.push(Entry::Status("conversation summarized".to_string()));
+            }
+            TranscriptItem::Plan { .. } => {}
+        }
+    }
+    for entry in &mut entries {
+        if let Entry::Tool(card) = entry {
+            if card.status == CardStatus::Running {
+                card.status = CardStatus::Failed;
+                card.detail = Some(INTERRUPTED_RESULT.to_string());
+            }
+        }
+    }
+    entries
 }
 
 /// `ait_agent::ToolStatus` → [`CardStatus`] — the worker's
@@ -796,12 +979,24 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     if inner.height < 3 {
         return;
     }
+    // The pinned plan block (Spec R08-T5, us-14): directly under the
+    // title — each `update_plan` snapshot replaces its contents — and
+    // the conversation scrolls beneath. The cap keeps a long plan
+    // from crowding the scrollback out of the panel.
+    let available = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
+    let block = plan_lines(&panel.plan, PLAN_BLOCK_MAX.min(available.saturating_sub(1)));
+    let plan_rows = block.len() as u16;
+    for (index, (text, style)) in block.iter().enumerate() {
+        let y = inner.y + 1 + index as u16;
+        reset_span(buf, y, inner.x..inner.right());
+        buf.set_stringn(inner.x, y, text, width, *style);
+    }
     // The conversation between them, pinned to the tail unless the
     // user scrolled up — the paint pass owns the wrap, so it also
     // owns the scroll clamp: `top`/`painted` are what the wheel
     // handlers bound against.
     let conversation = display_lines(&panel.entries, width);
-    let height = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
+    let height = available - block.len();
     let max_top = conversation.len().saturating_sub(height);
     let top = if panel.pinned {
         max_top
@@ -810,7 +1005,7 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     };
     panel.painted.set((top, max_top));
     for row in 0..height {
-        let y = inner.y + 1 + row as u16;
+        let y = inner.y + 1 + plan_rows + row as u16;
         reset_span(buf, y, inner.x..inner.right());
         if let Some((text, style)) = conversation.get(top + row) {
             buf.set_stringn(inner.x, y, text, width, *style);
@@ -845,6 +1040,45 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
             }
         }
     }
+    lines
+}
+
+/// The pinned plan block's display rows (Spec R08-T5, us-14): a
+/// `plan` header, then one row per todo — `✓` done, `▸` in progress,
+/// `○` pending — and a trailing blank separating the block from the
+/// scrollback. More rows than `cap` folds the tail into a `… N more`
+/// note, so a long plan can never crowd the conversation out of the
+/// panel; below a useful minimum (header + one todo + separator) the
+/// rows are better spent on scrollback and the block sits out.
+fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<(String, Style)> {
+    if plan.is_empty() || cap < 3 {
+        return Vec::new();
+    }
+    let mut lines = vec![(
+        String::from(" plan"),
+        Style::default().fg(RtColor::DarkGray),
+    )];
+    // `cap - 2` todo rows at most — one for the header, one for the
+    // separator/overflow row.
+    let visible = (cap - 2).min(plan.len());
+    for todo in &plan[..visible] {
+        let (mark, style) = match todo.status {
+            PlanTodoStatus::Done => ("✓", Style::default().fg(RtColor::DarkGray)),
+            PlanTodoStatus::InProgress => ("▸", Style::default().add_modifier(Modifier::BOLD)),
+            PlanTodoStatus::Pending => ("○", Style::default()),
+        };
+        lines.push((format!("{mark} {}", todo.content), style));
+    }
+    if plan.len() > visible {
+        // The row this note replaces counted as hidden too.
+        let hidden = plan.len() - visible + 1;
+        lines.pop();
+        lines.push((
+            format!("    … {hidden} more"),
+            Style::default().fg(RtColor::DarkGray),
+        ));
+    }
+    lines.push((String::new(), Style::default()));
     lines
 }
 
@@ -1113,6 +1347,80 @@ mod tests {
         assert!(!panel.running);
     }
 
+    /// The persisted vocabulary (Spec R08-T3): sends and applied
+    /// events accumulate [`TranscriptItem`]s in order — a real submit
+    /// records the `task`, deltas coalesce, a gated call and its
+    /// verdict land as `tool_call` + `tool_result`, the terminal
+    /// event as `status` — and `take` yields the batch once.
+    #[test]
+    fn sends_and_events_accumulate_transcript_items() {
+        let mut panel = panel();
+        let mut toast = None;
+        panel.submit(
+            AgentRequest {
+                settings: ait_config::Settings::default(),
+                profile: "default".to_string(),
+                task: "fix it".to_string(),
+                context: AgentContext {
+                    cwd: "/tmp".into(),
+                    shell: "sh".into(),
+                    os: "test".into(),
+                    output_lines: Vec::new(),
+                },
+                prior: Vec::new(),
+                bridge: None,
+            },
+            &mut toast,
+        );
+        panel.apply(AgentEvent::TextDelta("on ".into()));
+        panel.apply(AgentEvent::TextDelta("it".into()));
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: ait_agent::ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                arguments: "{\"pattern\":\"x\"}".into(),
+            },
+            summary: "x".into(),
+        });
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Denied,
+            detail: Some("no".into()),
+            result: Some("no".into()),
+        });
+        panel.apply(AgentEvent::Cancelled);
+
+        assert_eq!(
+            panel.take_transcript_items(),
+            vec![
+                ait_agent::TranscriptItem::Task {
+                    text: "fix it".into(),
+                },
+                ait_agent::TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+                ait_agent::TranscriptItem::ToolCall {
+                    id: "call_1".into(),
+                    name: "glob".into(),
+                    args: "{\"pattern\":\"x\"}".into(),
+                    summary: "x".into(),
+                },
+                ait_agent::TranscriptItem::ToolResult {
+                    id: "call_1".into(),
+                    text: "no".into(),
+                    status: ait_agent::ToolStatus::Denied,
+                },
+                ait_agent::TranscriptItem::Status {
+                    text: "cancelled".into(),
+                },
+            ]
+        );
+        assert!(
+            panel.take_transcript_items().is_empty(),
+            "drained items don't repeat"
+        );
+    }
+
     /// A real submit round-trips the channel: the task lands in the
     /// conversation, `running` holds until the worker's terminal
     /// event (the unconfigured model's `Error`) releases it.
@@ -1131,6 +1439,7 @@ mod tests {
                     os: "test".into(),
                     output_lines: Vec::new(),
                 },
+                prior: Vec::new(),
                 bridge: None,
             },
             &mut toast,
@@ -1209,6 +1518,152 @@ mod tests {
         assert_eq!(panel.input(), "fix");
         assert_eq!(panel.take_input(), "fix");
         assert_eq!(panel.input(), "");
+    }
+
+    /// Spec R08-T6: resume's scrollback rebuild — every item kind
+    /// maps to its entry: the tool card transitions on its result,
+    /// the ask card carries its recorded answer, statuses and the
+    /// `summary` marker land as status lines, `plan` items stay out
+    /// (the pinned block owns them).
+    #[test]
+    fn entries_from_rebuilds_the_scrollback() {
+        let entries = entries_from(&[
+            TranscriptItem::Task {
+                text: "fix it".into(),
+            },
+            TranscriptItem::ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                args: "{}".into(),
+                summary: "\"*.rs\"".into(),
+            },
+            TranscriptItem::ToolResult {
+                id: "call_1".into(),
+                text: "a.rs\nb.rs".into(),
+                status: ait_agent::ToolStatus::Done,
+            },
+            TranscriptItem::Ask {
+                question: "Ship it?".into(),
+                choices: vec!["yes".into(), "no".into()],
+            },
+            TranscriptItem::Answer { text: "no".into() },
+            TranscriptItem::AssistantText {
+                text: "on it".into(),
+            },
+            TranscriptItem::Plan { todos: vec![] },
+            TranscriptItem::Summary {
+                text: "older half".into(),
+                covers_seq: 3,
+            },
+            TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ]);
+
+        assert_eq!(
+            entries,
+            vec![
+                Entry::Task("fix it".into()),
+                Entry::Tool(ToolCard {
+                    id: "call_1".into(),
+                    name: "glob".into(),
+                    summary: "\"*.rs\"".into(),
+                    status: CardStatus::Done,
+                    detail: Some("a.rs …".into()),
+                }),
+                Entry::Ask(AskCard {
+                    id: "ask_replay_1".into(),
+                    question: "Ship it?".into(),
+                    choices: vec!["yes".into(), "no".into()],
+                    selected: 0,
+                    answer: Some("no".into()),
+                }),
+                Entry::Text("on it".into()),
+                Entry::Status("conversation summarized".into()),
+                Entry::Status("done".into()),
+            ],
+            "no entry for the plan item — the pinned block owns it"
+        );
+    }
+
+    /// us-9: a call whose run died before its result closes as
+    /// interrupted — never an eternal `…` spinner or a live-looking
+    /// awaiting card.
+    #[test]
+    fn an_unanswered_call_closes_interrupted() {
+        let entries = entries_from(&[
+            TranscriptItem::ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                args: "{}".into(),
+                summary: "\"ls\"".into(),
+            },
+            TranscriptItem::Status {
+                text: "cancelled".into(),
+            },
+        ]);
+        assert_eq!(
+            entries[0],
+            Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                summary: "\"ls\"".into(),
+                status: CardStatus::Failed,
+                detail: Some(INTERRUPTED_RESULT.to_string()),
+            })
+        );
+    }
+
+    /// Spec R08-T6/us-6: `restore` swaps the panel to the loaded
+    /// conversation — entries rebuilt, plan pinned, transcript
+    /// adopted already-flushed (nothing re-appends on the next
+    /// drain; the next `prior` IS the restored transcript) — and
+    /// the split opens focused.
+    #[test]
+    fn restore_swaps_the_panel_to_the_loaded_conversation() {
+        let mut panel = panel();
+        panel.entries.push(Entry::Task("old work".into()));
+        panel.plan = vec![PlanTodo {
+            content: "old".into(),
+            status: PlanTodoStatus::Pending,
+        }];
+        panel.open = false;
+        panel.focused = false;
+
+        let plan = vec![PlanTodo {
+            content: "verify".into(),
+            status: PlanTodoStatus::Pending,
+        }];
+        panel.restore(
+            vec![
+                TranscriptItem::Task {
+                    text: "fix the tests".into(),
+                },
+                TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+            ],
+            Some(plan.clone()),
+        );
+
+        assert_eq!(
+            panel.entries(),
+            &[
+                Entry::Task("fix the tests".into()),
+                Entry::Text("on it".into()),
+            ]
+        );
+        assert_eq!(panel.plan(), plan.as_slice(), "the pinned block restores");
+        assert!(panel.is_open() && panel.is_focused());
+        assert!(
+            panel.take_transcript_items().is_empty(),
+            "the restored items are already persisted — nothing re-appends"
+        );
+        assert_eq!(
+            panel.transcript_items().len(),
+            2,
+            "the next task's prior IS the restored transcript"
+        );
     }
 
     /// `wrap` honors embedded newlines and hard-wraps long runs —
@@ -1355,6 +1810,7 @@ mod tests {
             call_id: "call_1".into(),
             status: ait_agent::ToolStatus::Done,
             detail: Some("a.rs".into()),
+            result: Some("a.rs".into()),
         });
         assert_eq!(
             panel.entries().last(),
@@ -1377,6 +1833,7 @@ mod tests {
             call_id: "call_2".into(),
             status: ait_agent::ToolStatus::Denied,
             detail: Some("not now".into()),
+            result: Some("not now".into()),
         });
         assert!(!panel.awaiting_verdict());
         assert!(matches!(
@@ -1415,6 +1872,144 @@ mod tests {
             question: question.into(),
             choices: choices.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    /// Spec R08 us-13–15: a `PlanUpdated` pins the TODO block under
+    /// the title — one styled row per todo — the call's ordinary
+    /// card still sits in the scrollback, and the NEXT snapshot
+    /// replaces the block's contents in place (never appends).
+    #[test]
+    fn plan_updates_pin_a_block_that_replaces_in_place() {
+        use ait_agent::{PlanTodo, PlanTodoStatus};
+        let todos = |items: &[(&str, PlanTodoStatus)]| {
+            items
+                .iter()
+                .map(|(content, status)| PlanTodo {
+                    content: (*content).into(),
+                    status: *status,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut panel = panel();
+        panel.apply(AgentEvent::ToolCall {
+            call: call("call_1", "update_plan"),
+            summary: "3 todos".into(),
+        });
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: todos(&[
+                ("reproduce", PlanTodoStatus::Done),
+                ("fix", PlanTodoStatus::InProgress),
+                ("verify", PlanTodoStatus::Pending),
+            ]),
+        });
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Done,
+            detail: Some("plan updated — 3 todos".into()),
+            result: Some("plan updated — 3 todos".into()),
+        });
+
+        // The call's ordinary card landed in the scrollback like
+        // every other tool call.
+        assert_eq!(
+            panel.entries(),
+            &[Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "update_plan".into(),
+                summary: "3 todos".into(),
+                status: CardStatus::Done,
+                detail: Some("plan updated — 3 todos".into()),
+            })]
+        );
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 12));
+        let area = Rect::new(0, 0, 30, 12);
+        paint_agent_panel(&mut buf, area, &panel);
+        // Column 0 is the `│` separator — content starts at 1.
+        fn row(buf: &Buffer, y: u16) -> String {
+            (1..30).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        }
+        // Row 0 is the title; the pinned block owns the next rows.
+        assert_eq!(row(&buf, 1).trim_end(), " plan");
+        assert_eq!(row(&buf, 2).trim_end(), "✓ reproduce");
+        assert_eq!(row(&buf, 3).trim_end(), "▸ fix");
+        assert_eq!(row(&buf, 4).trim_end(), "○ verify");
+        // …and the scrollback conversation begins beneath it.
+        assert_eq!(row(&buf, 5).trim_end(), "");
+        assert_eq!(row(&buf, 6).trim_end(), "✓ update_plan 3 todos");
+
+        // A second call replaces the block's contents — nothing of
+        // the first list survives.
+        panel.apply(AgentEvent::ToolCall {
+            call: call("call_2", "update_plan"),
+            summary: "1 todo".into(),
+        });
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: todos(&[("ship it", PlanTodoStatus::InProgress)]),
+        });
+        paint_agent_panel(&mut buf, area, &panel);
+        assert_eq!(row(&buf, 2).trim_end(), "▸ ship it");
+        assert_eq!(row(&buf, 3).trim_end(), "", "the old rows cleared");
+        assert!(panel.plan().iter().all(|todo| todo.content != "verify"));
+    }
+
+    /// An empty snapshot clears the block — the newest plan IS
+    /// "no plan".
+    #[test]
+    fn an_empty_plan_snapshot_clears_the_block() {
+        let mut panel = panel();
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: vec![ait_agent::PlanTodo {
+                content: "step".into(),
+                status: ait_agent::PlanTodoStatus::Pending,
+            }],
+        });
+        assert_eq!(panel.plan().len(), 1);
+        panel.apply(AgentEvent::PlanUpdated { todos: vec![] });
+        assert!(panel.plan().is_empty());
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 8));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 20, 8), &panel);
+        let row: String = (1..20).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(row.trim_end(), "", "no block under the title");
+    }
+
+    /// Spec R08 us-22: a `Summarized` event folds into a `summary`
+    /// transcript item AND leaves a visible status entry — the
+    /// rewrite is never silent — while the task keeps running.
+    #[test]
+    fn a_summarized_event_shows_a_status_entry_and_records_the_marker() {
+        let mut panel = panel();
+        panel.running = true; // staged — a submit would set it
+        panel.apply(AgentEvent::TextDelta("on it".into()));
+        panel.apply(AgentEvent::Summarized {
+            covers_seq: 4,
+            text: "the old half".into(),
+        });
+
+        assert!(
+            matches!(
+                panel.entries().last(),
+                Some(Entry::Status(text)) if text == "conversation summarized"
+            ),
+            "{:?}",
+            panel.entries()
+        );
+        assert_eq!(
+            panel.transcript_items().last(),
+            Some(&ait_agent::TranscriptItem::Summary {
+                text: "the old half".into(),
+                covers_seq: 4,
+            })
+        );
+        // Non-terminal: the task still runs until Done.
+        assert!(panel.running);
+        panel.apply(AgentEvent::Done);
+        assert!(matches!(
+            panel.entries().last(),
+            Some(Entry::Status(text)) if text == "done"
+        ));
     }
 
     /// An `AskRequest` opens its own card — question and choices in
@@ -1584,6 +2179,7 @@ mod tests {
             call_id: "call_1".into(),
             status: ait_agent::ToolStatus::Done,
             detail: Some("note.txt: contents".into()),
+            result: Some("note.txt: contents".into()),
         });
         let mut buf = Buffer::empty(Rect::new(0, 0, 60, 7));
         paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 7), &panel);

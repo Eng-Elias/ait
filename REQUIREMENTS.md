@@ -58,7 +58,7 @@ cloud dependency, no vendor lock-in.
 | HTTP / streaming | `reqwest` + `eventsource-stream` (SSE) | Streaming for every provider schema |
 | Config | `toml` + `serde` + `schemars` | `settings.toml` + emitted JSON Schema |
 | Secrets | env vars + `keyring` crate | Never in `settings.toml` |
-| Storage | **Proposed:** `rusqlite` | Conversations, blocks, plans (Round 8) |
+| Storage | `rusqlite` (`bundled`) | Conversations, blocks, plans (Round 8, ADR-0011) |
 | MCP | `rmcp` | Round 10 |
 | Search (later) | `tantivy` | Optional, post-v1 |
 | Errors / logs | `thiserror` in libs, `anyhow` in binaries, `tracing` | Logs to file, never to the TUI |
@@ -104,9 +104,10 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 | `ait-shell` | Shell-integration scripts (bash/zsh/fish) and the hook/exec protocol |
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction |
 | `ait` | TUI binary (frontend only — no business logic) |
+| `ait-store` | SQLite store: conversations, transcript items, plans, terminal sessions, block metadata |
 
-The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-store`,
-`ait-ssh`).
+The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-ssh`);
+`ait-store` landed in Round 8 (ADR-0011).
 
 ---
 

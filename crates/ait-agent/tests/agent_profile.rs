@@ -98,6 +98,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
             os: String::from("linux"),
             output_lines: Vec::new(),
         },
+        prior: Vec::new(),
         bridge: None,
     }
 }
@@ -473,6 +474,7 @@ fn never_denies_the_call_and_the_denial_reaches_the_model() {
                 call_id,
                 status: ToolStatus::Denied,
                 detail: Some(detail),
+                ..
             } if call_id == "call_1" && detail == "denied by execution profile default"
         )),
         "{events:?}"
@@ -542,6 +544,7 @@ fn never_on_ask_user_question_returns_the_profile_denial() {
                 call_id,
                 status: ToolStatus::Denied,
                 detail: Some(detail),
+                ..
             } if call_id == "call_1" && detail == "denied by execution profile default"
         )),
         "{events:?}"
@@ -1006,6 +1009,7 @@ fn write_to_pty_first_write_asks_then_the_session_runs_free() {
                 call_id,
                 status: ToolStatus::Done,
                 detail: Some(_),
+                ..
             } if call_id == "call_2"
         )),
         "{events:?}"
@@ -1067,6 +1071,7 @@ fn a_denied_first_write_asks_again_on_the_next_call() {
                 call_id,
                 status: ToolStatus::Denied,
                 detail,
+                ..
             } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(detail.as_deref(), Some("not that"));
@@ -1249,6 +1254,7 @@ fn the_deny_floor_still_refuses_alongside_a_first_write_ask() {
             call_id,
             status: ToolStatus::Denied,
             detail: Some(detail),
+            ..
         } => {
             assert_eq!(call_id, "call_1");
             assert_eq!(detail, "denied by execution profile default");
@@ -1407,6 +1413,7 @@ fn a_denylisted_command_denies_even_at_always_allow() {
                 call_id,
                 status: ToolStatus::Denied,
                 detail: Some(detail),
+                ..
             } if call_id == "call_1" && detail == "denied by execution profile default"
         )),
         "{events:?}"
@@ -1536,6 +1543,7 @@ fn the_denylist_beats_the_allow_for_task_memory() {
                 call_id,
                 status: ToolStatus::Denied,
                 detail: Some(detail),
+                ..
             } if call_id == "call_2" && detail == "denied by execution profile default"
         )),
         "{events:?}"
@@ -1666,6 +1674,7 @@ fn directory_allowlist_widens_confinement_without_weakening_the_gate() {
                 call_id,
                 status: ToolStatus::Failed,
                 detail: Some(detail),
+                ..
             } if call_id == "call_3" && detail.contains("outside the working directory")
         )),
         "call_3's card reads the confinement error: {events:?}"
@@ -1749,6 +1758,7 @@ execute_commands = "never"
                 call_id,
                 status: ToolStatus::Denied,
                 detail: Some(detail),
+                ..
             } if call_id == "call_1" && detail == "denied by execution profile work"
         )),
         "{events:?}"

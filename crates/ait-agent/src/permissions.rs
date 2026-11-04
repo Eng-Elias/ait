@@ -19,6 +19,9 @@
 //! a deny answers that call only. The `directory_allowlist` (T4)
 //! widens confinement at the `ToolCwd` seam, not here — an
 //! allowlist expands what file tools may touch, never a verdict;
+//! Round 8's `update_plan` is gate-exempt by design (its effect IS
+//! its card — §5.7 gains no field for it, so every stance allows
+//! it outright);
 //! `mcp_*` fields and
 //! `context_window_limit` stay inert (Rounds 10/8).
 
@@ -28,7 +31,7 @@ use ait_config::{ExecutionProfile, PermissionLevel};
 use regex::Regex;
 
 use crate::tool_call::ToolCall;
-use crate::tools::ASK_USER_QUESTION;
+use crate::tools::{ASK_USER_QUESTION, UPDATE_PLAN};
 
 /// What the gate does with one tool call — the vocabulary the
 /// interim gate's `needs_verdict` boolean could not express.
@@ -66,7 +69,9 @@ pub(crate) enum Verdict {
 ///
 /// Decision order: `never` denies first — the hard floor no list,
 /// verdict memory or flag crosses; `ask_user_question` at a
-/// non-`never` level allows through to its own card; for `run_command`
+/// non-`never` level allows through to its own card, and
+/// `update_plan` allows outright — §5.7 declares no field for it
+/// (Spec R08 us-16); for `run_command`
 /// the profile's `command_denylist` then `command_allowlist` consult
 /// the verbatim `command` argument (unanchored `regex::is_match`)
 /// — a denylist hit refuses with the same profile-denial text
@@ -92,6 +97,15 @@ pub(crate) fn evaluate(
     // `ask_user_question` is never gated and never executed — any
     // non-`never` level sends it to the ask card (us-10).
     if call.name == ASK_USER_QUESTION {
+        return Verdict::Allow;
+    }
+    // `update_plan` is exempt the same way (Spec R08 us-16): the
+    // call's effect IS its card — the snapshot the panel pins — so
+    // §5.7 gains no profile field for it. With nothing to gate on,
+    // every stance allows outright; `level_for` maps it to `None`,
+    // which is also what keeps `is_agent_decided` (and its `safety`
+    // argument) off it.
+    if call.name == UPDATE_PLAN {
         return Verdict::Allow;
     }
     // `run_command` alone consults the command lists (Spec R07, T3)
@@ -324,6 +338,50 @@ mod tests {
         assert_eq!(
             evaluate(Some(&profile), "default", &call(ASK_USER_QUESTION), &empty),
             Verdict::Deny(String::from("denied by execution profile default"))
+        );
+    }
+
+    /// `update_plan` is gate-exempt like `ask_user_question` (Spec
+    /// R08 us-16): §5.7 gains no profile field for it — the call's
+    /// effect IS its card — so every profile allows it, including
+    /// `never` on every mapped field, an all-`agent_decides` stance,
+    /// and the missing-profile fail-safe that asks everything else.
+    #[test]
+    fn update_plan_allows_under_every_profile() {
+        let empty = HashSet::new();
+        let locked = ExecutionProfile {
+            read_files: Some(PermissionLevel::Never),
+            write_to_pty: Some(PermissionLevel::Never),
+            execute_commands: Some(PermissionLevel::Never),
+            apply_code_diffs: Some(PermissionLevel::Never),
+            ask_user_question: Some(PermissionLevel::Never),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(Some(&locked), "locked", &call("update_plan"), &empty),
+            Verdict::Allow,
+            "no field maps to it, so `never` cannot reach it"
+        );
+        let decided = ExecutionProfile {
+            read_files: Some(PermissionLevel::AgentDecides),
+            write_to_pty: Some(PermissionLevel::AgentDecides),
+            execute_commands: Some(PermissionLevel::AgentDecides),
+            apply_code_diffs: Some(PermissionLevel::AgentDecides),
+            ask_user_question: Some(PermissionLevel::AgentDecides),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(Some(&decided), "default", &call("update_plan"), &empty),
+            Verdict::Allow
+        );
+        assert!(
+            !is_agent_decided(Some(&decided), "update_plan"),
+            "the safety flag can never be required of it"
+        );
+        assert_eq!(
+            evaluate(None, "default", &call("update_plan"), &empty),
+            Verdict::Allow,
+            "even the missing-profile fail-safe spares it"
         );
     }
 

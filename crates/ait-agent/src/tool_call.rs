@@ -33,8 +33,10 @@ pub struct ToolCall {
 /// A tool card's status transition, emitted as
 /// [`AgentEvent::ToolUpdate`](crate::AgentEvent::ToolUpdate) (Spec R06
 /// us-5). `AwaitingApproval` is not listed: the approve card is its
-/// own event — a call either asks first or starts `Running`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// own event — a call either asks first or starts `Running`. Serde
+/// puts it inside persisted `tool_result` payloads (Spec R08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     /// Approved (or gate-exempt) and executing.
     Running,

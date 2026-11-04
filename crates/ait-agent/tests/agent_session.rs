@@ -88,6 +88,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
                 String::from("test result: FAILED"),
             ],
         },
+        prior: Vec::new(),
         bridge: None,
     }
 }

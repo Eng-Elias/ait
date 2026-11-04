@@ -28,7 +28,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use ait_agent::{AgentRequest, ApprovalVerdict};
 use ait_config::Settings;
@@ -39,7 +39,9 @@ use ait_term::{
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::agent_panel::{context_for, edit_input, AgentPanel};
-use crate::blocks::{row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus};
+use crate::blocks::{
+    row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus, PersistedBlock,
+};
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::render::session_size;
@@ -47,6 +49,7 @@ use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
 use crate::shell_bridge::{self, BridgeRequest, BridgeService};
 use crate::status::Toast;
+use crate::store::StoreHandle;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
@@ -87,6 +90,11 @@ pub struct PromptMark {
     /// When the drain recorded the mark — block duration is
     /// `D.at − C.at` (falling back to `B.at` when `C` never arrives).
     pub at: Instant,
+    /// The wall clock captured beside `at` (Spec R08): `Instant` can
+    /// never convert to `SystemTime`, so the persisted `blocks` row's
+    /// `started_at`/`ended_at` bounds come from the marks' paired
+    /// wall times, anchored at seal.
+    pub wall: SystemTime,
 }
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
@@ -187,6 +195,18 @@ pub struct Tab {
     /// shell or a materialize failure.
     #[allow(dead_code)] // held for its Drop alone
     materialized: Option<ait_shell::Materialized>,
+    /// The `terminal_sessions` row `app` opened for this tab at spawn
+    /// (Spec R08) — `blocks` rows and the `ended_at` stamp key on it.
+    /// `None` while the store is off or its insert failed: the sealed-
+    /// block queue still drains so an unpersisted tab never grows it.
+    store_session: Option<i64>,
+    /// The `conversations` row this tab's transcript appends to
+    /// (Spec R08-T3) — created by the first transcript flush, which
+    /// is the first task: every later task in the same tab appends to
+    /// the SAME row. `None` while the store is off or no task ran —
+    /// the transcript queue still drains so an unpersisted tab never
+    /// grows it.
+    conversation: Option<i64>,
     /// This tab's agent conversation panel (Spec R06 / issue #85):
     /// `None` until the first `Alt+A` creates it — lazily, so a tab
     /// that never opens the panel never pays for the worker thread.
@@ -513,6 +533,75 @@ impl Tab {
         self.finish_selection()
     }
 
+    /// This tab's `terminal_sessions` row id, if `app` opened one at
+    /// spawn (Spec R08) — what `blocks` rows and the `ended_at` stamp
+    /// key on.
+    pub fn store_session(&self) -> Option<i64> {
+        self.store_session
+    }
+
+    /// Bind the `terminal_sessions` row `app` opened for this tab's
+    /// session — called once, right after the spawn insert lands.
+    pub(crate) fn set_store_session(&mut self, id: i64) {
+        self.store_session = Some(id);
+    }
+
+    /// This tab's `conversations` row id, if a transcript flush has
+    /// created one (Spec R08-T3) — what `transcript_items` rows and
+    /// `plans` upserts key on, and what `status` closes on.
+    pub fn conversation(&self) -> Option<i64> {
+        self.conversation
+    }
+
+    /// Bind the `conversations` row the first transcript flush
+    /// created — the same row every later task in this tab appends to.
+    pub(crate) fn set_conversation(&mut self, id: i64) {
+        self.conversation = Some(id);
+    }
+
+    /// Resume a stored conversation into this tab's panel (Spec
+    /// R08-T6, us-6): the panel swaps to the loaded transcript —
+    /// scrollback and pinned plan rebuilt, the mirror adopted
+    /// already-flushed so the next task's `prior` IS this
+    /// conversation — and `conversation` binds the row so every
+    /// later flush appends to IT. The panel (and its shell bridge)
+    /// is created like `Alt+A`'s first toggle when the tab never
+    /// had one. Callers refuse while a task runs — a live run is
+    /// never clobbered (us-10).
+    pub(crate) fn resume_conversation(
+        &mut self,
+        id: i64,
+        items: Vec<ait_agent::TranscriptItem>,
+        plan: Option<Vec<ait_agent::PlanTodo>>,
+    ) {
+        if self.bridge.is_none() {
+            self.bridge = Some(shell_bridge::pair().1);
+        }
+        let panel = self.agent.get_or_insert_with(AgentPanel::new);
+        panel.restore(items, plan);
+        self.conversation = Some(id);
+    }
+
+    /// The blocks sealed since the last call, as `blocks`-row-shaped
+    /// [`PersistedBlock`]s — the store's batched insert (Spec R08).
+    /// Each sealed entry resolves its command against the live grid
+    /// right here (the `preexec` hook's text, else the `B→C` echo
+    /// slice); the queue drains regardless of whether a store row
+    /// exists, so an unpersisted tab's queue can't grow.
+    pub(crate) fn take_persisted_blocks(&mut self) -> Vec<PersistedBlock> {
+        let sealed = self.blocks.take_sealed();
+        if sealed.is_empty() {
+            return Vec::new();
+        }
+        let grid = self.grid();
+        let extent = self.scrollback() + grid.lines();
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        sealed
+            .iter()
+            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent, cwd.clone()))
+            .collect()
+    }
+
     /// The last finished block's exit code and duration — the status
     /// line's `✓/✗ <code> · <dur>` segment (Spec R05 us-15). `None`
     /// when no block has reported an `OSC 133;D` exit code yet.
@@ -749,10 +838,22 @@ impl Tab {
         task: String,
         toast: &mut Option<Toast>,
     ) {
+        // The conversation is the continuity unit (Spec R08-T4): the
+        // panel's accumulated transcript rides `prior` so the worker
+        // replays it before this task lands — task two continues
+        // where task one left off. The panel scrollback is unchanged;
+        // the send records the task item itself after submission, so
+        // `prior` never double-carries it.
+        let prior = self
+            .agent
+            .as_ref()
+            .map(|panel| panel.transcript_items().to_vec())
+            .unwrap_or_default();
         let request = AgentRequest {
             settings: settings.clone(),
             profile: profile.to_owned(),
             task,
+            prior,
             context: context_for(self),
             bridge: self
                 .bridge
@@ -1063,6 +1164,8 @@ impl TabManager {
             scrollback_cap,
             inband: InBandExec::new(),
             materialized,
+            store_session: None,
+            conversation: None,
             agent: None,
             bridge: None,
         });
@@ -1250,6 +1353,7 @@ impl TabManager {
                             line: scrollback + cursor.line,
                             column: cursor.column,
                             at: Instant::now(),
+                            wall: SystemTime::now(),
                         };
                         // Fingerprint the open block's echo span —
                         // final once the command runs — so `resolve`
@@ -1337,6 +1441,35 @@ impl TabManager {
         events
     }
 
+    /// Every `(terminal_sessions id, persisted block)` pair sealed
+    /// since the last call — the store's per-drain batch insert
+    /// (Spec R08). Tabs without a session row (store off or the spawn
+    /// insert failed) still drain their sealed queue — it can't grow
+    /// behind an unpersisted run.
+    pub fn take_persisted_blocks(&mut self) -> Vec<(i64, PersistedBlock)> {
+        let mut rows = Vec::new();
+        for tab in &mut self.tabs {
+            let persisted = tab.take_persisted_blocks();
+            if let Some(session) = tab.store_session {
+                rows.extend(persisted.into_iter().map(|block| (session, block)));
+            }
+        }
+        rows
+    }
+
+    /// Detach `id` from every tab bound to it (Spec R08-T6, us-11):
+    /// the row was deleted — a later task must open a NEW row
+    /// rather than append to a deleted one. The panel's scrollback
+    /// and in-memory transcript stay: what the user sees is theirs
+    /// to keep reading; only the row binding clears.
+    pub fn detach_conversation(&mut self, id: i64) {
+        for tab in &mut self.tabs {
+            if tab.conversation == Some(id) {
+                tab.conversation = None;
+            }
+        }
+    }
+
     /// Drain every tab's agent session once (Spec R06): `AgentEvent`s
     /// land in each tab's conversation on the same tick the PTY
     /// sessions drain — a background tab's task keeps streaming too.
@@ -1345,6 +1478,63 @@ impl TabManager {
         for tab in &mut self.tabs {
             if let Some(panel) = tab.agent.as_mut() {
                 panel.drain();
+            }
+        }
+    }
+
+    /// Flush every tab's accumulated transcript items into the store
+    /// (Spec R08-T3, user story 28): the first flush creates the
+    /// tab's `conversations` row — titled from its first task — and
+    /// every later flush appends to the SAME row, so task two in a
+    /// tab continues task one's transcript. Each append is the
+    /// store's own transaction; every write goes through the degrade
+    /// rule, so a disabled store just drops the items — the panel's
+    /// in-memory transcript keeps them regardless (T4's `prior`).
+    pub fn drain_transcripts(&mut self, store: &mut StoreHandle, toast: &mut Option<Toast>) {
+        for tab in &mut self.tabs {
+            let items = match tab.agent.as_mut() {
+                Some(panel) => panel.take_transcript_items(),
+                None => continue,
+            };
+            if items.is_empty() {
+                continue;
+            }
+            let conversation = match tab.conversation {
+                Some(id) => Some(id),
+                None => {
+                    // The title reads the batch's first task, falling
+                    // back through the panel's whole transcript — a
+                    // post-detach batch can start mid-conversation,
+                    // and the detached row's first task still names
+                    // the same conversation (Spec R08 us-5).
+                    let history = tab
+                        .agent
+                        .as_ref()
+                        .map(|panel| panel.transcript_items())
+                        .unwrap_or(&[]);
+                    let id = store.conversation_started(
+                        toast,
+                        &crate::transcript::conversation_title(&items, history),
+                        &tab.cwd,
+                    );
+                    if let Some(id) = id {
+                        tab.set_conversation(id);
+                    }
+                    id
+                }
+            };
+            if let Some(id) = conversation {
+                store.append_transcript(toast, id, &items);
+                // `plan` items also upsert the conversation's
+                // `plans` row (Spec R08-T5, us-17): the transcript
+                // keeps every snapshot for the audit trail while the
+                // row keeps only the newest — the last upsert in the
+                // batch wins, matching the event order.
+                for item in &items {
+                    if let ait_agent::TranscriptItem::Plan { .. } = item {
+                        store.plan_upsert(toast, id, item);
+                    }
+                }
             }
         }
     }
@@ -1674,6 +1864,318 @@ mod tests {
         for mark in marks {
             assert!(mark.line < total, "mark line out of grid: {mark:?}");
         }
+    }
+
+    /// Spec R08: each sealed block surfaces once through
+    /// `take_persisted_blocks` as a `(terminal_sessions id, row)` pair
+    /// — the store's per-drain batch — and never repeats. The scripted
+    /// `/bin/sh` emits two full `A B C D` quadruples with no `preexec`
+    /// hook, so the persisted command is the `B→C` echo slice.
+    #[test]
+    fn sealed_blocks_surface_once_as_persisted_rows() {
+        let mut manager = manager(1, "/tmp");
+        // `sleep` splits the burst so each mark's `line`/`column`
+        // records against its own chunk — mid-burst marks record the
+        // post-chunk cursor (the `block_manager` fixture's trick).
+        manager
+            .spawn_tab(sh_script(
+                "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                 printf 'first'; sleep 0.2; \
+                 printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                 printf 'out1\\n'; sleep 0.2; \
+                 printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+                 printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                 printf 'second'; sleep 0.2; \
+                 printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                 printf 'out2\\n'; sleep 0.2; \
+                 printf '\\033]133;D;7\\007'; sleep 0.5",
+            ))
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1]
+                .blocks()
+                .iter()
+                .filter(|b| b.completed())
+                .count()
+                == 2
+        });
+        // `app` binds the session row right after the spawn insert.
+        manager.active_mut().unwrap().set_store_session(7);
+
+        let rows = manager.take_persisted_blocks();
+        assert_eq!(rows.len(), 2);
+        let (id, first) = &rows[0];
+        assert_eq!(*id, 7, "the row keys on the session's store id");
+        assert_eq!(first.command.as_deref(), Some("first"));
+        assert_eq!(first.cwd, manager.tabs()[1].cwd.to_string_lossy());
+        assert_eq!(first.exit, Some(0));
+        assert!(first.duration.is_some());
+        assert!(first.started_at.is_some());
+        assert!(first.ended_at.is_some());
+        assert!(first.started_at <= first.ended_at);
+        let (_, second) = &rows[1];
+        assert_eq!(second.command.as_deref(), Some("second"));
+        assert_eq!(second.exit, Some(7));
+        // Sealed entries drain once — a second take finds nothing.
+        assert!(manager.take_persisted_blocks().is_empty());
+    }
+
+    /// Spec R08's unpersisted-tab contract: a tab with no
+    /// `terminal_sessions` row yields no pairs — but its sealed queue
+    /// still drains, so the queue can't grow behind a disabled store.
+    #[test]
+    fn unpersisted_tabs_drain_sealed_without_rows() {
+        let mut manager = manager(1, "/tmp");
+        manager
+            .spawn_tab(sh_script(
+                "printf '\\033]133;A\\007$ \\033]133;B\\007cmd\\n'; \
+                 printf '\\033]133;C\\007out\\n'; \
+                 printf '\\033]133;D;0\\007'",
+            ))
+            .unwrap();
+        // The `D` mark seals the block — waiting on marks (not
+        // resolved blocks) keeps the burst timing out of it.
+        drain_until(&mut manager, |m| m.tabs()[1].prompt_marks().count() >= 4);
+
+        // No `set_store_session` — the manager yields no rows…
+        assert!(manager.take_persisted_blocks().is_empty());
+        // …and the seal is GONE, not deferred: binding a session row
+        // afterwards can't resurrect it.
+        manager.active_mut().unwrap().set_store_session(9);
+        assert!(manager.take_persisted_blocks().is_empty());
+    }
+
+    /// A minimal `AgentRequest` for the transcript tests — the send
+    /// succeeds (the channel is real); the unconfigured model's
+    /// `Error` just sits in the event queue, undrained.
+    fn agent_request(task: &str) -> ait_agent::AgentRequest {
+        ait_agent::AgentRequest {
+            settings: ait_config::Settings::default(),
+            profile: "default".to_string(),
+            task: task.to_string(),
+            context: ait_agent::AgentContext {
+                cwd: "/tmp".into(),
+                shell: "sh".into(),
+                os: "test".into(),
+                output_lines: Vec::new(),
+            },
+            prior: Vec::new(),
+            bridge: None,
+        }
+    }
+
+    /// Spec R08-T3: the first transcript flush creates the tab's
+    /// `conversations` row titled from its first task; every later
+    /// flush — a second task in the same tab — appends to the SAME
+    /// row, seqs continuing contiguously (us-4's in-tab continuity
+    /// unit persisted).
+    #[test]
+    fn drain_transcripts_creates_one_row_and_appends_the_next_task() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let mut handle = StoreHandle::from_store(ait_store::Store::open(&db).unwrap());
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fix the tests"), &mut toast);
+        panel.apply(ait_agent::AgentEvent::TextDelta("on it".into()));
+        panel.apply(ait_agent::AgentEvent::Done);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        // A second connection reads what the handle committed —
+        // the same WAL-sharing rule the e2e relies on.
+        let store = ait_store::Store::open(&db).unwrap();
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 1, "the first task created the row");
+        assert_eq!(rows[0].title, "fix the tests", "titled from the task");
+        let items = store.load_transcript(rows[0].id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "assistant_text", "status"],
+            "send-side then drained items, in order"
+        );
+
+        // Task two in the same tab appends to the SAME row.
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("and the lint"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 1, "no second conversation row");
+        let items = store.load_transcript(rows[0].id).unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "seqs continue across flushes"
+        );
+        assert_eq!(items[3].kind, "task");
+        // The tab bound the row — resume/delete address it (T6).
+        assert_eq!(manager.active().unwrap().conversation(), Some(rows[0].id));
+    }
+
+    /// Spec R08-T5/us-17: `plan` items append to the transcript like
+    /// every other kind AND upsert the conversation's `plans` row —
+    /// the row always holds the latest snapshot while the transcript
+    /// keeps every snapshot the calls produced.
+    #[test]
+    fn drain_transcripts_appends_plan_items_and_upserts_the_latest() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let mut handle = StoreHandle::from_store(ait_store::Store::open(&db).unwrap());
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        let todo = |content: &str, status| ait_agent::PlanTodo {
+            content: content.into(),
+            status,
+        };
+        panel.submit(agent_request("plan the work"), &mut toast);
+        panel.apply(ait_agent::AgentEvent::PlanUpdated {
+            todos: vec![todo("reproduce", ait_agent::PlanTodoStatus::InProgress)],
+        });
+        panel.apply(ait_agent::AgentEvent::PlanUpdated {
+            todos: vec![
+                todo("reproduce", ait_agent::PlanTodoStatus::Done),
+                todo("fix", ait_agent::PlanTodoStatus::InProgress),
+            ],
+        });
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        let store = ait_store::Store::open(&db).unwrap();
+        let id = store.list_conversations().unwrap()[0].id;
+        // Both snapshots land as transcript items — the audit trail.
+        let items = store.load_transcript(id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "plan", "plan"]
+        );
+        // …and the `plans` row holds only the latest.
+        let payload = store.load_plan(id).unwrap().expect("a plans row");
+        let back: ait_agent::TranscriptItem =
+            serde_json::from_str(&payload).expect("the payload deserializes");
+        assert_eq!(
+            back,
+            ait_agent::TranscriptItem::Plan {
+                todos: vec![
+                    todo("reproduce", ait_agent::PlanTodoStatus::Done),
+                    todo("fix", ait_agent::PlanTodoStatus::InProgress),
+                ]
+            }
+        );
+    }
+
+    /// Spec R08-T6/us-6: `resume_conversation` binds the row and
+    /// rebuilds the panel — a fresh flush then appends to the
+    /// RESUMED row, and `detach_conversation` clears the binding so
+    /// the next flush opens a new row instead of appending to a
+    /// deleted one.
+    #[test]
+    fn resume_binds_the_row_and_detach_clears_it() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let store = ait_store::Store::open(&db).unwrap();
+        let stored = store
+            .create_conversation(ait_store::NewConversation {
+                title: "fix the tests",
+                cwd: "/w",
+                status: "open",
+            })
+            .unwrap();
+        let items = vec![
+            ait_agent::TranscriptItem::Task {
+                text: "fix the tests".into(),
+            },
+            ait_agent::TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ];
+        let mut handle = StoreHandle::from_store(store);
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+
+        // Resume into a tab that never opened a panel — the panel
+        // (and its bridge) is created like Alt+A's first toggle.
+        let tab = manager.active_mut().unwrap();
+        tab.resume_conversation(stored.id, items.clone(), None);
+        assert_eq!(tab.conversation(), Some(stored.id));
+        let panel = tab.agent_panel().expect("the resume built a panel");
+        assert!(panel.is_open());
+        assert_eq!(
+            panel.transcript_items(),
+            items.as_slice(),
+            "the next task's prior IS the resumed transcript"
+        );
+
+        // A new task's flush appends to the RESUMED row — no new
+        // conversation row is created.
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("and the lint"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let store = ait_store::Store::open(&db).unwrap();
+        assert_eq!(store.list_conversations().unwrap().len(), 1);
+        let kinds: Vec<String> = store
+            .load_transcript(stored.id)
+            .unwrap()
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect();
+        assert_eq!(kinds.last().unwrap(), "task");
+
+        // Deleting that row detaches the binding: the next flush
+        // opens a NEW row rather than appending to a deleted one.
+        manager.detach_conversation(stored.id);
+        assert_eq!(manager.active().unwrap().conversation(), None);
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fresh work"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 2, "the next task opened a new row");
+        assert_eq!(rows[0].title, "fresh work");
+        // …and its transcript holds only what followed the detach —
+        // the deleted row's items never re-appended.
+        assert_eq!(store.load_transcript(rows[0].id).unwrap()[0].kind, "task");
+    }
+
+    /// An unpersisted run (disabled handle) still drains every tab's
+    /// accumulated items — the transcript queue can't grow behind a
+    /// dead store, and the panel keeps the whole thing in memory
+    /// regardless (T4's `prior` source).
+    #[test]
+    fn drain_transcripts_on_a_disabled_store_drops_and_moves_on() {
+        let mut handle = StoreHandle::disabled();
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fix the tests"), &mut toast);
+
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a disabled store is a silent no-op");
+        assert_eq!(
+            manager.active().unwrap().conversation(),
+            None,
+            "no row ever bound"
+        );
+        assert!(
+            manager
+                .active_mut()
+                .unwrap()
+                .agent
+                .as_mut()
+                .unwrap()
+                .take_transcript_items()
+                .is_empty(),
+            "the batch drained rather than queueing"
+        );
     }
 
     /// Resize reaches every tab's session, not just the visible one.
@@ -2971,6 +3473,7 @@ mod tests {
                         os: "test".into(),
                         output_lines: Vec::new(),
                     },
+                    prior: Vec::new(),
                     bridge: None,
                 },
                 &mut toast,

@@ -75,6 +75,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
             os: String::from("linux"),
             output_lines: Vec::new(),
         },
+        prior: Vec::new(),
         bridge: None,
     }
 }
@@ -313,11 +314,13 @@ fn approval_gates_execution_and_result_reenters_as_tool_item() {
                 call_id: "call_1".into(),
                 status: ToolStatus::Running,
                 detail: None,
+                result: None,
             },
             AgentEvent::ToolUpdate {
                 call_id: "call_1".into(),
                 status: ToolStatus::Done,
                 detail: Some("note.txt: …".into()),
+                result: Some("note.txt:\nNOTE-CONTENTS".into()),
             },
         ],
         "{events:?}"
@@ -374,6 +377,7 @@ fn denied_call_feeds_the_denial_text_back_as_its_result() {
             call_id: "call_1".into(),
             status: ToolStatus::Denied,
             detail: Some("not that file".into()),
+            result: Some("not that file".into()),
         }
     );
     assert!(!events.iter().any(|e| matches!(
@@ -1158,6 +1162,7 @@ fn write_to_pty_gates_then_round_trips_through_the_agent_pty() {
                 call_id,
                 status: ToolStatus::Done,
                 detail: Some(_),
+                ..
             } if call_id == "call_2"
         )),
         "{events:?}"
@@ -1211,6 +1216,7 @@ fn denied_write_to_pty_never_writes() {
             call_id: "call_1".into(),
             status: ToolStatus::Denied,
             detail: Some("keep hands off".into()),
+            result: Some("keep hands off".into()),
         }
     );
     assert!(

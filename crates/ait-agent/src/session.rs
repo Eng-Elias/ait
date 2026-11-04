@@ -47,7 +47,10 @@
 //! suspends on an [`AgentEvent::AskRequest`] — carrying the
 //! question and its choices-or-free-text — until the frontend's
 //! [`AgentSession::answer`] replies, and the answer text becomes
-//! the call's tool result. A profile that resolves to nothing —
+//! the call's tool result. `update_plan` (Spec R08 us-16) is exempt
+//! outright on the same logic: §5.7 maps no field to it, so every
+//! stance allows and its [`AgentEvent::PlanUpdated`] snapshot IS the
+//! effect. A profile that resolves to nothing —
 //! missing, renamed or zero declared — evaluates to the Round 6
 //! interim ask-everything rule: the fail-safe asks rather than
 //! silently loosening. Round 7 swapped the policy, not the
@@ -70,6 +73,7 @@
 //! panics and never wedges — a poisoned task answers `Error`, then the
 //! next queued task is served.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -84,20 +88,33 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext};
 use crate::conversation::Conversation;
-use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
+use crate::endpoint_bridge::{extract, llm_schema, reported_tokens, slot, Extracted};
 use crate::executor::{CommandExecutor, DetachedExecutor, ShellBridge, UserShellExecutor};
 use crate::files::{ToolCwd, ToolOutput};
 use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
 use crate::redact::redact;
+use crate::summarize;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
+use crate::transcript::{PlanTodo, TranscriptItem, TranscriptMirror};
 
 /// The step budget (Spec R06, glossary): at most this many model turns
 /// per task. Configurability is a later round's decision; the constant
 /// names the termination condition the agent loop checks before every
 /// request — tool-call turns included.
 pub const STEP_BUDGET: usize = 50;
+
+/// The context-limit fraction that triggers summarization (Spec R08
+/// §5.8, ticket R08-T7): when the estimate — provider `usage` where
+/// the stream reports it, else serialized-item chars over four —
+/// reaches this share of the effective limit (the active profile's
+/// `context_window_limit`, else the model's `context_window`), the
+/// oldest half of the transcript is rewritten into a `summary`
+/// marker by one extra call to the task's coding endpoint.
+/// Configurability is a later round's decision, on the
+/// [`STEP_BUDGET`] precedent.
+pub const SUMMARIZE_AT: f64 = 0.8;
 
 /// How often a gate wait wakes to check the cancellation token — the
 /// only reason the wait is a poll at all (us-9: prompts never time
@@ -130,6 +147,15 @@ pub struct AgentRequest {
     /// The task text — sent verbatim, never redacted (the
     /// typed-request rule, §5.4 us-19).
     pub task: String,
+    /// The conversation's accumulated transcript — the continuity
+    /// record (Spec R08 §5.8): the worker replays it into the
+    /// resolved schema's IR ([`Conversation::from_transcript`])
+    /// before the task lands, so a second task in a tab continues
+    /// where the first left off — the R06 per-task fresh context is
+    /// superseded. An empty vec is exactly that old fresh
+    /// conversation; a resumed conversation's stored items ride the
+    /// same field — the worker never touches disk either way.
+    pub prior: Vec<TranscriptItem>,
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
@@ -225,6 +251,45 @@ pub enum AgentEvent {
         status: ToolStatus,
         /// A one-line detail for the card — result preview or error.
         detail: Option<String>,
+        /// The call's full result text — `Some` on the terminal
+        /// updates (`Done`/`Failed`/`Denied`), carrying verbatim what
+        /// entered the model's conversation (already redacted): the
+        /// transcript mirror (Spec R08) persists it while the card
+        /// keeps `detail`'s clipped preview. `None` on `Running`,
+        /// a card transition rather than a result.
+        result: Option<String>,
+    },
+    /// An `update_plan` call's snapshot (Spec R08 us-13/14): the
+    /// whole TODO list — replace semantics, never a diff — carried
+    /// in the transcript vocabulary's own [`PlanTodo`] shape. The
+    /// panel swaps its pinned plan block for this list; the store
+    /// upserts it as the conversation's `plans` row; the transcript
+    /// mirror records a `plan` item. An empty list clears the plan.
+    PlanUpdated {
+        /// The call's full TODO list, in model order.
+        todos: Vec<PlanTodo>,
+    },
+    /// The worker rewrote the conversation's oldest half into a
+    /// summary marker (Spec R08 us-18/22): the estimate crossed
+    /// [`SUMMARIZE_AT`] of the effective limit, one summarize call
+    /// to the task's coding endpoint produced `text` (the current
+    /// plan rides verbatim inside it), and the covered span was
+    /// replaced in the live conversation. Non-terminal — the task
+    /// continues on the compacted context. The transcript mirror
+    /// records the `summary` item; the panel shows a "conversation
+    /// summarized" entry so the rewrite is never silent.
+    Summarized {
+        /// The persisted transcript's seq domain: how many leading
+        /// items (`0..covers_seq`) the summary replaces. Counted on
+        /// the worker's own [`TranscriptMirror`](crate::TranscriptMirror),
+        /// which folds the same events by the same rule as the
+        /// frontend's — the domains agree unless a steering message
+        /// raced a tool-turn boundary (see the mirror's doc), and
+        /// replay tolerates either edge.
+        covers_seq: u64,
+        /// The marker's stored text — the model's summary with the
+        /// current plan appended verbatim.
+        text: String,
     },
     /// The task finished cleanly: the model ended its turn with no
     /// tool calls and no steering queued. Terminal.
@@ -438,6 +503,31 @@ impl Drop for AgentSession {
     }
 }
 
+/// The event channel plus the worker's transcript mirror in one
+/// wrapper: every emitted [`AgentEvent`] folds into the mirror by
+/// the same rule the frontend's drain applies (R08-T3's mirror,
+/// shared as [`TranscriptMirror`]), so the worker's seq domain is
+/// the persisted transcript's — which is what makes a
+/// [`AgentEvent::Summarized`]'s `covers_seq` count correctly. The
+/// mirror lives behind a `RefCell` so the immutable `&EventSink`
+/// every loop function already takes can fold as it sends.
+struct EventSink<'a> {
+    /// The frontend's channel.
+    sender: &'a Sender<AgentEvent>,
+    /// The worker's transcript mirror — seeded from
+    /// `AgentRequest.prior`, grown send-side and per emitted event.
+    mirror: RefCell<TranscriptMirror>,
+}
+
+impl EventSink<'_> {
+    /// Fold `event` into the mirror, then send it — `false` when the
+    /// frontend's receiver is gone (the [`emit`] rule verbatim).
+    fn emit(&self, event: AgentEvent) -> bool {
+        self.mirror.borrow_mut().apply(&event);
+        self.sender.send(event).is_ok()
+    }
+}
+
 /// The worker thread: own the current-thread runtime and serve tasks
 /// in order. A runtime that cannot be built degrades every task to an
 /// `Error` event rather than wedging the frontend (§6).
@@ -503,6 +593,20 @@ fn serve(
     store: &dyn SecretStore,
     agent_pty: &mut AgentPty,
 ) {
+    // The worker's transcript mirror (R08-T7): seeded from `prior`
+    // verbatim — those items were folded when first recorded — then
+    // grown send-side and per emitted event through the sink, so
+    // summarization counts `covers_seq` in the persisted
+    // transcript's seq domain. `events` shadows the sender for the
+    // rest of the task; every emit folds then sends.
+    let mut mirror = TranscriptMirror::default();
+    for item in &request.prior {
+        mirror.record(item.clone());
+    }
+    let events = EventSink {
+        sender: events,
+        mirror: RefCell::new(mirror),
+    };
     // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
     // store's `&dyn` reference flows straight through. The task's own
     // profile resolves the role (§4.2/§5.7): the selection the
@@ -513,18 +617,15 @@ fn serve(
     {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
-            emit(
-                events,
-                AgentEvent::Error(format!(
-                    "profile {:?} has no coding_model configured \
+            events.emit(AgentEvent::Error(format!(
+                "profile {:?} has no coding_model configured \
                      (and no base_model fallback) — set it in settings.toml",
-                    request.profile
-                )),
-            );
+                request.profile
+            )));
             return;
         }
         Err(error) => {
-            emit(events, AgentEvent::Error(format!("{error}")));
+            events.emit(AgentEvent::Error(format!("{error}")));
             return;
         }
     };
@@ -538,7 +639,7 @@ fn serve(
     }) {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            emit(events, AgentEvent::Error(format!("{error}")));
+            events.emit(AgentEvent::Error(format!("{error}")));
             return;
         }
     };
@@ -559,11 +660,18 @@ fn serve(
     // `declare` is profile-aware: the `agent_decides` tools of this
     // stance gain the required `safety` argument in their schemas
     // (R07-T2) — per task, so a profile change applies next task.
-    let mut conversation = Conversation::new(endpoint.schema(), profile);
+    // The conversation is the continuity unit (Spec R08): the
+    // transcript on `prior` replays into THIS resolved schema's IR —
+    // a mid-conversation endpoint switch strands nothing — then the
+    // new task appends on top. An empty `prior` is the R06 fresh
+    // conversation verbatim.
+    let mut conversation =
+        Conversation::from_transcript(endpoint.schema(), &request.prior, profile);
+    events.mirror.borrow_mut().task(&request.task);
     conversation.push_user(request.task);
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
-    drain_steering(steering, &mut conversation);
+    drain_steering(steering, &mut conversation, &mut events.mirror.borrow_mut());
     // The task's file tools bind to the session's cwd ∪ the active
     // profile's normalized `directory_allowlist` roots (§5.7,
     // R07-T4): a missing profile or an empty list confines to cwd
@@ -585,6 +693,16 @@ fn serve(
         Some(bridge) => Box::new(UserShellExecutor::new(bridge, token.clone())),
         None => Box::new(DetachedExecutor),
     };
+    // The summarization threshold's denominator (R08-T7, us-19):
+    // the profile's `context_window_limit` when it is >0, else the
+    // resolved model's `context_window`, else `None` — with no
+    // limit configured nothing ever fires.
+    let context_limit = summarize::effective_limit(
+        profile
+            .map(|profile| profile.context_window_limit)
+            .unwrap_or(0),
+        resolved.model.context_window,
+    );
     runtime.block_on(run_loop(
         &endpoint,
         &mut conversation,
@@ -595,10 +713,11 @@ fn serve(
         &cwd,
         profile,
         &request.profile,
+        context_limit,
         agent_pty,
         executor.as_mut(),
         token,
-        events,
+        &events,
     ));
     slot(in_flight).take();
 }
@@ -610,6 +729,13 @@ fn serve(
 /// the [`STEP_BUDGET`] tripping, cancellation, or a failure mapped to
 /// a terminal `Error`. Steering queued mid-run is drained into the
 /// conversation at each turn boundary — model turn or tool turn alike.
+///
+/// Before every model request the summarization check (Spec R08-T7):
+/// when `context_limit` resolved to a real cap, the estimate —
+/// the last stream's provider `usage` where one was reported, else
+/// the serialized-item chars/4 heuristic — is measured against
+/// [`SUMMARIZE_AT`]; crossing it fires one summarize call and the
+/// oldest half of the transcript becomes a `summary` marker.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     endpoint: &Endpoint,
@@ -621,12 +747,22 @@ async fn run_loop(
     cwd: &ToolCwd,
     profile: Option<&ExecutionProfile>,
     profile_name: &str,
+    context_limit: Option<usize>,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     cancel: CancellationToken,
-    events: &Sender<AgentEvent>,
+    events: &EventSink<'_>,
 ) {
     let mut turns = 0usize;
+    // `context_limit` goes `None` on a failed summarize call —
+    // retrying every turn would just spend a doomed request each
+    // loop, so one failure disables summarization for the task.
+    let mut context_limit = context_limit;
+    // The last turn's provider-reported token count — the
+    // estimate's preferred source, cleared by every rewrite so the
+    // compacted conversation measures against the heuristic until
+    // the next stream reports.
+    let mut reported: Option<u64> = None;
     // Tools the user allowed for the rest of the task — the gate's
     // per-task memory; per name, never blanket (us-7). *Allow this
     // tool for the rest of the task* always records; under
@@ -636,22 +772,42 @@ async fn run_loop(
     let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
-            emit(events, AgentEvent::BudgetReached);
+            events.emit(AgentEvent::BudgetReached);
             return;
+        }
+        if let Some(limit) = context_limit {
+            let estimate = match reported {
+                Some(tokens) => tokens as usize,
+                None => conversation.estimated_tokens(),
+            };
+            if estimate as f64 >= limit as f64 * SUMMARIZE_AT {
+                match summarize_context(endpoint, conversation, profile, &cancel, events).await {
+                    SummarizeOutcome::Summarized => reported = None,
+                    SummarizeOutcome::NoSpan => {}
+                    SummarizeOutcome::Unavailable => context_limit = None,
+                    SummarizeOutcome::Cancelled => {
+                        events.emit(AgentEvent::Cancelled);
+                        return;
+                    }
+                }
+            }
         }
         let request = conversation.request(&endpoint.config().model, system);
         match stream_turn(endpoint, request, cancel.clone(), events).await {
-            TurnOutcome::EndTurn { text, calls } => {
+            TurnOutcome::EndTurn { text, calls, usage } => {
                 turns += 1;
+                if let Some(tokens) = usage {
+                    reported = Some(tokens);
+                }
                 if calls.is_empty() {
                     conversation.push_assistant(text);
                     // A steering message queued during the stream
                     // becomes a user message on the next request —
                     // the run continues instead of finishing.
-                    if drain_steering(steering, conversation) {
+                    if drain_steering(steering, conversation, &mut events.mirror.borrow_mut()) {
                         continue;
                     }
-                    emit(events, AgentEvent::Done);
+                    events.emit(AgentEvent::Done);
                     return;
                 }
                 // A tool turn: the assistant item lands first — the
@@ -662,7 +818,7 @@ async fn run_loop(
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     if cancel.is_cancelled() {
-                        emit(events, AgentEvent::Cancelled);
+                        events.emit(AgentEvent::Cancelled);
                         return;
                     }
                     match gate_and_execute(
@@ -685,10 +841,10 @@ async fn run_loop(
                 conversation.push_tool_results(&calls, &results);
                 // Steering queued during the tool turn rides the next
                 // request beside the results.
-                drain_steering(steering, conversation);
+                drain_steering(steering, conversation, &mut events.mirror.borrow_mut());
             }
             TurnOutcome::Cancelled => {
-                emit(events, AgentEvent::Cancelled);
+                events.emit(AgentEvent::Cancelled);
                 return;
             }
             // The `Error` event was already emitted inside
@@ -697,6 +853,93 @@ async fn run_loop(
             TurnOutcome::Ended => return,
         }
     }
+}
+
+/// How one summarize attempt ended — `run_loop` maps it onto
+/// continue / disable / cancel.
+enum SummarizeOutcome {
+    /// The marker recorded, [`AgentEvent::Summarized`] emitted, the
+    /// live conversation rebuilt around it.
+    Summarized,
+    /// No pair-safe span exists yet — nothing fired; a later check
+    /// may still find one as the transcript grows.
+    NoSpan,
+    /// The summarize call failed (transport, stream, provider error
+    /// or an empty reply) — summarization disables for the task
+    /// rather than retry-failing every turn. The task itself is
+    /// unaffected: the rewrite is housekeeping, never load-bearing.
+    Unavailable,
+    /// Esc fired mid-call.
+    Cancelled,
+}
+
+/// One summarize call (Spec R08 us-18/20): pick the covered span in
+/// the mirror — the persisted transcript's seq domain — render it,
+/// ask the task's coding endpoint to compact it, then record the
+/// marker and emit [`AgentEvent::Summarized`] (the emit IS the
+/// mirror's record — the shared fold). The live conversation then
+/// rebuilds by replaying the mirror exactly like a resume would, so
+/// persisted and live state stay identical by construction.
+async fn summarize_context(
+    endpoint: &Endpoint,
+    conversation: &mut Conversation,
+    profile: Option<&ExecutionProfile>,
+    cancel: &CancellationToken,
+    events: &EventSink<'_>,
+) -> SummarizeOutcome {
+    let (request, covers_seq) = {
+        let mirror = events.mirror.borrow();
+        let items = mirror.items();
+        match summarize::covered_span(items) {
+            Some(cut) => {
+                let prompt = summarize::prompt(&summarize::render(&items[..cut]));
+                (
+                    summarize::request(endpoint.schema(), &endpoint.config().model, prompt),
+                    cut,
+                )
+            }
+            None => return SummarizeOutcome::NoSpan,
+        }
+    };
+    let mut stream: EndpointStream = match endpoint.stream(request, cancel.clone()).await {
+        Ok(stream) => stream,
+        Err(LlmError::Cancelled) => return SummarizeOutcome::Cancelled,
+        Err(_) => return SummarizeOutcome::Unavailable,
+    };
+    // The reply collects silently — the panel's record of the
+    // rewrite is the status entry `Summarized` renders, not a
+    // pseudo-assistant text stream.
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Err(LlmError::Cancelled) => return SummarizeOutcome::Cancelled,
+            Err(_) => return SummarizeOutcome::Unavailable,
+            Ok(event) => match extract(event) {
+                Extracted::Text(fragment) => text.push_str(&fragment),
+                Extracted::ProviderError(_) => return SummarizeOutcome::Unavailable,
+                Extracted::Other => {}
+            },
+        }
+    }
+    if text.trim().is_empty() {
+        return SummarizeOutcome::Unavailable;
+    }
+    // The current plan rides verbatim inside the marker's text
+    // (us-20) — read it BEFORE the emit's fold records the item.
+    let text = {
+        let mirror = events.mirror.borrow();
+        summarize::carrying_plan(&text, summarize::current_plan(mirror.items()))
+    };
+    if !events.emit(AgentEvent::Summarized {
+        covers_seq: covers_seq as u64,
+        text,
+    }) {
+        // The receiver is gone — abandon like every emit path.
+        return SummarizeOutcome::Cancelled;
+    }
+    *conversation =
+        Conversation::from_transcript(endpoint.schema(), events.mirror.borrow().items(), profile);
+    SummarizeOutcome::Summarized
 }
 
 /// The §5.7 permission gate plus one call's execution (Spec R07):
@@ -720,7 +963,7 @@ fn gate_and_execute(
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     cancel: &CancellationToken,
-    events: &Sender<AgentEvent>,
+    events: &EventSink<'_>,
 ) -> Option<String> {
     // The consult point Spec R06 built the engine swap for: the
     // verdict, not the plumbing, is what profiles change.
@@ -731,6 +974,14 @@ fn gate_and_execute(
     // result. `never` falls through to the profile denial below.
     if call.name == tools::ASK_USER_QUESTION && !matches!(verdict, Verdict::Deny(_)) {
         return ask_and_answer(call, answers, cancel, events);
+    }
+    // `update_plan` is exempt the same way (Spec R08 us-16): §5.7
+    // maps no profile field to it, so `verdict` is always `Allow`
+    // here — and its own snapshot IS the effect. The divert emits
+    // the ordinary ungated card plus `PlanUpdated`; nothing reaches
+    // the executor.
+    if call.name == tools::UPDATE_PLAN {
+        return update_plan(call, events);
     }
     // `edit_files` plans BEFORE the card (Spec R06 us-22/23): the
     // plan's unified diff is the summary the user approves, and the
@@ -763,7 +1014,7 @@ fn gate_and_execute(
             summary,
         },
     };
-    if !emit(events, event) {
+    if !events.emit(event) {
         return None;
     }
     match verdict {
@@ -772,14 +1023,12 @@ fn gate_and_execute(
         // the model reads which profile refused it. The call never
         // runs: no `Running` update, nothing reaches the executor.
         Verdict::Deny(reason) => {
-            emit(
-                events,
-                AgentEvent::ToolUpdate {
-                    call_id: call.id.clone(),
-                    status: ToolStatus::Denied,
-                    detail: Some(reason.clone()),
-                },
-            );
+            events.emit(AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Denied,
+                detail: Some(reason.clone()),
+                result: Some(reason.clone()),
+            });
             return Some(reason);
         }
         Verdict::Ask { first_write } => {
@@ -801,32 +1050,28 @@ fn gate_and_execute(
                     if reason.is_empty() {
                         reason = DEFAULT_DENIAL.to_string();
                     }
-                    emit(
-                        events,
-                        AgentEvent::ToolUpdate {
-                            call_id: call.id.clone(),
-                            status: ToolStatus::Denied,
-                            detail: Some(reason.clone()),
-                        },
-                    );
+                    events.emit(AgentEvent::ToolUpdate {
+                        call_id: call.id.clone(),
+                        status: ToolStatus::Denied,
+                        detail: Some(reason.clone()),
+                        result: Some(reason.clone()),
+                    });
                     // The denial text IS the tool result (us-8) — the
                     // model reads it and picks a different approach.
                     return Some(reason);
                 }
                 ReplyOutcome::Cancelled => {
-                    emit(events, AgentEvent::Cancelled);
+                    events.emit(AgentEvent::Cancelled);
                     return None;
                 }
                 ReplyOutcome::Gone => return None,
             }
-            if !emit(
-                events,
-                AgentEvent::ToolUpdate {
-                    call_id: call.id.clone(),
-                    status: ToolStatus::Running,
-                    detail: None,
-                },
-            ) {
+            if !events.emit(AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Running,
+                detail: None,
+                result: None,
+            }) {
                 return None;
             }
         }
@@ -843,25 +1088,23 @@ fn gate_and_execute(
     // task is over: emit `Cancelled` rather than re-entering the loop
     // for one more doomed request.
     if cancel.is_cancelled() {
-        emit(events, AgentEvent::Cancelled);
+        events.emit(AgentEvent::Cancelled);
         return None;
     }
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
     // preview comes from the same redacted text.
     let text = redact(&output.text);
-    emit(
-        events,
-        AgentEvent::ToolUpdate {
-            call_id: call.id.clone(),
-            status: if output.is_error {
-                ToolStatus::Failed
-            } else {
-                ToolStatus::Done
-            },
-            detail: Some(card_detail(&call.name, &text)),
+    events.emit(AgentEvent::ToolUpdate {
+        call_id: call.id.clone(),
+        status: if output.is_error {
+            ToolStatus::Failed
+        } else {
+            ToolStatus::Done
         },
-    );
+        detail: Some(card_detail(&call.name, &text)),
+        result: Some(text.clone()),
+    });
     Some(text)
 }
 
@@ -878,59 +1121,102 @@ fn ask_and_answer(
     call: &ToolCall,
     answers: &Receiver<(String, String)>,
     cancel: &CancellationToken,
-    events: &Sender<AgentEvent>,
+    events: &EventSink<'_>,
 ) -> Option<String> {
     let (question, choices) = match tools::parse_question(call) {
         Ok(parsed) => parsed,
         Err(error) => {
-            if !emit(
-                events,
-                AgentEvent::ToolCall {
-                    call: call.clone(),
-                    summary: tools::summarize_args(call),
-                },
-            ) {
+            if !events.emit(AgentEvent::ToolCall {
+                call: call.clone(),
+                summary: tools::summarize_args(call),
+            }) {
                 return None;
             }
-            emit(
-                events,
-                AgentEvent::ToolUpdate {
-                    call_id: call.id.clone(),
-                    status: ToolStatus::Failed,
-                    detail: Some(error.clone()),
-                },
-            );
+            events.emit(AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Failed,
+                detail: Some(error.clone()),
+                result: Some(error.clone()),
+            });
             return Some(error);
         }
     };
-    if !emit(
-        events,
-        AgentEvent::AskRequest {
-            call: call.clone(),
-            question,
-            choices,
-        },
-    ) {
+    if !events.emit(AgentEvent::AskRequest {
+        call: call.clone(),
+        question,
+        choices,
+    }) {
         return None;
     }
     match await_reply(answers, &call.id, cancel) {
         ReplyOutcome::Replied(answer) => {
-            emit(
-                events,
-                AgentEvent::ToolUpdate {
-                    call_id: call.id.clone(),
-                    status: ToolStatus::Done,
-                    detail: Some(preview(&answer)),
-                },
-            );
+            // The reply IS the call's tool result — the transcript
+            // records it as the send-side `answer` item (the
+            // frontend records at send time; the worker at the
+            // reply's arrival, which is the same position: no event
+            // can interpose while the wait is parked).
+            events.mirror.borrow_mut().answer(&answer);
+            events.emit(AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Done,
+                detail: Some(result_preview(&answer)),
+                result: Some(answer.clone()),
+            });
             Some(answer)
         }
         ReplyOutcome::Cancelled => {
-            emit(events, AgentEvent::Cancelled);
+            events.emit(AgentEvent::Cancelled);
             None
         }
         ReplyOutcome::Gone => None,
     }
+}
+
+/// The `update_plan` flow (Spec R08 us-13–16): gate-exempt — the
+/// engine always `Allow`s it — so the call opens an ordinary ungated
+/// card (us-15: its evolution stays auditable in scrollback), the
+/// parsed TODO list rides [`AgentEvent::PlanUpdated`] to the panel's
+/// pinned block and the store's `plans` upsert, and a fixed result
+/// text re-enters the conversation like every tool result. A call
+/// whose arguments carry no usable list is a tool error — model
+/// input, never a wedge. Returns `None` only when the frontend's
+/// channels are gone.
+fn update_plan(call: &ToolCall, events: &EventSink<'_>) -> Option<String> {
+    if !events.emit(AgentEvent::ToolCall {
+        call: call.clone(),
+        summary: tools::summarize_args(call),
+    }) {
+        return None;
+    }
+    let todos = match tools::parse_plan(call) {
+        Ok(todos) => todos,
+        Err(error) => {
+            events.emit(AgentEvent::ToolUpdate {
+                call_id: call.id.clone(),
+                status: ToolStatus::Failed,
+                detail: Some(error.clone()),
+                result: Some(error.clone()),
+            });
+            return Some(error);
+        }
+    };
+    // The model reads a confirmation, not the list back — the
+    // snapshot itself just went out on the event.
+    let text = match todos.len() {
+        0 => String::from("plan cleared"),
+        1 => String::from("plan updated — 1 todo"),
+        n => format!("plan updated — {n} todos"),
+    };
+    if !events.emit(AgentEvent::PlanUpdated { todos }) {
+        return None;
+    }
+    events.emit(AgentEvent::ToolUpdate {
+        call_id: call.id.clone(),
+        status: ToolStatus::Done,
+        detail: Some(text.clone()),
+        result: Some(text.clone()),
+    });
+    Some(text)
 }
 
 /// Park on a reply channel until the answer for `call_id` arrives —
@@ -967,14 +1253,17 @@ fn card_detail(name: &str, text: &str) -> String {
     if name == "write_to_pty" {
         tail_preview(text)
     } else {
-        preview(text)
+        result_preview(text)
     }
 }
+
+/// A card `detail`'s char cap — the last non-empty line clips from
+/// the tail, the first line from the head, both to this width.
+const PREVIEW_CHARS: usize = 120;
 
 /// The last non-empty line of `text`, clipped to the preview width
 /// from the tail — `write_to_pty`'s card detail.
 fn tail_preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
     let last = text
         .lines()
         .rev()
@@ -993,9 +1282,9 @@ fn tail_preview(text: &str) -> String {
 
 /// A card's `detail`: the first line of the (already redacted) tool
 /// result, clipped — enough to recognize what ran without turning
-/// the scrollback into the output itself.
-fn preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
+/// the scrollback into the output itself. The `ait` frontend's
+/// resume rebuild clips stored `tool_result`s through this same fn.
+pub fn result_preview(text: &str) -> String {
     let first = text.lines().next().unwrap_or_default();
     if first.chars().count() > PREVIEW_CHARS {
         format!("{}…", first.chars().take(PREVIEW_CHARS).collect::<String>())
@@ -1011,8 +1300,18 @@ enum TurnOutcome {
     /// The stream ended cleanly; carries the reply's concatenated
     /// text and the turn's accumulated tool calls (empty on a plain
     /// end turn — the cross-schema "the model asked for tools"
-    /// signal is ≥1 accumulated call, not a `Finish` reason).
-    EndTurn { text: String, calls: Vec<ToolCall> },
+    /// signal is ≥1 accumulated call, not a `Finish` reason), plus
+    /// the provider-reported token count `Finish` carried, if any —
+    /// the summarization estimate's preferred source (R08-T7).
+    EndTurn {
+        /// The turn's concatenated reply text.
+        text: String,
+        /// The turn's accumulated tool calls.
+        calls: Vec<ToolCall>,
+        /// Provider `usage` from `Finish`, normalized to the turn's
+        /// total tokens; `None` when the stream reported none.
+        usage: Option<u64>,
+    },
     /// The cancellation token fired (in-flight or pre-flight).
     Cancelled,
     /// Terminal: an `Error` was emitted, or the frontend's receiver is
@@ -1021,10 +1320,18 @@ enum TurnOutcome {
 }
 
 /// Drain queued steering messages into `conversation` as user
-/// messages; `true` when at least one was appended.
-fn drain_steering(steering: &Receiver<String>, conversation: &mut Conversation) -> bool {
+/// messages and into the mirror as `steering` items; `true` when at
+/// least one was appended. The mirror records at drain time while
+/// the frontend records at send time — the one ordering divergence
+/// [`AgentEvent::Summarized`]'s `covers_seq` doc calls out.
+fn drain_steering(
+    steering: &Receiver<String>,
+    conversation: &mut Conversation,
+    mirror: &mut TranscriptMirror,
+) -> bool {
     let mut drained = false;
     while let Ok(message) = steering.try_recv() {
+        mirror.steering(&message);
         conversation.push_user(message);
         drained = true;
     }
@@ -1041,36 +1348,43 @@ async fn stream_turn(
     endpoint: &Endpoint,
     request: EndpointRequest,
     cancel: CancellationToken,
-    events: &Sender<AgentEvent>,
+    events: &EventSink<'_>,
 ) -> TurnOutcome {
     let mut stream: EndpointStream = match endpoint.stream(request, cancel).await {
         Ok(stream) => stream,
         Err(LlmError::Cancelled) => return TurnOutcome::Cancelled,
         Err(error) => {
-            emit(events, AgentEvent::Error(format!("{error}")));
+            events.emit(AgentEvent::Error(format!("{error}")));
             return TurnOutcome::Ended;
         }
     };
     let mut reply = String::new();
     let mut accumulator = CallAccumulator::new();
+    // The provider-reported token count on `Finish` — the
+    // summarization estimate's preferred source (R08-T7); the last
+    // report wins.
+    let mut usage = None;
     while let Some(item) = stream.next().await {
         match item {
             Err(LlmError::Cancelled) => return TurnOutcome::Cancelled,
             Err(error) => {
-                emit(events, AgentEvent::Error(format!("{error}")));
+                events.emit(AgentEvent::Error(format!("{error}")));
                 return TurnOutcome::Ended;
             }
             Ok(event) => {
+                if let Some(tokens) = reported_tokens(&event) {
+                    usage = Some(tokens);
+                }
                 accumulator.push(&event);
                 match extract(event) {
                     Extracted::Text(text) => {
                         reply.push_str(&text);
-                        if !emit(events, AgentEvent::TextDelta(text)) {
+                        if !events.emit(AgentEvent::TextDelta(text)) {
                             return TurnOutcome::Ended;
                         }
                     }
                     Extracted::ProviderError(message) => {
-                        emit(events, AgentEvent::Error(message));
+                        events.emit(AgentEvent::Error(message));
                         return TurnOutcome::Ended;
                     }
                     Extracted::Other => {}
@@ -1081,6 +1395,7 @@ async fn stream_turn(
     TurnOutcome::EndTurn {
         text: reply,
         calls: accumulator.finish(),
+        usage,
     }
 }
 

@@ -69,6 +69,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
             os: String::from("linux"),
             output_lines: Vec::new(),
         },
+        prior: Vec::new(),
         bridge: None,
     }
 }
@@ -201,6 +202,7 @@ fn a_multiple_choice_question_parks_on_its_own_card_and_the_answer_reenters() {
                 call_id,
                 status: ToolStatus::Done,
                 detail: Some(detail),
+                ..
             } if call_id == "call_1" && detail == "patch"
         )),
         "{events:?}"

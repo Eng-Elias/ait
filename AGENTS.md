@@ -46,7 +46,14 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   hook/run codec, `RunAccumulator` and the in-band `__ait_run`
   emit side, rc snippets and the injection planner; `ait` wires
   the planner into session spawn and tracks per-tab integration
-  state — `Absent`/`MarksOnly`/`Integrated`).
+  state — `Absent`/`MarksOnly`/`Integrated`);
+  `crates/ait-store` — exists (Round 8: §5.8 persistence — the
+  synchronous `Store` facade over bundled `rusqlite`,
+  `PRAGMA user_version` migrations, conversations /
+  transcript_items / plans / terminal_sessions / blocks under
+  `$XDG_DATA_HOME/ait`; `ait` holds the handle via the
+  `StoreHandle` degrade seam and `ait-agent` stays disk-free;
+  ADR-0011).
 
 ## Commands
 
