@@ -596,9 +596,10 @@ impl Tab {
         }
         let grid = self.grid();
         let extent = self.scrollback() + grid.lines();
+        let cwd = self.cwd.to_string_lossy().into_owned();
         sealed
             .iter()
-            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent))
+            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent, cwd.clone()))
             .collect()
     }
 
@@ -1896,14 +1897,15 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let (id, first) = &rows[0];
         assert_eq!(*id, 7, "the row keys on the session's store id");
-        assert_eq!(first.command, "first");
+        assert_eq!(first.command.as_deref(), Some("first"));
+        assert_eq!(first.cwd, manager.tabs()[1].cwd.to_string_lossy());
         assert_eq!(first.exit, Some(0));
         assert!(first.duration.is_some());
         assert!(first.started_at.is_some());
         assert!(first.ended_at.is_some());
         assert!(first.started_at <= first.ended_at);
         let (_, second) = &rows[1];
-        assert_eq!(second.command, "second");
+        assert_eq!(second.command.as_deref(), Some("second"));
         assert_eq!(second.exit, Some(7));
         // Sealed entries drain once — a second take finds nothing.
         assert!(manager.take_persisted_blocks().is_empty());

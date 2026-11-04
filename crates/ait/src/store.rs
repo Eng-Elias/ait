@@ -234,6 +234,7 @@ impl StoreHandle {
             .map(|(session_id, block)| NewBlock {
                 session_id: *session_id,
                 command: block.command.clone(),
+                cwd: Some(block.cwd.clone()),
                 exit: block.exit,
                 duration: block.duration,
                 started_at: block.started_at,
@@ -263,7 +264,8 @@ mod tests {
 
     fn block(command: &str) -> PersistedBlock {
         PersistedBlock {
-            command: command.to_owned(),
+            command: Some(command.to_owned()),
+            cwd: "/w".to_owned(),
             exit: Some(0),
             duration: Some(Duration::from_millis(4)),
             started_at: Some(SystemTime::now()),
@@ -292,7 +294,8 @@ mod tests {
         assert!(session.ended_at.is_some(), "ended_at stamped");
         let blocks = store.list_blocks(id).unwrap();
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].command, "ls");
+        assert_eq!(blocks[0].command.as_deref(), Some("ls"));
+        assert_eq!(blocks[0].cwd.as_deref(), Some("/w"));
         assert_eq!(blocks[0].exit, Some(0));
     }
 

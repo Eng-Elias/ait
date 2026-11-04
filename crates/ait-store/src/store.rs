@@ -25,52 +25,79 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sequential schema migrations applied in order and tracked by
 /// `PRAGMA user_version` (user story 2): entry `i` upgrades version
 /// `i` → `i + 1`. New schema versions are appended to the end — a
-/// landed entry is never edited; the DB schema is a one-way door.
-const MIGRATIONS: &[&str] = &[
-    // Version 0 → 1: the Round-8 schema (Spec R08 "Implementation
-    // Decisions"). Times are milliseconds since the Unix epoch;
-    // `transcript_items.kind`/`payload_json` and `plans.payload_json`
-    // hold the caller's vocabulary and JSON verbatim.
-    "CREATE TABLE conversations (
-        id          INTEGER PRIMARY KEY,
-        title       TEXT NOT NULL,
-        created_at  INTEGER NOT NULL,
-        updated_at  INTEGER NOT NULL,
-        cwd         TEXT NOT NULL,
-        status      TEXT NOT NULL
-    );
-    CREATE TABLE transcript_items (
-        id              INTEGER PRIMARY KEY,
-        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        seq             INTEGER NOT NULL,
-        kind            TEXT NOT NULL,
-        payload_json    TEXT NOT NULL,
-        UNIQUE (conversation_id, seq)
-    );
-    CREATE TABLE plans (
-        conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-        payload_json    TEXT NOT NULL,
-        updated_at      INTEGER NOT NULL
-    );
-    CREATE TABLE terminal_sessions (
-        id         INTEGER PRIMARY KEY,
-        shell      TEXT NOT NULL,
-        cwd        TEXT NOT NULL,
-        started_at INTEGER NOT NULL,
-        ended_at   INTEGER
-    );
-    CREATE TABLE blocks (
-        id          INTEGER PRIMARY KEY,
-        session_id  INTEGER NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
-        seq         INTEGER NOT NULL,
-        command     TEXT NOT NULL,
-        exit        INTEGER,
-        duration_ms INTEGER,
-        started_at  INTEGER,
-        ended_at    INTEGER,
-        UNIQUE (session_id, seq)
-    );",
-];
+/// landed entry's OBSERVABLE shape is never edited (the v1 DDL below
+/// was amended pre-release to the post-v2 shape; a real v1 database
+/// reaches the same shape through `migration_v2`, which is why it is
+/// conditional). The DB schema is a one-way door.
+const MIGRATIONS: &[fn(&Connection) -> Result<(), rusqlite::Error>] = &[migration_v1, migration_v2];
+
+/// Version 0 → 1: the Round-8 schema (Spec R08 "Implementation
+/// Decisions"). Times are milliseconds since the Unix epoch;
+/// `transcript_items.kind`/`payload_json` and `plans.payload_json`
+/// hold the caller's vocabulary and JSON verbatim. Nullable columns
+/// hold what the hooks never reported — `command` and `cwd` among
+/// them (the echo-slice fallback can fail to resolve, and pre-v2
+/// rows have no cwd at all).
+fn migration_v1(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE conversations (
+            id          INTEGER PRIMARY KEY,
+            title       TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            cwd         TEXT NOT NULL,
+            status      TEXT NOT NULL
+        );
+        CREATE TABLE transcript_items (
+            id              INTEGER PRIMARY KEY,
+            conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            seq             INTEGER NOT NULL,
+            kind            TEXT NOT NULL,
+            payload_json    TEXT NOT NULL,
+            UNIQUE (conversation_id, seq)
+        );
+        CREATE TABLE plans (
+            conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            payload_json    TEXT NOT NULL,
+            updated_at      INTEGER NOT NULL
+        );
+        CREATE TABLE terminal_sessions (
+            id         INTEGER PRIMARY KEY,
+            shell      TEXT NOT NULL,
+            cwd        TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            ended_at   INTEGER
+        );
+        CREATE TABLE blocks (
+            id          INTEGER PRIMARY KEY,
+            session_id  INTEGER NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            command     TEXT,
+            cwd         TEXT,
+            exit        INTEGER,
+            duration_ms INTEGER,
+            started_at  INTEGER,
+            ended_at    INTEGER,
+            UNIQUE (session_id, seq)
+        );",
+    )
+}
+
+/// Version 1 → 2: `blocks` gains `cwd` — the tab's cwd at `preexec`
+/// (Spec R08: block rows carry it). `ALTER TABLE … ADD COLUMN` has no
+/// `IF NOT EXISTS`, and a fresh database already has the post-v2
+/// shape — the amended v1 DDL declares `cwd` directly — so the
+/// migration is a no-op when the column is already there.
+fn migration_v2(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_cwd = conn
+        .prepare("PRAGMA table_info(blocks)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.is_ok_and(|name| name == "cwd"));
+    if !has_cwd {
+        conn.execute_batch("ALTER TABLE blocks ADD COLUMN cwd TEXT")?;
+    }
+    Ok(())
+}
 
 /// A synchronous facade over the `store.db` SQLite database (Spec R08):
 /// conversations, their transcripts and plans, and per-session command-
@@ -402,12 +429,13 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO blocks
-                 (session_id, seq, command, exit, duration_ms, started_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (session_id, seq, command, cwd, exit, duration_ms, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 block.session_id,
                 seq,
                 block.command,
+                block.cwd,
                 block.exit,
                 block.duration.map(duration_ms),
                 block.started_at.map(system_to_ms),
@@ -419,6 +447,7 @@ impl Store {
             seq,
             session_id: block.session_id,
             command: block.command,
+            cwd: block.cwd,
             exit: block.exit,
             duration: block.duration,
             started_at: block.started_at,
@@ -440,8 +469,8 @@ impl Store {
             tx.prepare("SELECT COALESCE(MAX(seq) + 1, 0) FROM blocks WHERE session_id = ?1")?;
         let mut insert = tx.prepare(
             "INSERT INTO blocks
-                 (session_id, seq, command, exit, duration_ms, started_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (session_id, seq, command, cwd, exit, duration_ms, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         // `seq` continues per session across the batch: the first row
         // of each session queries its max, later rows increment it.
@@ -462,6 +491,7 @@ impl Store {
                 block.session_id,
                 seq,
                 block.command,
+                block.cwd,
                 block.exit,
                 block.duration.map(duration_ms),
                 block.started_at.map(system_to_ms),
@@ -479,7 +509,7 @@ impl Store {
     /// that lets tests observe block persistence.
     pub fn list_blocks(&self, session_id: i64) -> Result<Vec<Block>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, session_id, command, exit, duration_ms, started_at, ended_at
+            "SELECT seq, session_id, command, cwd, exit, duration_ms, started_at, ended_at
              FROM blocks WHERE session_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([session_id], |row| {
@@ -487,10 +517,11 @@ impl Store {
                 seq: row.get(0)?,
                 session_id: row.get(1)?,
                 command: row.get(2)?,
-                exit: row.get(3)?,
-                duration: row.get::<_, Option<i64>>(4)?.map(ms_to_duration),
-                started_at: row.get::<_, Option<i64>>(5)?.map(ms_to_system),
-                ended_at: row.get::<_, Option<i64>>(6)?.map(ms_to_system),
+                cwd: row.get(3)?,
+                exit: row.get(4)?,
+                duration: row.get::<_, Option<i64>>(5)?.map(ms_to_duration),
+                started_at: row.get::<_, Option<i64>>(6)?.map(ms_to_system),
+                ended_at: row.get::<_, Option<i64>>(7)?.map(ms_to_system),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -512,13 +543,13 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(StoreError::Query)?;
-    for (index, ddl) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+    for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         let target = index as u32 + 1;
         let tx = conn.transaction().map_err(|source| StoreError::Migrate {
             version: target,
             source,
         })?;
-        tx.execute_batch(ddl)
+        migration(&tx)
             .and_then(|()| tx.pragma_update(None, "user_version", target))
             .map_err(|source| StoreError::Migrate {
                 version: target,
