@@ -456,7 +456,12 @@ mod tests {
         let empty = HashSet::new();
         for command in ["sudo rm -rf /", "echo ok\nrm -rf /"] {
             assert_eq!(
-                evaluate(Some(&profile), "default", &run_command_call(command), &empty),
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &run_command_call(command),
+                    &empty
+                ),
                 Verdict::Deny(String::from("denied by execution profile default")),
                 "{command:?}"
             );
@@ -469,7 +474,12 @@ mod tests {
         };
         for command in ["git status && rm -rf /", "rm -rf /\necho done"] {
             assert_eq!(
-                evaluate(Some(&profile), "default", &run_command_call(command), &empty),
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &run_command_call(command),
+                    &empty
+                ),
                 Verdict::Ask,
                 "{command:?} matches neither anchored entry"
             );
@@ -559,12 +569,7 @@ mod tests {
         };
         let empty = HashSet::new();
         assert_eq!(
-            evaluate(
-                Some(&profile),
-                "default",
-                &run_command_call("ls"),
-                &empty
-            ),
+            evaluate(Some(&profile), "default", &run_command_call("ls"), &empty),
             Verdict::Ask,
             "directory_allowlist is not a command list — the level decides"
         );
