@@ -332,6 +332,7 @@ fn sessions_and_blocks_survive_reopen() {
                 session_id,
                 command: Some("cargo test".to_owned()),
                 cwd: Some("/repo".to_owned()),
+                host: Some("prod".to_owned()),
                 exit: Some(0),
                 duration: Some(Duration::from_millis(1200)),
                 started_at: Some(started_at),
@@ -344,6 +345,7 @@ fn sessions_and_blocks_survive_reopen() {
                 session_id,
                 command: None,
                 cwd: Some("/repo".to_owned()),
+                host: None,
                 exit: None,
                 duration: None,
                 started_at: Some(started_at),
@@ -366,6 +368,11 @@ fn sessions_and_blocks_survive_reopen() {
         blocks[0].cwd.as_deref(),
         Some("/repo"),
         "the tab's cwd at preexec"
+    );
+    assert_eq!(
+        blocks[0].host.as_deref(),
+        Some("prod"),
+        "the remote host token persists (Spec R09-T7)"
     );
     assert_eq!(blocks[0].exit, Some(0));
     assert_eq!(blocks[0].duration, Some(Duration::from_millis(1200)));
@@ -392,6 +399,7 @@ fn insert_blocks_batches_per_session_seqs() {
         session_id,
         command: Some(command.to_owned()),
         cwd: Some("/w".to_owned()),
+        host: None,
         exit: Some(0),
         duration: Some(Duration::from_millis(3)),
         started_at: None,
@@ -437,6 +445,7 @@ fn insert_blocks_is_atomic_and_empty_is_a_noop() {
         session_id,
         command: Some("c".to_owned()),
         cwd: Some("/w".to_owned()),
+        host: None,
         exit: None,
         duration: None,
         started_at: None,
@@ -520,6 +529,7 @@ fn a_v1_database_migrates_to_the_post_v2_shape() {
             session_id: session.id,
             command: Some("new block".to_owned()),
             cwd: Some("/work".to_owned()),
+            host: None,
             exit: None,
             duration: None,
             started_at: None,
@@ -532,6 +542,10 @@ fn a_v1_database_migrates_to_the_post_v2_shape() {
     assert_eq!(
         migrated[0].cwd, None,
         "a pre-v2 row has no cwd to backfill from"
+    );
+    assert_eq!(
+        migrated[0].host, None,
+        "a pre-v3 row has no host to backfill from"
     );
     let fresh = store.list_blocks(session.id).unwrap();
     assert_eq!(fresh[0].cwd.as_deref(), Some("/work"));

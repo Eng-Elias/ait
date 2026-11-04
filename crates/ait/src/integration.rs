@@ -115,12 +115,20 @@ impl IntegrationState {
 ///
 /// `session_id` is exported to the shell as `AIT_SESSION_ID` and echoed
 /// back in every hook payload; the caller supplies the tab's stable id
-/// (CODING_STANDARDS.md 14 — never an index or a pid).
+/// (CODING_STANDARDS.md 14 — never an index or a pid). `ssh` is the
+/// armed `[ssh]` policy (Spec R09-T1/T2): its `AIT_SSH_*` env arms the
+/// snippet's `ssh()` wrapper and carries the remote bootstrap command
+/// into the session — only when an injection exists, since only an
+/// injected shell defines `ssh()` to read them.
 ///
 /// `None` is the graceful degrade (standard 1): the resolved program
 /// isn't a supported shell, or the session dir couldn't be written —
 /// `options` is left untouched and the spawn proceeds uninjected.
-pub fn inject(options: &mut LiveSessionOptions, session_id: &str) -> Option<Materialized> {
+pub fn inject(
+    options: &mut LiveSessionOptions,
+    session_id: &str,
+    ssh: &crate::remote::SshSpawn,
+) -> Option<Materialized> {
     let injection = ait_shell::plan(Path::new(&options.resolved_program()))?;
     let mut materialized = injection.materialize().ok()?;
     materialized.set_session_id(session_id);
@@ -129,8 +137,10 @@ pub fn inject(options: &mut LiveSessionOptions, session_id: &str) -> Option<Mate
     let mut args = materialized.args().to_vec();
     args.append(&mut options.args);
     options.args = args;
-    // Env overrides layer on last so the injected vars win.
+    // Env overrides layer on last so the injected vars win — the
+    // snippet's own env first, the armed ssh policy's beside it.
     options.env.extend(materialized.env().iter().cloned());
+    options.env.extend(ssh.env(session_id));
     Some(materialized)
 }
 
@@ -339,7 +349,8 @@ mod tests {
             args: vec![OsString::from("-l")],
             ..Default::default()
         };
-        let materialized = inject(&mut options, "7").expect("bash plans an injection");
+        let materialized =
+            inject(&mut options, "7", &Default::default()).expect("bash plans an injection");
 
         // `--rcfile <dir>/bashrc` leads, the caller's `-l` keeps its slot.
         assert_eq!(options.args.len(), 3);
@@ -354,6 +365,19 @@ mod tests {
             OsString::from(ait_shell::ENV_SESSION_ID),
             OsString::from("7")
         )));
+        // Spec R09-T2: the armed `[ssh]` policy's `AIT_SSH_*` env lands
+        // beside it — the bootstrap command carries this session's id.
+        assert!(
+            options
+                .env
+                .iter()
+                .any(|(k, _)| k == ait_shell::ENV_SSH_BOOTSTRAP),
+            "AIT_SSH_BOOTSTRAP reaches the spawned shell"
+        );
+        assert!(options.env.contains(&(
+            OsString::from(ait_shell::ENV_SSH_ENABLED),
+            OsString::from("1")
+        )));
 
         // Unknown shells leave everything untouched.
         let mut plain = LiveSessionOptions {
@@ -361,7 +385,7 @@ mod tests {
             ..Default::default()
         };
         let snapshot = plain.clone();
-        assert!(inject(&mut plain, "7").is_none());
+        assert!(inject(&mut plain, "7", &Default::default()).is_none());
         assert_eq!(plain.args, snapshot.args);
         assert_eq!(plain.env, snapshot.env);
     }

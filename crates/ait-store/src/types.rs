@@ -103,7 +103,9 @@ pub struct TerminalSession {
 /// bounds. Fields the hooks never reported stay `None` — `command`
 /// among them (nothing resolved at seal); `cwd` is `None` only on
 /// rows a pre-v2 database carried over (the column is a v2
-/// migration). No output text or scrollback is ever stored.
+/// migration), `host` on local and pre-v3 rows (Spec R09-T7 — the
+/// destination token of the `ssh` session the block ran under, NULL
+/// otherwise). No output text or scrollback is ever stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     /// Ordering within the session — `0, 1, 2, …` assigned at insert.
@@ -117,6 +119,9 @@ pub struct Block {
     /// The tab's cwd at `preexec`; `None` on pre-v2 rows the
     /// migration could not backfill.
     pub cwd: Option<String>,
+    /// The remote host the block ran under — the `ssh` destination
+    /// token — or `None` for a local block (Spec R09-T7).
+    pub host: Option<String>,
     /// The exit code, if the block's `D` mark carried one.
     pub exit: Option<i64>,
     /// Execution time, if both bounds were known.
@@ -138,6 +143,9 @@ pub struct NewBlock {
     pub command: Option<String>,
     /// The tab's cwd at `preexec` (see [`Block::cwd`]).
     pub cwd: Option<String>,
+    /// The remote host the block ran under (see [`Block::host`]) —
+    /// `None` stores NULL.
+    pub host: Option<String>,
     /// The exit code, if reported.
     pub exit: Option<i64>,
     /// Execution time, if known.

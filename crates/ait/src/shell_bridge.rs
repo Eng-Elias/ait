@@ -26,7 +26,7 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use ait_agent::{BridgeError, BridgeEvent, ShellBridge, ShellIntegration};
+use ait_agent::{BridgeError, BridgeEvent, RemoteState, ShellBridge, ShellIntegration};
 use ait_shell::RunResult;
 use ait_term::PromptMarkKind;
 
@@ -75,6 +75,10 @@ impl ShellBridge for TabBridge {
 
     fn output_tail(&self) -> Result<Vec<u8>, BridgeError> {
         self.ask(BridgeRequest::OutputTail)
+    }
+
+    fn remote_state(&self) -> Result<RemoteState, BridgeError> {
+        self.ask(BridgeRequest::Remote)
     }
 }
 
@@ -142,6 +146,10 @@ pub(crate) enum BridgeRequest {
     },
     /// `output_tail` — the session's raw output tail.
     OutputTail(Sender<Vec<u8>>),
+    /// `remote_state` — the tab's live remote context (Spec R09-T5):
+    /// the `ssh()`-wrapped session's target and ControlPath while one
+    /// is open, `Local` otherwise — `select_executor`'s tier input.
+    Remote(Sender<RemoteState>),
 }
 
 /// The service side of a [`TabBridge`] — owned by its `Tab`, pumped

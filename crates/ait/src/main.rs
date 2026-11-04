@@ -18,6 +18,7 @@ mod integration;
 mod keymap;
 mod keys;
 mod profile;
+mod remote;
 mod render;
 mod scroll;
 mod selection;

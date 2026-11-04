@@ -32,7 +32,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// One migration step — entry `i` upgrades `user_version` `i` → `i + 1`.
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
-const MIGRATIONS: &[Migration] = &[migration_v1, migration_v2];
+const MIGRATIONS: &[Migration] = &[migration_v1, migration_v2, migration_v3];
 
 /// Version 0 → 1: the Round-8 schema (Spec R08 "Implementation
 /// Decisions"). Times are milliseconds since the Unix epoch;
@@ -77,6 +77,7 @@ fn migration_v1(conn: &Connection) -> Result<(), rusqlite::Error> {
             seq         INTEGER NOT NULL,
             command     TEXT,
             cwd         TEXT,
+            host        TEXT,
             exit        INTEGER,
             duration_ms INTEGER,
             started_at  INTEGER,
@@ -98,6 +99,22 @@ fn migration_v2(conn: &Connection) -> Result<(), rusqlite::Error> {
         .any(|name| name.is_ok_and(|name| name == "cwd"));
     if !has_cwd {
         conn.execute_batch("ALTER TABLE blocks ADD COLUMN cwd TEXT")?;
+    }
+    Ok(())
+}
+
+/// Version 2 → 3: `blocks` gains `host` — the `ssh` destination token
+/// of the remote session the block ran under, NULL for local blocks
+/// (Spec R09-T7). Conditional like v2: a fresh database already has
+/// the post-v3 shape because the amended v1 DDL declares `host`
+/// directly.
+fn migration_v3(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_host = conn
+        .prepare("PRAGMA table_info(blocks)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.is_ok_and(|name| name == "host"));
+    if !has_host {
+        conn.execute_batch("ALTER TABLE blocks ADD COLUMN host TEXT")?;
     }
     Ok(())
 }
@@ -432,13 +449,14 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO blocks
-                 (session_id, seq, command, cwd, exit, duration_ms, started_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (session_id, seq, command, cwd, host, exit, duration_ms, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 block.session_id,
                 seq,
                 block.command,
                 block.cwd,
+                block.host,
                 block.exit,
                 block.duration.map(duration_ms),
                 block.started_at.map(system_to_ms),
@@ -451,6 +469,7 @@ impl Store {
             session_id: block.session_id,
             command: block.command,
             cwd: block.cwd,
+            host: block.host,
             exit: block.exit,
             duration: block.duration,
             started_at: block.started_at,
@@ -472,8 +491,8 @@ impl Store {
             tx.prepare("SELECT COALESCE(MAX(seq) + 1, 0) FROM blocks WHERE session_id = ?1")?;
         let mut insert = tx.prepare(
             "INSERT INTO blocks
-                 (session_id, seq, command, cwd, exit, duration_ms, started_at, ended_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (session_id, seq, command, cwd, host, exit, duration_ms, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         // `seq` continues per session across the batch: the first row
         // of each session queries its max, later rows increment it.
@@ -495,6 +514,7 @@ impl Store {
                 seq,
                 block.command,
                 block.cwd,
+                block.host,
                 block.exit,
                 block.duration.map(duration_ms),
                 block.started_at.map(system_to_ms),
@@ -512,7 +532,7 @@ impl Store {
     /// that lets tests observe block persistence.
     pub fn list_blocks(&self, session_id: i64) -> Result<Vec<Block>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, session_id, command, cwd, exit, duration_ms, started_at, ended_at
+            "SELECT seq, session_id, command, cwd, host, exit, duration_ms, started_at, ended_at
              FROM blocks WHERE session_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([session_id], |row| {
@@ -521,10 +541,11 @@ impl Store {
                 session_id: row.get(1)?,
                 command: row.get(2)?,
                 cwd: row.get(3)?,
-                exit: row.get(4)?,
-                duration: row.get::<_, Option<i64>>(5)?.map(ms_to_duration),
-                started_at: row.get::<_, Option<i64>>(6)?.map(ms_to_system),
-                ended_at: row.get::<_, Option<i64>>(7)?.map(ms_to_system),
+                host: row.get(4)?,
+                exit: row.get(5)?,
+                duration: row.get::<_, Option<i64>>(6)?.map(ms_to_duration),
+                started_at: row.get::<_, Option<i64>>(7)?.map(ms_to_system),
+                ended_at: row.get::<_, Option<i64>>(8)?.map(ms_to_system),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
