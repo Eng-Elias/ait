@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
-use ait_testkit::{ait_bin, E2e, Size, SpawnConfig};
+use ait_testkit::{ait_bin, wait_fresh_prompt, E2e, Size, SpawnConfig};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line.
 const SIZE: Size = Size {
@@ -34,21 +34,6 @@ fn spawn_ait_with_shell(shell: &str) -> E2e {
         .env
         .push((OsString::from("SHELL"), OsString::from(shell)));
     E2e::spawn(config).expect("spawn the ait binary")
-}
-
-/// Wait for a fresh, empty prompt before typing: an interactive
-/// bash/zsh/fish prompt ends `$`/`%`/`>` (host-dependent text, prompt
-/// shape is the constant) and a line *ending* in such a char is a
-/// prompt with nothing typed yet — screen rows are trim_end'ed, and a
-/// prompt carrying text ends in the command instead. Without this
-/// gate a `type_text` can beat the prompt's render and interleave
-/// echo, prompt and output on one row (the `-sh` scenario race).
-fn wait_fresh_prompt(app: &mut E2e, description: &str) {
-    app.wait_for_screen(description, |app| {
-        app.screen_text()
-            .lines()
-            .any(|line| line.ends_with('$') || line.ends_with('%') || line.ends_with('>'))
-    });
 }
 
 /// Type `command` + Enter and wait out its execution: first its own

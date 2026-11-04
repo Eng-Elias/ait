@@ -55,6 +55,13 @@ asserts on a screen from before the command ran:
   exactly at the right margin — check for any rendered non-empty row
   instead.
 
+Code-first tests share `ait_testkit`'s probes rather than re-rolling
+these gates: `wait_fresh_prompt` (every prompt char, `#` included for
+uid-0 shells whose PS1 `\$` renders `#`), `terminal_half` /
+`panel_has_line` (the `│` split), `sentinel_result` (the
+`__AIT_END_<id>=<exit>` result row — never the echo's `=%d`) and
+`json_string` (`src/probes.rs`).
+
 ## Watch it run
 
 ```bash

@@ -25,7 +25,10 @@ use std::fs;
 use std::path::Path;
 
 use ait_llm::testing::{assert_post, sse, Fixture};
-use ait_testkit::{ait_bin, E2e, Size, SpawnConfig};
+use ait_testkit::{
+    ait_bin, json_string, panel_has_line, sentinel_result, terminal_half, wait_fresh_prompt, E2e,
+    Size, SpawnConfig,
+};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line; an open panel
 /// takes two fifths of the content band — the terminal keeps 48
@@ -126,17 +129,6 @@ fn wait_for_chrome(app: &mut E2e) {
     });
 }
 
-/// A line *ending* in `$`/`%`/`>` is a fresh, empty prompt — the
-/// gate before any typing, so keystrokes can never interleave with an
-/// unrendered prompt.
-fn wait_fresh_prompt(app: &mut E2e, description: &str) {
-    app.wait_for_screen(description, |app| {
-        app.screen_text()
-            .lines()
-            .any(|line| line.ends_with('$') || line.ends_with('%') || line.ends_with('>'))
-    });
-}
-
 /// `Alt+A` opens the split focused: the `│` separator renders and the
 /// title row reads `│ agent`.
 fn open_panel(app: &mut E2e) {
@@ -153,58 +145,6 @@ fn submit_task(app: &mut E2e, task: &str) {
         app.screen_text().contains(task)
     });
     app.press("Enter");
-}
-
-/// The terminal half of one screen row — everything left of the
-/// panel's `│` separator. The panel never reaches these columns, so
-/// probes here can only be the session's own grid.
-fn terminal_half(row: &str) -> &str {
-    row.split('│').next().unwrap_or(row)
-}
-
-/// `true` when `row`'s terminal half carries a sentinel *result*
-/// line — `__AIT_END_<id>=<exit>` — which only the run's `printf`
-/// produces. The echoed type-in line carries the same `__AIT_END_`
-/// prefix verbatim but `=%d`, never `=<digit>`, so a bare
-/// `contains("__AIT_END_")` would pass on echo alone — the exact
-/// wait CODING_STANDARDS §15 forbids.
-fn sentinel_result(row: &str) -> bool {
-    let half = terminal_half(row);
-    let Some(start) = half.find("__AIT_END_") else {
-        return false;
-    };
-    half[start..]
-        .split('=')
-        .nth(1)
-        .is_some_and(|tail| tail.starts_with(|ch: char| ch.is_ascii_digit()))
-}
-
-/// Whether any screen row's *panel* half trims to exactly `text` —
-/// how a conversation status line (`done`, `cancelled`) is found
-/// without colliding with terminal-side text.
-fn panel_has_line(app: &E2e, text: &str) -> bool {
-    app.screen_text().lines().any(|row| {
-        row.split('│')
-            .nth(1)
-            .is_some_and(|half| half.trim() == text)
-    })
-}
-
-/// A JSON string literal (`"…"`) for hand-built chunk bodies.
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// One `chat.completion.chunk` `data:` frame carrying a content

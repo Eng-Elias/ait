@@ -77,6 +77,9 @@ crates/ait-testkit/            the harness library
   src/command.rs               Command driver (AIT_E2E_DRIVER subprocess)
   src/scenario.rs              TOML scenario format + runner
   src/evidence.rs              failure dumps, dump_root, panic_text
+  src/probes.rs                shared probes for code-first tests:
+                               fresh-prompt wait, panel/sentinel
+                               predicates, json_string
   tests/                       self-tests on /bin/sh — no ait needed
 
 crates/ait/tests/

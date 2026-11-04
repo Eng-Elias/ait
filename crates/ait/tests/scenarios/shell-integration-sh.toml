@@ -3,11 +3,12 @@
 # terminal works exactly as before: output renders, no block segment
 # ever appears on the status line, no errors.
 #
-# A line ENDING in `$` is a fresh, empty prompt (rows are trim_end'ed;
-# a prompt carrying typed text ends in the command). Every command is
-# fenced by two waits: first its own ECHO (until the typed text
-# renders, the previous bare prompt still satisfies `…\$$` and a
-# fresh-prompt wait could pass early), then a fresh bare prompt.
+# A line ENDING in `$`/`#` is a fresh, empty prompt — `#` covers uid-0
+# shells, whose PS1 `\$` renders `#` (rows are trim_end'ed; a prompt
+# carrying typed text ends in the command). Every command is fenced by
+# two waits: first its own ECHO (until the typed text renders, the
+# previous bare prompt still satisfies `…[$#]$` and a fresh-prompt
+# wait could pass early), then a fresh bare prompt.
 feature = "shell-integration"
 size = [80, 24]
 
@@ -15,7 +16,7 @@ size = [80, 24]
 wait_text = "· sh · — · running"
 
 [[steps]]
-expect_regex = "(?m)^[^\\n]*\\$$"
+expect_regex = "(?m)^[^\\n]*[$#]$"
 
 [[steps]]
 text = "echo SHMARKER\n"
@@ -25,7 +26,7 @@ expect_regex = "echo SHMARKER"
 
 # Back at a bare prompt — the echo ran to completion.
 [[steps]]
-expect_regex = "(?m)^[^\\n]*\\$$"
+expect_regex = "(?m)^[^\\n]*[$#]$"
 
 # A failing command: the error output proves `ls` ran to completion,
 # and the fresh prompt behind it lands after its block would have
@@ -41,7 +42,7 @@ expect_regex = "ls /ait-no-such-dir"
 expect_regex = "No such file"
 
 [[steps]]
-expect_regex = "(?m)^[^\\n]*\\$$"
+expect_regex = "(?m)^[^\\n]*[$#]$"
 
 # The summary is still `cwd · sh · — · running` — no `✓/✗ <code> ·
 # <dur>` segment could slot between `—` and `running`, so this match
