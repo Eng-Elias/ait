@@ -75,8 +75,19 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   fail-safe) renders.
 - **Step budget** — the cap on model turns per task (`STEP_BUDGET`, 50);
   tripping it ends the task with a `BudgetReached` status.
-- **Remote bootstrap** — injecting shell integration into a remote shell over
-  SSH.
+- **Remote bootstrap** — the self-contained POSIX-sh script an integrated
+  `ssh()` sends as the remote command (Spec R09): it lands the injected
+  snippet file set in a private remote `mktemp -d`, exports the session env
+  (`AIT_SESSION_ID`, `AIT_IS_SSH=1`, the `AIT_SSH_*` policy), traps
+  EXIT/HUP for `exit_shell` and cleanup, then runs the remote `$SHELL` —
+  never touching a remote dotfile.
+- **Remote session** — a tab whose foreground shell is a bootstrapped
+  remote shell; `ssh_begin` opens it, `ssh_end` or a remote `exit_shell`
+  closes it, and the status line marks it `ssh:<target>` (§5.9).
+- **ControlMaster tier** — the executor tier that multiplexes `run_command`
+  out-of-band over the SSH control socket the `ssh()` wrapper attached
+  (`ssh -S <sock> <target> <cmd>`); a transport failure demotes the task to
+  the in-band tier for good (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.

@@ -31,6 +31,7 @@ params.
 ESC ] 7700 ; <hex(json)> BEL
 json = {"hook":"<name>","value":{…}}
 hooks: init_shell | bootstrapped | precmd | preexec | exit_shell
+         | ssh_begin | ssh_end        (amended, Round 9 / ADR-0012)
 ```
 
 Exactly one parameter — a hex-encoded JSON object carrying `"hook"`
@@ -73,6 +74,13 @@ inside the reassembled payload — `<id>;<merged stdout+stderr>;
 <exit_code>`, split on the *first* and *last* `;` so output containing
 semicolons survives. `7701` traffic never renders in the grid; the
 typed `__ait_run` line stays visible.
+
+**Amendment (Round 9, ADR-0012):** `ssh_begin` and `ssh_end` joined the
+hook vocabulary. The `ssh()` wrapper emits `ssh_begin` before the wrapped
+connect (`value.target` is the destination token, `value.bootstrapped`
+whether the remote command integrates, `value.control_path` the negotiated
+ControlPath when one exists) and `ssh_end` after `ssh` returns — the
+frontend folds both into the per-tab remote context (§5.9).
 
 ### 7702 / 7703 — reserved, unimplemented
 
