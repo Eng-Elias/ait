@@ -95,7 +95,7 @@ use crate::pty::AgentPty;
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
-use crate::transcript::PlanTodo;
+use crate::transcript::{PlanTodo, TranscriptItem};
 
 /// The step budget (Spec R06, glossary): at most this many model turns
 /// per task. Configurability is a later round's decision; the constant
@@ -134,6 +134,15 @@ pub struct AgentRequest {
     /// The task text — sent verbatim, never redacted (the
     /// typed-request rule, §5.4 us-19).
     pub task: String,
+    /// The conversation's accumulated transcript — the continuity
+    /// record (Spec R08 §5.8): the worker replays it into the
+    /// resolved schema's IR ([`Conversation::from_transcript`])
+    /// before the task lands, so a second task in a tab continues
+    /// where the first left off — the R06 per-task fresh context is
+    /// superseded. An empty vec is exactly that old fresh
+    /// conversation; a resumed conversation's stored items ride the
+    /// same field — the worker never touches disk either way.
+    pub prior: Vec<TranscriptItem>,
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
@@ -580,7 +589,13 @@ fn serve(
     // `declare` is profile-aware: the `agent_decides` tools of this
     // stance gain the required `safety` argument in their schemas
     // (R07-T2) — per task, so a profile change applies next task.
-    let mut conversation = Conversation::new(endpoint.schema(), profile);
+    // The conversation is the continuity unit (Spec R08): the
+    // transcript on `prior` replays into THIS resolved schema's IR —
+    // a mid-conversation endpoint switch strands nothing — then the
+    // new task appends on top. An empty `prior` is the R06 fresh
+    // conversation verbatim.
+    let mut conversation =
+        Conversation::from_transcript(endpoint.schema(), &request.prior, profile);
     conversation.push_user(request.task);
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.

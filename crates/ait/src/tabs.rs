@@ -815,10 +815,22 @@ impl Tab {
         task: String,
         toast: &mut Option<Toast>,
     ) {
+        // The conversation is the continuity unit (Spec R08-T4): the
+        // panel's accumulated transcript rides `prior` so the worker
+        // replays it before this task lands — task two continues
+        // where task one left off. The panel scrollback is unchanged;
+        // the send records the task item itself after submission, so
+        // `prior` never double-carries it.
+        let prior = self
+            .agent
+            .as_ref()
+            .map(|panel| panel.transcript_items().to_vec())
+            .unwrap_or_default();
         let request = AgentRequest {
             settings: settings.clone(),
             profile: profile.to_owned(),
             task,
+            prior,
             context: context_for(self),
             bridge: self
                 .bridge
@@ -1900,6 +1912,7 @@ mod tests {
                 os: "test".into(),
                 output_lines: Vec::new(),
             },
+            prior: Vec::new(),
             bridge: None,
         }
     }
@@ -3341,6 +3354,7 @@ mod tests {
                         os: "test".into(),
                         output_lines: Vec::new(),
                     },
+                    prior: Vec::new(),
                     bridge: None,
                 },
                 &mut toast,

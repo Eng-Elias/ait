@@ -103,6 +103,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
             output_lines: Vec::new(),
         },
         bridge: None,
+        prior: Vec::new(),
     }
 }
 
