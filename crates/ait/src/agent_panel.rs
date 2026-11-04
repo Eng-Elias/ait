@@ -37,7 +37,8 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use ait_agent::{
-    AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, ToolStatus,
+    AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, PlanTodo,
+    PlanTodoStatus, ToolStatus,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -57,6 +58,12 @@ const INPUT_PROMPT: &str = "› ";
 /// [`INPUT_PROMPT`]'s cell width — `›` is three bytes but one column;
 /// input-line math works in cells, never `str::len`.
 const PROMPT_WIDTH: usize = 2;
+
+/// The pinned plan block's row cap — header, visible todos and the
+/// trailing separator together (Spec R08-T5). A longer plan folds
+/// into a `… N more` row rather than crowding the scrollback out of
+/// the panel.
+const PLAN_BLOCK_MAX: usize = 10;
 
 /// One conversation entry — what the panel's scrollback is made of.
 /// Each variant owns its display shape in [`display_lines`].
@@ -227,6 +234,10 @@ pub(crate) struct AgentPanel {
     /// [`TranscriptItem`](ait_agent::TranscriptItem)s — the store's
     /// append source and the `prior` continuity record alike.
     transcript: Transcript,
+    /// The newest `update_plan` snapshot (Spec R08-T5, us-14) — what
+    /// the pinned block under the title renders. Each `PlanUpdated`
+    /// replaces it wholesale; an empty list clears the block.
+    plan: Vec<PlanTodo>,
 }
 
 impl AgentPanel {
@@ -270,7 +281,15 @@ impl AgentPanel {
             painted: Cell::new((0, 0)),
             revision: 0,
             transcript: Transcript::default(),
+            plan: Vec::new(),
         }
+    }
+
+    /// The current plan snapshot — what the pinned block paints
+    /// (Spec R08-T5); empty while no `update_plan` has landed.
+    #[allow(dead_code)] // the paint path + tests and T6's restore read this
+    pub(crate) fn plan(&self) -> &[PlanTodo] {
+        &self.plan
     }
 
     /// Whether the split is open — drives the layout and the tab's
@@ -638,6 +657,12 @@ impl AgentPanel {
                     self.pending_ask = None;
                 }
             }
+            AgentEvent::PlanUpdated { todos } => {
+                // The pinned block's whole content — replace
+                // semantics (us-14): each call's snapshot IS the
+                // plan; an empty list clears the block.
+                self.plan = todos;
+            }
             AgentEvent::Done => {
                 self.running = false;
                 self.pending = None;
@@ -826,12 +851,24 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     if inner.height < 3 {
         return;
     }
+    // The pinned plan block (Spec R08-T5, us-14): directly under the
+    // title — each `update_plan` snapshot replaces its contents — and
+    // the conversation scrolls beneath. The cap keeps a long plan
+    // from crowding the scrollback out of the panel.
+    let available = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
+    let block = plan_lines(&panel.plan, PLAN_BLOCK_MAX.min(available.saturating_sub(1)));
+    let plan_rows = block.len() as u16;
+    for (index, (text, style)) in block.iter().enumerate() {
+        let y = inner.y + 1 + index as u16;
+        reset_span(buf, y, inner.x..inner.right());
+        buf.set_stringn(inner.x, y, text, width, *style);
+    }
     // The conversation between them, pinned to the tail unless the
     // user scrolled up — the paint pass owns the wrap, so it also
     // owns the scroll clamp: `top`/`painted` are what the wheel
     // handlers bound against.
     let conversation = display_lines(&panel.entries, width);
-    let height = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
+    let height = available - block.len();
     let max_top = conversation.len().saturating_sub(height);
     let top = if panel.pinned {
         max_top
@@ -840,7 +877,7 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     };
     panel.painted.set((top, max_top));
     for row in 0..height {
-        let y = inner.y + 1 + row as u16;
+        let y = inner.y + 1 + plan_rows + row as u16;
         reset_span(buf, y, inner.x..inner.right());
         if let Some((text, style)) = conversation.get(top + row) {
             buf.set_stringn(inner.x, y, text, width, *style);
@@ -875,6 +912,45 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
             }
         }
     }
+    lines
+}
+
+/// The pinned plan block's display rows (Spec R08-T5, us-14): a
+/// `plan` header, then one row per todo — `✓` done, `▸` in progress,
+/// `○` pending — and a trailing blank separating the block from the
+/// scrollback. More rows than `cap` folds the tail into a `… N more`
+/// note, so a long plan can never crowd the conversation out of the
+/// panel; below a useful minimum (header + one todo + separator) the
+/// rows are better spent on scrollback and the block sits out.
+fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<(String, Style)> {
+    if plan.is_empty() || cap < 3 {
+        return Vec::new();
+    }
+    let mut lines = vec![(
+        String::from(" plan"),
+        Style::default().fg(RtColor::DarkGray),
+    )];
+    // `cap - 2` todo rows at most — one for the header, one for the
+    // separator/overflow row.
+    let visible = (cap - 2).min(plan.len());
+    for todo in &plan[..visible] {
+        let (mark, style) = match todo.status {
+            PlanTodoStatus::Done => ("✓", Style::default().fg(RtColor::DarkGray)),
+            PlanTodoStatus::InProgress => ("▸", Style::default().add_modifier(Modifier::BOLD)),
+            PlanTodoStatus::Pending => ("○", Style::default()),
+        };
+        lines.push((format!("{mark} {}", todo.content), style));
+    }
+    if plan.len() > visible {
+        // The row this note replaces counted as hidden too.
+        let hidden = plan.len() - visible + 1;
+        lines.pop();
+        lines.push((
+            format!("    … {hidden} more"),
+            Style::default().fg(RtColor::DarkGray),
+        ));
+    }
+    lines.push((String::new(), Style::default()));
     lines
 }
 
@@ -1520,6 +1596,107 @@ mod tests {
             question: question.into(),
             choices: choices.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    /// Spec R08 us-13–15: a `PlanUpdated` pins the TODO block under
+    /// the title — one styled row per todo — the call's ordinary
+    /// card still sits in the scrollback, and the NEXT snapshot
+    /// replaces the block's contents in place (never appends).
+    #[test]
+    fn plan_updates_pin_a_block_that_replaces_in_place() {
+        use ait_agent::{PlanTodo, PlanTodoStatus};
+        let todos = |items: &[(&str, PlanTodoStatus)]| {
+            items
+                .iter()
+                .map(|(content, status)| PlanTodo {
+                    content: (*content).into(),
+                    status: *status,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut panel = panel();
+        panel.apply(AgentEvent::ToolCall {
+            call: call("call_1", "update_plan"),
+            summary: "3 todos".into(),
+        });
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: todos(&[
+                ("reproduce", PlanTodoStatus::Done),
+                ("fix", PlanTodoStatus::InProgress),
+                ("verify", PlanTodoStatus::Pending),
+            ]),
+        });
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Done,
+            detail: Some("plan updated — 3 todos".into()),
+            result: Some("plan updated — 3 todos".into()),
+        });
+
+        // The call's ordinary card landed in the scrollback like
+        // every other tool call.
+        assert_eq!(
+            panel.entries(),
+            &[Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "update_plan".into(),
+                summary: "3 todos".into(),
+                status: CardStatus::Done,
+                detail: Some("plan updated — 3 todos".into()),
+            })]
+        );
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 12));
+        let area = Rect::new(0, 0, 30, 12);
+        paint_agent_panel(&mut buf, area, &panel);
+        // Column 0 is the `│` separator — content starts at 1.
+        fn row(buf: &Buffer, y: u16) -> String {
+            (1..30).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        }
+        // Row 0 is the title; the pinned block owns the next rows.
+        assert_eq!(row(&buf, 1).trim_end(), " plan");
+        assert_eq!(row(&buf, 2).trim_end(), "✓ reproduce");
+        assert_eq!(row(&buf, 3).trim_end(), "▸ fix");
+        assert_eq!(row(&buf, 4).trim_end(), "○ verify");
+        // …and the scrollback conversation begins beneath it.
+        assert_eq!(row(&buf, 5).trim_end(), "");
+        assert_eq!(row(&buf, 6).trim_end(), "✓ update_plan 3 todos");
+
+        // A second call replaces the block's contents — nothing of
+        // the first list survives.
+        panel.apply(AgentEvent::ToolCall {
+            call: call("call_2", "update_plan"),
+            summary: "1 todo".into(),
+        });
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: todos(&[("ship it", PlanTodoStatus::InProgress)]),
+        });
+        paint_agent_panel(&mut buf, area, &panel);
+        assert_eq!(row(&buf, 2).trim_end(), "▸ ship it");
+        assert_eq!(row(&buf, 3).trim_end(), "", "the old rows cleared");
+        assert!(panel.plan().iter().all(|todo| todo.content != "verify"));
+    }
+
+    /// An empty snapshot clears the block — the newest plan IS
+    /// "no plan".
+    #[test]
+    fn an_empty_plan_snapshot_clears_the_block() {
+        let mut panel = panel();
+        panel.apply(AgentEvent::PlanUpdated {
+            todos: vec![ait_agent::PlanTodo {
+                content: "step".into(),
+                status: ait_agent::PlanTodoStatus::Pending,
+            }],
+        });
+        assert_eq!(panel.plan().len(), 1);
+        panel.apply(AgentEvent::PlanUpdated { todos: vec![] });
+        assert!(panel.plan().is_empty());
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 8));
+        paint_agent_panel(&mut buf, Rect::new(0, 0, 20, 8), &panel);
+        let row: String = (1..20).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert_eq!(row.trim_end(), "", "no block under the title");
     }
 
     /// An `AskRequest` opens its own card — question and choices in

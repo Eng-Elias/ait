@@ -123,6 +123,11 @@ impl Transcript {
                     });
                 }
             }
+            AgentEvent::PlanUpdated { todos } => {
+                self.items.push(TranscriptItem::Plan {
+                    todos: todos.clone(),
+                });
+            }
             AgentEvent::Done => self.status("done"),
             AgentEvent::Cancelled => self.status("cancelled"),
             AgentEvent::BudgetReached => self.status("step budget reached"),
@@ -324,6 +329,36 @@ mod tests {
                     choices: vec!["yes".into(), "no".into()],
                 },
                 TranscriptItem::Answer { text: "no".into() },
+            ]
+        );
+    }
+
+    /// Spec R08-T5: a `PlanUpdated` folds into a `plan` item — the
+    /// whole snapshot, so the row append and the `plans` upsert read
+    /// the same list (each call's item is a new row: the evolution
+    /// stays auditable like every other item).
+    #[test]
+    fn a_plan_update_records_a_plan_item() {
+        let mut transcript = Transcript::default();
+        let todos = || {
+            vec![
+                ait_agent::PlanTodo {
+                    content: "reproduce".into(),
+                    status: ait_agent::PlanTodoStatus::Done,
+                },
+                ait_agent::PlanTodo {
+                    content: "fix".into(),
+                    status: ait_agent::PlanTodoStatus::InProgress,
+                },
+            ]
+        };
+        transcript.apply(&AgentEvent::PlanUpdated { todos: todos() });
+        transcript.apply(&AgentEvent::PlanUpdated { todos: vec![] });
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::Plan { todos: todos() },
+                TranscriptItem::Plan { todos: vec![] },
             ]
         );
     }

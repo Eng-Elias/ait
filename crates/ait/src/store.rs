@@ -145,6 +145,30 @@ impl StoreHandle {
         });
     }
 
+    /// The latest `update_plan` snapshot for a conversation (Spec
+    /// R08-T5, us-17): `plans` keeps one row — each call's snapshot
+    /// replaces it — so `load_plan` always reads the newest. The
+    /// item serializes exactly like a `transcript_items` payload:
+    /// its whole serde form, opaque to the store.
+    pub fn plan_upsert(
+        &mut self,
+        toast: &mut Option<Toast>,
+        conversation_id: i64,
+        item: &TranscriptItem,
+    ) {
+        debug_assert!(
+            matches!(item, TranscriptItem::Plan { .. }),
+            "plan_upsert stores plan items only"
+        );
+        // Serialization cannot fail — the item is plain data — but
+        // a payload that somehow didn't serialize is dropped here
+        // rather than panicking on the degrade seam.
+        let Ok(payload) = serde_json::to_string(item) else {
+            return;
+        };
+        self.write(toast, |store| store.upsert_plan(conversation_id, &payload));
+    }
+
     /// The per-drain batch: every `(session id, sealed block)` pair in
     /// ONE transaction (Spec R08 — "writes batched per drain"). An
     /// empty batch costs nothing.
@@ -319,6 +343,54 @@ mod tests {
                 text: "fix the tests".into()
             }
         );
+    }
+
+    /// Spec R08-T5/us-17: each `update_plan` snapshot replaces the
+    /// `plans` row — the row count stays one and `load_plan` reads
+    /// back the newest payload verbatim (the item's whole serde
+    /// form, like a `transcript_items` payload). A dangling
+    /// conversation id degrades through the same toast-once rule.
+    #[test]
+    fn plan_upserts_keep_only_the_latest_snapshot() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+        let id = handle
+            .conversation_started(&mut toast, "plan the work", Path::new("/w"))
+            .expect("the conversation insert lands");
+
+        let first = TranscriptItem::Plan {
+            todos: vec![ait_agent::PlanTodo {
+                content: "reproduce".into(),
+                status: ait_agent::PlanTodoStatus::InProgress,
+            }],
+        };
+        let second = TranscriptItem::Plan {
+            todos: vec![ait_agent::PlanTodo {
+                content: "reproduce".into(),
+                status: ait_agent::PlanTodoStatus::Done,
+            }],
+        };
+        handle.plan_upsert(&mut toast, id, &first);
+        handle.plan_upsert(&mut toast, id, &second);
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        let store = handle.inner.as_ref().unwrap();
+        let payload = store.load_plan(id).unwrap().expect("a plans row");
+        // The newest snapshot, verbatim — and it deserializes back
+        // into the plan item (the T6 restore contract).
+        let back: TranscriptItem = serde_json::from_str(&payload).expect("payload");
+        assert_eq!(back, second);
+
+        // A dangling id is a foreign-key error — toast once, then
+        // the handle goes silent (user story 25).
+        handle.plan_upsert(&mut toast, 999, &first);
+        assert!(
+            toast
+                .as_ref()
+                .is_some_and(|t| t.text().contains("store write failed")),
+            "the failure surfaced as a toast"
+        );
+        assert!(handle.inner.is_none(), "the run continues unpersisted");
     }
 
     /// A transcript append to a dangling conversation id is a
