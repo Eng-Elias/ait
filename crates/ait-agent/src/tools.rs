@@ -515,20 +515,23 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 /// calls after the gate (or directly, for calls the engine allowed).
 /// `pty` is the worker's lazily-spawned agent PTY (`write_to_pty`'s
 /// drop-in seam, R06-T7); `executor` is the task's §5.9
-/// [`CommandExecutor`] — only `run_command` consumes it, so the
-/// file tools never notice which tier is bound; `cancel` lets a
-/// tool's bounded waits — the PTY settle — end early on Esc. Every
-/// failure mode is a [`ToolOutput`] error: a tool error is model
-/// input, never a task failure. This arm IS the dispatcher: the
-/// `edit_files` arm only serves callers that arrive unplanned (the
-/// gate applies its own pre-rendered plan, us-22) and
-/// `ask_user_question` never reaches here (its card answers on the
-/// ask channel, us-10).
+/// [`CommandExecutor`]; `remote` marks the session's bound state —
+/// on a `Remote` task the read-only file tools run as remote
+/// commands through that same executor (Spec R09-T6) while
+/// `edit_files` refuses honestly (remote writes are a later
+/// round's); `cancel` lets a tool's bounded waits — the PTY
+/// settle — end early on Esc. Every failure mode is a
+/// [`ToolOutput`] error: a tool error is model input, never a task
+/// failure. This arm IS the dispatcher: the `edit_files` arm only
+/// serves callers that arrive unplanned (the gate applies its own
+/// pre-rendered plan, us-22) and `ask_user_question` never reaches
+/// here (its card answers on the ask channel, us-10).
 pub(crate) fn execute(
     call: &ToolCall,
     cwd: &ToolCwd,
     pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
+    remote: bool,
     cancel: &CancellationToken,
 ) -> ToolOutput {
     let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
@@ -541,6 +544,21 @@ pub(crate) fn execute(
         }
     };
     match call.name.as_str() {
+        // Spec R09-T6: on a remote task the read-only tools ride the
+        // same executor `run_command` uses — ControlMaster when the
+        // socket lives, in-band through the remote shell otherwise —
+        // so the agent inspects the machine the user is actually
+        // connected to.
+        "read_files" if remote => cwd.remote_read_files(&args, executor),
+        "grep" if remote => cwd.remote_grep(&args, executor),
+        "glob" if remote => cwd.remote_glob(&args, executor),
+        // Remote editing is explicitly out of scope (Spec R09-T6) —
+        // refuse honestly instead of writing to the local disk the
+        // model did not ask about.
+        "edit_files" if remote => ToolOutput::error(String::from(
+            "edit_files: remote editing is not supported — the agent \
+             reads remote files but writes stay local-only",
+        )),
         "read_files" => cwd.read_files(&args),
         "grep" => cwd.grep(&args),
         "glob" => cwd.glob(&args),
@@ -1006,6 +1024,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(!out.is_error);
@@ -1017,6 +1036,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(
@@ -1032,6 +1052,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(
@@ -1045,6 +1066,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(
@@ -1057,6 +1079,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(out.is_error && out.text.contains("input"), "{:?}", out.text);
@@ -1067,6 +1090,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(out.is_error && out.text.contains("ask card"));
@@ -1075,6 +1099,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(out.is_error && out.text.contains("unknown tool"));
@@ -1083,6 +1108,7 @@ mod tests {
             &cwd,
             &mut pty,
             &mut executor,
+            false,
             &cancel,
         );
         assert!(out.is_error && out.text.contains("not valid JSON"));
@@ -1115,6 +1141,7 @@ mod tests {
                 &cwd,
                 &mut pty,
                 &mut executor,
+                false,
                 &cancel,
             );
             assert!(

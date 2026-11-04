@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use regex::Regex;
 
 use crate::diff::unified_diff;
+use crate::executor::CommandExecutor;
 
 /// The largest single file `read_files` returns (Spec R06's size
 /// guard): bigger files report an error rather than flooding the
@@ -129,11 +130,277 @@ impl ToolCwd {
         Self { root, extra_roots }
     }
 
+    /// `new` for a REMOTE session (Spec R09-T6): the same cwd ∪
+    /// allowlist union — but lexical only. The paths live on the
+    /// machine the user ssh'd into, so nothing canonicalizes; the
+    /// matching [`confine_remote`](Self::confine_remote) does the
+    /// same `..` collapse and prefix check [`confine`](Self::confine)
+    /// does, minus the symlink resolution only the local filesystem
+    /// could perform.
+    pub(crate) fn new_remote(cwd: &str, allowlist: &[String]) -> Self {
+        let root = normalize(Path::new(cwd));
+        let extra_roots = allowlist
+            .iter()
+            .map(|entry| {
+                let candidate = Path::new(entry);
+                let joined = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                normalize(&joined)
+            })
+            .collect();
+        Self { root, extra_roots }
+    }
+
     /// The bound working directory — the union's first root and the
     /// directory `write_to_pty` spawns the agent's interactive
     /// session in (R06-T7).
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Remote `read_files` (Spec R09-T6): each confined path runs as
+    /// one remote command through the task's executor — `[ -f ]`, a
+    /// `wc -c` size guard, then `head -c` — so the agent reads the
+    /// machine the user is actually connected to through the same
+    /// channel `run_command` rides. Exit codes carry the refusal
+    /// reason (3 = not a file, 4 = unreadable, 5 = over the size
+    /// cap); the payload is the file bytes, binary-sniffed here
+    /// exactly like a local read.
+    pub(crate) fn remote_read_files(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
+            return ToolOutput::error(String::from(
+                "read_files: `paths` must be an array of file paths",
+            ));
+        };
+        if paths.is_empty() {
+            return ToolOutput::error(String::from("read_files: `paths` is empty"));
+        }
+        let mut out = String::new();
+        let mut failures = 0usize;
+        for (index, path) in paths.iter().enumerate() {
+            if index > 0 {
+                out.push_str("\n\n");
+            }
+            let Some(path) = path.as_str() else {
+                failures += 1;
+                out.push_str("error: every `paths` entry must be a string");
+                continue;
+            };
+            match self.remote_read_one(path, executor) {
+                Ok((display, contents)) => {
+                    out.push_str(&display);
+                    out.push_str(":\n");
+                    out.push_str(&contents);
+                }
+                Err(error) => {
+                    failures += 1;
+                    out.push_str(path);
+                    out.push_str(": error: ");
+                    out.push_str(&error);
+                }
+            }
+        }
+        if failures == paths.len() {
+            ToolOutput::error(out)
+        } else {
+            ToolOutput::ok(out)
+        }
+    }
+
+    /// One remote `read_files` path: confine lexically, run the
+    /// remote stat+cat command, map its exit code to the local
+    /// read's refusal text.
+    fn remote_read_one(
+        &self,
+        path: &str,
+        executor: &mut dyn CommandExecutor,
+    ) -> Result<(String, String), String> {
+        let confined = self.confine_remote(path)?;
+        let display = remote_display(&self.root, &confined);
+        let command = format!(
+            "p={}; if [ ! -f \"$p\" ]; then exit 3; fi; \
+             s=$(wc -c <\"$p\" 2>/dev/null) || exit 4; \
+             [ \"$s\" -gt {cap} ] && exit 5; head -c {cap} \"$p\" || exit 4",
+            sh_quote(&confined),
+            cap = READ_FILE_MAX_BYTES
+        );
+        match executor.run(&command) {
+            Ok(result) => match result.exit_code {
+                Some(0) => {
+                    if looks_binary(&result.output) {
+                        Err(format!("{display} looks binary"))
+                    } else {
+                        Ok((
+                            display,
+                            String::from_utf8_lossy(&result.output).into_owned(),
+                        ))
+                    }
+                }
+                Some(3) => Err(format!("{display} is not a regular file")),
+                Some(5) => Err(format!(
+                    "{display} exceeds the {} KiB read limit",
+                    READ_FILE_MAX_BYTES / 1024
+                )),
+                _ => Err(format!("cannot read {display}")),
+            },
+            Err(error) => Err(format!("cannot read {display}: {error}")),
+        }
+    }
+
+    /// Remote `grep` (Spec R09-T6): `find` walks the confined base
+    /// skipping dot-paths, remote `grep -nHE` applies the pattern
+    /// line-wise, `head` caps at [`GREP_MATCH_CAP`] +1 so a
+    /// truncation note renders — the same `path:line: text` shape the
+    /// local tool prints, base-relative where the path sits under
+    /// the session root.
+    pub(crate) fn remote_grep(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("grep: `pattern` must be a string"));
+        };
+        if pattern.is_empty() {
+            return ToolOutput::error(String::from("grep: `pattern` must not be empty"));
+        }
+        if Regex::new(pattern).is_err() {
+            return ToolOutput::error(format!("grep: invalid pattern {pattern:?}"));
+        }
+        let base = match self.remote_base(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let command = format!(
+            "find {} -type f ! -path '*/.*' -exec grep -nHE -- {} {{}} + 2>/dev/null \
+             | head -n {}",
+            sh_quote(&base),
+            sh_quote(pattern),
+            GREP_MATCH_CAP + 1
+        );
+        match executor.run(&command) {
+            Err(error) => ToolOutput::error(format!("grep: {error}")),
+            Ok(result) => {
+                let text = String::from_utf8_lossy(&result.output);
+                let lines: Vec<String> = text
+                    .lines()
+                    .take(GREP_MATCH_CAP)
+                    .map(|line| remote_display_line(&self.root, line))
+                    .collect();
+                if lines.is_empty() {
+                    ToolOutput::ok(format!("grep: no lines match {pattern:?}"))
+                } else {
+                    let mut out = lines.join("\n");
+                    if text.lines().count() > GREP_MATCH_CAP {
+                        out.push_str(&format!("\n… stopped after {GREP_MATCH_CAP} matches"));
+                    }
+                    ToolOutput::ok(out)
+                }
+            }
+        }
+    }
+
+    /// Remote `glob` (Spec R09-T6): `find` lists the confined base
+    /// (dot-paths skipped like the local walk), remote `grep -E`
+    /// applies the glob translated to an anchored ERE — `*`/`?` stay
+    /// segment-local (`[^/]*`, `[^/]`), `**` crosses segments — and
+    /// `head` caps at [`GLOB_RESULT_CAP`] +1 for the truncation
+    /// note.
+    pub(crate) fn remote_glob(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("glob: `pattern` must be a string"));
+        };
+        let segments: Vec<&str> = pattern.split('/').collect();
+        if pattern.is_empty()
+            || segments
+                .iter()
+                .any(|s| s.is_empty() || *s == "." || *s == "..")
+            || pattern.starts_with('/')
+        {
+            return ToolOutput::error(format!(
+                "glob: `pattern` {pattern:?} must be a relative path pattern \
+                 (`*`, `?`, `**`; no `.`/`..` segments)"
+            ));
+        }
+        let base = match self.remote_base(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let regex = format!("^{}/{}$", ere_escape(&base), glob_to_ere(&segments));
+        let command = format!(
+            "find {} -type f ! -path '*/.*' -print | grep -E -- {} | head -n {}",
+            sh_quote(&base),
+            sh_quote(&regex),
+            GLOB_RESULT_CAP + 1
+        );
+        match executor.run(&command) {
+            Err(error) => ToolOutput::error(format!("glob: {error}")),
+            Ok(result) => {
+                let text = String::from_utf8_lossy(&result.output);
+                let found: Vec<String> = text
+                    .lines()
+                    .take(GLOB_RESULT_CAP)
+                    .map(|line| remote_display(&self.root, line))
+                    .collect();
+                if found.is_empty() {
+                    ToolOutput::ok(format!("glob: no paths match {pattern:?}"))
+                } else {
+                    let mut out = found.join("\n");
+                    if text.lines().count() > GLOB_RESULT_CAP {
+                        out.push_str("\n… truncated");
+                    }
+                    ToolOutput::ok(out)
+                }
+            }
+        }
+    }
+
+    /// The remote twin of [`base_dir`](Self::base_dir): the optional
+    /// `path` argument confined lexically.
+    fn remote_base(&self, arg: Option<&serde_json::Value>) -> Result<String, String> {
+        match arg {
+            None | Some(serde_json::Value::Null) => Ok(self.root.to_string_lossy().into_owned()),
+            Some(value) => match value.as_str() {
+                Some(path) => self.confine_remote(path),
+                None => Err(String::from("`path` must be a string")),
+            },
+        }
+    }
+
+    /// The remote twin of [`confine`](Self::confine): join relative
+    /// paths to the session root, collapse `.`/`..` lexically, then
+    /// the prefix check — but nothing canonicalizes, because the
+    /// filesystem lives on the remote host (Spec R09-T6). The gap
+    /// this leaves is honest and documented: a symlink that escapes
+    /// the union reads through the remote commands exactly like the
+    /// user's own `cat` would — confinement governs which paths the
+    /// tools ASK about, never smuggles a write.
+    fn confine_remote(&self, input: &str) -> Result<String, String> {
+        let candidate = Path::new(input);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.root.join(candidate)
+        };
+        let normalized = normalize(&joined);
+        if !self.contains(&normalized) {
+            return Err(format!(
+                "{input:?} is outside the working directory {}",
+                self.root.display()
+            ));
+        }
+        Ok(normalized.to_string_lossy().into_owned())
     }
 
     /// `read_files` — read each of the arguments' `paths`, with the
@@ -597,6 +864,80 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// POSIX single-quote `value` for a remote command line — every
+/// interpolated path and pattern goes through it, so a `'` in a
+/// model-supplied argument can never break out of its quoting (the
+/// commands the remote tools compose ARE shell text the executor
+/// sends).
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `line` (a remote path) shown relative to the session root when it
+/// sits under it — the remote tools' [`ToolCwd::display`] analog.
+fn remote_display(root: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    match path.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => String::from("."),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// A `path:N: text` grep line with `path` rebased through
+/// [`remote_display`] — only the first `:` split, so colons inside
+/// file names and match text survive.
+fn remote_display_line(root: &Path, line: &str) -> String {
+    match line.split_once(':') {
+        Some((path, rest)) => format!("{}:{rest}", remote_display(root, path)),
+        None => line.to_owned(),
+    }
+}
+
+/// Escape `text` so it matches literally inside a POSIX ERE — used on
+/// the base path half of the remote `glob` regex.
+fn ere_escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if "\\.[]{}()*+?^$|".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// One glob pattern as a POSIX ERE body (unanchored): `*`/`?` stay
+/// segment-local (`[^/]*`, `[^/]`), `**` crosses path separators,
+/// everything else is literal — the translation the remote `grep -E`
+/// filters `find` output by (Spec R09-T6).
+fn glob_to_ere(segments: &[&str]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            if *segment == "**" {
+                return String::from(".*");
+            }
+            let mut out = String::new();
+            let mut chars = segment.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '*' if chars.peek() == Some(&'*') => {
+                        chars.next();
+                        out.push_str(".*");
+                    }
+                    '*' => out.push_str("[^/]*"),
+                    '?' => out.push_str("[^/]"),
+                    _ => out.push_str(&ere_escape(&c.to_string())),
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Depth-first file listing under `base`: hidden entries (any name
