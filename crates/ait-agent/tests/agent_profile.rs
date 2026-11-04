@@ -947,6 +947,327 @@ fn a_profile_without_agent_decides_ships_identical_declarations() {
 }
 
 /// Zero declared profiles — a `default` that was never written or
+/// `write_to_pty = "ask_on_first_write"` — the §5.7 headline (us-11):
+/// the task's first write parks on the approve card; *allow once* is
+/// the interactive session's consent, so the second write runs with
+/// a `Running` card and no ask — and the bytes really reach the live
+/// PTY the first write spawned.
+#[test]
+fn write_to_pty_first_write_asks_then_the_session_runs_free() {
+    // Same shell pin as the R06 round-trip test: bash's `OSC 133`
+    // marks give the settle its deterministic path.
+    if std::path::Path::new("/bin/bash").exists() {
+        // Env mutation is process-global but safe here — no other
+        // test in this binary spawns a PTY.
+        std::env::set_var("SHELL", "/bin/bash");
+    }
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "write_to_pty",
+            r#"{"input":"read v; echo READ-$v\n"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "write_to_pty",
+            r#"{"input":"hello\n"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "write_to_pty = \"ask_on_first_write\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // The first write parks — nothing spawns until consent lands.
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_1", "write_to_pty"));
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // The second write opens an already-running card — no ask.
+    assert_eq!(until_tool_call(&session), "call_2");
+    let events = collect(&session);
+    assert!(
+        no_approval(&events),
+        "one consent covers the session: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Done,
+                detail: Some(_),
+            } if call_id == "call_2"
+        )),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // `READ-hello` is the shell's answer to the second call's input —
+    // the session the first write consented to really kept running.
+    fixture.captured();
+    fixture.captured();
+    let third = fixture.captured();
+    assert!(third.body.contains("READ-hello"), "{}", third.body);
+}
+
+/// A deny on the first write answers that call only — the next write
+/// asks again (us-12: one refusal doesn't lock the model out), and
+/// the allow that lands then covers the rest of the task.
+#[test]
+fn a_denied_first_write_asks_again_on_the_next_call() {
+    if std::path::Path::new("/bin/bash").exists() {
+        std::env::set_var("SHELL", "/bin/bash");
+    }
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[
+            (0, "call_1", "write_to_pty", r#"{"input":"rm x\n"}"#),
+            (1, "call_2", "write_to_pty", r#"{"input":"echo HI\n"}"#),
+        ])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "write_to_pty",
+            r#"{"input":"echo MORE\n"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "write_to_pty = \"ask_on_first_write\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // The first write asks and is refused — that call only.
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::Deny("not that".into()))
+        .expect("deny");
+
+    // The very next write asks again — a deny is not a lockout. On
+    // the way to the re-ask, the refused call's card flips `Denied`
+    // with the user's reason.
+    let mut denied_card = false;
+    let (id, name) = loop {
+        match next(&session) {
+            AgentEvent::ApprovalRequest { call, .. } => break (call.id, call.name),
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail,
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(detail.as_deref(), Some("not that"));
+                denied_card = true;
+            }
+            event @ (AgentEvent::Done
+            | AgentEvent::Cancelled
+            | AgentEvent::BudgetReached
+            | AgentEvent::Error(_)) => panic!("expected an ApprovalRequest, got {event:?}"),
+            _ => {}
+        }
+    };
+    assert!(denied_card, "call_1's card rendered its Denied update");
+    assert_eq!((id.as_str(), name.as_str()), ("call_2", "write_to_pty"));
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // …and the allow covers the rest of the task — call_3 runs free.
+    assert_eq!(until_tool_call(&session), "call_3");
+    let events = collect(&session);
+    assert!(no_approval(&events), "{events:?}");
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The denial text reached the model beside the allowed call's
+    // result in the same turn's results.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("not that"), "{}", second.body);
+}
+
+/// The first-write semantics are uniform across fields (us-12) — not
+/// write-specific: on `read_files`, the field's first `read_files`
+/// call asks and its allow covers `read_files`, while `grep` — a
+/// different tool on the same field — asks its own first ask. The
+/// memory stays per tool name, never per field, never blanket.
+#[test]
+fn ask_on_first_write_is_uniform_across_fields() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[
+            (0, "call_1", "read_files", r#"{"paths":["note.txt"]}"#),
+            (1, "call_2", "read_files", r#"{"paths":["note.txt"]}"#),
+        ])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "grep",
+            r#"{"pattern":"NOTE","path":"."}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "read_files = \"ask_on_first_write\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // First gated read_files call asks; *allow once* covers it…
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_1", "read_files"));
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // …so the second read_files call — same tool, same turn — runs
+    // without asking.
+    assert_eq!(until_tool_call(&session), "call_2");
+
+    // `grep` rides the same profile field but is a different tool —
+    // its first call asks its own first-write ask.
+    let (id, name, _) = until_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_3", "grep"));
+    session
+        .approve(&id, ApprovalVerdict::AllowForTask)
+        .expect("approve");
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
+/// The first-write memory is per task (us-11): a new task asks on
+/// first write again — consent never leaks across task boundaries.
+#[test]
+fn a_new_task_asks_on_first_write_again() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        // Task one: first write asks and is allowed, then it ends.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "write_to_pty",
+            r#"{"input":"q"}"#,
+        )])),
+        sse(&chat_text_turn("task one done")),
+        // Task two: the first write asks again — deny it so no more
+        // writes run.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "write_to_pty",
+            r#"{"input":"q"}"#,
+        )])),
+        sse(&chat_text_turn("task two done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "write_to_pty = \"ask_on_first_write\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::AllowForTask)
+        .expect("approve");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // A fresh task on the same session gets a fresh memory.
+    session
+        .submit(task(
+            settings(&fixture.base_url, "write_to_pty = \"ask_on_first_write\""),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_2", "write_to_pty"));
+    session
+        .approve(&id, ApprovalVerdict::Deny("not now".into()))
+        .expect("deny");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
+/// The deny floor composes with the flag: in one profile,
+/// `execute_commands = "never"` refuses its call outright — card
+/// `Denied`, no approve card, floor first in the decision order —
+/// while `write_to_pty`'s first-write ask still parks.
+#[test]
+fn the_deny_floor_still_refuses_alongside_a_first_write_ask() {
+    if std::path::Path::new("/bin/bash").exists() {
+        std::env::set_var("SHELL", "/bin/bash");
+    }
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[
+            (0, "call_1", "run_command", r#"{"command":"rm note.txt"}"#),
+            (1, "call_2", "write_to_pty", r#"{"input":"echo HI\n"}"#),
+        ])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"never\"\nwrite_to_pty = \"ask_on_first_write\"",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // The `never` call never reaches an approve card: its card opens
+    // then flips `Denied` with the profile's refusal.
+    match next(&session) {
+        AgentEvent::ToolCall { call, .. } => {
+            assert_eq!(
+                (call.id.as_str(), call.name.as_str()),
+                ("call_1", "run_command")
+            )
+        }
+        other => panic!("expected the denied call's card, got {other:?}"),
+    }
+    match next(&session) {
+        AgentEvent::ToolUpdate {
+            call_id,
+            status: ToolStatus::Denied,
+            detail: Some(detail),
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(detail, "denied by execution profile default");
+        }
+        other => panic!("expected the Denied update, got {other:?}"),
+    }
+
+    // The first write still asks — the floor only touches `never`.
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_2", "write_to_pty"));
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    let events = collect(&session);
+    assert!(no_approval(&events), "{events:?}");
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
 /// was removed — evaluates every tool as `always_ask`: the Round 6
 /// interim gate verbatim, fail-safe never silent.
 #[test]
@@ -1033,6 +1354,343 @@ coding_model = "coding-key"
         ),
         other => panic!("expected a terminal Error, got {other:?}"),
     }
+    fixture.assert_no_more_requests();
+}
+
+/// A `command_denylist` hit refuses `run_command` exactly like a
+/// `never` level — even at `always_allow` (Spec R07's order:
+/// `never` → denylist → allowlist → level). The card opens then
+/// flips `Denied`, nothing reaches the executor, and the
+/// `"denied by execution profile <name>"` text is the tool result
+/// the model reads in the next request.
+#[test]
+fn a_denylisted_command_denies_even_at_always_allow() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"rm -rf note.txt"}"#,
+        )])),
+        sse(&chat_text_turn("understood, using read_files instead")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_allow\"\ncommand_denylist = ['^rm']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // No approve card: the profile's verdict is `Deny`, so the call
+    // opens a plain card…
+    match next(&session) {
+        AgentEvent::ToolCall { call, .. } => {
+            assert_eq!(
+                (call.id.as_str(), call.name.as_str()),
+                ("call_1", "run_command")
+            )
+        }
+        other => panic!("expected the denied call's card, got {other:?}"),
+    }
+    let events = collect(&session);
+    // …which the `Denied` update flips immediately — and nothing
+    // ever ran.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail: Some(detail),
+            } if call_id == "call_1" && detail == "denied by execution profile default"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                status: ToolStatus::Running,
+                ..
+            }
+        )),
+        "a denied call never runs: {events:?}"
+    );
+    assert!(no_approval(&events));
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The refusal text IS the tool result in the next request.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second.body.contains("denied by execution profile default"),
+        "{}",
+        second.body
+    );
+    assert!(
+        !second.body.contains("no live shell"),
+        "the call never reached the executor: {}",
+        second.body
+    );
+}
+
+/// A `command_allowlist` hit runs `run_command` without asking —
+/// even at `always_ask` — opening a `Running` card straight to the
+/// executor, whose result text re-enters the conversation as the
+/// tool result.
+#[test]
+fn an_allowlisted_command_runs_without_asking() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"ls -la"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_ask\"\ncommand_allowlist = ['^ls']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    assert_eq!(until_tool_call(&session), "call_1");
+    let events = collect(&session);
+    assert!(
+        no_approval(&events),
+        "an allowlisted command never parks on the card: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The call reached the executor — the no-bridge tier's
+    // `Unbound` text is the tool result the second request carries.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second
+            .body
+            .contains("no live shell bound to run commands in"),
+        "{}",
+        second.body
+    );
+}
+
+/// The denylist sits above the gate memory: after the user allowed
+/// `run_command` for the rest of the task, a denylisted command
+/// still refuses — no card ask, no run — while the unlisted
+/// command that earned the memory ran ungated.
+#[test]
+fn the_denylist_beats_the_allow_for_task_memory() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"ls"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "run_command",
+            r#"{"command":"rm -rf note.txt"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_ask\"\ncommand_denylist = ['^rm']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // `ls` asks; the user allows `run_command` for the task…
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_1", "run_command"));
+    session
+        .approve(&id, ApprovalVerdict::AllowForTask)
+        .expect("approve");
+
+    // …yet the denylisted `rm` still refuses outright.
+    let events = collect(&session);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail: Some(detail),
+            } if call_id == "call_2" && detail == "denied by execution profile default"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Running,
+                ..
+            } if call_id == "call_2"
+        )),
+        "a denied call never runs: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The first call ran (the executor's `Unbound` result rode the
+    // second request); the refusal rode the third.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second
+            .body
+            .contains("no live shell bound to run commands in"),
+        "the allow-for-task call ran ungated: {}",
+        second.body
+    );
+    let third = fixture.captured();
+    assert!(
+        third.body.contains("denied by execution profile default"),
+        "{}",
+        third.body
+    );
+}
+
+/// §5.7 `directory_allowlist` at the channel seam (R07-T4): the
+/// file tools' confinement is the session cwd ∪ the profile's
+/// listed roots. A `read_files` under the listed root runs and its
+/// contents reach the model; an `edit_files` under the same root
+/// still gates on the approve card — carrying its `/dev/null` diff
+/// — and an allow verdict writes it; a path under neither root
+/// answers the unchanged escape tool error. The allowlist widens
+/// only what the tools may touch: verdicts, cards and diffs are
+/// the same as inside the tree.
+#[test]
+fn directory_allowlist_widens_confinement_without_weakening_the_gate() {
+    let dir = project();
+    let shared = tempfile::tempdir().expect("shared dir");
+    std::fs::write(shared.path().join("shared.txt"), "SHARED-CONTENTS").expect("shared");
+    let outside = tempfile::tempdir().expect("outside dir");
+    std::fs::write(outside.path().join("secret.txt"), "SECRET-OUTSIDE").expect("secret");
+    let shared_file = shared.path().join("shared.txt");
+    // Canonical spelling: the leaf does not exist, so confinement
+    // compares its lexical form against the canonicalized root.
+    let new_file = std::fs::canonicalize(shared.path())
+        .expect("canonical shared")
+        .join("fresh.txt");
+    let secret = outside.path().join("secret.txt");
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "read_files",
+            &serde_json::json!({"paths": [shared_file]}).to_string(),
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "edit_files",
+            &serde_json::json!({
+                "files": [{"path": new_file, "content": "FRESH\n"}]
+            })
+            .to_string(),
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "read_files",
+            &serde_json::json!({"paths": [secret]}).to_string(),
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                &format!(
+                    "read_files = \"always_allow\"\n\
+                     apply_code_diffs = \"always_ask\"\n\
+                     directory_allowlist = [{}]",
+                    json_string(shared.path().to_str().expect("utf-8 shared"))
+                ),
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // `read_files` under the listed root: `always_allow` runs it
+    // ungated, exactly as inside the tree.
+    assert_eq!(until_tool_call(&session), "call_1");
+
+    // `edit_files` under the listed root: `always_ask` still parks —
+    // the allowlist never weakens consent — and the card carries the
+    // `/dev/null` preview for the new file.
+    let (id, name, summary) = until_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_2", "edit_files"));
+    assert!(
+        summary.starts_with("--- /dev/null\n+++ b/"),
+        "new-file diff preview: {summary}"
+    );
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // `read_files` under neither root: runs (the level allows it)
+    // and fails inside confinement — the union's edge is the
+    // unchanged escape tool error.
+    assert_eq!(until_tool_call(&session), "call_3");
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Failed,
+                detail: Some(detail),
+            } if call_id == "call_3" && detail.contains("outside the working directory")
+        )),
+        "call_3's card reads the confinement error: {events:?}"
+    );
+    // The allow verdict's plan applied — the write landed under the
+    // listed root, not the session cwd.
+    assert_eq!(
+        std::fs::read_to_string(&new_file).expect("applied edit"),
+        "FRESH\n"
+    );
+
+    // What reached the model: the listed tree's contents, the write
+    // result, and the escape error — never the outside file's bytes.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("SHARED-CONTENTS"), "{}", second.body);
+    let third = fixture.captured();
+    assert!(third.body.contains("wrote"), "{}", third.body);
+    let fourth = fixture.captured();
+    assert!(
+        fourth.body.contains("outside the working directory"),
+        "{}",
+        fourth.body
+    );
+    assert!(!fourth.body.contains("SECRET-OUTSIDE"), "{}", fourth.body);
     fixture.assert_no_more_requests();
 }
 

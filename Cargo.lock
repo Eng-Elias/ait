@@ -61,6 +61,7 @@ dependencies = [
  "ait-config",
  "keyring",
  "notify",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

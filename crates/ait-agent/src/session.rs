@@ -133,7 +133,9 @@ pub struct AgentRequest {
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
-    /// every path the agent reads or searches stays under it.
+    /// every path the agent reads or searches stays under it —
+    /// plus under any `directory_allowlist` root the active profile
+    /// declares (§5.7, R07-T4).
     pub context: AgentContext,
     /// The shell binding `run_command` executes against (Spec R06-T4):
     /// the frontend hands each task the `ShellBridge` its `Tab`
@@ -562,9 +564,16 @@ fn serve(
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
     drain_steering(steering, &mut conversation);
-    // The task's file tools bind to the session's cwd — every path
-    // they touch stays under it (Spec R06's confinement rule).
-    let cwd = ToolCwd::new(&request.context.cwd);
+    // The task's file tools bind to the session's cwd ∪ the active
+    // profile's normalized `directory_allowlist` roots (§5.7,
+    // R07-T4): a missing profile or an empty list confines to cwd
+    // exactly (Spec R06's confinement rule). The union only widens
+    // what the tools may touch — the engine's verdicts, cards and
+    // diffs are unaffected.
+    let allowlist: &[String] = profile
+        .map(|profile| profile.directory_allowlist.as_slice())
+        .unwrap_or(&[]);
+    let cwd = ToolCwd::new(&request.context.cwd, allowlist);
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
@@ -619,7 +628,11 @@ async fn run_loop(
 ) {
     let mut turns = 0usize;
     // Tools the user allowed for the rest of the task — the gate's
-    // per-task memory; per name, never blanket (us-7).
+    // per-task memory; per name, never blanket (us-7). *Allow this
+    // tool for the rest of the task* always records; under
+    // `ask_on_first_write` so does *allow once* — the first write's
+    // consent IS the interactive session's (us-11/12). Fresh per
+    // task, so a new task asks on first write again.
     let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
@@ -741,7 +754,7 @@ fn gate_and_execute(
     // `Deny` open an ungated card — `Deny`'s `Denied` update flips
     // it immediately after.
     let event = match &verdict {
-        Verdict::Ask => AgentEvent::ApprovalRequest {
+        Verdict::Ask { .. } => AgentEvent::ApprovalRequest {
             call: call.clone(),
             summary,
         },
@@ -769,9 +782,18 @@ fn gate_and_execute(
             );
             return Some(reason);
         }
-        Verdict::Ask => {
+        Verdict::Ask { first_write } => {
             match await_reply(verdicts, &call.id, cancel) {
-                ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {}
+                // `ask_on_first_write` (us-11/12): under it *allow
+                // once* is the interactive session's consent — the
+                // first write's allow covers the tool for the rest
+                // of the task, recorded in the same per-tool memory
+                // *allow for task* uses.
+                ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {
+                    if first_write {
+                        allowed_for_task.insert(call.name.clone());
+                    }
+                }
                 ReplyOutcome::Replied(ApprovalVerdict::AllowForTask) => {
                     allowed_for_task.insert(call.name.clone());
                 }

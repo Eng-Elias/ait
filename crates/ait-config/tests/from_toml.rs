@@ -401,3 +401,57 @@ fn missing_required_endpoint_field_names_the_table() {
     );
     assert!(message.contains("base_url"), "actual: {message:?}");
 }
+
+#[test]
+fn a_broken_command_list_regex_names_the_entry() {
+    // §5.7's command lists are regexes the permission engine matches
+    // unanchored — a broken pattern would silently never match, so it
+    // fails at load naming its `…[index]` path. Valid entries already
+    // ride `full_spec_document_parses` (the shipped denylist).
+    let cases: &[(&str, &str)] = &[
+        (
+            "[agents.execution_profiles.default]\ncommand_denylist = ['^ok$', '(']",
+            "agents.execution_profiles.default.command_denylist[1]:",
+        ),
+        (
+            "[agents.execution_profiles.default]\ncommand_allowlist = ['*']",
+            "agents.execution_profiles.default.command_allowlist[0]:",
+        ),
+        (
+            "[agents.execution_profiles.work]\ncommand_denylist = ['[']",
+            "agents.execution_profiles.work.command_denylist[0]:",
+        ),
+    ];
+    for (input, expected) in cases {
+        let err = Settings::from_toml(input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(expected),
+            "input {input:?}\nexpected prefix {expected:?}\nactual   {message:?}"
+        );
+        assert!(
+            message.len() > expected.len(),
+            "the regex error itself must follow the path: {message:?}"
+        );
+    }
+}
+
+#[test]
+fn directory_and_mcp_lists_are_not_regex_validated() {
+    // `directory_allowlist` holds paths and the `mcp_*` lists are inert
+    // (§5.7, Rounds 10/8) — only the command lists compile, so
+    // non-regex text parses here untouched.
+    let settings = Settings::from_toml(
+        r#"
+        [agents.execution_profiles.default]
+        directory_allowlist = ["(", "/tmp"]
+        mcp_allowlist = ["("]
+        mcp_denylist = ["*"]
+        "#,
+    )
+    .unwrap();
+    let profile = &settings.agents.execution_profiles["default"];
+    assert_eq!(profile.directory_allowlist, ["(", "/tmp"]);
+    assert_eq!(profile.mcp_allowlist, ["("]);
+    assert_eq!(profile.mcp_denylist, ["*"]);
+}
