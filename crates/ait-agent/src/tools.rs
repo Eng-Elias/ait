@@ -31,9 +31,10 @@ use crate::files::{EditPlan, ToolCwd, ToolOutput};
 use crate::pty::AgentPty;
 use crate::tool_call::ToolCall;
 
-/// The `ask_user_question` tool's registry name — [`gate_exempt`]
-/// compares against it; the agent loop diverts it into the ask-card
-/// flow before [`execute`] is ever called.
+/// The `ask_user_question` tool's registry name — the permission
+/// engine (`permissions::evaluate`) special-cases it and the agent
+/// loop diverts it into the ask-card flow before [`execute`] is
+/// ever called.
 pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
 
 /// One tool, provider-neutrally: what the model sees, translated
@@ -197,13 +198,6 @@ fn registry() -> &'static [ToolSpec] {
         ]
     });
     &REGISTRY
-}
-
-/// Whether the interim gate asks before `name` runs (Spec R06's
-/// ask-everything rule): every tool asks except
-/// `ask_user_question` — its own card IS the ask (us-10).
-pub(crate) fn gate_exempt(name: &str) -> bool {
-    name == ASK_USER_QUESTION
 }
 
 /// Parse an `ask_user_question` call's arguments into the card's
@@ -372,8 +366,8 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 }
 
 /// Run `call` against `cwd` — the sequential executor the loop
-/// calls after the gate (or directly, for gate-exempt calls). `pty`
-/// is the worker's lazily-spawned agent PTY (`write_to_pty`'s
+/// calls after the gate (or directly, for calls the engine allowed).
+/// `pty` is the worker's lazily-spawned agent PTY (`write_to_pty`'s
 /// drop-in seam, R06-T7); `executor` is the task's §5.9
 /// [`CommandExecutor`] — only `run_command` consumes it, so the
 /// file tools never notice which tier is bound; `cancel` lets a
@@ -543,23 +537,6 @@ mod tests {
             summarize_args(&call("read_files", "{not json")),
             "{not json"
         );
-    }
-
-    /// `ask_user_question` is the gate's one exemption — its card is
-    /// the ask (us-10).
-    #[test]
-    fn gate_exempts_only_ask_user_question() {
-        assert!(gate_exempt(ASK_USER_QUESTION));
-        for name in [
-            "read_files",
-            "grep",
-            "glob",
-            "run_command",
-            "edit_files",
-            "write_to_pty",
-        ] {
-            assert!(!gate_exempt(name), "{name}");
-        }
     }
 
     /// The ask card's pure seam: `question` plus `choices` come out

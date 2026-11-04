@@ -24,22 +24,29 @@
 //!
 //! The agent loop: assemble → stream → accumulate streamed tool-call
 //! deltas → gate + execute sequentially → append per-schema result
-//! items → re-request. The **interim permission gate** (Spec R06's
-//! ask-everything rule, until Round 7's §5.7 profiles land): every
-//! tool call suspends the loop on an
-//! [`AgentEvent::ApprovalRequest`] — carrying the call and a
-//! renderable argument summary — until the frontend's
-//! [`AgentSession::approve`] answers with an [`ApprovalVerdict`]:
-//! *allow once*, *allow this tool for the rest of the task*, or
-//! *deny* (the denial text becomes the tool result). Prompts never
-//! time out (us-9); Esc still cancels the whole task, and
-//! `ask_user_question` is exempt by design — its own card is the ask
-//! (us-10): a call to it suspends on an [`AgentEvent::AskRequest`] —
-//! carrying the question and its choices-or-free-text — until the
-//! frontend's [`AgentSession::answer`] replies, and the answer text
-//! becomes the call's tool result. The gate sits at the same
-//! consult-point §5.7's profile engine will drive — Round 7 swaps
-//! the policy, not the plumbing.
+//! items → re-request. The **permission gate** (§5.7, Spec R07):
+//! every tool call evaluates the task's active execution profile
+//! through the pure `permissions::evaluate` seam — `Allow` runs the
+//! call with its card already `Running`,
+//! `Ask` suspends the loop on an [`AgentEvent::ApprovalRequest`] —
+//! carrying the call and a renderable argument summary — until the
+//! frontend's [`AgentSession::approve`] answers with an
+//! [`ApprovalVerdict`]: *allow once*, *allow this tool for the rest
+//! of the task*, or *deny* (the denial text becomes the tool
+//! result), and `Deny` refuses the call outright — a
+//! `"denied by execution profile <name>"` text becomes the tool
+//! result and the card renders `Denied`. Prompts never time out
+//! (us-9); Esc still cancels the whole task, and
+//! `ask_user_question` at a non-`never` level keeps its exemption
+//! by design — its own card is the ask (us-10): a call to it
+//! suspends on an [`AgentEvent::AskRequest`] — carrying the
+//! question and its choices-or-free-text — until the frontend's
+//! [`AgentSession::answer`] replies, and the answer text becomes
+//! the call's tool result. A profile that resolves to nothing —
+//! missing, renamed or zero declared — evaluates to the Round 6
+//! interim ask-everything rule: the fail-safe asks rather than
+//! silently loosening. Round 7 swapped the policy, not the
+//! plumbing (Spec R06 us-37).
 //!
 //! Calls in one turn execute sequentially in model order (us-33),
 //! each gated. Every tool result passes [`redact`](crate::redact)
@@ -65,7 +72,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ait_config::{ModelRole, OsKeyring, SecretStore, Settings};
+use ait_config::{ExecutionProfile, ModelRole, OsKeyring, SecretStore, Settings};
 use ait_llm::{Endpoint, EndpointConfig, EndpointRequest, EndpointStream, LlmError};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -75,15 +82,17 @@ use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
 use crate::executor::{CommandExecutor, DetachedExecutor, ShellBridge, UserShellExecutor};
 use crate::files::{ToolCwd, ToolOutput};
+use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
 
-/// The execution profile whose model roles agent tasks resolve
-/// against (§4.2 — the only profile Round 6 wires; per-profile roles
-/// are Round 7). The `CommandSuggester` precedent resolves on the same
-/// profile.
+/// The active execution profile (§5.7): the stance whose model roles
+/// (§4.2) and permission levels every task resolves against. T1 binds
+/// the session's only wired name — `default`; the user's ephemeral
+/// selection rides `AgentRequest` once T6 plumbs it. The
+/// `CommandSuggester` precedent resolves on the same profile.
 const PROFILE: &str = "default";
 
 /// The step budget (Spec R06, glossary): at most this many model turns
@@ -130,9 +139,9 @@ pub struct AgentRequest {
 }
 
 /// The user's answer to an [`AgentEvent::ApprovalRequest`] — the
-/// interim gate's whole vocabulary (Spec R06's three-way card).
-/// Round 7's profile engine will compute the same verdict itself;
-/// the channel shape survives it.
+/// ask verdict's whole vocabulary (Spec R06's three-way card).
+/// The §5.7 engine decides when the card appears; the card's
+/// verdicts and the channel shape survive it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalVerdict {
     /// Run this call once; ask again next time.
@@ -172,9 +181,11 @@ pub enum AgentEvent {
         /// file paths — the `edit_files` unified diff, us-22).
         summary: String,
     },
-    /// A call began executing without a gate wait — an
-    /// allow-for-task repeat or a gate-exempt tool. The panel opens
-    /// its tool card already `Running`.
+    /// A call proceeded without a gate wait — the engine allowed it
+    /// (`always_allow`, an allow-for-task repeat) or refused it (a
+    /// profile `Deny` opens this card then flips it `Denied` with
+    /// the next [`ToolUpdate`](AgentEvent::ToolUpdate)). The panel
+    /// opens its tool card already `Running`.
     ToolCall {
         /// The call now executing.
         call: ToolCall,
@@ -534,6 +545,11 @@ fn serve(
     // The task's file tools bind to the session's cwd — every path
     // they touch stays under it (Spec R06's confinement rule).
     let cwd = ToolCwd::new(&request.context.cwd);
+    // The §5.7 stance the permission engine consults on every tool
+    // call — a `default` profile missing, renamed or never declared
+    // resolves to `None`, and the engine's fail-safe asks for every
+    // call (the Round 6 interim gate verbatim).
+    let profile = request.settings.agents.execution_profiles.get(PROFILE);
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
@@ -553,6 +569,7 @@ fn serve(
         verdicts,
         answers,
         &cwd,
+        profile,
         agent_pty,
         executor.as_mut(),
         token,
@@ -577,14 +594,15 @@ async fn run_loop(
     verdicts: &Receiver<(String, ApprovalVerdict)>,
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
+    profile: Option<&ExecutionProfile>,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     cancel: CancellationToken,
     events: &Sender<AgentEvent>,
 ) {
     let mut turns = 0usize;
-    // Tools the user allowed for the rest of the task — the interim
-    // gate's only memory; per name, never blanket (us-7).
+    // Tools the user allowed for the rest of the task — the gate's
+    // per-task memory; per name, never blanket (us-7).
     let mut allowed_for_task: HashSet<String> = HashSet::new();
     loop {
         if turns >= STEP_BUDGET {
@@ -619,6 +637,8 @@ async fn run_loop(
                     }
                     match gate_and_execute(
                         call,
+                        profile,
+                        PROFILE,
                         &mut allowed_for_task,
                         verdicts,
                         answers,
@@ -649,16 +669,20 @@ async fn run_loop(
     }
 }
 
-/// The interim permission gate plus one call's execution (Spec R06):
-/// emit the call's card event, suspend on an
-/// [`ApprovalVerdict`] when the tool is not exempt and was not
-/// allowed for the task, then run the executor. Returns the text the
-/// tool result carries — the executor's (redacted) output, or the
-/// denial text — and `None` when the run must end (cancelled, or the
+/// The §5.7 permission gate plus one call's execution (Spec R07):
+/// the pure `permissions::evaluate` seam resolves the call's
+/// `Verdict` under the task's active profile — `Ask` parks on the
+/// unchanged three-option approve card, `Allow` runs it with the
+/// card already `Running`, `Deny` refuses it outright — then the
+/// executor runs whatever survived. Returns the text the tool
+/// result carries — the executor's (redacted) output, or a denial
+/// text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
-#[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — Round 7 swaps the policy, not the plumbing
+#[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — the profile engine swaps the policy, not the plumbing
 fn gate_and_execute(
     call: &ToolCall,
+    profile: Option<&ExecutionProfile>,
+    profile_name: &str,
     allowed_for_task: &mut HashSet<String>,
     verdicts: &Receiver<(String, ApprovalVerdict)>,
     answers: &Receiver<(String, String)>,
@@ -668,10 +692,14 @@ fn gate_and_execute(
     cancel: &CancellationToken,
     events: &Sender<AgentEvent>,
 ) -> Option<String> {
-    // `ask_user_question` never gates and never executes — its own
-    // card IS the ask (us-10): it suspends on the answer channel and
-    // the reply becomes the call's tool result.
-    if call.name == tools::ASK_USER_QUESTION {
+    // The consult point Spec R06 built the engine swap for: the
+    // verdict, not the plumbing, is what profiles change.
+    let verdict = permissions::evaluate(profile, profile_name, call, allowed_for_task);
+    // `ask_user_question` at a non-`never` level never gates and
+    // never executes — its own card IS the ask (us-10): it suspends
+    // on the answer channel and the reply becomes the call's tool
+    // result. `never` falls through to the profile denial below.
+    if call.name == tools::ASK_USER_QUESTION && !matches!(verdict, Verdict::Deny(_)) {
         return ask_and_answer(call, answers, cancel, events);
     }
     // `edit_files` plans BEFORE the card (Spec R06 us-22/23): the
@@ -692,59 +720,78 @@ fn gate_and_execute(
         },
         None => tools::summarize_args(call),
     };
-    let needs_verdict = !tools::gate_exempt(&call.name) && !allowed_for_task.contains(&call.name);
-    let event = if needs_verdict {
-        AgentEvent::ApprovalRequest {
+    // `Ask` parks on the three-option approve card; `Allow` and
+    // `Deny` open an ungated card — `Deny`'s `Denied` update flips
+    // it immediately after.
+    let event = match &verdict {
+        Verdict::Ask => AgentEvent::ApprovalRequest {
             call: call.clone(),
             summary,
-        }
-    } else {
-        AgentEvent::ToolCall {
+        },
+        Verdict::Allow | Verdict::Deny(_) => AgentEvent::ToolCall {
             call: call.clone(),
             summary,
-        }
+        },
     };
     if !emit(events, event) {
         return None;
     }
-    if needs_verdict {
-        match await_reply(verdicts, &call.id, cancel) {
-            ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {}
-            ReplyOutcome::Replied(ApprovalVerdict::AllowForTask) => {
-                allowed_for_task.insert(call.name.clone());
-            }
-            ReplyOutcome::Replied(ApprovalVerdict::Deny(mut reason)) => {
-                if reason.is_empty() {
-                    reason = DEFAULT_DENIAL.to_string();
+    match verdict {
+        // A profile denial mirrors a user denial (us-8): the card
+        // renders `Denied` and the refusal text IS the tool result —
+        // the model reads which profile refused it. The call never
+        // runs: no `Running` update, nothing reaches the executor.
+        Verdict::Deny(reason) => {
+            emit(
+                events,
+                AgentEvent::ToolUpdate {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Denied,
+                    detail: Some(reason.clone()),
+                },
+            );
+            return Some(reason);
+        }
+        Verdict::Ask => {
+            match await_reply(verdicts, &call.id, cancel) {
+                ReplyOutcome::Replied(ApprovalVerdict::AllowOnce) => {}
+                ReplyOutcome::Replied(ApprovalVerdict::AllowForTask) => {
+                    allowed_for_task.insert(call.name.clone());
                 }
-                emit(
-                    events,
-                    AgentEvent::ToolUpdate {
-                        call_id: call.id.clone(),
-                        status: ToolStatus::Denied,
-                        detail: Some(reason.clone()),
-                    },
-                );
-                // The denial text IS the tool result (us-8) — the
-                // model reads it and picks a different approach.
-                return Some(reason);
+                ReplyOutcome::Replied(ApprovalVerdict::Deny(mut reason)) => {
+                    if reason.is_empty() {
+                        reason = DEFAULT_DENIAL.to_string();
+                    }
+                    emit(
+                        events,
+                        AgentEvent::ToolUpdate {
+                            call_id: call.id.clone(),
+                            status: ToolStatus::Denied,
+                            detail: Some(reason.clone()),
+                        },
+                    );
+                    // The denial text IS the tool result (us-8) — the
+                    // model reads it and picks a different approach.
+                    return Some(reason);
+                }
+                ReplyOutcome::Cancelled => {
+                    emit(events, AgentEvent::Cancelled);
+                    return None;
+                }
+                ReplyOutcome::Gone => return None,
             }
-            ReplyOutcome::Cancelled => {
-                emit(events, AgentEvent::Cancelled);
+            if !emit(
+                events,
+                AgentEvent::ToolUpdate {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Running,
+                    detail: None,
+                },
+            ) {
                 return None;
             }
-            ReplyOutcome::Gone => return None,
         }
-        if !emit(
-            events,
-            AgentEvent::ToolUpdate {
-                call_id: call.id.clone(),
-                status: ToolStatus::Running,
-                detail: None,
-            },
-        ) {
-            return None;
-        }
+        Verdict::Allow => {}
     }
     // Apply the plan the card showed (edit_files); every other call
     // dispatches through the executor.

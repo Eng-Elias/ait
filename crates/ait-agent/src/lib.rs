@@ -29,14 +29,18 @@
 //!   file tools (`read_files`, `grep`, `glob`, `edit_files` — the
 //!   last with an internal unified diff the approve card renders)
 //!   confined to the bound session's cwd.
-//! - the interim permission gate (Spec R06's ask-everything rule):
-//!   every call suspends on an
-//!   [`AgentEvent::ApprovalRequest`] until
-//!   [`AgentSession::approve`] answers an [`ApprovalVerdict`] —
-//!   results, denials included, re-enter the conversation redacted.
-//!   `ask_user_question` is exempt by design (us-10): its
-//!   [`AgentEvent::AskRequest`] card IS the ask, answered through
-//!   [`AgentSession::answer`].
+//! - the permission gate — Spec R06's ask-everything rule, consumed
+//!   by Round 7's §5.7 permission engine
+//!   (`permissions::evaluate`): every call evaluates the active
+//!   execution profile — `Allow` runs with the card `Running`,
+//!   `Ask` suspends on an [`AgentEvent::ApprovalRequest`] until
+//!   [`AgentSession::approve`] answers an [`ApprovalVerdict`],
+//!   `Deny` answers the refusal text outright — and a missing
+//!   profile evaluates to the interim ask-everything rule.
+//!   `ask_user_question` at a non-`never` level stays exempt by
+//!   design (us-10): its [`AgentEvent::AskRequest`] card IS the
+//!   ask, answered through [`AgentSession::answer`]. Results,
+//!   denials included, re-enter the conversation redacted.
 //! - `write_to_pty` and the agent-owned PTY (R06-T7): a lazily
 //!   spawned [`ait_term::LiveSession`] injected through `ait-shell`'s
 //!   planner, driven write↔settle-read from the worker thread for
@@ -56,6 +60,7 @@ mod diff;
 mod endpoint_bridge;
 mod executor;
 mod files;
+mod permissions;
 mod pty;
 mod redact;
 mod sanitize;
