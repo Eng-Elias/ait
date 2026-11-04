@@ -689,8 +689,7 @@ impl AgentPanel {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries
-                    .push(Entry::Status(STATUS_BUDGET.to_string()));
+                self.entries.push(Entry::Status(STATUS_BUDGET.to_string()));
             }
             AgentEvent::Error(message) => {
                 self.running = false;

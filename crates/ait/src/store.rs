@@ -378,13 +378,7 @@ mod tests {
 
         // Reads survive the degraded write path — the picker still
         // lists what already landed.
-        assert_eq!(
-            handle
-                .conversations()
-                .expect("reads keep working")
-                .len(),
-            1
-        );
+        assert_eq!(handle.conversations().expect("reads keep working").len(), 1);
         assert_eq!(
             handle.load_transcript(conversation).unwrap().len(),
             0,

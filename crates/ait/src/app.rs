@@ -324,8 +324,7 @@ pub fn run() -> io::Result<ExitCode> {
             .into_iter()
             .flatten()
             .collect();
-            (!failures.is_empty())
-                .then(|| Toast::new(failures.join(" · "), Instant::now()))
+            (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), Instant::now()))
         },
         config,
         // `OsKeyring` is the default secret store — `api_key_env`

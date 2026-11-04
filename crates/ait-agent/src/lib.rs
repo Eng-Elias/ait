@@ -86,6 +86,6 @@ pub use session::{
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
 pub use tool_call::{ToolCall, ToolStatus};
 pub use transcript::{
-    ask_replay_id, PlanTodo, PlanTodoStatus, TranscriptItem, TranscriptMirror,
-    INTERRUPTED_RESULT, STATUS_BUDGET, STATUS_CANCELLED, STATUS_DONE,
+    ask_replay_id, PlanTodo, PlanTodoStatus, TranscriptItem, TranscriptMirror, INTERRUPTED_RESULT,
+    STATUS_BUDGET, STATUS_CANCELLED, STATUS_DONE,
 };
