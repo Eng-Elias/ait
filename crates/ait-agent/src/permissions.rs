@@ -354,7 +354,7 @@ mod tests {
                     &call_with("read_files", args),
                     &empty
                 ),
-                Verdict::Ask,
+                Verdict::Ask { first_write: false },
                 "{args}"
             );
         }
@@ -633,7 +633,7 @@ mod tests {
                 &run_command_call("cargo test"),
                 &memory
             ),
-            Verdict::Ask,
+            Verdict::Ask { first_write: false },
             "and to the level when the memory is empty"
         );
     }
@@ -681,7 +681,7 @@ mod tests {
                     &run_command_call(command),
                     &empty
                 ),
-                Verdict::Ask,
+                Verdict::Ask { first_write: false },
                 "{command:?} matches neither anchored entry"
             );
         }
@@ -720,7 +720,7 @@ mod tests {
             };
             assert_eq!(
                 evaluate(Some(&profile), "default", &call, &empty),
-                Verdict::Ask,
+                Verdict::Ask { first_write: false },
                 "arguments {arguments:?} carry no matchable command"
             );
         }
@@ -747,7 +747,7 @@ mod tests {
                 &run_command_call("rm -rf /"),
                 &HashSet::new()
             ),
-            Verdict::Ask
+            Verdict::Ask { first_write: false }
         );
     }
 
