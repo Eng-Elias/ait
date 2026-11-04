@@ -557,7 +557,7 @@ fn serve(
     // diffs are unaffected.
     let allowlist: &[String] = profile
         .map(|profile| profile.directory_allowlist.as_slice())
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     let cwd = ToolCwd::new(&request.context.cwd, allowlist);
 
     let token = CancellationToken::new();
