@@ -2020,11 +2020,7 @@ base_model = "key-1"
         harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
         assert_eq!(harness.state.profile, "work");
         assert!(harness.state.picker.is_none(), "two profiles never pick");
-        let toast = harness
-            .state
-            .toast
-            .as_ref()
-            .expect("a real switch toasts");
+        let toast = harness.state.toast.as_ref().expect("a real switch toasts");
         assert!(
             toast.text().contains("\"work\""),
             "the toast names the armed profile: {}",
