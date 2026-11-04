@@ -16,6 +16,7 @@ mod inband;
 mod integration;
 mod keymap;
 mod keys;
+mod profile;
 mod render;
 mod scroll;
 mod selection;

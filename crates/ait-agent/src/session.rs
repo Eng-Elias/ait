@@ -8,10 +8,12 @@
 //! `ait` binary's dependency tree or its synchronous poll loop.
 //!
 //! Per task the worker resolves
-//! `Settings::resolve_model("default", ModelRole::Coding, store)` —
-//! the `coding_model` → `base_model` fallback lives inside
-//! `resolve_model` (§4.2) — so a hot reload that swapped `Settings`
-//! app-side takes effect on the next task with no plumbing here. It
+//! `Settings::resolve_model(&request.profile, ModelRole::Coding,
+//! store)` — the task's armed execution profile picks the stance
+//! (§5.7, Spec R07), the `coding_model` → `base_model` fallback lives
+//! inside `resolve_model` (§4.2) — so a hot reload that swapped
+//! `Settings` app-side takes effect on the next task with no plumbing
+//! here. It
 //! then assembles the per-schema request ([`Conversation`]): the
 //! system prompt carries cwd/OS/shell, the nearest `AGENTS.md` found
 //! walking up from cwd, and the last
