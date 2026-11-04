@@ -106,13 +106,27 @@ mod tests {
 
     use super::*;
 
-    /// A call carrying `name` — the verdict reads only the name in
-    /// T1 (T2/T3 give `arguments` consumers).
+    /// A call carrying `name` — the verdict reads only the name for
+    /// every tool but `run_command` (T2/T3 give `arguments`
+    /// consumers).
     fn call(name: &str) -> ToolCall {
         ToolCall {
             id: String::from("call_1"),
             name: name.into(),
             arguments: String::from("{}"),
+        }
+    }
+
+    /// A `run_command` call carrying the verbatim `command` — what
+    /// the T3 allow/deny lists match against.
+    fn run_command_call(command: &str) -> ToolCall {
+        ToolCall {
+            id: String::from("call_1"),
+            name: String::from("run_command"),
+            arguments: format!(
+                "{{\"command\":{}}}",
+                serde_json::to_string(command).expect("a JSON string literal")
+            ),
         }
     }
 
@@ -296,18 +310,205 @@ mod tests {
         );
     }
 
-    /// The command/directory lists and the `mcp_*`/`context_window_limit`
-    /// fields stay parsed-but-unconsumed (T3/T4, Rounds 10/8): a
-    /// populated allowlist does not relax a call, a populated denylist
-    /// does not tighten one, and `mcp_permissions = "never"` forbids
-    /// nothing the registry declares today.
+    /// `run_command`'s list consult sits between `never` and the
+    /// memory/level consult (Spec R07, T3): a denylist hit refuses
+    /// outright — beating `always_allow`, an allowlist hit and the
+    /// allow-for-task memory alike — an allowlist hit runs without
+    /// asking, and no hit falls through to memory then level like
+    /// every other call.
     #[test]
-    fn lists_and_inert_fields_stay_unconsumed() {
+    fn the_command_lists_decide_before_memory_and_level() {
+        let empty = HashSet::new();
+        // Denylist beats `always_allow`, the allowlist and memory.
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAllow),
+            command_allowlist: vec![String::from(".*")],
+            command_denylist: vec![String::from("^rm")],
+            ..Default::default()
+        };
+        let mut memory = HashSet::from([String::from("run_command")]);
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("rm -rf /"),
+                &memory
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        // An allowlist hit beats an `always_ask` level — no card.
         let profile = ExecutionProfile {
             execute_commands: Some(PermissionLevel::AlwaysAsk),
+            command_allowlist: vec![String::from("^git ")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("git status"),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        // `never` still floors an allowlist hit.
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::Never),
             command_allowlist: vec![String::from(".*")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("git status"),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        // No list hit: the memory, then the level, decide unchanged.
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            command_allowlist: vec![String::from("^git ")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("cargo test"),
+                &memory
+            ),
+            Verdict::Allow,
+            "an unmatched allowlist falls to the gate memory"
+        );
+        memory.clear();
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("cargo test"),
+                &memory
+            ),
+            Verdict::Ask,
+            "and to the level when the memory is empty"
+        );
+    }
+
+    /// Matching is `regex::Regex::is_match` — unanchored, on the
+    /// verbatim command: a bare `rm` matches `sudo rm -rf /`
+    /// mid-string and `echo ok\nrm -rf /` past a line break, while
+    /// an anchored entry binds only where the author anchored it —
+    /// `^git status$` must not allow a chained `&& rm`, and
+    /// `^rm(\s.*)?$` must not swallow a multiline payload (`.` never
+    /// crosses `\n`, `$` binds only the end). Hostile text the
+    /// author's anchors do not cover falls through to the level —
+    /// which still asks — never to a silent allow.
+    #[test]
+    fn command_list_matching_is_unanchored_on_the_verbatim_command() {
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAllow),
+            command_denylist: vec![String::from("rm")],
+            ..Default::default()
+        };
+        let empty = HashSet::new();
+        for command in ["sudo rm -rf /", "echo ok\nrm -rf /"] {
+            assert_eq!(
+                evaluate(Some(&profile), "default", &run_command_call(command), &empty),
+                Verdict::Deny(String::from("denied by execution profile default")),
+                "{command:?}"
+            );
+        }
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            command_allowlist: vec![String::from("^git status$")],
+            command_denylist: vec![String::from("^rm(\\s.*)?$")],
+            ..Default::default()
+        };
+        for command in ["git status && rm -rf /", "rm -rf /\necho done"] {
+            assert_eq!(
+                evaluate(Some(&profile), "default", &run_command_call(command), &empty),
+                Verdict::Ask,
+                "{command:?} matches neither anchored entry"
+            );
+        }
+    }
+
+    /// The lists govern `run_command` alone: a catch-all denylist
+    /// changes nothing for the read tools — their level still
+    /// decides — and a `run_command` call with no usable `command`
+    /// argument (bad JSON, a missing or non-string member) has
+    /// nothing verbatim to match, so it falls through to
+    /// memory/level and the executor reports the bad call like any
+    /// other tool error.
+    #[test]
+    fn the_lists_govern_run_command_only() {
+        let profile = ExecutionProfile {
+            read_files: Some(PermissionLevel::AlwaysAllow),
             command_denylist: vec![String::from(".*")],
-            directory_allowlist: vec![String::from("/tmp")],
+            ..Default::default()
+        };
+        let empty = HashSet::new();
+        assert_eq!(
+            evaluate(Some(&profile), "default", &call("read_files"), &empty),
+            Verdict::Allow,
+            "a command denylist never governs read_files"
+        );
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            command_denylist: vec![String::from(".*")],
+            ..Default::default()
+        };
+        for arguments in ["{}", "not json", "{\"command\":7}"] {
+            let call = ToolCall {
+                id: String::from("call_1"),
+                name: String::from("run_command"),
+                arguments: String::from(arguments),
+            };
+            assert_eq!(
+                evaluate(Some(&profile), "default", &call, &empty),
+                Verdict::Ask,
+                "arguments {arguments:?} carry no matchable command"
+            );
+        }
+    }
+
+    /// An entry that fails to compile simply never matches:
+    /// `Settings::from_toml` compiles every list entry at load
+    /// (ait-config's validation), so an uncompilable pattern can
+    /// only arrive through a hand-built profile — and degrading to
+    /// the level (which still asks) is the safe fallback, never a
+    /// silent allow or deny.
+    #[test]
+    fn an_uncompilable_list_entry_never_matches() {
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            command_allowlist: vec![String::from("(")],
+            command_denylist: vec![String::from("[")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("rm -rf /"),
+                &HashSet::new()
+            ),
+            Verdict::Ask
+        );
+    }
+
+    /// `directory_allowlist`, the `mcp_*` fields and
+    /// `context_window_limit` stay parsed-but-unconsumed (T4, Rounds
+    /// 10/8): a populated directory list neither relaxes nor
+    /// tightens `run_command` — it is a path list, not a command
+    /// list — and `mcp_permissions = "never"` forbids nothing the
+    /// registry declares today.
+    #[test]
+    fn directory_and_mcp_lists_stay_unconsumed() {
+        let profile = ExecutionProfile {
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            directory_allowlist: vec![String::from(".*"), String::from("/tmp")],
             mcp_permissions: Some(PermissionLevel::Never),
             mcp_allowlist: vec![String::from("*")],
             mcp_denylist: vec![String::from("*")],
@@ -316,9 +517,14 @@ mod tests {
         };
         let empty = HashSet::new();
         assert_eq!(
-            evaluate(Some(&profile), "default", &call("run_command"), &empty),
+            evaluate(
+                Some(&profile),
+                "default",
+                &run_command_call("ls"),
+                &empty
+            ),
             Verdict::Ask,
-            "the lists must not relax or tighten a call in T1"
+            "directory_allowlist is not a command list — the level decides"
         );
         let profile = ExecutionProfile {
             read_files: Some(PermissionLevel::AlwaysAllow),
