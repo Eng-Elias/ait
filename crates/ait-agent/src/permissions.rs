@@ -5,14 +5,18 @@
 //! gate is not deleted; it is what a missing profile evaluates to —
 //! the fail-safe asks rather than silently loosening.
 //!
-//! In scope this ticket: the tool → profile-field mapping, the
-//! `always_allow`/`always_ask`/`never` levels and the
-//! `ask_user_question` special case (any non-`never` level behaves
-//! as before — its own card IS the ask), plus `run_command`'s
-//! `command_denylist`/`command_allowlist` consult (T3). `agent_decides`
-//! and `ask_on_first_write` degrade to `always_ask` until the safety
-//! flag (T2) and the first-write memory (T5) land; the directory
-//! allowlist stays parsed-but-unconsumed (T4); `mcp_*` fields and
+//! In scope so far: the tool → profile-field mapping, the
+//! `always_allow`/`always_ask`/`never` levels, the `ask_user_question`
+//! special case (any non-`never` level behaves as before — its own
+//! card IS the ask), the `agent_decides` self-assessment flag
+//! (T2): a call whose own arguments carry `safety: "safe"` allows —
+//! `"unsafe"`, an absent flag or a malformed one asks (the flag's
+//! schema is what `tools::declare` injects into the governed tools'
+//! declarations — [`is_agent_decided`]), and `run_command`'s
+//! `command_denylist`/`command_allowlist` consult (T3).
+//! `ask_on_first_write` degrades to `always_ask` until its
+//! first-write memory (T5) lands; the directory allowlist stays
+//! parsed-but-unconsumed (T4); `mcp_*` fields and
 //! `context_window_limit` stay inert (Rounds 10/8).
 
 use std::collections::HashSet;
@@ -51,17 +55,18 @@ pub(crate) enum Verdict {
 /// *allow this tool for the rest of the task* verdicts populate —
 /// per tool name, never blanket (us-7).
 ///
-/// Decision order: `never` denies first — the hard floor no list
-/// or verdict memory crosses; `ask_user_question` at a non-`never`
-/// level allows through to its own card; for `run_command` the
-/// profile's `command_denylist` then `command_allowlist` consult
+/// Decision order: `never` denies first — the hard floor no list,
+/// verdict memory or flag crosses; `ask_user_question` at a
+/// non-`never` level allows through to its own card; for `run_command`
+/// the profile's `command_denylist` then `command_allowlist` consult
 /// the verbatim `command` argument (unanchored `regex::is_match`)
 /// — a denylist hit refuses with the same profile-denial text
 /// `never` produces, an allowlist hit allows; an allow-for-task
 /// memory allows; then the mapped level decides — `always_allow`
-/// allows, everything else asks (`always_ask`, an unset field, an
-/// unmapped tool name, and `agent_decides`/`ask_on_first_write`
-/// degrading until their consumers land).
+/// allows, `agent_decides` consults the call's own `safety` flag
+/// (`"safe"` allows; `"unsafe"`, absent or malformed asks), and
+/// everything else asks (`always_ask`, an unset field, an unmapped
+/// tool name, and `ask_on_first_write` degrading until T5 lands).
 pub(crate) fn evaluate(
     profile: Option<&ExecutionProfile>,
     profile_name: &str,
@@ -94,8 +99,34 @@ pub(crate) fn evaluate(
     }
     match level {
         Some(PermissionLevel::AlwaysAllow) => Verdict::Allow,
+        // `agent_decides` (T2): the model's self-assessment rides the
+        // call's own arguments — `"safe"` runs unasked, anything else
+        // asks. The `never` check above already outranks the flag: a
+        // `safe`-flagged call to a forbidden tool still denies.
+        Some(PermissionLevel::AgentDecides) if flagged_safe(call) => Verdict::Allow,
         _ => Verdict::Ask,
     }
+}
+
+/// `true` when `tool`'s mapped level under `profile` is
+/// `agent_decides` — the question the declaration transform asks:
+/// `tools::declare` injects the required `safety` argument into
+/// exactly these tools' parameter schemas (Spec R07-T2). A `None`
+/// profile — the missing-profile fail-safe — declares nothing extra:
+/// every call asks anyway.
+pub(crate) fn is_agent_decided(profile: Option<&ExecutionProfile>, tool: &str) -> bool {
+    profile.and_then(|profile| level_for(profile, tool)) == Some(PermissionLevel::AgentDecides)
+}
+
+/// The `agent_decides` flag check: `true` only when the call's own
+/// arguments parse and carry `safety: "safe"` verbatim — the
+/// required parameter the declaration injects for `agent_decides`
+/// tools. `"unsafe"`, an absent flag, a non-string value and
+/// unparseable arguments all fail back to the ask path — the flag is
+/// opt-in, never opt-out.
+fn flagged_safe(call: &ToolCall) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    args.get("safety").and_then(|v| v.as_str()) == Some("safe")
 }
 
 /// The tool → profile-field mapping (Spec R07): `run_command` is
@@ -148,14 +179,23 @@ mod tests {
 
     use super::*;
 
-    /// A call carrying `name` — the verdict reads only the name for
-    /// every tool but `run_command` (T2/T3 give `arguments`
-    /// consumers).
+    /// A call carrying `name` — the verdict reads the `arguments`
+    /// too now (T2's flag check; T3 gives them a second consumer).
     fn call(name: &str) -> ToolCall {
         ToolCall {
             id: String::from("call_1"),
             name: name.into(),
             arguments: String::from("{}"),
+        }
+    }
+
+    /// A call carrying `name` and explicit `arguments` JSON — the
+    /// `agent_decides` flag lives inside the call's own arguments.
+    fn call_with(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: String::from("call_1"),
+            name: name.into(),
+            arguments: String::from(arguments),
         }
     }
 
@@ -202,8 +242,9 @@ mod tests {
     /// The full level × tool matrix: `always_allow` runs, `never`
     /// denies with the profile's name, `ask_user_question` reaches
     /// its own card on every non-`never` level — and the rest ask.
-    /// `agent_decides`, `ask_on_first_write` and unset fields all
-    /// degrade to ask (T2/T5 land their semantics).
+    /// `agent_decides` here carries no `safety` flag, so it asks;
+    /// `ask_on_first_write` still degrades to ask until T5, and
+    /// unset fields ask.
     #[test]
     fn the_level_by_tool_matrix() {
         let gated = [
@@ -256,6 +297,87 @@ mod tests {
             evaluate(Some(&profile), "default", &call(ASK_USER_QUESTION), &empty),
             Verdict::Deny(String::from("denied by execution profile default"))
         );
+    }
+
+    /// `agent_decides` trusts the model's declared self-assessment
+    /// (Spec R07 us-9/10): `safety: "safe"` inside the call's own
+    /// arguments allows; `"unsafe"`, an absent flag, a non-string
+    /// value, a differently-cased flag and unparseable arguments all
+    /// ask — the flag is opt-in, never opt-out.
+    #[test]
+    fn agent_decides_reads_the_safety_flag() {
+        let profile = profile_with("read_files", Some(PermissionLevel::AgentDecides));
+        let empty = HashSet::new();
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with("read_files", r#"{"paths":["a.rs"],"safety":"safe"}"#),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        for args in [
+            r#"{"paths":["a.rs"],"safety":"unsafe"}"#,
+            r#"{"paths":["a.rs"]}"#,
+            r#"{"paths":["a.rs"],"safety":true}"#,
+            r#"{"paths":["a.rs"],"safety":"Safe"}"#,
+            "{not json",
+        ] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with("read_files", args),
+                    &empty
+                ),
+                Verdict::Ask,
+                "{args}"
+            );
+        }
+    }
+
+    /// The flag never crosses the `never` floor: a `safe`-flagged
+    /// call to a forbidden tool still denies.
+    #[test]
+    fn agent_decides_flag_cannot_cross_never() {
+        let profile = profile_with("read_files", Some(PermissionLevel::Never));
+        assert!(matches!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with("read_files", r#"{"paths":["a.rs"],"safety":"safe"}"#),
+                &HashSet::new()
+            ),
+            Verdict::Deny(_)
+        ));
+    }
+
+    /// `is_agent_decided` answers the declaration transform's
+    /// question — `true` only for a tool whose mapped level is
+    /// `agent_decides`; a `None` profile and every other level are
+    /// `false`, so their declarations ship unchanged.
+    #[test]
+    fn is_agent_decided_marks_only_agent_decides_tools() {
+        let profile = ExecutionProfile {
+            read_files: Some(PermissionLevel::AgentDecides),
+            execute_commands: Some(PermissionLevel::AlwaysAsk),
+            ..Default::default()
+        };
+        for tool in ["read_files", "grep", "glob"] {
+            assert!(is_agent_decided(Some(&profile), tool), "{tool}");
+        }
+        for tool in [
+            "run_command",
+            "edit_files",
+            "write_to_pty",
+            ASK_USER_QUESTION,
+        ] {
+            assert!(!is_agent_decided(Some(&profile), tool), "{tool}");
+        }
+        assert!(!is_agent_decided(None, "read_files"));
+        let profile = profile_with("read_files", Some(PermissionLevel::AlwaysAllow));
+        assert!(!is_agent_decided(Some(&profile), "read_files"));
     }
 
     /// The denial text names the profile that refused — the model
