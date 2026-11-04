@@ -13,6 +13,7 @@ use ait_llm::{
     anthropic_messages, openai_chat_completions, openai_responses, EndpointRequest, EndpointSchema,
 };
 
+use crate::summarize::CHARS_PER_TOKEN;
 use crate::tool_call::ToolCall;
 use crate::tools::{self, ToolDecls};
 use crate::transcript::TranscriptItem;
@@ -20,7 +21,7 @@ use crate::transcript::TranscriptItem;
 /// `anthropic_messages` requires `max_tokens` — the schema has no
 /// default. Generous enough for long agent replies; the `chat` example
 /// uses 4096 for smoke answers.
-const ANTHROPIC_MAX_TOKENS: u32 = 8192;
+pub(crate) const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
 /// One task's conversation in a single endpoint schema's message IR.
 /// Created from the resolved endpoint's schema, so the
@@ -381,6 +382,21 @@ impl Conversation {
         }
     }
 
+    /// A rough in-context size for the summarization check (Spec
+    /// R08-T7): serialized-item chars / [`CHARS_PER_TOKEN`]. The
+    /// provider's reported `usage` supersedes it whenever a stream
+    /// carried one; the system prompt and tool declarations are the
+    /// request's constant overhead, not the conversation's growth,
+    /// so they stay out of the count.
+    pub(crate) fn estimated_tokens(&self) -> usize {
+        let chars = match self {
+            Self::OpenAiChatCompletions { messages, .. } => serialized_len(messages),
+            Self::OpenAiResponses { input, .. } => serialized_len(input),
+            Self::AnthropicMessages { messages, .. } => serialized_len(messages),
+        };
+        chars / CHARS_PER_TOKEN
+    }
+
     /// Build this turn's request in the schema's own IR: the
     /// conversation, `model`, the freshly assembled `system` prompt
     /// and the schema's tool declarations.
@@ -503,6 +519,14 @@ impl ReplayTurn {
     }
 }
 
+/// The serialized-item char count the fallback estimate divides —
+/// `0` rather than a wrong guess when serde somehow declines.
+fn serialized_len<T: serde::Serialize>(items: &[T]) -> usize {
+    serde_json::to_string(items)
+        .map(|json| json.len())
+        .unwrap_or(0)
+}
+
 /// Guarantee the first IR item the replay emits is user-role
 /// ([`RESUMED_CONTEXT`]) — a slice opening on assistant content
 /// would otherwise produce a conversation anthropic rejects.
@@ -514,8 +538,9 @@ fn lead(conversation: &mut Conversation, emitted: &mut bool) {
 }
 
 /// The latest `plan` snapshot as injected context — labeled state,
-/// not a fresh instruction.
-fn plan_context(todos: &[crate::transcript::PlanTodo]) -> String {
+/// not a fresh instruction. `summarize` reuses it to carry the plan
+/// verbatim inside a summary marker's text (R08-T7 us-20).
+pub(crate) fn plan_context(todos: &[crate::transcript::PlanTodo]) -> String {
     let mut text = String::from("[the conversation's current plan]");
     for todo in todos {
         let status = match todo.status {
@@ -1000,5 +1025,26 @@ mod tests {
             assert!(body.contains("NOTE-CONTENTS"), "{schema}: {body}");
             assert!(body.contains("ask_user_question"), "{schema}: {body}");
         }
+    }
+
+    /// The fallback estimate (R08-T7): serialized-item chars / 4.
+    /// One chat user message "ab" serializes to the literal
+    /// `[{"role":"user","content":"ab"}]` — 32 chars → 8 tokens.
+    #[test]
+    fn the_fallback_estimate_is_serialized_chars_over_four() {
+        let mut conversation = Conversation::new(EndpointSchema::OpenAiChatCompletions, None);
+        assert_eq!(conversation.estimated_tokens(), 0);
+        conversation.push_user("ab".into());
+        // [{"role":"user","content":"ab"}] = 32 chars.
+        assert_eq!(
+            serde_json::to_string(&[openai_chat_completions::Message::User {
+                content: "ab".into(),
+            }])
+            .unwrap()
+            .len(),
+            32,
+            "the worked example's wire shape"
+        );
+        assert_eq!(conversation.estimated_tokens(), 32 / 4);
     }
 }
