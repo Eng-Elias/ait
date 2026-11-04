@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use ait_store::ListedConversation;
 
 /// One picker row — a stored conversation's display form.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConversationRow {
     /// The `conversations` row id resume and delete address.
     pub id: i64,
@@ -35,7 +35,7 @@ pub(crate) struct ConversationRow {
 /// first press arms the highlighted row, the second deletes it and
 /// any other key disarms (us-11: delete is one gesture but never an
 /// accident).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConversationPicker {
     /// The display rows, newest first.
     rows: Vec<ConversationRow>,
