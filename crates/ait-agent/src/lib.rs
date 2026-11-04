@@ -66,6 +66,7 @@ mod redact;
 mod sanitize;
 mod session;
 mod suggester;
+mod summarize;
 mod tool_call;
 mod tools;
 mod transcript;
@@ -79,8 +80,8 @@ pub use executor::{
 pub use redact::redact;
 pub use sanitize::{sanitize_reply, ReplySanitizer};
 pub use session::{
-    AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, STEP_BUDGET,
+    AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, STEP_BUDGET, SUMMARIZE_AT,
 };
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
 pub use tool_call::{ToolCall, ToolStatus};
-pub use transcript::{PlanTodo, PlanTodoStatus, TranscriptItem};
+pub use transcript::{PlanTodo, PlanTodoStatus, TranscriptItem, TranscriptMirror};

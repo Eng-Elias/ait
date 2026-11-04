@@ -9,9 +9,10 @@
 //! are both the store's append source (the per-drain `take_new`) and
 //! the in-memory transcript a next task's `AgentRequest.prior` will
 //! replay (R08-T4) — kept in full either way, whether or not a store
-//! is live.
-
-use std::collections::HashSet;
+//! is live. The fold itself is shared
+//! [`ait_agent::TranscriptMirror`] — R08-T7's worker keeps the same
+//! mirror so a `summary` marker's `covers_seq` counts in this
+//! transcript's own seq domain.
 
 use ait_agent::{AgentEvent, TranscriptItem};
 
@@ -19,120 +20,46 @@ use ait_agent::{AgentEvent, TranscriptItem};
 /// truncated (Spec R08 us-5: "titled from the first task").
 const TITLE_CHARS: usize = 60;
 
-/// One panel's accumulated transcript plus the fold state the mirror
-/// needs. Item-level mirror rules (all in [`apply`](Self::apply)):
-///
-/// - `TextDelta`s coalesce onto the newest `assistant_text` — one
-///   item per assistant turn, since a turn's deltas are contiguous
-///   and the next turn's events always interpose a non-delta event.
-/// - `ApprovalRequest` and `ToolCall` both record `tool_call` — the
-///   card variant is a frontend distinction the transcript drops.
-/// - `ToolUpdate` records `tool_result` only when it carries the
-///   full `result` text: `Running` is a card transition, not a
-///   record, and an `ask`'s `Done` update would double-record the
-///   `answer` item the send side already wrote.
-/// - terminal events record `status` with the line the panel shows.
+/// One panel's accumulated transcript — the shared
+/// [`ait_agent::TranscriptMirror`] fold plus the per-drain flush
+/// watermark the store's append batching needs.
 #[derive(Default)]
 pub(crate) struct Transcript {
     /// The whole accumulated transcript — the store's append source
     /// AND the `prior` continuity record (T4): a disabled store never
-    /// truncates it.
-    items: Vec<TranscriptItem>,
+    /// truncates it. The fold rules live on `TranscriptMirror`.
+    mirror: ait_agent::TranscriptMirror,
     /// Items already handed to a [`take_new`](Self::take_new) caller —
     /// the per-drain watermark; the take advances it whether or not
     /// the write landed (the unpersisted-run rule).
     flushed: usize,
-    /// `ask_user_question` call ids — a matching `ToolUpdate`'s
-    /// `result` would double-record the `answer` item the send side
-    /// already wrote (the reply IS the call's result verbatim).
-    asks: HashSet<String>,
 }
 
 impl Transcript {
     /// The send-side record of a submitted task — first task of a
     /// flush is what [`conversation_title`] reads.
     pub(crate) fn task(&mut self, text: &str) {
-        self.items.push(TranscriptItem::Task {
-            text: text.to_owned(),
-        });
+        self.mirror.task(text);
     }
 
     /// The send-side record of a steering message — in send order,
     /// even while the worker only reads it inside the next task's
     /// conversation.
     pub(crate) fn steering(&mut self, text: &str) {
-        self.items.push(TranscriptItem::Steering {
-            text: text.to_owned(),
-        });
+        self.mirror.steering(text);
     }
 
     /// The send-side record of an `ask_user_question` answer — the
     /// full text is known here; the matching `ToolUpdate` only ever
     /// carries a preview (and is skipped on it).
     pub(crate) fn answer(&mut self, text: &str) {
-        self.items.push(TranscriptItem::Answer {
-            text: text.to_owned(),
-        });
+        self.mirror.answer(text);
     }
 
-    /// Fold one drained [`AgentEvent`] into items — the mirror rules
-    /// in the struct doc. Called for every event the panel applies.
+    /// Fold one drained [`AgentEvent`] into items — the shared
+    /// mirror rules. Called for every event the panel applies.
     pub(crate) fn apply(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::TextDelta(text) => match self.items.last_mut() {
-                Some(TranscriptItem::AssistantText { text: last }) => last.push_str(text),
-                _ => self
-                    .items
-                    .push(TranscriptItem::AssistantText { text: text.clone() }),
-            },
-            // The gated and ungated cards are the same record — a
-            // call the model made, verdict pending or not.
-            AgentEvent::ApprovalRequest { call, summary }
-            | AgentEvent::ToolCall { call, summary } => {
-                self.items.push(TranscriptItem::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    args: call.arguments.clone(),
-                    summary: summary.clone(),
-                });
-            }
-            AgentEvent::AskRequest {
-                call,
-                question,
-                choices,
-            } => {
-                self.asks.insert(call.id.clone());
-                self.items.push(TranscriptItem::Ask {
-                    question: question.clone(),
-                    choices: choices.clone(),
-                });
-            }
-            AgentEvent::ToolUpdate {
-                call_id,
-                status,
-                result,
-                ..
-            } => {
-                // `result` carries the full text only on terminal
-                // updates; an ask's update duplicates the `answer`.
-                if let (Some(text), false) = (result, self.asks.contains(call_id)) {
-                    self.items.push(TranscriptItem::ToolResult {
-                        id: call_id.clone(),
-                        text: text.clone(),
-                        status: *status,
-                    });
-                }
-            }
-            AgentEvent::PlanUpdated { todos } => {
-                self.items.push(TranscriptItem::Plan {
-                    todos: todos.clone(),
-                });
-            }
-            AgentEvent::Done => self.status("done"),
-            AgentEvent::Cancelled => self.status("cancelled"),
-            AgentEvent::BudgetReached => self.status("step budget reached"),
-            AgentEvent::Error(message) => self.status(&format!("error: {message}")),
-        }
+        self.mirror.apply(event);
     }
 
     /// The items accumulated since the last take — the store's
@@ -140,22 +67,16 @@ impl Transcript {
     /// the caller does with them (the unpersisted-run rule); the
     /// full vec stays — it is the `prior` continuity record too.
     pub(crate) fn take_new(&mut self) -> Vec<TranscriptItem> {
-        let new = self.items[self.flushed..].to_vec();
-        self.flushed = self.items.len();
+        let items = self.mirror.items();
+        let new = items[self.flushed..].to_vec();
+        self.flushed = items.len();
         new
     }
 
     /// The whole accumulated transcript — what a resumed tab's next
     /// `AgentRequest.prior` hands the worker (R08-T4).
     pub(crate) fn items(&self) -> &[TranscriptItem] {
-        &self.items
-    }
-
-    /// Push a terminal-status line — the text the panel renders.
-    fn status(&mut self, text: &str) {
-        self.items.push(TranscriptItem::Status {
-            text: text.to_owned(),
-        });
+        self.mirror.items()
     }
 }
 

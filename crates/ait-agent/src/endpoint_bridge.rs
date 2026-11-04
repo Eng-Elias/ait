@@ -62,6 +62,34 @@ pub(crate) fn extract(event: EndpointStreamEvent) -> Extracted {
     }
 }
 
+/// The turn's token count as the provider reported it on `Finish`
+/// (Spec R08-T7): the summarization estimate prefers this over the
+/// chars/4 heuristic because the provider counted what actually
+/// crossed the context. The three adapters' `Usage` shapes
+/// normalize to the turn's total — chat and responses carry it
+/// directly; anthropic's optional input/output counts sum, and a
+/// report with neither is no report at all. Non-`Finish` events
+/// (and `Finish`es with no usage) return `None`.
+pub(crate) fn reported_tokens(event: &EndpointStreamEvent) -> Option<u64> {
+    match event {
+        EndpointStreamEvent::OpenAiChatCompletions(
+            openai_chat_completions::StreamEvent::Finish { usage, .. },
+        ) => usage.map(|usage| usage.total_tokens),
+        EndpointStreamEvent::OpenAiResponses(openai_responses::StreamEvent::Finish {
+            usage,
+            ..
+        }) => usage.map(|usage| usage.total_tokens),
+        EndpointStreamEvent::AnthropicMessages(anthropic_messages::StreamEvent::Finish {
+            usage,
+            ..
+        }) => usage.and_then(|usage| {
+            let total = usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
+            (total > 0).then_some(total)
+        }),
+        _ => None,
+    }
+}
+
 /// A provider error event for the channel: the message, with the
 /// machine-readable code appended when the endpoint sent one.
 fn provider_error(message: String, code: Option<String>) -> String {

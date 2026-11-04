@@ -21,8 +21,11 @@
 //! The store keeps payloads as opaque JSON; the vocabulary lives
 //! here and only here.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
+use crate::session::AgentEvent;
 use crate::tool_call::ToolStatus;
 
 /// One transcript record — the persisted form of a conversation
@@ -148,6 +151,161 @@ impl TranscriptItem {
             Self::Summary { .. } => "summary",
             Self::Plan { .. } => "plan",
         }
+    }
+}
+
+/// The `AgentEvent` → [`TranscriptItem`] fold (Spec R08 §5.8,
+/// user story 28 — the mirror rule R08-T3 first landed in the
+/// `ait` frontend and R08-T7 moved here so the worker folds the
+/// same events by the same rule). One mirror per conversation:
+/// `task`, `steering` and `answer` items are recorded at send time
+/// (they have no events); every drained event goes through
+/// [`apply`](Self::apply). Item-level rules:
+///
+/// - `TextDelta`s coalesce onto the newest `assistant_text` — one
+///   item per assistant turn, since a turn's deltas are contiguous
+///   and the next turn's events always interpose a non-delta event.
+/// - `ApprovalRequest` and `ToolCall` both record `tool_call` — the
+///   card variant is a frontend distinction the transcript drops.
+/// - `ToolUpdate` records `tool_result` only when it carries the
+///   full `result` text: `Running` is a card transition, not a
+///   record, and an `ask`'s `Done` update would double-record the
+///   `answer` item the send side already wrote.
+/// - `PlanUpdated` records the whole `plan` snapshot; `Summarized`
+///   records the `summary` marker it carries.
+/// - terminal events record `status` with the line the panel shows.
+///
+/// The worker keeps its own mirror to compute a `summary` marker's
+/// `covers_seq` — the persisted transcript's seq domain. The two
+/// mirrors hold the same items; the only possible divergence is a
+/// steering message sent mid-tool-turn, which the frontend records
+/// at send time while the worker records it at the next turn
+/// boundary — a boundary-adjacent `covers_seq` may then cover one
+/// item more or less than the span the summary was generated over,
+/// which replay always tolerates (orphan results drop; unanswered
+/// calls gain the interrupted result).
+#[derive(Default)]
+pub struct TranscriptMirror {
+    /// The accumulated items, in record order — the store's append
+    /// order and the `prior` continuity record alike.
+    items: Vec<TranscriptItem>,
+    /// `ask_user_question` call ids — a matching `ToolUpdate`'s
+    /// `result` would double-record the `answer` item the send side
+    /// already wrote (the reply IS the call's result verbatim).
+    asks: HashSet<String>,
+}
+
+impl TranscriptMirror {
+    /// Append `item` verbatim — the seeding path for
+    /// `AgentRequest.prior` (the items were folded when they were
+    /// first recorded; re-folding would double them).
+    pub fn record(&mut self, item: TranscriptItem) {
+        self.items.push(item);
+    }
+
+    /// The send-side record of a submitted task.
+    pub fn task(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Task {
+            text: text.to_owned(),
+        });
+    }
+
+    /// The send-side record of a steering message — the caller's
+    /// record position is the transcript's: the frontend records at
+    /// send time, the worker at its turn boundary.
+    pub fn steering(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Steering {
+            text: text.to_owned(),
+        });
+    }
+
+    /// The send-side record of an `ask_user_question` answer — the
+    /// full text is known at the send site; the matching
+    /// `ToolUpdate` only ever carries a preview (and is skipped on
+    /// it).
+    pub fn answer(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Answer {
+            text: text.to_owned(),
+        });
+    }
+
+    /// Fold one drained [`AgentEvent`] into items — the mirror rules
+    /// in the struct doc.
+    pub fn apply(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(text) => match self.items.last_mut() {
+                Some(TranscriptItem::AssistantText { text: last }) => last.push_str(text),
+                _ => self
+                    .items
+                    .push(TranscriptItem::AssistantText { text: text.clone() }),
+            },
+            // The gated and ungated cards are the same record — a
+            // call the model made, verdict pending or not.
+            AgentEvent::ApprovalRequest { call, summary }
+            | AgentEvent::ToolCall { call, summary } => {
+                self.items.push(TranscriptItem::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                    summary: summary.clone(),
+                });
+            }
+            AgentEvent::AskRequest {
+                call,
+                question,
+                choices,
+            } => {
+                self.asks.insert(call.id.clone());
+                self.items.push(TranscriptItem::Ask {
+                    question: question.clone(),
+                    choices: choices.clone(),
+                });
+            }
+            AgentEvent::ToolUpdate {
+                call_id,
+                status,
+                result,
+                ..
+            } => {
+                // `result` carries the full text only on terminal
+                // updates; an ask's update duplicates the `answer`.
+                if let (Some(text), false) = (result, self.asks.contains(call_id)) {
+                    self.items.push(TranscriptItem::ToolResult {
+                        id: call_id.clone(),
+                        text: text.clone(),
+                        status: *status,
+                    });
+                }
+            }
+            AgentEvent::PlanUpdated { todos } => {
+                self.items.push(TranscriptItem::Plan {
+                    todos: todos.clone(),
+                });
+            }
+            AgentEvent::Summarized { text, covers_seq } => {
+                self.items.push(TranscriptItem::Summary {
+                    text: text.clone(),
+                    covers_seq: *covers_seq,
+                });
+            }
+            AgentEvent::Done => self.status("done"),
+            AgentEvent::Cancelled => self.status("cancelled"),
+            AgentEvent::BudgetReached => self.status("step budget reached"),
+            AgentEvent::Error(message) => self.status(&format!("error: {message}")),
+        }
+    }
+
+    /// The whole accumulated transcript — the store's append source
+    /// and the `prior` continuity record alike.
+    pub fn items(&self) -> &[TranscriptItem] {
+        &self.items
+    }
+
+    /// Push a terminal-status line — the text the panel renders.
+    fn status(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Status {
+            text: text.to_owned(),
+        });
     }
 }
 

@@ -662,6 +662,15 @@ impl AgentPanel {
                 // plan; an empty list clears the block.
                 self.plan = todos;
             }
+            AgentEvent::Summarized { .. } => {
+                // The worker rewrote the conversation's oldest half
+                // into a summary marker (us-22): the status entry
+                // makes the rewrite visible — never silent. The
+                // transcript fold already recorded the `summary`
+                // item; the task keeps running.
+                self.entries
+                    .push(Entry::Status("conversation summarized".to_string()));
+            }
             AgentEvent::Done => {
                 self.running = false;
                 self.pending = None;
