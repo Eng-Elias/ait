@@ -583,6 +583,7 @@ impl AgentPanel {
                 call_id,
                 status,
                 detail,
+                ..
             } => {
                 // The newest card with the id wins — call ids are
                 // provider-unique but defensive all the same.
@@ -1355,6 +1356,7 @@ mod tests {
             call_id: "call_1".into(),
             status: ait_agent::ToolStatus::Done,
             detail: Some("a.rs".into()),
+            result: Some("a.rs".into()),
         });
         assert_eq!(
             panel.entries().last(),
@@ -1377,6 +1379,7 @@ mod tests {
             call_id: "call_2".into(),
             status: ait_agent::ToolStatus::Denied,
             detail: Some("not now".into()),
+            result: Some("not now".into()),
         });
         assert!(!panel.awaiting_verdict());
         assert!(matches!(
@@ -1584,6 +1587,7 @@ mod tests {
             call_id: "call_1".into(),
             status: ait_agent::ToolStatus::Done,
             detail: Some("note.txt: contents".into()),
+            result: Some("note.txt: contents".into()),
         });
         let mut buf = Buffer::empty(Rect::new(0, 0, 60, 7));
         paint_agent_panel(&mut buf, Rect::new(0, 0, 60, 7), &panel);

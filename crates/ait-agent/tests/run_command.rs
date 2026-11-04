@@ -325,11 +325,13 @@ fn run_command_gates_then_result_reenters_as_tool_item() {
                 call_id: "call_1".into(),
                 status: ToolStatus::Running,
                 detail: None,
+                result: None,
             },
             AgentEvent::ToolUpdate {
                 call_id: "call_1".into(),
                 status: ToolStatus::Done,
                 detail: Some("MERGED-OUT …".into()),
+                result: Some("MERGED-OUT\nexit code: 3".into()),
             },
         ],
         "{events:?}"

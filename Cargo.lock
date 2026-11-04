@@ -49,6 +49,7 @@ dependencies = [
  "ait-term",
  "futures-util",
  "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
