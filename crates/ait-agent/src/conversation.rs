@@ -8,6 +8,7 @@
 //! `instructions` fields, or the leading `system` message in
 //! `openai_chat_completions`).
 
+use ait_config::ExecutionProfile;
 use ait_llm::{
     anthropic_messages, openai_chat_completions, openai_responses, EndpointRequest, EndpointSchema,
 };
@@ -51,9 +52,12 @@ pub(crate) enum Conversation {
 
 impl Conversation {
     /// An empty conversation for `schema`, carrying the tool registry
-    /// translated into the schema's `Tool` shape ([`tools::declare`]).
-    pub(crate) fn new(schema: EndpointSchema) -> Self {
-        match tools::declare(schema) {
+    /// translated into the schema's `Tool` shape ([`tools::declare`])
+    /// under the task's active `profile` — the §5.7 stance decides
+    /// which tools declare the `agent_decides` `safety` argument
+    /// (R07-T2); `None` declares the registry verbatim.
+    pub(crate) fn new(schema: EndpointSchema, profile: Option<&ExecutionProfile>) -> Self {
+        match tools::declare(schema, profile) {
             ToolDecls::Chat(tools) => Self::OpenAiChatCompletions {
                 messages: Vec::new(),
                 tools,
