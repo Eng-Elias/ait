@@ -8,16 +8,17 @@
 //! In scope this ticket: the tool → profile-field mapping, the
 //! `always_allow`/`always_ask`/`never` levels and the
 //! `ask_user_question` special case (any non-`never` level behaves
-//! as before — its own card IS the ask). `agent_decides` and
-//! `ask_on_first_write` degrade to `always_ask` until the safety
-//! flag (T2) and the first-write memory (T5) land; the command and
-//! directory allow/deny lists stay parsed-but-unconsumed (T3/T4);
-//! `mcp_*` fields and `context_window_limit` stay inert (Rounds
-//! 10/8).
+//! as before — its own card IS the ask), plus `run_command`'s
+//! `command_denylist`/`command_allowlist` consult (T3). `agent_decides`
+//! and `ask_on_first_write` degrade to `always_ask` until the safety
+//! flag (T2) and the first-write memory (T5) land; the directory
+//! allowlist stays parsed-but-unconsumed (T4); `mcp_*` fields and
+//! `context_window_limit` stay inert (Rounds 10/8).
 
 use std::collections::HashSet;
 
 use ait_config::{ExecutionProfile, PermissionLevel};
+use regex::Regex;
 
 use crate::tool_call::ToolCall;
 use crate::tools::ASK_USER_QUESTION;
@@ -50,13 +51,17 @@ pub(crate) enum Verdict {
 /// *allow this tool for the rest of the task* verdicts populate —
 /// per tool name, never blanket (us-7).
 ///
-/// Decision order (R07-T1): `never` denies first — the hard floor no
-/// verdict memory crosses; `ask_user_question` at a non-`never`
-/// level allows through to its own card; an allow-for-task memory
-/// allows; then the mapped level decides — `always_allow` allows,
-/// everything else asks (`always_ask`, an unset field, an unmapped
-/// tool name, and `agent_decides`/`ask_on_first_write` degrading
-/// until their consumers land).
+/// Decision order: `never` denies first — the hard floor no list
+/// or verdict memory crosses; `ask_user_question` at a non-`never`
+/// level allows through to its own card; for `run_command` the
+/// profile's `command_denylist` then `command_allowlist` consult
+/// the verbatim `command` argument (unanchored `regex::is_match`)
+/// — a denylist hit refuses with the same profile-denial text
+/// `never` produces, an allowlist hit allows; an allow-for-task
+/// memory allows; then the mapped level decides — `always_allow`
+/// allows, everything else asks (`always_ask`, an unset field, an
+/// unmapped tool name, and `agent_decides`/`ask_on_first_write`
+/// degrading until their consumers land).
 pub(crate) fn evaluate(
     profile: Option<&ExecutionProfile>,
     profile_name: &str,
@@ -71,6 +76,18 @@ pub(crate) fn evaluate(
     // non-`never` level sends it to the ask card (us-10).
     if call.name == ASK_USER_QUESTION {
         return Verdict::Allow;
+    }
+    // `run_command` alone consults the command lists (Spec R07, T3)
+    // — after the `never` floor, before the memory and the level.
+    if call.name == "run_command" {
+        if let Some((command, profile)) = command_arg(call).zip(profile) {
+            if listed(&profile.command_denylist, &command) {
+                return Verdict::Deny(format!("denied by execution profile {profile_name}"));
+            }
+            if listed(&profile.command_allowlist, &command) {
+                return Verdict::Allow;
+            }
+        }
     }
     if allowed_for_task.contains(&call.name) {
         return Verdict::Allow;
@@ -96,6 +113,31 @@ fn level_for(profile: &ExecutionProfile, tool: &str) -> Option<PermissionLevel> 
         ASK_USER_QUESTION => profile.ask_user_question,
         _ => None,
     }
+}
+
+/// The verbatim `command` argument of a `run_command` call — the
+/// text the §5.7 lists match against. A call whose arguments are
+/// not JSON or carry no string `command` has nothing the lists can
+/// match: the level decides and the executor reports the malformed
+/// argument as a tool error, like every other bad call.
+fn command_arg(call: &ToolCall) -> Option<String> {
+    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    args.get("command")?.as_str().map(str::to_owned)
+}
+
+/// `true` when any entry in `list` — each a regex — matches
+/// `command`. `Regex::is_match` is unanchored: an entry's own
+/// `^`/`$` anchors decide where it binds (§5.7's shipped denylist
+/// anchors its entries itself). Entries compile per call —
+/// [`evaluate`] stays a pure function of the parsed `Settings`
+/// snapshot, whose `Vec<String>` lists can hold no precompiled
+/// form — and `Settings::from_toml` compiles every entry at load,
+/// so an uncompilable pattern can only arrive through a hand-built
+/// profile; it simply never matches, degrading to the level rather
+/// than silently allowing or denying.
+fn listed(list: &[String], command: &str) -> bool {
+    list.iter()
+        .any(|pattern| Regex::new(pattern).is_ok_and(|regex| regex.is_match(command)))
 }
 
 #[cfg(test)]
