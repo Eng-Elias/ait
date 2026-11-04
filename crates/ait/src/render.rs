@@ -18,6 +18,7 @@ use std::ops::Range;
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
 
+use crate::profile::ProfilePicker;
 use crate::selection::SelectionRange;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -296,6 +297,32 @@ pub fn paint_status_line(buf: &mut Buffer, area: Rect, text: &str, highlighted: 
         for x in area.x..end_x.min(area.right()) {
             buf[(x, y)].modifier |= Modifier::REVERSED;
         }
+    }
+}
+
+/// Paint the profile switcher (Spec R07 §5.7 / issue #101): the
+/// declared names as a small overlay anchored on `area`'s bottom rows
+/// — `▸` marks the highlighted row (the ask card's selection idiom,
+/// bolded). Each row is reset before its text so the list reads as an
+/// overlay rather than a patch over the session grid; more names than
+/// `area` has rows clip from the top like every painter's overflow.
+pub fn paint_profile_picker(buf: &mut Buffer, area: Rect, picker: &ProfilePicker) {
+    let names = picker.names();
+    let rows = names.len().min(usize::from(area.height));
+    let top = area.bottom().saturating_sub(rows as u16);
+    for (index, name) in names.iter().take(rows).enumerate() {
+        let y = top + index as u16;
+        reset_span(buf, y, area.x..area.right());
+        let (text, style) = if index == picker.selected() {
+            (
+                format!("▸ {name}"),
+                ratatui::style::Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (format!("  {name}"), ratatui::style::Style::default())
+        };
+        let width = usize::from(area.right() - area.x);
+        buf.set_stringn(area.x, y, text, width, style);
     }
 }
 

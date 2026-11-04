@@ -66,7 +66,7 @@ use ait_term::{
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::queue;
 use ratatui::layout::{Position, Rect};
@@ -74,12 +74,13 @@ use ratatui::Terminal;
 
 use crate::agent_panel::paint_agent_panel;
 use crate::backend::StyledBackend;
-use crate::config::{self, LiveSettings, NoSecrets};
+use crate::config::{self, LiveSettings};
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
+use crate::profile::{self, ProfilePicker};
 use crate::render::{
-    apply_selection, chrome_areas, content_size, grid_line, paint_session, paint_status_line,
-    paint_tab_bar, split_content, to_cursor_style, UnderlineOverlay,
+    apply_selection, chrome_areas, content_size, grid_line, paint_profile_picker, paint_session,
+    paint_status_line, paint_tab_bar, split_content, to_cursor_style, UnderlineOverlay,
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
@@ -168,6 +169,21 @@ struct AppState {
     /// the tab's stable [`id`](crate::tabs::Tab) — see
     /// [`suggest::SuggestionPin`] for the whole state machine.
     suggestion: SuggestionPin,
+    /// The active execution profile's name (Spec R07 §5.7 / issue
+    /// #101): the stance the NEXT `AgentRequest`/`SuggestRequest`
+    /// snapshots beside its `Settings` — an in-flight task keeps the
+    /// profile it started with, so consent is never rewritten mid-run.
+    /// `default` at launch, `Alt+P` switches it, and nothing ever
+    /// writes it back to `settings.toml` (us-27: ephemeral by design).
+    /// A name a reload deleted stays armed — the worker's
+    /// missing-profile fail-safe asks for every call until the user
+    /// picks a live one.
+    profile: String,
+    /// The open profile switcher, if any (`Alt+P` with ≥3 declared
+    /// profiles): the names and the highlighted row. App-global like
+    /// the selection itself — a tab switch or panel toggle never
+    /// disturbs it; a settings reload drops the stale list.
+    picker: Option<ProfilePicker>,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -202,6 +218,11 @@ struct Rendered {
     /// shell produces no grid damage, so the panel's mutation counter
     /// rides the snapshot to force its repaints.
     panel: Option<PanelView>,
+    /// The profile picker overlay's painted state (Spec R07): it
+    /// draws over the session grid, which reports no damage of its
+    /// own — opening, moving the highlight and closing must all show
+    /// up in the snapshot to repaint.
+    picker: Option<ProfilePicker>,
 }
 
 /// The painted agent panel's state for the [`Rendered`] snapshot:
@@ -251,9 +272,9 @@ pub fn run() -> io::Result<ExitCode> {
     // runs on defaults with the `ConfigError` toasted (stories 7–8) —
     // a typo never costs the terminal.
     let (config, load_error) = match ait_config::load() {
-        Ok(settings) => (LiveSettings::adopt(settings, &NoSecrets), None),
+        Ok(settings) => (LiveSettings::adopt(settings), None),
         Err(error) => (
-            LiveSettings::adopt(Settings::default(), &NoSecrets),
+            LiveSettings::adopt(Settings::default()),
             Some(error.message().to_string()),
         ),
     };
@@ -272,6 +293,10 @@ pub fn run() -> io::Result<ExitCode> {
         // first, OS keyring second (§4.1).
         suggester: CommandSuggester::new(),
         suggestion: SuggestionPin::new(),
+        // Every launch starts on `default` (Spec R07 us-27) — the
+        // selection is never read back from disk.
+        profile: profile::DEFAULT_PROFILE.to_string(),
+        picker: None,
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
@@ -403,6 +428,10 @@ pub fn run() -> io::Result<ExitCode> {
         // `view.cursor_cell` — both still repaint via the snapshot.
         let damaged = damaged_beyond_cursor(&tab.session.damage(), cursor);
         let now = Instant::now();
+        // The model slot resolves the ACTIVE profile's `base_model`
+        // (Spec R07 §4.2/us-25) — per tick, so a switch or a reload is
+        // the very next frame's text.
+        let model = state.config.model(&state.profile);
         let view = Rendered {
             active,
             count,
@@ -412,7 +441,8 @@ pub fn run() -> io::Result<ExitCode> {
                 &StatusLine {
                     cwd: tab.cwd(),
                     shell: tab.title(),
-                    model: state.config.model(),
+                    model: &model,
+                    profile: profile::status_slot(&state.profile),
                     block: tab.last_block_status(),
                     exit: tab.exit_status(),
                 },
@@ -430,6 +460,7 @@ pub fn run() -> io::Result<ExitCode> {
                 focused: panel.is_focused(),
                 revision: panel.revision(),
             }),
+            picker: state.picker.clone(),
         };
         if damaged || rendered.as_ref() != Some(&view) {
             render_frame(
@@ -437,6 +468,7 @@ pub fn run() -> io::Result<ExitCode> {
                 &tabs,
                 &view.status,
                 view.toast,
+                state.picker.as_ref(),
                 &underlines,
                 &mut last_cursor_shape,
             )?;
@@ -542,6 +574,7 @@ fn handle_event<W: Write>(
                     state.suggestion.suggest_from_line(
                         &state.suggester,
                         state.config.settings(),
+                        &state.profile,
                         tab,
                         &mut state.toast,
                     );
@@ -559,6 +592,43 @@ fn handle_event<W: Write>(
                     tab.clear_selection();
                     tab.toggle_agent_panel();
                     tabs.resize_active();
+                }
+                // `Alt+P` (Spec R07 §5.7 / issue #101): switch the
+                // active execution profile — a picker over three or
+                // more declared names (its keys route through the
+                // pass-through arm while open), a direct cycle
+                // between two, a toast when there is nothing to
+                // switch to. A second press while the picker is open
+                // dismisses it. The selection is app-global and
+                // ephemeral: it rides the NEXT `AgentRequest`/
+                // `SuggestRequest` snapshot, never settings.toml.
+                Resolution::Action(AppAction::SwitchProfile) => {
+                    if state.picker.take().is_some() {
+                        // Toggled closed — the highlight is dropped.
+                    } else {
+                        let names: Vec<String> = state
+                            .config
+                            .settings()
+                            .agents
+                            .execution_profiles
+                            .keys()
+                            .cloned()
+                            .collect();
+                        match profile::switch(&names, &state.profile) {
+                            profile::Switch::Picker => {
+                                state.picker = Some(ProfilePicker::new(names, &state.profile));
+                            }
+                            profile::Switch::Cycle(name) => {
+                                activate_profile(state, name);
+                            }
+                            profile::Switch::Unavailable => {
+                                state.toast = Some(Toast::new(
+                                    "no other execution profiles declared",
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 // Per-active-tab viewport actions: scrollback + paste.
                 Resolution::Action(action) => {
@@ -636,10 +706,22 @@ fn handle_event<W: Write>(
                         | AppAction::PrevTab
                         | AppAction::JumpToTab(_)
                         | AppAction::SuggestCommand
-                        | AppAction::AgentPanel => {} // dispatched above
+                        | AppAction::AgentPanel
+                        | AppAction::SwitchProfile => {} // dispatched above
                     }
                 }
                 Resolution::PassThrough => {
+                    // An open profile picker owns unbound keys (Spec
+                    // R07 §5.7): ↑/↓ move the highlight, Enter arms
+                    // the highlighted name, plain Esc dismisses, and
+                    // every other key is swallowed so nothing leaks
+                    // to the PTY mid-pick. Bound chords already ran
+                    // above — `Alt+P` itself dismisses there, like
+                    // `Alt+A` closes the focused panel.
+                    if state.picker.is_some() {
+                        picker_key(&key_event, state);
+                        return Handled::Continue;
+                    }
                     // The active tab's index BEFORE the mutable borrow —
                     // in-flight keys are scoped to the pinned tab
                     // (Spec R04 user story 14).
@@ -665,7 +747,12 @@ fn handle_event<W: Write>(
                     // keymap already resolved above — its bindings
                     // still win over panel focus (standard 7).
                     if tab.agent_focused() {
-                        tab.agent_key(&key_event, state.config.settings(), &mut state.toast);
+                        tab.agent_key(
+                            &key_event,
+                            state.config.settings(),
+                            &state.profile,
+                            &mut state.toast,
+                        );
                         return Handled::Continue;
                     }
                     // Typing snaps the view back to the live viewport, then
@@ -699,9 +786,11 @@ fn handle_event<W: Write>(
                             // (us-2). A live pin gates the next
                             // trigger — one request in flight at a time.
                             if state.suggestion.is_none() && suggest::is_submission(&key_event) {
-                                if let Some(request) =
-                                    suggest::request_for(tab, state.config.settings())
-                                {
+                                if let Some(request) = suggest::request_for(
+                                    tab,
+                                    state.config.settings(),
+                                    &state.profile,
+                                ) {
                                     state.suggestion.fire(
                                         &state.suggester,
                                         tab.id,
@@ -864,6 +953,14 @@ fn service_input<W: Write>(
 /// keep spawn-time values, story 14); a broken save toasts the
 /// `ConfigError` and keeps last-good. `try_recv` keeps the drain
 /// zero-cost inside the 8 ms poll loop — no async, no extra waking.
+///
+/// Spec R07 §5.7/us-24: a reload that renamed or deleted the ACTIVE
+/// execution profile does NOT rewrite the selection — the name stays
+/// armed so the worker's missing-profile fail-safe keeps asking for
+/// every call until the user picks a live one, and a toast names the
+/// vanished profile instead of a silent fallback. An open picker's
+/// snapshot is dropped with the old settings; the next `Alt+P` lists
+/// the new file's names.
 fn drain_config_events(
     receiver: &Receiver<Result<Settings, ConfigError>>,
     state: &mut AppState,
@@ -873,7 +970,16 @@ fn drain_config_events(
         match event {
             Ok(settings) => {
                 tabs.set_session_template(config::session_template(&settings.terminal));
-                state.config = LiveSettings::adopt(settings, &NoSecrets);
+                let vanished = profile::active_missing(&settings, &state.profile)
+                    .then(|| state.profile.clone());
+                state.config = LiveSettings::adopt(settings);
+                state.picker = None;
+                if let Some(name) = vanished {
+                    state.toast = Some(Toast::new(
+                        format!("execution profile \"{name}\" no longer declared"),
+                        Instant::now(),
+                    ));
+                }
             }
             Err(error) => {
                 state.toast = Some(Toast::new(
@@ -908,6 +1014,7 @@ fn render_frame(
     tabs: &TabManager,
     status: &str,
     toast: bool,
+    picker: Option<&ProfilePicker>,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
 ) -> io::Result<()> {
@@ -958,6 +1065,12 @@ fn render_frame(
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
         paint_status_line(buf, areas.status, status, toast);
+        // The profile switcher is an overlay (Spec R07 §5.7): it
+        // paints last over the content band's bottom rows so nothing
+        // underneath decides its hit-testing.
+        if let Some(picker) = picker {
+            paint_profile_picker(buf, areas.content, picker);
+        }
         if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
             if panel.is_focused() {
                 // The input line owns the host cursor while the panel
@@ -997,6 +1110,44 @@ fn damaged_beyond_cursor(damage: &Damage, cursor: Cursor) -> bool {
             !(b.line == cursor.line && b.left == cursor.column && b.right == cursor.column)
         }),
     }
+}
+
+/// One key while the profile picker is open (Spec R07 §5.7): the ask
+/// card's vocabulary — ↑/↓ move the highlight, Enter arms the
+/// highlighted name and closes, plain Esc closes without switching.
+/// Anything else is swallowed: a picker that let `q` through would
+/// have typed it into the shell. `state.picker` is `Some` on entry —
+/// the caller already routed.
+fn picker_key(key: &KeyEvent, state: &mut AppState) {
+    let Some(picker) = state.picker.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up => picker.prev(),
+        KeyCode::Down => picker.next(),
+        KeyCode::Enter => {
+            let name = picker.selected_name().to_string();
+            state.picker = None;
+            activate_profile(state, name);
+        }
+        // Plain Esc dismisses; a modified Esc is swallowed like any
+        // other key — a chord with modifiers never types into the PTY
+        // mid-pick.
+        KeyCode::Esc if key.modifiers.is_empty() => {
+            state.picker = None;
+        }
+        _ => {}
+    }
+}
+
+/// Arm a newly chosen execution profile (Spec R07 §5.7): the name is
+/// the active stance from the NEXT `AgentRequest`/`SuggestRequest`
+/// onward — nothing persists it, nothing rewrites an in-flight
+/// request. `default` needs no announcement (the status slot hides
+/// it); a non-default arm confirms itself in the new status slot, so
+/// no toast either way.
+fn activate_profile(state: &mut AppState, name: String) {
+    state.profile = name;
 }
 
 /// The last closed tab's exit status as the process exit code.
@@ -1095,11 +1246,13 @@ mod tests {
                     copied_text: None,
                     last_exit: None,
                     toast: None,
-                    config: LiveSettings::adopt(Settings::default(), &NoSecrets),
+                    config: LiveSettings::adopt(Settings::default()),
                     // `NoSecrets` keeps keyring lookups out of tests —
                     // resolution never blocks on the Secret Service.
-                    suggester: CommandSuggester::with_secret_store(NoSecrets),
+                    suggester: CommandSuggester::with_secret_store(config::NoSecrets),
                     suggestion: SuggestionPin::new(),
+                    profile: profile::DEFAULT_PROFILE.to_string(),
+                    picker: None,
                 },
                 sink: Vec::new(),
             }
@@ -1780,7 +1933,7 @@ base_model = "key-1"
         drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
 
         assert_eq!(
-            harness.state.config.model(),
+            harness.state.config.model("default"),
             "Alias Name",
             "the status slot follows the swap (story 10)"
         );
@@ -1804,9 +1957,174 @@ base_model = "key-1"
             toast.text()
         );
         assert_eq!(
-            harness.state.config.model(),
+            harness.state.config.model("default"),
             "Alias Name",
             "last-good settings are kept (story 11)"
+        );
+    }
+
+    // ---- Spec R07 §5.7 / issue #101: the active execution profile ----
+
+    /// `Alt+P` with fewer than two declared profiles leaves the armed
+    /// `default` alone and says so — the toast is the whole action,
+    /// no picker opens (us-23).
+    #[test]
+    fn alt_p_toasts_when_there_is_nothing_to_switch_to() {
+        // `Settings::default()` declares no `execution_profiles`.
+        let mut harness = Harness::new(manager());
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+
+        assert_eq!(harness.state.profile, "default");
+        assert!(harness.state.picker.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the small count toasts");
+        assert!(
+            toast.text().contains("no other execution profiles"),
+            "the toast says why: {}",
+            toast.text()
+        );
+    }
+
+    /// Exactly two declared profiles: `Alt+P` arms the other one
+    /// directly — no picker ever appears — and pressing again cycles
+    /// straight back (us-23).
+    #[test]
+    fn alt_p_cycles_between_two_profiles() {
+        let mut harness = Harness::new(manager());
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(harness.state.profile, "work");
+        assert!(harness.state.picker.is_none(), "two profiles never pick");
+        assert!(harness.state.toast.is_none(), "a real switch stays silent");
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(harness.state.profile, "default");
+        assert!(harness.state.picker.is_none());
+    }
+
+    /// Three or more open the picker (us-23): the armed name starts
+    /// highlighted, ↑/↓ move over the declared list, Enter arms the
+    /// highlighted name and closes, plain Esc dismisses without
+    /// switching, a stray character is swallowed rather than typed,
+    /// and `Alt+P` itself toggles the picker away.
+    #[test]
+    fn alt_p_picks_from_three_or_more() {
+        let mut harness = Harness::new(manager());
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.scratch]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        let picker = harness
+            .state
+            .picker
+            .as_ref()
+            .expect("three or more open the picker");
+        assert_eq!(picker.names(), &["default", "scratch", "work"]);
+        assert_eq!(
+            picker.selected_name(),
+            "default",
+            "the armed name starts highlighted"
+        );
+
+        // ↓ moves the highlight; a stray character reaches neither
+        // the armed name nor the PTY — the pass-through arm routed
+        // it to the picker.
+        harness.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.picker.as_ref().unwrap().selected_name(),
+            "scratch"
+        );
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(harness.state.picker.is_some());
+        assert_eq!(harness.state.profile, "default");
+
+        // Plain Esc dismisses without switching.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(harness.state.profile, "default");
+
+        // Enter arms the highlighted name and closes.
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(harness.state.profile, "scratch");
+
+        // `Alt+P` while open toggles the picker away — like `Alt+A`
+        // closes the focused panel.
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_some());
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(
+            harness.state.profile, "scratch",
+            "the toggle changes nothing"
+        );
+    }
+
+    /// A reload that drops or renames the armed profile toasts its
+    /// name and keeps the selection armed (us-24/us-28): the worker's
+    /// missing-profile fail-safe — ask everything — is what the name
+    /// resolves to, so the toast is the frontend's whole part of the
+    /// story. An open picker's stale list drops with the old file.
+    #[test]
+    fn a_reload_that_drops_the_active_profile_toasts_its_name() {
+        let mut harness = Harness::new(manager());
+        let (tx, rx) = std::sync::mpsc::channel();
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.scratch]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+        harness.state.profile = "work".to_string();
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_some());
+
+        let renamed = Settings::from_toml(
+            "[agents.execution_profiles.default]\n\
+             [agents.execution_profiles.scratch]\n",
+        )
+        .unwrap();
+        tx.send(Ok(renamed)).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        assert_eq!(
+            harness.state.profile, "work",
+            "the selection is never rewritten — the name stays armed"
+        );
+        assert!(
+            harness.state.picker.is_none(),
+            "the stale list dropped with the old settings"
+        );
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the vanished profile toasts");
+        assert!(
+            toast.text().contains("\"work\""),
+            "the toast names the missing profile: {}",
+            toast.text()
         );
     }
 
@@ -2681,7 +2999,6 @@ coding_model = "coding-key"
                 fixture.base_url
             ))
             .expect("settings"),
-            &NoSecrets,
         );
         // Stage the panel + bridge service — `with_session` opens
         // focused; the service is what `toggle_agent_panel` creates.
@@ -2690,7 +3007,7 @@ coding_model = "coding-key"
             let (_handle, service) = crate::shell_bridge::pair();
             tab.bridge = Some(service);
             tab.agent = Some(crate::agent_panel::AgentPanel::with_session(
-                ait_agent::AgentSession::with_secret_store(NoSecrets),
+                ait_agent::AgentSession::with_secret_store(config::NoSecrets),
             ));
         }
 

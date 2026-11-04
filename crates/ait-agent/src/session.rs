@@ -8,10 +8,12 @@
 //! `ait` binary's dependency tree or its synchronous poll loop.
 //!
 //! Per task the worker resolves
-//! `Settings::resolve_model("default", ModelRole::Coding, store)` —
-//! the `coding_model` → `base_model` fallback lives inside
-//! `resolve_model` (§4.2) — so a hot reload that swapped `Settings`
-//! app-side takes effect on the next task with no plumbing here. It
+//! `Settings::resolve_model(&request.profile, ModelRole::Coding,
+//! store)` — the task's armed execution profile picks the stance
+//! (§5.7, Spec R07), the `coding_model` → `base_model` fallback lives
+//! inside `resolve_model` (§4.2) — so a hot reload that swapped
+//! `Settings` app-side takes effect on the next task with no plumbing
+//! here. It
 //! then assembles the per-schema request ([`Conversation`]): the
 //! system prompt carries cwd/OS/shell, the nearest `AGENTS.md` found
 //! walking up from cwd, and the last
@@ -91,13 +93,6 @@ use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
 
-/// The active execution profile (§5.7): the stance whose model roles
-/// (§4.2) and permission levels every task resolves against. T1 binds
-/// the session's only wired name — `default`; the user's ephemeral
-/// selection rides `AgentRequest` once T6 plumbs it. The
-/// `CommandSuggester` precedent resolves on the same profile.
-const PROFILE: &str = "default";
-
 /// The step budget (Spec R06, glossary): at most this many model turns
 /// per task. Configurability is a later round's decision; the constant
 /// names the termination condition the agent loop checks before every
@@ -125,6 +120,13 @@ pub struct AgentRequest {
     /// `base_model` fallback) is resolved per task, so the latest
     /// hot-reloaded binding applies immediately.
     pub settings: Settings,
+    /// The active execution profile's name (§5.7 / Spec R07 us-26):
+    /// the stance the permission engine and the `coding_model` role
+    /// both resolve against for THIS task. Snapshotted beside
+    /// `settings`, so a frontend-side switch applies to the next task
+    /// and can never rewrite an in-flight one's consent. A name that
+    /// resolves to nothing arms the engine's ask-everything fail-safe.
+    pub profile: String,
     /// The task text — sent verbatim, never redacted (the
     /// typed-request rule, §5.4 us-19).
     pub task: String,
@@ -502,18 +504,21 @@ fn serve(
     agent_pty: &mut AgentPty,
 ) {
     // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
-    // store's `&dyn` reference flows straight through.
+    // store's `&dyn` reference flows straight through. The task's own
+    // profile resolves the role (§4.2/§5.7): the selection the
+    // frontend armed when it submitted, never a global.
     let resolved = match request
         .settings
-        .resolve_model(PROFILE, ModelRole::Coding, store)
+        .resolve_model(&request.profile, ModelRole::Coding, store)
     {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
             emit(
                 events,
                 AgentEvent::Error(format!(
-                    "profile {PROFILE:?} has no coding_model configured \
-                     (and no base_model fallback) — set it in settings.toml"
+                    "profile {:?} has no coding_model configured \
+                     (and no base_model fallback) — set it in settings.toml",
+                    request.profile
                 )),
             );
             return;
@@ -543,10 +548,14 @@ fn serve(
         find_agents_md(Path::new(&request.context.cwd)).as_deref(),
     );
     // The §5.7 stance the permission engine consults on every tool
-    // call — a `default` profile missing, renamed or never declared
-    // resolves to `None`, and the engine's fail-safe asks for every
-    // call (the Round 6 interim gate verbatim).
-    let profile = request.settings.agents.execution_profiles.get(PROFILE);
+    // call — the task's armed profile missing, renamed or never
+    // declared resolves to `None`, and the engine's fail-safe asks
+    // for every call (the Round 6 interim gate verbatim).
+    let profile = request
+        .settings
+        .agents
+        .execution_profiles
+        .get(request.profile.as_str());
     // `declare` is profile-aware: the `agent_decides` tools of this
     // stance gain the required `safety` argument in their schemas
     // (R07-T2) — per task, so a profile change applies next task.
@@ -585,6 +594,7 @@ fn serve(
         answers,
         &cwd,
         profile,
+        &request.profile,
         agent_pty,
         executor.as_mut(),
         token,
@@ -610,6 +620,7 @@ async fn run_loop(
     answers: &Receiver<(String, String)>,
     cwd: &ToolCwd,
     profile: Option<&ExecutionProfile>,
+    profile_name: &str,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     cancel: CancellationToken,
@@ -657,7 +668,7 @@ async fn run_loop(
                     match gate_and_execute(
                         call,
                         profile,
-                        PROFILE,
+                        profile_name,
                         &mut allowed_for_task,
                         verdicts,
                         answers,
