@@ -61,7 +61,13 @@ impl Settings {
     ///   references ambiguous;
     /// - every model-role reference (`base_model`, `coding_model`,
     ///   `command_model` on every execution profile) resolves to a declared
-    ///   `config_key`, with the error naming the role's key path.
+    ///   `config_key`, with the error naming the role's key path;
+    /// - every `command_allowlist`/`command_denylist` entry compiles as
+    ///   a `regex` pattern (§5.7) — a broken one would silently never
+    ///   match in the permission engine, so it is a load error naming
+    ///   the entry's own `…[index]` path. `directory_allowlist` holds
+    ///   paths and the `mcp_*` lists are inert — neither is a regex
+    ///   list, and neither is validated here.
     fn validate(&self) -> Result<(), ConfigError> {
         // `config_key` -> key path of its first declaration, for duplicate
         // reporting and role-reference lookups.
@@ -93,6 +99,19 @@ impl Settings {
                         return Err(ConfigError::at(
                             format!("agents.execution_profiles.{profile_name}.{role}"),
                             format!("references unknown config_key {config_key:?}"),
+                        ));
+                    }
+                }
+            }
+            for (list, entries) in [
+                ("command_allowlist", &profile.command_allowlist),
+                ("command_denylist", &profile.command_denylist),
+            ] {
+                for (index, pattern) in entries.iter().enumerate() {
+                    if let Err(error) = regex::Regex::new(pattern) {
+                        return Err(ConfigError::at(
+                            format!("agents.execution_profiles.{profile_name}.{list}[{index}]"),
+                            error,
                         ));
                     }
                 }

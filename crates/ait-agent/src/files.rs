@@ -498,8 +498,7 @@ impl ToolCwd {
     /// `path` sits inside the confinement union — under the session
     /// root or under any `directory_allowlist` root (§5.7).
     fn contains(&self, path: &Path) -> bool {
-        path.starts_with(&self.root)
-            || self.extra_roots.iter().any(|root| path.starts_with(root))
+        path.starts_with(&self.root) || self.extra_roots.iter().any(|root| path.starts_with(root))
     }
 
     /// `path` shown relative to the session root when it sits under
