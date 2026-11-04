@@ -47,6 +47,7 @@ use ratatui::style::{Color as RtColor, Modifier, Style};
 use crate::status::Toast;
 use crate::suggest;
 use crate::tabs::Tab;
+use crate::transcript::Transcript;
 
 /// The input line's prompt marker — user text (a submitted task and a
 /// mid-run steering message alike) carries the same marker in the
@@ -221,6 +222,11 @@ pub(crate) struct AgentPanel {
     /// change the paint can see — an edit, an event, a focus change —
     /// bumps it, so a stale frame can never survive one.
     revision: u64,
+    /// The persisted-vocabulary mirror (Spec R08-T3): every applied
+    /// event and every successful send folds into the accumulated
+    /// [`TranscriptItem`](ait_agent::TranscriptItem)s — the store's
+    /// append source and the `prior` continuity record alike.
+    transcript: Transcript,
 }
 
 impl AgentPanel {
@@ -228,6 +234,22 @@ impl AgentPanel {
     /// on a tab that had none.
     pub(crate) fn new() -> Self {
         Self::with_session(AgentSession::new())
+    }
+
+    /// The transcript items accumulated since the last take — the
+    /// store's per-drain batch (Spec R08-T3; the
+    /// [`take_persisted_blocks`](Tab::take_persisted_blocks)
+    /// precedent: the take drains regardless of a live store).
+    pub(crate) fn take_transcript_items(&mut self) -> Vec<ait_agent::TranscriptItem> {
+        self.transcript.take_new()
+    }
+
+    /// The whole accumulated transcript — the items a resumed tab's
+    /// next `AgentRequest.prior` hands the worker for in-tab
+    /// continuity (R08-T4).
+    #[allow(dead_code)] // T4's prior hand-off; nothing consumes it yet
+    pub(crate) fn transcript_items(&self) -> &[ait_agent::TranscriptItem] {
+        self.transcript.items()
     }
 
     /// [`new`](Self::new) over a caller's session — the seam tests
@@ -247,6 +269,7 @@ impl AgentPanel {
             top: Cell::new(0),
             painted: Cell::new((0, 0)),
             revision: 0,
+            transcript: Transcript::default(),
         }
     }
 
@@ -404,6 +427,7 @@ impl AgentPanel {
         match self.session.answer(&call_id, answer.clone()) {
             Ok(()) => {
                 self.pinned = true;
+                self.transcript.answer(&answer);
                 if let Some(card) = self.entries.iter_mut().rev().find_map(|entry| match entry {
                     Entry::Ask(card) if card.id == call_id => Some(card),
                     _ => None,
@@ -498,6 +522,7 @@ impl AgentPanel {
             Ok(()) => {
                 self.running = true;
                 self.pinned = true;
+                self.transcript.task(&task);
                 self.push(Entry::Task(task));
             }
             Err(error) => *toast = Some(Toast::new(format!("{error}"), Instant::now())),
@@ -512,6 +537,7 @@ impl AgentPanel {
         match self.session.steer(message.clone()) {
             Ok(()) => {
                 self.pinned = true;
+                self.transcript.steering(&message);
                 self.push(Entry::Steering(message));
             }
             Err(error) => *toast = Some(Toast::new(format!("{error}"), Instant::now())),
@@ -535,8 +561,11 @@ impl AgentPanel {
     /// `ToolUpdate` transitions the card its `call_id` addresses and
     /// resolves a matching wait; every terminal event releases
     /// `running`, drops any pending approval and leaves a `Status`
-    /// line the user can read against the stream above it.
+    /// line the user can read against the stream above it. Every
+    /// event also folds into the persisted-vocabulary mirror (Spec
+    /// R08-T3) — staged `apply` tests exercise it too.
     pub(crate) fn apply(&mut self, event: AgentEvent) {
+        self.transcript.apply(&event);
         match event {
             AgentEvent::TextDelta(text) => match self.entries.last_mut() {
                 Some(Entry::Text(last)) => last.push_str(&text),
@@ -1112,6 +1141,79 @@ mod tests {
             ]
         );
         assert!(!panel.running);
+    }
+
+    /// The persisted vocabulary (Spec R08-T3): sends and applied
+    /// events accumulate [`TranscriptItem`]s in order — a real submit
+    /// records the `task`, deltas coalesce, a gated call and its
+    /// verdict land as `tool_call` + `tool_result`, the terminal
+    /// event as `status` — and `take` yields the batch once.
+    #[test]
+    fn sends_and_events_accumulate_transcript_items() {
+        let mut panel = panel();
+        let mut toast = None;
+        panel.submit(
+            AgentRequest {
+                settings: ait_config::Settings::default(),
+                profile: "default".to_string(),
+                task: "fix it".to_string(),
+                context: AgentContext {
+                    cwd: "/tmp".into(),
+                    shell: "sh".into(),
+                    os: "test".into(),
+                    output_lines: Vec::new(),
+                },
+                bridge: None,
+            },
+            &mut toast,
+        );
+        panel.apply(AgentEvent::TextDelta("on ".into()));
+        panel.apply(AgentEvent::TextDelta("it".into()));
+        panel.apply(AgentEvent::ApprovalRequest {
+            call: ait_agent::ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                arguments: "{\"pattern\":\"x\"}".into(),
+            },
+            summary: "x".into(),
+        });
+        panel.apply(AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ait_agent::ToolStatus::Denied,
+            detail: Some("no".into()),
+            result: Some("no".into()),
+        });
+        panel.apply(AgentEvent::Cancelled);
+
+        assert_eq!(
+            panel.take_transcript_items(),
+            vec![
+                ait_agent::TranscriptItem::Task {
+                    text: "fix it".into(),
+                },
+                ait_agent::TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+                ait_agent::TranscriptItem::ToolCall {
+                    id: "call_1".into(),
+                    name: "glob".into(),
+                    args: "{\"pattern\":\"x\"}".into(),
+                    summary: "x".into(),
+                },
+                ait_agent::TranscriptItem::ToolResult {
+                    id: "call_1".into(),
+                    text: "no".into(),
+                    status: ait_agent::ToolStatus::Denied,
+                },
+                ait_agent::TranscriptItem::Status {
+                    text: "cancelled".into(),
+                },
+            ]
+        );
+        assert!(
+            panel.take_transcript_items().is_empty(),
+            "drained items don't repeat"
+        );
     }
 
     /// A real submit round-trips the channel: the task lands in the

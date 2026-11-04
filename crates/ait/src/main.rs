@@ -26,6 +26,7 @@ mod store;
 mod suggest;
 mod tabs;
 mod terminal;
+mod transcript;
 
 use std::env;
 use std::process::ExitCode;

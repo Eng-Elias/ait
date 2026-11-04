@@ -1,0 +1,439 @@
+//! The `AgentEvent` → [`TranscriptItem`] mirror (Spec R08 §5.8,
+//! ticket R08-T3, user story 28): every event the frontend already
+//! drains folds into the neutral vocabulary `ait-agent` owns, so
+//! persistence needs no new channel surface. `task`, `steering` and
+//! `answer` have no events — they are recorded at send time, in send
+//! order.
+//!
+//! One [`Transcript`] lives per agent panel: the accumulated items
+//! are both the store's append source (the per-drain `take_new`) and
+//! the in-memory transcript a next task's `AgentRequest.prior` will
+//! replay (R08-T4) — kept in full either way, whether or not a store
+//! is live.
+
+use std::collections::HashSet;
+
+use ait_agent::{AgentEvent, TranscriptItem};
+
+/// A conversation row's title source — the first task's first line,
+/// truncated (Spec R08 us-5: "titled from the first task").
+const TITLE_CHARS: usize = 60;
+
+/// One panel's accumulated transcript plus the fold state the mirror
+/// needs. Item-level mirror rules (all in [`apply`](Self::apply)):
+///
+/// - `TextDelta`s coalesce onto the newest `assistant_text` — one
+///   item per assistant turn, since a turn's deltas are contiguous
+///   and the next turn's events always interpose a non-delta event.
+/// - `ApprovalRequest` and `ToolCall` both record `tool_call` — the
+///   card variant is a frontend distinction the transcript drops.
+/// - `ToolUpdate` records `tool_result` only when it carries the
+///   full `result` text: `Running` is a card transition, not a
+///   record, and an `ask`'s `Done` update would double-record the
+///   `answer` item the send side already wrote.
+/// - terminal events record `status` with the line the panel shows.
+#[derive(Default)]
+pub(crate) struct Transcript {
+    /// The whole accumulated transcript — the store's append source
+    /// AND the `prior` continuity record (T4): a disabled store never
+    /// truncates it.
+    items: Vec<TranscriptItem>,
+    /// Items already handed to a [`take_new`](Self::take_new) caller —
+    /// the per-drain watermark; the take advances it whether or not
+    /// the write landed (the unpersisted-run rule).
+    flushed: usize,
+    /// `ask_user_question` call ids — a matching `ToolUpdate`'s
+    /// `result` would double-record the `answer` item the send side
+    /// already wrote (the reply IS the call's result verbatim).
+    asks: HashSet<String>,
+}
+
+impl Transcript {
+    /// The send-side record of a submitted task — first task of a
+    /// flush is what [`conversation_title`] reads.
+    pub(crate) fn task(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Task {
+            text: text.to_owned(),
+        });
+    }
+
+    /// The send-side record of a steering message — in send order,
+    /// even while the worker only reads it inside the next task's
+    /// conversation.
+    pub(crate) fn steering(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Steering {
+            text: text.to_owned(),
+        });
+    }
+
+    /// The send-side record of an `ask_user_question` answer — the
+    /// full text is known here; the matching `ToolUpdate` only ever
+    /// carries a preview (and is skipped on it).
+    pub(crate) fn answer(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Answer {
+            text: text.to_owned(),
+        });
+    }
+
+    /// Fold one drained [`AgentEvent`] into items — the mirror rules
+    /// in the struct doc. Called for every event the panel applies.
+    pub(crate) fn apply(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::TextDelta(text) => match self.items.last_mut() {
+                Some(TranscriptItem::AssistantText { text: last }) => last.push_str(text),
+                _ => self
+                    .items
+                    .push(TranscriptItem::AssistantText { text: text.clone() }),
+            },
+            // The gated and ungated cards are the same record — a
+            // call the model made, verdict pending or not.
+            AgentEvent::ApprovalRequest { call, summary }
+            | AgentEvent::ToolCall { call, summary } => {
+                self.items.push(TranscriptItem::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                    summary: summary.clone(),
+                });
+            }
+            AgentEvent::AskRequest {
+                call,
+                question,
+                choices,
+            } => {
+                self.asks.insert(call.id.clone());
+                self.items.push(TranscriptItem::Ask {
+                    question: question.clone(),
+                    choices: choices.clone(),
+                });
+            }
+            AgentEvent::ToolUpdate {
+                call_id,
+                status,
+                result,
+                ..
+            } => {
+                // `result` carries the full text only on terminal
+                // updates; an ask's update duplicates the `answer`.
+                if let (Some(text), false) = (result, self.asks.contains(call_id)) {
+                    self.items.push(TranscriptItem::ToolResult {
+                        id: call_id.clone(),
+                        text: text.clone(),
+                        status: *status,
+                    });
+                }
+            }
+            AgentEvent::Done => self.status("done"),
+            AgentEvent::Cancelled => self.status("cancelled"),
+            AgentEvent::BudgetReached => self.status("step budget reached"),
+            AgentEvent::Error(message) => self.status(&format!("error: {message}")),
+        }
+    }
+
+    /// The items accumulated since the last take — the store's
+    /// per-drain batch. The watermark advances regardless of what
+    /// the caller does with them (the unpersisted-run rule); the
+    /// full vec stays — it is the `prior` continuity record too.
+    pub(crate) fn take_new(&mut self) -> Vec<TranscriptItem> {
+        let new = self.items[self.flushed..].to_vec();
+        self.flushed = self.items.len();
+        new
+    }
+
+    /// The whole accumulated transcript — what a resumed tab's next
+    /// `AgentRequest.prior` hands the worker (R08-T4).
+    #[allow(dead_code)] // T4's prior hand-off; nothing consumes it yet
+    pub(crate) fn items(&self) -> &[TranscriptItem] {
+        &self.items
+    }
+
+    /// Push a terminal-status line — the text the panel renders.
+    fn status(&mut self, text: &str) {
+        self.items.push(TranscriptItem::Status {
+            text: text.to_owned(),
+        });
+    }
+}
+
+/// The `conversations.title` for a first flush: the first task's
+/// first line, trimmed and clipped to [`TITLE_CHARS`] — Spec R08's
+/// "titled from the first task, truncated". A flush with no task
+/// item (unreachable — the send side records before any event can)
+/// falls back to a nameable row.
+pub(crate) fn conversation_title(items: &[TranscriptItem]) -> String {
+    let task = items.iter().find_map(|item| match item {
+        TranscriptItem::Task { text } => Some(text.as_str()),
+        _ => None,
+    });
+    let line = task
+        .and_then(|text| text.lines().next())
+        .unwrap_or_default()
+        .trim();
+    let mut title: String = line.chars().take(TITLE_CHARS).collect();
+    if line.chars().count() > TITLE_CHARS {
+        title.push('…');
+    }
+    if title.is_empty() {
+        "untitled conversation".to_string()
+    } else {
+        title
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The mirror seam (Spec R08 us-28): staged events and send-side
+    //! records in, ordered [`TranscriptItem`]s out — the exact item
+    //! list a `transcript_items` flush appends.
+
+    use super::*;
+    use ait_agent::{ToolCall, ToolStatus};
+
+    /// A staged call.
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    /// A done-update carrying the full result.
+    fn done_update(id: &str, result: &str) -> AgentEvent {
+        AgentEvent::ToolUpdate {
+            call_id: id.into(),
+            status: ToolStatus::Done,
+            detail: Some(result.lines().next().unwrap_or_default().into()),
+            result: Some(result.into()),
+        }
+    }
+
+    /// Spec R08 us-28 + ticket: a contiguous `TextDelta` run is ONE
+    /// `assistant_text`; a turn's tool turn ends the run and the next
+    /// deltas open a fresh one.
+    #[test]
+    fn deltas_coalesce_into_one_item_per_assistant_turn() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&AgentEvent::TextDelta("The tests ".into()));
+        transcript.apply(&AgentEvent::TextDelta("fail because".into()));
+        transcript.apply(&AgentEvent::ToolCall {
+            call: call("call_1", "read_files"),
+            summary: "a.rs".into(),
+        });
+        transcript.apply(&done_update("call_1", "contents"));
+        transcript.apply(&AgentEvent::TextDelta("all read".into()));
+
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::AssistantText {
+                    text: "The tests fail because".into(),
+                },
+                TranscriptItem::ToolCall {
+                    id: "call_1".into(),
+                    name: "read_files".into(),
+                    args: "{}".into(),
+                    summary: "a.rs".into(),
+                },
+                TranscriptItem::ToolResult {
+                    id: "call_1".into(),
+                    text: "contents".into(),
+                    status: ToolStatus::Done,
+                },
+                TranscriptItem::AssistantText {
+                    text: "all read".into(),
+                },
+            ]
+        );
+    }
+
+    /// The gated card records the same `tool_call` the ungated one
+    /// does — the approve/ungated distinction is frontend state.
+    #[test]
+    fn approval_request_records_a_tool_call() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&AgentEvent::ApprovalRequest {
+            call: call("call_1", "run_command"),
+            summary: "\"rm x\"".into(),
+        });
+        transcript.apply(&AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ToolStatus::Denied,
+            detail: Some("not today".into()),
+            result: Some("not today".into()),
+        });
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::ToolCall {
+                    id: "call_1".into(),
+                    name: "run_command".into(),
+                    args: "{}".into(),
+                    summary: "\"rm x\"".into(),
+                },
+                TranscriptItem::ToolResult {
+                    id: "call_1".into(),
+                    text: "not today".into(),
+                    status: ToolStatus::Denied,
+                },
+            ]
+        );
+    }
+
+    /// `Running` carries no `result` — it is a card transition and
+    /// leaves no item; the call stays unanswered until a terminal
+    /// update (which is what replay's "interrupted" rule keys on).
+    #[test]
+    fn running_updates_leave_no_item() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&AgentEvent::ToolCall {
+            call: call("call_1", "glob"),
+            summary: "s".into(),
+        });
+        transcript.apply(&AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ToolStatus::Running,
+            detail: None,
+            result: None,
+        });
+        assert_eq!(transcript.items().len(), 1, "only the tool_call");
+    }
+
+    /// The ask card's `Done` update would duplicate the `answer` —
+    /// the pair on record is `ask` + `answer`, no `tool_result`.
+    #[test]
+    fn an_ask_records_ask_and_answer_not_a_result() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&AgentEvent::AskRequest {
+            call: call("call_1", "ask_user_question"),
+            question: "Ship it?".into(),
+            choices: vec!["yes".into(), "no".into()],
+        });
+        transcript.answer("no");
+        transcript.apply(&AgentEvent::ToolUpdate {
+            call_id: "call_1".into(),
+            status: ToolStatus::Done,
+            detail: Some("no".into()),
+            result: Some("no".into()),
+        });
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::Ask {
+                    question: "Ship it?".into(),
+                    choices: vec!["yes".into(), "no".into()],
+                },
+                TranscriptItem::Answer { text: "no".into() },
+            ]
+        );
+    }
+
+    /// Every terminal event lands its status line — the text the
+    /// panel renders.
+    #[test]
+    fn terminal_events_record_status_lines() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&AgentEvent::Done);
+        transcript.apply(&AgentEvent::Cancelled);
+        transcript.apply(&AgentEvent::BudgetReached);
+        transcript.apply(&AgentEvent::Error("endpoint down".into()));
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::Status {
+                    text: "done".into()
+                },
+                TranscriptItem::Status {
+                    text: "cancelled".into(),
+                },
+                TranscriptItem::Status {
+                    text: "step budget reached".into(),
+                },
+                TranscriptItem::Status {
+                    text: "error: endpoint down".into(),
+                },
+            ]
+        );
+    }
+
+    /// Send-order is the transcript's order: a steering message sent
+    /// while the worker idles precedes the next task's item even
+    /// though the model reads it inside that task.
+    #[test]
+    fn send_side_items_record_in_send_order() {
+        let mut transcript = Transcript::default();
+        transcript.task("first");
+        transcript.steering("while you think");
+        transcript.task("second");
+        assert_eq!(
+            transcript.items(),
+            &[
+                TranscriptItem::Task {
+                    text: "first".into(),
+                },
+                TranscriptItem::Steering {
+                    text: "while you think".into(),
+                },
+                TranscriptItem::Task {
+                    text: "second".into(),
+                },
+            ]
+        );
+    }
+
+    /// `take_new` is the per-drain watermark: each take yields only
+    /// what arrived since the last — while `items()` keeps the whole
+    /// transcript for T4's `prior`.
+    #[test]
+    fn take_new_yields_each_item_once_but_keeps_the_whole() {
+        let mut transcript = Transcript::default();
+        transcript.task("fix it");
+        transcript.apply(&AgentEvent::TextDelta("on it".into()));
+
+        let first = transcript.take_new();
+        assert_eq!(first.len(), 2);
+        assert!(
+            transcript.take_new().is_empty(),
+            "drained items are not re-yielded"
+        );
+        transcript.apply(&AgentEvent::Done);
+        assert_eq!(
+            transcript.take_new(),
+            vec![TranscriptItem::Status {
+                text: "done".into()
+            }]
+        );
+        assert_eq!(
+            transcript.items().len(),
+            3,
+            "the full transcript outlives the flushes"
+        );
+    }
+
+    /// The row title: the first task's first line, truncated; a
+    /// taskless flush names the row anyway.
+    #[test]
+    fn conversation_title_takes_the_first_task_first_line() {
+        assert_eq!(
+            conversation_title(&[
+                TranscriptItem::Task {
+                    text: "fix the tests\nplease".into(),
+                },
+                TranscriptItem::Task {
+                    text: "never the second".into(),
+                },
+            ]),
+            "fix the tests"
+        );
+        let long = "x".repeat(TITLE_CHARS + 10);
+        assert_eq!(
+            conversation_title(&[TranscriptItem::Task { text: long }]),
+            format!("{}…", "x".repeat(TITLE_CHARS)),
+            "clipped with an ellipsis"
+        );
+        assert_eq!(
+            conversation_title(&[TranscriptItem::Status { text: "s".into() }]),
+            "untitled conversation"
+        );
+    }
+}

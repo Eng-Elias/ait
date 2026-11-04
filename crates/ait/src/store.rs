@@ -11,7 +11,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use ait_store::{NewBlock, Store, StoreError};
+use ait_agent::TranscriptItem;
+use ait_store::{NewBlock, NewConversation, NewTranscriptItem, Store, StoreError};
 
 use crate::blocks::PersistedBlock;
 use crate::status::Toast;
@@ -35,6 +36,14 @@ impl StoreHandle {
     /// test `Harness`) degrades to.
     pub fn disabled() -> Self {
         Self { inner: None }
+    }
+
+    /// Wrap a caller-opened `Store` — the seam tests outside this
+    /// module inject a tempdir database through instead of touching
+    /// the real XDG path.
+    #[cfg(test)]
+    pub(crate) fn from_store(store: Store) -> Self {
+        Self { inner: Some(store) }
     }
 
     /// One write through the degrade rule: a success returns `Some`,
@@ -78,6 +87,62 @@ impl StoreHandle {
     /// exit both land here (Spec R08).
     pub fn session_ended(&mut self, toast: &mut Option<Toast>, id: i64) {
         self.write(toast, |store| store.finish_terminal_session(id).map(|_| ()));
+    }
+
+    /// The `conversations` row a tab's first task creates (Spec
+    /// R08-T3) — the caller binds the returned id to the tab
+    /// (`Tab::set_conversation`) so every later task appends to the
+    /// same row. `status` opens as `"open"`: the picker/resume
+    /// lifecycle vocabulary is the caller's to own, and nothing
+    /// closes a conversation yet.
+    pub fn conversation_started(
+        &mut self,
+        toast: &mut Option<Toast>,
+        title: &str,
+        cwd: &Path,
+    ) -> Option<i64> {
+        self.write(toast, |store| {
+            store.create_conversation(NewConversation {
+                title,
+                cwd: &cwd.to_string_lossy(),
+                status: "open",
+            })
+        })
+        .map(|conversation| conversation.id)
+    }
+
+    /// One drain's worth of [`TranscriptItem`]s appended in the
+    /// store's single transaction (Spec R08 — "writes batched per
+    /// drain in one transaction"): each item serializes to the
+    /// `(kind, payload_json)` pair the row stores — the payload is
+    /// the item's whole serde form, opaque to the store.
+    pub fn append_transcript(
+        &mut self,
+        toast: &mut Option<Toast>,
+        conversation_id: i64,
+        items: &[TranscriptItem],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        // Serialization cannot fail — every field is plain data —
+        // but an item that somehow didn't serialize is dropped here
+        // rather than panicking on the degrade seam.
+        let serialized: Vec<(String, String)> = items
+            .iter()
+            .filter_map(|item| {
+                serde_json::to_string(item)
+                    .ok()
+                    .map(|payload| (item.kind().to_owned(), payload))
+            })
+            .collect();
+        let rows: Vec<NewTranscriptItem> = serialized
+            .iter()
+            .map(|(kind, payload_json)| NewTranscriptItem { kind, payload_json })
+            .collect();
+        self.write(toast, |store| {
+            store.append_transcript_items(conversation_id, &rows)
+        });
     }
 
     /// The per-drain batch: every `(session id, sealed block)` pair in
@@ -194,5 +259,94 @@ mod tests {
         handle.session_ended(&mut toast, 7);
         handle.insert_blocks(&mut toast, &[(1, block("z"))]);
         assert!(toast.is_none());
+    }
+
+    /// Spec R08-T3: a conversation row plus its transcript append —
+    /// the `(kind, payload_json)` pairs land in `seq` order and every
+    /// payload deserializes back into its item.
+    #[test]
+    fn conversation_rows_and_items_round_trip() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+
+        let id = handle
+            .conversation_started(&mut toast, "fix the tests", Path::new("/w"))
+            .expect("the conversation insert lands");
+        handle.append_transcript(
+            &mut toast,
+            id,
+            &[
+                TranscriptItem::Task {
+                    text: "fix the tests".into(),
+                },
+                TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+                TranscriptItem::Status {
+                    text: "done".into(),
+                },
+            ],
+        );
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        let store = handle.inner.as_ref().unwrap();
+        let row = store
+            .list_conversations()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(row.id, id);
+        assert_eq!(row.title, "fix the tests");
+        assert_eq!(row.cwd, "/w");
+        assert_eq!(row.status, "open");
+        let items = store.load_transcript(id).unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+            [0, 1, 2],
+            "seqs assigned contiguously in append order"
+        );
+        for (item, kind) in items.iter().zip(["task", "assistant_text", "status"]) {
+            assert_eq!(item.kind, kind);
+        }
+        // The payload is the item's whole serde form — it reads back
+        // into the same TranscriptItem (T4's verbatim contract).
+        let back: TranscriptItem =
+            serde_json::from_str(&items[0].payload_json).expect("payload deserializes");
+        assert_eq!(
+            back,
+            TranscriptItem::Task {
+                text: "fix the tests".into()
+            }
+        );
+    }
+
+    /// A transcript append to a dangling conversation id is a
+    /// foreign-key error — it degrades through the same toast-once-
+    /// and-disable rule every other write obeys (user story 25).
+    #[test]
+    fn an_append_failure_toasts_once_and_disables() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+
+        handle.append_transcript(
+            &mut toast,
+            999,
+            &[TranscriptItem::Status { text: "x".into() }],
+        );
+
+        assert!(
+            toast
+                .as_ref()
+                .is_some_and(|t| t.text().contains("store write failed")),
+            "the failure surfaced as a toast"
+        );
+        assert!(handle.inner.is_none(), "the run continues unpersisted");
+
+        toast.take();
+        assert!(handle
+            .conversation_started(&mut toast, "t", Path::new("/w"))
+            .is_none());
+        assert!(toast.is_none(), "a disabled handle never re-toasts");
     }
 }

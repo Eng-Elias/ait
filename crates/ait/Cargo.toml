@@ -30,7 +30,10 @@ ait-shell = { path = "../ait-shell" }
 ait-store = { path = "../ait-store" }
 # Semver requirements per Spec R02; chosen releases are >=7 days old
 # (ADR-0002 supply-chain rule): ratatui 0.30.2 (2026-06-19),
-# crossterm 0.29.0 (2025-04-05).
+# crossterm 0.29.0 (2025-04-05); serde_json 1.0.154 (2026-10-11) —
+# TranscriptItem payloads serialize to the opaque JSON the store
+# keeps verbatim (Spec R08).
+serde_json = "1"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm",
     "crossterm_0_29",
