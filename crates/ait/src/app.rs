@@ -313,12 +313,19 @@ pub fn run() -> io::Result<ExitCode> {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: load_error
-            .map(|text| Toast::new(format!("config error: {text}"), Instant::now()))
-            .or_else(|| {
-                store_error
-                    .map(|text| Toast::new(format!("store unavailable: {text}"), Instant::now()))
-            }),
+        toast: {
+            // Both failures can land on one launch — the store's
+            // signal must surface even when a config error already
+            // toasted, so they share the line.
+            let failures: Vec<String> = [
+                load_error.map(|text| format!("config error: {text}")),
+                store_error.map(|text| format!("store unavailable: {text}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), Instant::now()))
+        },
         config,
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
@@ -539,6 +546,9 @@ pub fn run() -> io::Result<ExitCode> {
         if let Some(id) = tab.store_session() {
             state.store.session_ended(&mut state.toast, id);
         }
+        if let Some(id) = tab.conversation() {
+            state.store.conversation_closed(&mut state.toast, id);
+        }
     }
 
     Ok(exit_code(state.last_exit.as_ref()))
@@ -620,9 +630,14 @@ fn handle_event<W: Write>(
                         state.last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
                     }
                     // `ended_at` on tab close (Spec R08): the row this
-                    // tab's spawn opened finishes with the tab.
+                    // tab's spawn opened finishes with the tab. Its
+                    // conversation closes the same way — `status` is
+                    // "open" only while a live tab owns the row.
                     if let Some(id) = tabs.active().and_then(|tab| tab.store_session()) {
                         state.store.session_ended(&mut state.toast, id);
+                    }
+                    if let Some(id) = tabs.active().and_then(|tab| tab.conversation()) {
+                        state.store.conversation_closed(&mut state.toast, id);
                     }
                     // `false` = the set is now empty: quit rather than ever
                     // indexing it (standard 6).
@@ -1419,8 +1434,15 @@ fn resume_conversation(id: i64, tabs: &mut TabManager, state: &mut AppState) {
         }
     };
     if let Some(tab) = tabs.active_mut() {
+        let previous = tab.conversation();
         tab.resume_conversation(id, items, plan);
         state.toast = Some(Toast::new("conversation resumed", Instant::now()));
+        // `status` mirrors the binding: the resumed row re-opens, and
+        // the row this tab just swapped away from is unowned now.
+        state.store.conversation_reopened(&mut state.toast, id);
+        if let Some(old) = previous.filter(|old| *old != id) {
+            state.store.conversation_closed(&mut state.toast, old);
+        }
     }
     // The panel may have opened on a tab that never had one —
     // re-derive its winsize through the same path `Alt+A` takes.

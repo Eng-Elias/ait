@@ -595,13 +595,14 @@ impl BlockEntry {
         grid: &GridView<'_>,
         dropped: usize,
         extent: usize,
+        cwd: String,
     ) -> PersistedBlock {
         PersistedBlock {
             command: self
                 .resolve(grid, dropped, extent)
                 .map(|block| block.command)
-                .or_else(|| self.command.clone())
-                .unwrap_or_default(),
+                .or_else(|| self.command.clone()),
+            cwd,
             exit: self.exit.map(i64::from),
             duration: self.duration,
             started_at: Some(self.output_start.map_or(self.start.wall, |m| m.wall)),
@@ -617,9 +618,14 @@ impl BlockEntry {
 #[derive(Debug)]
 pub(crate) struct PersistedBlock {
     /// The command text — `preexec` when the shell reported one, else
-    /// the echo slice; `""` when nothing could be resolved (the
-    /// `blocks.command` column is `NOT NULL`).
-    pub command: String,
+    /// the echo slice; `None` when nothing could be resolved (the
+    /// `blocks.command` column is nullable: NULL is honest, `""`
+    /// claims a command that never was).
+    pub command: Option<String>,
+    /// The tab's tracked cwd at seal — the `blocks.cwd` column (Spec
+    /// R08: the tab's cwd at `preexec`). Filled by the tab, the only
+    /// side that knows it.
+    pub cwd: String,
     /// The `OSC 133;D` exit code.
     pub exit: Option<i64>,
     /// Execution time (`D.at − C.at`, `B.at` fallback).
@@ -1103,8 +1109,9 @@ mod tests {
             size: Size::new(40, 10),
             ..Default::default()
         });
-        let persisted = sealed[0].persisted(&session.grid(), 0, 10);
-        assert_eq!(persisted.command, "sleep 1");
+        let persisted = sealed[0].persisted(&session.grid(), 0, 10, "/w".to_owned());
+        assert_eq!(persisted.command.as_deref(), Some("sleep 1"));
+        assert_eq!(persisted.cwd, "/w");
         assert_eq!(persisted.exit, Some(3));
         assert_eq!(persisted.duration, Some(2 * MS));
         assert_eq!(persisted.started_at, Some(w0 + MS), "C's wall time");
@@ -1141,8 +1148,8 @@ mod tests {
             size: Size::new(40, 10),
             ..Default::default()
         });
-        let persisted = sealed[0].persisted(&session.grid(), 0, 24);
-        assert_eq!(persisted.command, "ctrl-c'd thing");
+        let persisted = sealed[0].persisted(&session.grid(), 0, 24, "/w".to_owned());
+        assert_eq!(persisted.command.as_deref(), Some("ctrl-c'd thing"));
         assert_eq!(persisted.exit, None);
         assert_eq!(persisted.duration, None);
         assert_eq!(persisted.started_at, Some(w0), "B's wall — no C ever came");
@@ -1171,8 +1178,8 @@ mod tests {
 
         let sealed = asm.take_sealed();
         assert_eq!(sealed.len(), 1);
-        let persisted = sealed[0].persisted(&grid, 0, extent);
-        assert_eq!(persisted.command, "echo hi");
+        let persisted = sealed[0].persisted(&grid, 0, extent, "/w".to_owned());
+        assert_eq!(persisted.command.as_deref(), Some("echo hi"));
     }
 
     /// A `preexec` report survives an unresolvable grid: when the
@@ -1193,8 +1200,8 @@ mod tests {
         });
         let sealed = asm.take_sealed();
         // `dropped` past every recorded line: resolve finds no range.
-        let persisted = sealed[0].persisted(&session.grid(), 99, 10);
-        assert_eq!(persisted.command, "kept");
+        let persisted = sealed[0].persisted(&session.grid(), 99, 10, "/w".to_owned());
+        assert_eq!(persisted.command.as_deref(), Some("kept"));
         assert_eq!(persisted.exit, Some(0));
     }
 }

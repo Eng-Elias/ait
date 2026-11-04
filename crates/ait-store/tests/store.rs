@@ -330,7 +330,8 @@ fn sessions_and_blocks_survive_reopen() {
         store
             .insert_block(NewBlock {
                 session_id,
-                command: "cargo test".to_owned(),
+                command: Some("cargo test".to_owned()),
+                cwd: Some("/repo".to_owned()),
                 exit: Some(0),
                 duration: Some(Duration::from_millis(1200)),
                 started_at: Some(started_at),
@@ -341,7 +342,8 @@ fn sessions_and_blocks_survive_reopen() {
         store
             .insert_block(NewBlock {
                 session_id,
-                command: "ctrl-c'd thing".to_owned(),
+                command: None,
+                cwd: Some("/repo".to_owned()),
                 exit: None,
                 duration: None,
                 started_at: Some(started_at),
@@ -359,12 +361,18 @@ fn sessions_and_blocks_survive_reopen() {
     let blocks = store.list_blocks(session_id).unwrap();
     assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].seq, 0);
-    assert_eq!(blocks[0].command, "cargo test");
+    assert_eq!(blocks[0].command.as_deref(), Some("cargo test"));
+    assert_eq!(
+        blocks[0].cwd.as_deref(),
+        Some("/repo"),
+        "the tab's cwd at preexec"
+    );
     assert_eq!(blocks[0].exit, Some(0));
     assert_eq!(blocks[0].duration, Some(Duration::from_millis(1200)));
     assert_eq!(blocks[0].started_at, Some(started_at));
     assert_eq!(blocks[0].ended_at, Some(ended_at));
     assert_eq!(blocks[1].seq, 1);
+    assert_eq!(blocks[1].command, None, "unresolved command stores NULL");
     assert_eq!(blocks[1].exit, None);
     assert_eq!(blocks[1].duration, None);
     assert_eq!(blocks[1].ended_at, None);
@@ -382,7 +390,8 @@ fn insert_blocks_batches_per_session_seqs() {
     let second = store.insert_terminal_session("zsh", "/w").unwrap();
     let block = |session_id: i64, command: &str| NewBlock {
         session_id,
-        command: command.to_owned(),
+        command: Some(command.to_owned()),
+        cwd: Some("/w".to_owned()),
         exit: Some(0),
         duration: Some(Duration::from_millis(3)),
         started_at: None,
@@ -404,15 +413,15 @@ fn insert_blocks_batches_per_session_seqs() {
     let a_blocks = store.list_blocks(first.id).unwrap();
     let a: Vec<_> = a_blocks
         .iter()
-        .map(|b| (b.seq, b.command.as_str()))
+        .map(|b| (b.seq, b.command.as_deref()))
         .collect();
-    assert_eq!(a, vec![(0, "a1"), (1, "a2"), (2, "a3")]);
+    assert_eq!(a, vec![(0, Some("a1")), (1, Some("a2")), (2, Some("a3"))]);
     let b_blocks = store.list_blocks(second.id).unwrap();
     let b: Vec<_> = b_blocks
         .iter()
-        .map(|b| (b.seq, b.command.as_str()))
+        .map(|b| (b.seq, b.command.as_deref()))
         .collect();
-    assert_eq!(b, vec![(0, "b1")]);
+    assert_eq!(b, vec![(0, Some("b1"))]);
 }
 
 /// An empty batch is a no-op; a dangling `session_id` fails the whole
@@ -426,7 +435,8 @@ fn insert_blocks_is_atomic_and_empty_is_a_noop() {
     let session = store.insert_terminal_session("bash", "/w").unwrap();
     let block = |session_id: i64| NewBlock {
         session_id,
-        command: "c".to_owned(),
+        command: Some("c".to_owned()),
+        cwd: Some("/w".to_owned()),
         exit: None,
         duration: None,
         started_at: None,
@@ -441,6 +451,94 @@ fn insert_blocks_is_atomic_and_empty_is_a_noop() {
         store.list_blocks(session.id).unwrap().is_empty(),
         "the valid row rolled back with the batch"
     );
+}
+
+/// Spec R08 us-2: a database at the ORIGINAL v1 shape — `blocks`
+/// with `NOT NULL command` and no `cwd` — migrates forward: v2 adds
+/// `cwd` conditionally (the amended v1 DDL already declares it for
+/// fresh databases, so the ALTER must not trip on it), old rows read
+/// `cwd: None`, and `command`'s old `NOT NULL` constraint is left
+/// alone (pre-release data; only NULL-writing changed).
+#[test]
+fn a_v1_database_migrates_to_the_post_v2_shape() {
+    let (_dir, path) = temp_db();
+    {
+        // Hand-build the v1 schema — the pre-amendment `blocks` DDL.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id          INTEGER PRIMARY KEY,
+                title       TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                cwd         TEXT NOT NULL,
+                status      TEXT NOT NULL
+            );
+            CREATE TABLE transcript_items (
+                id              INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                seq             INTEGER NOT NULL,
+                kind            TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                UNIQUE (conversation_id, seq)
+            );
+            CREATE TABLE plans (
+                conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                payload_json    TEXT NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+            CREATE TABLE terminal_sessions (
+                id         INTEGER PRIMARY KEY,
+                shell      TEXT NOT NULL,
+                cwd        TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at   INTEGER
+            );
+            CREATE TABLE blocks (
+                id          INTEGER PRIMARY KEY,
+                session_id  INTEGER NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+                seq         INTEGER NOT NULL,
+                command     TEXT NOT NULL,
+                exit        INTEGER,
+                duration_ms INTEGER,
+                started_at  INTEGER,
+                ended_at    INTEGER,
+                UNIQUE (session_id, seq)
+            );
+            INSERT INTO terminal_sessions (shell, cwd, started_at) VALUES ('bash', '/w', 1);
+            INSERT INTO blocks (session_id, seq, command) VALUES (1, 0, 'old block');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).expect("the v1 database migrates");
+    let session = store.insert_terminal_session("sh", "/w").unwrap();
+    store
+        .insert_block(NewBlock {
+            session_id: session.id,
+            command: Some("new block".to_owned()),
+            cwd: Some("/work".to_owned()),
+            exit: None,
+            duration: None,
+            started_at: None,
+            ended_at: None,
+        })
+        .unwrap();
+
+    let migrated = store.list_blocks(1).unwrap();
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(
+        migrated[0].cwd, None,
+        "a pre-v2 row has no cwd to backfill from"
+    );
+    let fresh = store.list_blocks(session.id).unwrap();
+    assert_eq!(fresh[0].cwd.as_deref(), Some("/work"));
+
+    // Reopen: every migration idempotent — the same file opens again.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.list_blocks(session.id).unwrap().len(), 1);
 }
 
 /// Every `terminal_sessions` row, oldest first — the read side that

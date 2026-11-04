@@ -135,6 +135,29 @@ pub enum TranscriptItem {
     },
 }
 
+/// The synthetic text an unanswered `tool_call` closes with (Spec
+/// R08 us-9): the model-facing `tool_result` the replay emits AND
+/// the card `detail` the panel rebuilds for the same record — one
+/// phrase, owned here so both read it verbatim.
+pub const INTERRUPTED_RESULT: &str =
+    "(interrupted — the run ended before this call produced a result)";
+
+/// The `status` item's terminal-outcome vocabulary — the lines the
+/// mirror records AND the panel's status entries render.
+pub const STATUS_DONE: &str = "done";
+/// `Cancelled` events' status text.
+pub const STATUS_CANCELLED: &str = "cancelled";
+/// `BudgetReached` events' status text.
+pub const STATUS_BUDGET: &str = "step budget reached";
+
+/// The call id replay synthesizes for an `ask` (`ask_replay_N`,
+/// counted per replayed transcript): `ask` items record no provider
+/// id — the card IS the record — so replay and the rebuilt card
+/// share this one convention.
+pub fn ask_replay_id(n: usize) -> String {
+    format!("ask_replay_{n}")
+}
+
 impl TranscriptItem {
     /// The `transcript_items.kind` column value — the serde tag,
     /// duplicated for SQL filtering (the payload carries it too).
@@ -288,9 +311,9 @@ impl TranscriptMirror {
                     covers_seq: *covers_seq,
                 });
             }
-            AgentEvent::Done => self.status("done"),
-            AgentEvent::Cancelled => self.status("cancelled"),
-            AgentEvent::BudgetReached => self.status("step budget reached"),
+            AgentEvent::Done => self.status(STATUS_DONE),
+            AgentEvent::Cancelled => self.status(STATUS_CANCELLED),
+            AgentEvent::BudgetReached => self.status(STATUS_BUDGET),
             AgentEvent::Error(message) => self.status(&format!("error: {message}")),
         }
     }

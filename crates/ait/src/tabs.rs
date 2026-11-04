@@ -548,8 +548,7 @@ impl Tab {
 
     /// This tab's `conversations` row id, if a transcript flush has
     /// created one (Spec R08-T3) — what `transcript_items` rows and
-    /// `plans` upserts key on.
-    #[allow(dead_code)] // T6's picker reads it; the flush writes it
+    /// `plans` upserts key on, and what `status` closes on.
     pub fn conversation(&self) -> Option<i64> {
         self.conversation
     }
@@ -596,9 +595,10 @@ impl Tab {
         }
         let grid = self.grid();
         let extent = self.scrollback() + grid.lines();
+        let cwd = self.cwd.to_string_lossy().into_owned();
         sealed
             .iter()
-            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent))
+            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent, cwd.clone()))
             .collect()
     }
 
@@ -1502,9 +1502,19 @@ impl TabManager {
             let conversation = match tab.conversation {
                 Some(id) => Some(id),
                 None => {
+                    // The title reads the batch's first task, falling
+                    // back through the panel's whole transcript — a
+                    // post-detach batch can start mid-conversation,
+                    // and the detached row's first task still names
+                    // the same conversation (Spec R08 us-5).
+                    let history = tab
+                        .agent
+                        .as_ref()
+                        .map(|panel| panel.transcript_items())
+                        .unwrap_or(&[]);
                     let id = store.conversation_started(
                         toast,
-                        &crate::transcript::conversation_title(&items),
+                        &crate::transcript::conversation_title(&items, history),
                         &tab.cwd,
                     );
                     if let Some(id) = id {
@@ -1896,14 +1906,15 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let (id, first) = &rows[0];
         assert_eq!(*id, 7, "the row keys on the session's store id");
-        assert_eq!(first.command, "first");
+        assert_eq!(first.command.as_deref(), Some("first"));
+        assert_eq!(first.cwd, manager.tabs()[1].cwd.to_string_lossy());
         assert_eq!(first.exit, Some(0));
         assert!(first.duration.is_some());
         assert!(first.started_at.is_some());
         assert!(first.ended_at.is_some());
         assert!(first.started_at <= first.ended_at);
         let (_, second) = &rows[1];
-        assert_eq!(second.command, "second");
+        assert_eq!(second.command.as_deref(), Some("second"));
         assert_eq!(second.exit, Some(7));
         // Sealed entries drain once — a second take finds nothing.
         assert!(manager.take_persisted_blocks().is_empty());

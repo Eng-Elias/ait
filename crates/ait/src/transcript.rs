@@ -96,17 +96,21 @@ impl Transcript {
     }
 }
 
-/// The `conversations.title` for a first flush: the first task's
-/// first line, trimmed and clipped to [`TITLE_CHARS`] — Spec R08's
-/// "titled from the first task, truncated". A flush with no task
-/// item (unreachable — the send side records before any event can)
-/// falls back to a nameable row.
-pub(crate) fn conversation_title(items: &[TranscriptItem]) -> String {
-    let task = items.iter().find_map(|item| match item {
-        TranscriptItem::Task { text } => Some(text.as_str()),
-        _ => None,
-    });
-    let line = task
+/// The `conversations.title` for a flush: the first task's first
+/// line in `batch`, trimmed and clipped to [`TITLE_CHARS`] — Spec
+/// R08's "titled from the first task, truncated". A batch starting
+/// mid-conversation (the row it continued was deleted — us-11's
+/// detach) can hold no task at all, so `history` — the panel's
+/// whole transcript — names the row from the conversation's own
+/// first task instead; only a taskless history gets the generic.
+pub(crate) fn conversation_title(batch: &[TranscriptItem], history: &[TranscriptItem]) -> String {
+    let line = batch
+        .iter()
+        .chain(history)
+        .find_map(|item| match item {
+            TranscriptItem::Task { text } => Some(text.as_str()),
+            _ => None,
+        })
         .and_then(|text| text.lines().next())
         .unwrap_or_default()
         .trim();
@@ -410,29 +414,61 @@ mod tests {
         );
     }
 
-    /// The row title: the first task's first line, truncated; a
-    /// taskless flush names the row anyway.
+    /// The row title: the batch's first task's first line,
+    /// truncated — the transcript's own first task names a batch
+    /// that starts mid-conversation (post-detach), and a fully
+    /// taskless history falls back to a nameable row.
     #[test]
     fn conversation_title_takes_the_first_task_first_line() {
+        let empty: &[TranscriptItem] = &[];
         assert_eq!(
-            conversation_title(&[
-                TranscriptItem::Task {
-                    text: "fix the tests\nplease".into(),
-                },
-                TranscriptItem::Task {
-                    text: "never the second".into(),
-                },
-            ]),
+            conversation_title(
+                &[
+                    TranscriptItem::Task {
+                        text: "fix the tests\nplease".into(),
+                    },
+                    TranscriptItem::Task {
+                        text: "never the second".into(),
+                    },
+                ],
+                empty,
+            ),
             "fix the tests"
         );
         let long = "x".repeat(TITLE_CHARS + 10);
         assert_eq!(
-            conversation_title(&[TranscriptItem::Task { text: long }]),
+            conversation_title(&[TranscriptItem::Task { text: long }], empty),
             format!("{}…", "x".repeat(TITLE_CHARS)),
             "clipped with an ellipsis"
         );
+        // A mid-conversation batch: the detached row's first task is
+        // the title (the new row continues the same conversation).
         assert_eq!(
-            conversation_title(&[TranscriptItem::Status { text: "s".into() }]),
+            conversation_title(
+                &[TranscriptItem::Status { text: "s".into() }],
+                &[
+                    TranscriptItem::Task {
+                        text: "the detached row's task".into(),
+                    },
+                    TranscriptItem::Status { text: "s".into() },
+                ],
+            ),
+            "the detached row's task"
+        );
+        // …but a batch task still wins over history's.
+        assert_eq!(
+            conversation_title(
+                &[TranscriptItem::Task {
+                    text: "fresh work".into(),
+                }],
+                &[TranscriptItem::Task {
+                    text: "the detached row's task".into(),
+                }],
+            ),
+            "fresh work"
+        );
+        assert_eq!(
+            conversation_title(&[TranscriptItem::Status { text: "s".into() }], empty),
             "untitled conversation"
         );
     }

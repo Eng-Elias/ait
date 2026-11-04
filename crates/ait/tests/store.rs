@@ -126,15 +126,20 @@ fn commands_leave_session_and_block_rows() {
 
     // Tab 1's blocks: the two commands, in order.
     let blocks = store.list_blocks(first.id).expect("list blocks");
-    let commands: Vec<&str> = blocks.iter().map(|b| b.command.as_str()).collect();
+    let commands: Vec<Option<&str>> = blocks.iter().map(|b| b.command.as_deref()).collect();
     let marker = commands
         .iter()
-        .position(|c| *c == "echo R08MARKER")
+        .position(|c| *c == Some("echo R08MARKER"))
         .expect("the echo block persisted");
     assert_eq!(blocks[marker].exit, Some(0));
     assert_eq!(
+        blocks[marker].cwd.as_deref(),
+        Some(spawn_cwd.to_string_lossy().as_ref()),
+        "the tab's cwd at preexec"
+    );
+    assert_eq!(
         commands[marker + 1],
-        "false",
+        Some("false"),
         "the next sealed block is the second command"
     );
     assert_eq!(blocks[marker + 1].exit, Some(1), "false's exit code");
@@ -150,7 +155,9 @@ fn commands_leave_session_and_block_rows() {
     // Tab 2's blocks live against its own session row.
     let second_blocks = store.list_blocks(second.id).expect("list tab-2 blocks");
     assert!(
-        second_blocks.iter().any(|b| b.command == "echo TAB2"),
+        second_blocks
+            .iter()
+            .any(|b| b.command.as_deref() == Some("echo TAB2")),
         "tab 2's command persisted under its session: {second_blocks:?}"
     );
 
@@ -158,7 +165,9 @@ fn commands_leave_session_and_block_rows() {
     // `seq`'s middle row only ever existed as output, never as a
     // typed line.
     assert!(
-        commands.iter().all(|c| !c.contains("9001")),
+        commands
+            .iter()
+            .all(|c| !c.is_some_and(|c| c.contains("9001"))),
         "output text never lands in a block row: {commands:?}"
     );
 }
@@ -388,7 +397,10 @@ fn agent_tasks_leave_a_transcript_and_the_second_appends() {
         "titled from the first task"
     );
     assert_eq!(conversation.cwd, spawn_cwd.to_string_lossy());
-    assert_eq!(conversation.status, "open");
+    assert_eq!(
+        conversation.status, "closed",
+        "the app exit closed the row (open only while a tab owns it)"
+    );
 
     let rows = store
         .load_transcript(conversation.id)

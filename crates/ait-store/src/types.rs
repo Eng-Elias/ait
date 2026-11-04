@@ -16,7 +16,8 @@ pub struct Conversation {
     pub title: String,
     /// The working directory the conversation ran in.
     pub cwd: String,
-    /// Opaque lifecycle tag the caller owns ("running", "done", …).
+    /// Opaque lifecycle tag the caller owns — the `ait` binary
+    /// writes `"open"` while a tab is bound and `"closed"` after.
     pub status: String,
     /// When the row was created.
     pub created_at: SystemTime,
@@ -98,17 +99,24 @@ pub struct TerminalSession {
 }
 
 /// A `blocks` row — one sealed command block's *metadata* (Spec R08,
-/// user stories 23–24): command, exit, duration and wall-clock bounds.
-/// Fields the hooks never reported stay `None`; no output text or
-/// scrollback is ever stored.
+/// user stories 23–24): command, cwd, exit, duration and wall-clock
+/// bounds. Fields the hooks never reported stay `None` — `command`
+/// among them (nothing resolved at seal); `cwd` is `None` only on
+/// rows a pre-v2 database carried over (the column is a v2
+/// migration). No output text or scrollback is ever stored.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     /// Ordering within the session — `0, 1, 2, …` assigned at insert.
     pub seq: i64,
     /// The session this block ran in.
     pub session_id: i64,
-    /// The command text as reported or resolved at seal.
-    pub command: String,
+    /// The command text as reported or resolved at seal, if anything
+    /// resolved — `None` records "the hooks never reported it" rather
+    /// than a fake empty command.
+    pub command: Option<String>,
+    /// The tab's cwd at `preexec`; `None` on pre-v2 rows the
+    /// migration could not backfill.
+    pub cwd: Option<String>,
     /// The exit code, if the block's `D` mark carried one.
     pub exit: Option<i64>,
     /// Execution time, if both bounds were known.
@@ -126,8 +134,10 @@ pub struct Block {
 pub struct NewBlock {
     /// The session this block ran in — a [`TerminalSession::id`].
     pub session_id: i64,
-    /// The command text (see [`Block::command`]).
-    pub command: String,
+    /// The command text (see [`Block::command`]) — `None` stores NULL.
+    pub command: Option<String>,
+    /// The tab's cwd at `preexec` (see [`Block::cwd`]).
+    pub cwd: Option<String>,
     /// The exit code, if reported.
     pub exit: Option<i64>,
     /// Execution time, if known.

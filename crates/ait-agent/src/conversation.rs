@@ -16,7 +16,7 @@ use ait_llm::{
 use crate::summarize::CHARS_PER_TOKEN;
 use crate::tool_call::ToolCall;
 use crate::tools::{self, ToolDecls};
-use crate::transcript::TranscriptItem;
+use crate::transcript::{ask_replay_id, TranscriptItem, INTERRUPTED_RESULT};
 
 /// `anthropic_messages` requires `max_tokens` — the schema has no
 /// default. Generous enough for long agent replies; the `chat` example
@@ -134,28 +134,18 @@ impl Conversation {
         // content must open on a user message (see `lead`).
         let mut emitted = false;
         let mut asks = 0usize;
+        // Non-pair items observed while a tool call was still
+        // unanswered — they belong AFTER the pair closes. An
+        // `update_plan` transcript is `[tool_call, plan, tool_result]`
+        // and mid-turn steering is the same shape: replaying the
+        // middle item in place would split call from result, closing
+        // the call `interrupted` while its real result orphaned.
+        let mut deferred: Vec<(usize, &TranscriptItem)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
             if index < covered {
                 continue;
             }
             match item {
-                TranscriptItem::Task { text } | TranscriptItem::Steering { text } => {
-                    turn.flush(&mut conversation, &mut emitted);
-                    conversation.push_user(text.clone());
-                    emitted = true;
-                }
-                // Held, not pushed: when calls follow, the text merges
-                // into their assistant item like the live loop's —
-                // otherwise the flush lands it as `push_assistant`.
-                // A text arriving while calls are already buffered
-                // belongs to a LATER turn (the live stream orders a
-                // turn's deltas before its calls), so it opens fresh.
-                TranscriptItem::AssistantText { text } => {
-                    if !turn.calls.is_empty() {
-                        turn.flush(&mut conversation, &mut emitted);
-                    }
-                    turn.text.push_str(text);
-                }
                 TranscriptItem::ToolCall { id, name, args, .. } => {
                     turn.calls.push(ToolCall {
                         id: id.clone(),
@@ -172,7 +162,7 @@ impl Conversation {
                     // one; its pairing with the result is what the
                     // schema requires, not the provider's original id.
                     asks += 1;
-                    let id = format!("ask_replay_{asks}");
+                    let id = ask_replay_id(asks);
                     turn.calls.push(ToolCall {
                         id: id.clone(),
                         name: tools::ASK_USER_QUESTION.to_string(),
@@ -191,23 +181,50 @@ impl Conversation {
                         turn.results.push((id, text.clone()));
                     }
                 }
-                // Panel state, never model context — but it DOES end
-                // an open turn: a crash mid-run leaves a parked call
-                // that must close before the status lands.
-                TranscriptItem::Status { .. } => turn.flush(&mut conversation, &mut emitted),
-                TranscriptItem::Summary { text, .. } => {
-                    turn.flush(&mut conversation, &mut emitted);
-                    conversation.push_user(format!("{SUMMARY_CONTEXT}\n{text}"));
-                    emitted = true;
-                }
-                TranscriptItem::Plan { todos } => {
-                    if Some(index) == last_plan {
-                        turn.flush(&mut conversation, &mut emitted);
-                        conversation.push_user(plan_context(todos));
-                        emitted = true;
+                _ => {
+                    if turn.has_unanswered() {
+                        deferred.push((index, item));
+                    } else {
+                        replay_item(
+                            item,
+                            index,
+                            last_plan,
+                            &mut turn,
+                            &mut conversation,
+                            &mut emitted,
+                        );
                     }
                 }
             }
+            // The last pending call just got its result: the pair is
+            // whole, so the turn closes — and anything deferred while
+            // it was open lands AFTER it, never inside it.
+            if !turn.has_unanswered() && !deferred.is_empty() {
+                turn.flush(&mut conversation, &mut emitted);
+                for (index, item) in deferred.drain(..) {
+                    replay_item(
+                        item,
+                        index,
+                        last_plan,
+                        &mut turn,
+                        &mut conversation,
+                        &mut emitted,
+                    );
+                }
+            }
+        }
+        // End of items: a still-open turn closes (its calls take the
+        // synthetic interrupted result), then the deferred tail lands.
+        turn.flush(&mut conversation, &mut emitted);
+        for (index, item) in deferred {
+            replay_item(
+                item,
+                index,
+                last_plan,
+                &mut turn,
+                &mut conversation,
+                &mut emitted,
+            );
         }
         turn.flush(&mut conversation, &mut emitted);
         conversation
@@ -443,12 +460,13 @@ impl Conversation {
     }
 }
 
-/// The synthetic result a `tool_call` with no recorded `tool_result`
-/// gains on replay (Spec R08 us-9): a crash mid-run, or an
-/// approve/ask card parked when the session ended. Anthropic
-/// hard-requires every `tool_use` to pair with a `tool_result`, and
-/// the text tells the model why the call produced nothing.
-const INTERRUPTED_RESULT: &str = "(interrupted — the run ended before this call produced a result)";
+// `INTERRUPTED_RESULT` (re-exported by the crate root from
+// `transcript`) is the synthetic result a `tool_call` with no
+// recorded `tool_result` gains on replay (Spec R08 us-9): a crash
+// mid-run, or an approve/ask card parked when the session ended.
+// Anthropic hard-requires every `tool_use` to pair with a
+// `tool_result`, and the text tells the model why the call
+// produced nothing.
 
 /// The label on a `summary` marker's injected text — context about
 /// the earlier conversation, not a fresh user instruction.
@@ -487,6 +505,15 @@ struct ReplayTurn {
 }
 
 impl ReplayTurn {
+    /// Whether any buffered call still lacks its result — the pair is
+    /// open: a non-pair item seen now belongs AFTER it closes, not
+    /// inside it (see `deferred` in [`Conversation::from_transcript`]).
+    fn has_unanswered(&self) -> bool {
+        self.calls
+            .iter()
+            .any(|call| !self.results.iter().any(|(id, _)| id == &call.id))
+    }
+
     /// Close the turn: buffered calls land as one assistant item
     /// followed by their results — in call order, each answered by
     /// its recorded `tool_result` or the synthetic
@@ -516,6 +543,56 @@ impl ReplayTurn {
         self.results.clear();
         self.text.clear();
         self.open_ask = None;
+    }
+}
+
+/// Replay one non-pair item — everything that is not a `tool_call`,
+/// `tool_result`, `ask` or `answer`. Called in place while no call
+/// is unanswered, or from `deferred` once the pair it would have
+/// split has closed.
+fn replay_item(
+    item: &TranscriptItem,
+    index: usize,
+    last_plan: Option<usize>,
+    turn: &mut ReplayTurn,
+    conversation: &mut Conversation,
+    emitted: &mut bool,
+) {
+    match item {
+        TranscriptItem::Task { text } | TranscriptItem::Steering { text } => {
+            turn.flush(conversation, emitted);
+            conversation.push_user(text.clone());
+            *emitted = true;
+        }
+        // Held, not pushed: when calls follow, the text merges
+        // into their assistant item like the live loop's —
+        // otherwise the flush lands it as `push_assistant`.
+        // A text arriving while calls are already buffered
+        // belongs to a LATER turn (the live stream orders a
+        // turn's deltas before its calls), so it opens fresh.
+        TranscriptItem::AssistantText { text } => {
+            if !turn.calls.is_empty() {
+                turn.flush(conversation, emitted);
+            }
+            turn.text.push_str(text);
+        }
+        // Panel state, never model context — but it DOES end
+        // an open turn: a crash mid-run leaves a parked call
+        // that must close before the status lands.
+        TranscriptItem::Status { .. } => turn.flush(conversation, emitted),
+        TranscriptItem::Summary { text, .. } => {
+            turn.flush(conversation, emitted);
+            conversation.push_user(format!("{SUMMARY_CONTEXT}\n{text}"));
+            *emitted = true;
+        }
+        TranscriptItem::Plan { todos } => {
+            if Some(index) == last_plan {
+                turn.flush(conversation, emitted);
+                conversation.push_user(plan_context(todos));
+                *emitted = true;
+            }
+        }
+        _ => unreachable!("pair items never reach replay_item"),
     }
 }
 
@@ -885,6 +962,62 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `update_plan`'s transcript shape is `[tool_call, plan,
+    /// tool_result]` — the `plan` item sits INSIDE the pair. The pair
+    /// must not split: the call answers with its real result (not a
+    /// synthetic "interrupted") and the deferred plan lands after it.
+    #[test]
+    fn a_plan_item_mid_pair_defers_until_the_result_lands() {
+        let items = vec![
+            TranscriptItem::Task {
+                text: "plan the fix".into(),
+            },
+            call("call_1", "update_plan"),
+            TranscriptItem::Plan {
+                todos: vec![PlanTodo {
+                    content: "fix".into(),
+                    status: PlanTodoStatus::InProgress,
+                }],
+            },
+            result("call_1", "plan updated"),
+        ];
+        let messages = chat_messages(&items);
+        let body = serde_json::to_string(&messages).unwrap();
+        assert!(body.contains("plan updated"), "{body}");
+        assert!(!body.contains("interrupted"), "{body}");
+        // Ordering: call → its real result → THEN the plan context.
+        let call_at = body.find("call_1").unwrap();
+        let result_at = body.find("plan updated").unwrap();
+        let plan_at = body.find("the conversation's current plan").unwrap();
+        assert!(call_at < result_at && result_at < plan_at, "{body}");
+    }
+
+    /// Steering recorded mid-tool-turn — `[tool_call, steering,
+    /// tool_result]` — defers the same way: the call keeps its real
+    /// result and the steering lands as the user message AFTER the
+    /// pair, never interrupting it.
+    #[test]
+    fn mid_turn_steering_does_not_interrupt_the_pair() {
+        let items = vec![
+            TranscriptItem::Task {
+                text: "do it".into(),
+            },
+            call("call_1", "run_command"),
+            TranscriptItem::Steering {
+                text: "and quickly".into(),
+            },
+            result("call_1", "done output"),
+        ];
+        let messages = chat_messages(&items);
+        let body = serde_json::to_string(&messages).unwrap();
+        assert!(body.contains("done output"), "{body}");
+        assert!(!body.contains("interrupted"), "{body}");
+        assert!(
+            body.find("done output").unwrap() < body.find("and quickly").unwrap(),
+            "the steering user message follows the closed pair: {body}"
+        );
     }
 
     /// An ask parked at exit — an `ask` whose `answer` never came —

@@ -95,10 +95,16 @@ pub enum Resolution {
 
 /// One row of the binding table. `enhanced_only` rows require the kitty
 /// keyboard enhancement — see the module docs for the collapse rule.
+/// `case_sensitive` rows match `Char` bindings by exact codepoint: an
+/// uppercase report IS the folded SHIFT (kitty's alternate-key report
+/// substitutes the shifted codepoint and clears the flag; the legacy
+/// Alt-prefix encodes `ESC R` the same way), so a case-insensitive
+/// `Char('r')` match would steal `Alt+Shift+R` for `Conversations`.
 struct Binding {
     code: KeyCode,
     modifiers: KeyModifiers,
     enhanced_only: bool,
+    case_sensitive: bool,
     action: AppAction,
 }
 
@@ -117,24 +123,28 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::PageUp,
         modifiers: SHIFT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::ScrollPageUp,
     },
     Binding {
         code: KeyCode::PageDown,
         modifiers: SHIFT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::ScrollPageDown,
     },
     Binding {
         code: KeyCode::Home,
         modifiers: SHIFT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::ScrollTop,
     },
     Binding {
         code: KeyCode::End,
         modifiers: SHIFT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::ScrollBottom,
     },
     // Tabs — both tiers.
@@ -142,78 +152,91 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::PageUp,
         modifiers: CONTROL,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::PrevTab,
     },
     Binding {
         code: KeyCode::PageDown,
         modifiers: CONTROL,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::NextTab,
     },
     Binding {
         code: KeyCode::Char('t'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::NewTab,
     },
     Binding {
         code: KeyCode::Char('w'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::CloseTab,
     },
     Binding {
         code: KeyCode::Char('1'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(1),
     },
     Binding {
         code: KeyCode::Char('2'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(2),
     },
     Binding {
         code: KeyCode::Char('3'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(3),
     },
     Binding {
         code: KeyCode::Char('4'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(4),
     },
     Binding {
         code: KeyCode::Char('5'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(5),
     },
     Binding {
         code: KeyCode::Char('6'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(6),
     },
     Binding {
         code: KeyCode::Char('7'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(7),
     },
     Binding {
         code: KeyCode::Char('8'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(8),
     },
     Binding {
         code: KeyCode::Char('9'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::JumpToTab(9),
     },
     // Paste own selection — T3.
@@ -221,6 +244,7 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Insert,
         modifiers: SHIFT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::Paste,
     },
     // Quit — both tiers.
@@ -228,6 +252,7 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Char('q'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::Quit,
     },
     // Spec R04 `Alt+Enter` trigger — both tiers: `ESC CR` is distinct
@@ -238,6 +263,7 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Enter,
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::SuggestCommand,
     },
     // Spec R05 §5.5 block UX — both tiers: `Alt+Up`/`Alt+Down` report
@@ -251,18 +277,21 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Up,
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::PrevBlockStart,
     },
     Binding {
         code: KeyCode::Down,
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::NextBlockStart,
     },
     Binding {
         code: KeyCode::Char('b'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::SelectBlock,
     },
     // Spec R06 `Alt+A` agent-panel toggle — both tiers: `ESC a` vs `a`
@@ -274,6 +303,7 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Char('a'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::AgentPanel,
     },
     // Spec R07 §5.7 `Alt+P` profile switch — both tiers: `ESC p` vs
@@ -285,6 +315,7 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Char('p'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: false,
         action: AppAction::SwitchProfile,
     },
     // Spec R08 §5.8 `Alt+R` conversation picker — both tiers:
@@ -292,11 +323,15 @@ const BINDINGS: &[Binding] = &[
     // and the kitty modifier report alike. `M-r` IS bound in
     // default readline (revert-line) — the same sanctioned trade
     // `Alt+B` makes with `M-b` (backward-word): the app-level
-    // feature wins the chord where it applies.
+    // feature wins the chord where it applies. The match is
+    // case-SENSITIVE, though: a `Char('R')` report is `Alt+Shift+R`
+    // (alternate-key hosts fold SHIFT into the codepoint and clear
+    // the flag) — that chord stays the shell's.
     Binding {
         code: KeyCode::Char('r'),
         modifiers: ALT,
         enhanced_only: false,
+        case_sensitive: true,
         action: AppAction::Conversations,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
@@ -306,18 +341,21 @@ const BINDINGS: &[Binding] = &[
         code: KeyCode::Char('t'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
+        case_sensitive: false,
         action: AppAction::NewTab,
     },
     Binding {
         code: KeyCode::Char('w'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
+        case_sensitive: false,
         action: AppAction::CloseTab,
     },
     Binding {
         code: KeyCode::Char('q'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
+        case_sensitive: false,
         action: AppAction::Quit,
     },
 ];
@@ -340,9 +378,15 @@ pub fn resolve(event: &KeyEvent, tier: CapabilityTier) -> Resolution {
         }
         let matched = match (binding.code, event.code) {
             // Letter bindings are case-insensitive: terminals differ on
-            // whether Alt+letter reports the shifted codepoint.
+            // whether Alt+letter reports the shifted codepoint — except
+            // `case_sensitive` rows, where the shifted codepoint IS the
+            // folded shift and must not bind (see `struct Binding`).
             (KeyCode::Char(expected), KeyCode::Char(actual)) => {
-                expected.eq_ignore_ascii_case(&actual)
+                if binding.case_sensitive {
+                    expected == actual
+                } else {
+                    expected.eq_ignore_ascii_case(&actual)
+                }
             }
             (expected, actual) => expected == actual,
         };
@@ -594,14 +638,18 @@ mod tests {
     /// `Alt+R` is the Spec R08 conversation picker (`Conversations`):
     /// `ESC r` vs `r` is byte-distinct on every host — no tier gate.
     /// `M-r` is bound in default readline (revert-line) — the same
-    /// sanctioned trade `Alt+B`/`M-b` makes — and the exact-modifier
-    /// rule keeps `Alt+Shift+R`/`Ctrl+Alt+R` for the PTY.
+    /// sanctioned trade `Alt+B`/`M-b` makes — and `Alt+Shift+R` is
+    /// NEVER stolen: the exact-modifier rule covers `Char('R')` +
+    /// ALT|SHIFT, and the case-sensitive match covers the
+    /// alternate-key hosts that report `Char('R')` + ALT.
     #[test]
     fn alt_r_binds_in_both_tiers() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
             assert_action(KeyCode::Char('r'), ALT, tier, AppAction::Conversations);
-            assert_action(KeyCode::Char('R'), ALT, tier, AppAction::Conversations);
             assert_pass(KeyCode::Char('r'), KeyModifiers::NONE, tier);
+            // `Char('R')` + ALT is `Alt+Shift+R` — the shifted
+            // codepoint means shift was folded in; it passes through.
+            assert_pass(KeyCode::Char('R'), ALT, tier);
             assert_pass(
                 KeyCode::Char('r'),
                 KeyModifiers::ALT | KeyModifiers::SHIFT,

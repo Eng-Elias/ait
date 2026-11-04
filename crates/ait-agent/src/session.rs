@@ -1159,7 +1159,7 @@ fn ask_and_answer(
             events.emit(AgentEvent::ToolUpdate {
                 call_id: call.id.clone(),
                 status: ToolStatus::Done,
-                detail: Some(preview(&answer)),
+                detail: Some(result_preview(&answer)),
                 result: Some(answer.clone()),
             });
             Some(answer)
@@ -1253,14 +1253,17 @@ fn card_detail(name: &str, text: &str) -> String {
     if name == "write_to_pty" {
         tail_preview(text)
     } else {
-        preview(text)
+        result_preview(text)
     }
 }
+
+/// A card `detail`'s char cap — the last non-empty line clips from
+/// the tail, the first line from the head, both to this width.
+const PREVIEW_CHARS: usize = 120;
 
 /// The last non-empty line of `text`, clipped to the preview width
 /// from the tail — `write_to_pty`'s card detail.
 fn tail_preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
     let last = text
         .lines()
         .rev()
@@ -1279,9 +1282,9 @@ fn tail_preview(text: &str) -> String {
 
 /// A card's `detail`: the first line of the (already redacted) tool
 /// result, clipped — enough to recognize what ran without turning
-/// the scrollback into the output itself.
-fn preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
+/// the scrollback into the output itself. The `ait` frontend's
+/// resume rebuild clips stored `tool_result`s through this same fn.
+pub fn result_preview(text: &str) -> String {
     let first = text.lines().next().unwrap_or_default();
     if first.chars().count() > PREVIEW_CHARS {
         format!("{}…", first.chars().take(PREVIEW_CHARS).collect::<String>())
