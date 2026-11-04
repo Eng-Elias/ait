@@ -521,8 +521,10 @@ pub fn run() -> io::Result<ExitCode> {
                 &tabs,
                 &view.status,
                 view.toast,
-                state.picker.as_ref(),
-                state.conversations.as_ref(),
+                Overlays {
+                    profile: state.picker.as_ref(),
+                    conversations: state.conversations.as_ref(),
+                },
                 &underlines,
                 &mut last_cursor_shape,
             )?;
@@ -1136,13 +1138,22 @@ fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPo
 /// toast), then the application-requested cursor shape and position:
 /// the panel's input-line cursor while it owns the keyboard, the
 /// session's otherwise.
+/// The overlay pickers one frame can paint (Spec R07 §5.7, R08-T6):
+/// dispatch keeps them mutually exclusive — either may be open,
+/// never both.
+struct Overlays<'a> {
+    /// The `Alt+P` profile switcher.
+    profile: Option<&'a ProfilePicker>,
+    /// The `Alt+R` conversation picker.
+    conversations: Option<&'a ConversationPicker>,
+}
+
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     tabs: &TabManager,
     status: &str,
     toast: bool,
-    picker: Option<&ProfilePicker>,
-    conversations: Option<&ConversationPicker>,
+    overlays: Overlays<'_>,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
 ) -> io::Result<()> {
@@ -1198,10 +1209,10 @@ fn render_frame(
         // content band's bottom rows so nothing underneath decides
         // their hit-testing. Dispatch keeps them mutually exclusive
         // — opening one drops the other.
-        if let Some(picker) = picker {
+        if let Some(picker) = overlays.profile {
             paint_profile_picker(buf, areas.content, picker);
         }
-        if let Some(picker) = conversations {
+        if let Some(picker) = overlays.conversations {
             paint_conversation_picker(buf, areas.content, picker);
         }
         if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
