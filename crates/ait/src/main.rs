@@ -22,6 +22,7 @@ mod scroll;
 mod selection;
 mod shell_bridge;
 mod status;
+mod store;
 mod suggest;
 mod tabs;
 mod terminal;

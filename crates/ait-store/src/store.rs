@@ -331,6 +331,26 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every `terminal_sessions` row, oldest first — symmetric with
+    /// [`list_blocks`](Self::list_blocks), the read side that lets
+    /// tests observe session persistence.
+    pub fn list_terminal_sessions(&self) -> Result<Vec<TerminalSession>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shell, cwd, started_at, ended_at
+             FROM terminal_sessions ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TerminalSession {
+                id: row.get(0)?,
+                shell: row.get(1)?,
+                cwd: row.get(2)?,
+                started_at: ms_to_system(row.get(3)?),
+                ended_at: row.get::<_, Option<i64>>(4)?.map(ms_to_system),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Stamp `ended_at` on a terminal session (tab close/exit) and
     /// return the updated row — `None` if the id never existed.
     pub fn finish_terminal_session(&self, id: i64) -> Result<Option<TerminalSession>, StoreError> {
@@ -375,6 +395,54 @@ impl Store {
             started_at: block.started_at,
             ended_at: block.ended_at,
         })
+    }
+
+    /// Insert a drain's worth of sealed blocks in ONE transaction
+    /// (Spec R08 — "writes batched per drain in one transaction"): a
+    /// batch may span several sessions — each `seq` continues against
+    /// its own `session_id` — and a single failure rolls the whole
+    /// batch back. An empty slice is a no-op.
+    pub fn insert_blocks(&self, blocks: &[NewBlock]) -> Result<(), StoreError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut next_seq =
+            tx.prepare("SELECT COALESCE(MAX(seq) + 1, 0) FROM blocks WHERE session_id = ?1")?;
+        let mut insert = tx.prepare(
+            "INSERT INTO blocks
+                 (session_id, seq, command, exit, duration_ms, started_at, ended_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        // `seq` continues per session across the batch: the first row
+        // of each session queries its max, later rows increment it.
+        let mut seqs: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for block in blocks {
+            let seq = match seqs.get_mut(&block.session_id) {
+                Some(seq) => {
+                    *seq += 1;
+                    *seq
+                }
+                None => {
+                    let seq: i64 = next_seq.query_row([block.session_id], |row| row.get(0))?;
+                    seqs.insert(block.session_id, seq);
+                    seq
+                }
+            };
+            insert.execute(params![
+                block.session_id,
+                seq,
+                block.command,
+                block.exit,
+                block.duration.map(duration_ms),
+                block.started_at.map(system_to_ms),
+                block.ended_at.map(system_to_ms),
+            ])?;
+        }
+        drop(insert);
+        drop(next_seq);
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every stored block of a session in `seq` order — symmetric with
