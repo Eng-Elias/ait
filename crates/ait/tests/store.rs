@@ -15,8 +15,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 
+use ait_agent::TranscriptItem;
+use ait_llm::testing::{sse, Fixture};
 use ait_store::Store;
-use ait_testkit::{ait_bin, wait_fresh_prompt, E2e, Size, SpawnConfig};
+use ait_testkit::{
+    ait_bin, json_string, panel_has_line, wait_fresh_prompt, E2e, Size, SpawnConfig,
+};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line.
 const SIZE: Size = Size {
@@ -187,5 +191,280 @@ fn an_unopenable_store_toasts_and_the_terminal_still_works() {
     assert!(
         status.success(),
         "the unpersisted run still exits cleanly, got {status:?}"
+    );
+}
+
+// ─── R08-T3: transcript mirroring (agent conversations) ─────────────
+
+/// Write `contents` as `<dir>/ait/settings.toml`, creating the `ait/`
+/// directory first (the `agent_panel.rs` precedent — the watcher
+/// needs the parent to exist at spawn).
+fn write_agent_settings(dir: &Path, contents: &str) {
+    let config = dir.join("ait");
+    fs::create_dir_all(&config).expect("create the fixture config directory");
+    fs::write(config.join("settings.toml"), contents).expect("write fixture settings.toml");
+}
+
+/// A `settings.toml` whose `coding_model` binds one model at the
+/// fixture's loopback `base_url` — no `api_key_env`, so requests go
+/// out unauthenticated.
+fn agent_settings_with_fixture(base_url: &str) -> String {
+    format!(
+        r#"
+[agents.custom_endpoints.local]
+name     = "Fixture"
+base_url = "{base_url}"
+schema   = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name       = "fixture-model"
+alias      = "Fixture Model"
+config_key = "coding-key"
+
+[agents.execution_profiles.default]
+coding_model = "coding-key"
+"#
+    )
+}
+
+/// Spawn `ait` with `XDG_CONFIG_HOME` (settings → fixture) and
+/// `XDG_DATA_HOME` (the store) pinned to fresh tempdirs, on `/bin/sh`
+/// — dash takes no injection, so `run_command` rides the typed-
+/// sentinel tier (the `agent_panel.rs` precedent).
+fn spawn_ait_for_agent(cfg: &Path, data: &Path) -> E2e {
+    let mut config = SpawnConfig::new(ait_bin!(), &[], SIZE);
+    for (key, value) in [
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            cfg.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("XDG_DATA_HOME"),
+            data.as_os_str().to_os_string(),
+        ),
+        (OsString::from("SHELL"), OsString::from("/bin/sh")),
+    ] {
+        config.env.push((key, value));
+    }
+    E2e::spawn(config).expect("spawn the ait binary")
+}
+
+/// `Alt+A` opens the split focused — the `agent_panel.rs` recipe.
+fn open_panel(app: &mut E2e) {
+    app.press("Alt+A");
+    app.wait_for_screen("the open, focused agent panel", |app| {
+        app.screen_text().contains('│') && app.screen_text().contains(" agent")
+    });
+}
+
+/// Type `task` on the panel's input line and submit it.
+fn submit_task(app: &mut E2e, task: &str) {
+    app.type_text(task);
+    app.wait_for_screen("the task on the input line", |app| {
+        app.screen_text().contains(task)
+    });
+    app.press("Enter");
+}
+
+/// One `chat.completion.chunk` `data:` frame carrying a content delta
+/// then the `[DONE]` sentinel — a plain end turn.
+fn chat_text_turn(text: &str) -> String {
+    format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+        json_string(text)
+    )
+}
+
+/// A `chat.completion.chunk` turn calling `name` once with `args` —
+/// the `agent_panel.rs` wire shape: `id`/`name` on the announce
+/// fragment, the arguments string fragment after, `finish_reason:
+/// "tool_calls"` closing.
+fn tool_turn(call_id: &str, name: &str, args: &str) -> String {
+    let mut body = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":{},\"type\":\"function\",\"function\":{{\"name\":{},\"arguments\":\"\"}}}}],\"finish_reason\":null}}}}]}}\n\n",
+        json_string(call_id),
+        json_string(name),
+    );
+    body.push_str(&format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{}}}}}]}}}}]}}\n\n",
+        json_string(args)
+    ));
+    body.push_str(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    );
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// The count of `done` status lines on the panel half — how a second
+/// finished task is told from the first.
+fn done_lines(app: &E2e) -> usize {
+    app.screen_text()
+        .lines()
+        .filter(|row| row.split('│').nth(1).is_some_and(|h| h.trim() == "done"))
+        .count()
+}
+
+/// Spec R08-T3 / us-4 + us-28: a scripted task leaves one
+/// `conversations` row titled from the first task and an ordered
+/// `transcript_items` trail covering every emitted event — the task,
+/// the gated `run_command` call and its full result, the ask card
+/// and its answer, the coalesced reply and the terminal status — and
+/// a second task in the same tab appends to the SAME row.
+#[test]
+fn agent_tasks_leave_a_transcript_and_the_second_appends() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_1",
+            "run_command",
+            r#"{"command":"echo T3-MARK"}"#,
+        )),
+        sse(&tool_turn(
+            "call_2",
+            "ask_user_question",
+            r#"{"question":"Ship it?","choices":["yes","no"]}"#,
+        )),
+        sse(&chat_text_turn("marker noted")),
+        sse(&chat_text_turn("second task done")),
+    ]);
+    let cfg = tempfile::tempdir().expect("config fixture tempdir");
+    let data = tempfile::tempdir().expect("data fixture tempdir");
+    write_agent_settings(cfg.path(), &agent_settings_with_fixture(&fixture.base_url));
+
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the tab bar and status line", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+    let spawn_cwd = app.cwd().to_path_buf();
+
+    // Task one: run_command gates on the approve card (`a` = allow
+    // once), then the ask card's first choice answers on Enter.
+    open_panel(&mut app);
+    submit_task(&mut app, "run my marker command");
+    app.wait_for_screen("the parked approve card", |app| {
+        app.screen_text().contains("approve run_command")
+    });
+    app.type_text("a");
+    app.wait_for_screen("the ask card", |app| app.screen_text().contains("Ship it?"));
+    app.press("Enter"); // select "yes"
+    app.wait_for_screen("task one's done status", |app| {
+        done_lines(app) == 1 && panel_has_line(app, "marker noted")
+    });
+
+    // Task two in the same tab.
+    submit_task(&mut app, "say done again");
+    app.wait_for_screen("task two's done status", |app| done_lines(app) == 2);
+
+    // Writes are synchronous per drain — durable the moment the
+    // status painted, so quitting now loses nothing.
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+
+    let store = open_store(data.path());
+    let conversations = store.list_conversations().expect("list conversations");
+    assert_eq!(
+        conversations.len(),
+        1,
+        "one row — task two appended, never created a second"
+    );
+    let conversation = &conversations[0];
+    assert_eq!(
+        conversation.title, "run my marker command",
+        "titled from the first task"
+    );
+    assert_eq!(conversation.cwd, spawn_cwd.to_string_lossy());
+    assert_eq!(conversation.status, "open");
+
+    let rows = store
+        .load_transcript(conversation.id)
+        .expect("load the transcript");
+    assert_eq!(
+        rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        (0..rows.len() as i64).collect::<Vec<_>>(),
+        "seqs contiguous in append order: {rows:?}"
+    );
+    let items: Vec<TranscriptItem> = rows
+        .iter()
+        .map(|row| {
+            assert_eq!(
+                row.kind,
+                serde_json::from_str::<serde_json::Value>(&row.payload_json)
+                    .expect("payload is JSON")["kind"]
+                    .as_str()
+                    .expect("kind tag"),
+                "the kind column duplicates the payload's tag"
+            );
+            serde_json::from_str(&row.payload_json).expect("payload deserializes")
+        })
+        .collect();
+    let kinds: Vec<&str> = items.iter().map(TranscriptItem::kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "task",
+            "tool_call",
+            "tool_result",
+            "ask",
+            "answer",
+            "assistant_text",
+            "status",
+            "task",
+            "assistant_text",
+            "status",
+        ],
+        "every event mirrored in order: {items:?}"
+    );
+    assert_eq!(
+        items[0],
+        TranscriptItem::Task {
+            text: "run my marker command".into()
+        }
+    );
+    // The call row keeps the raw argument text; the result row keeps
+    // the FULL text the model read — not the card's ≤120-char preview.
+    assert!(
+        matches!(&items[1], TranscriptItem::ToolCall { id, name, args, .. }
+            if id == "call_1" && name == "run_command"
+                && args == r#"{"command":"echo T3-MARK"}"#),
+        "{:?}",
+        items[1]
+    );
+    assert!(
+        matches!(&items[2], TranscriptItem::ToolResult { id, text, status }
+            if id == "call_1" && *status == ait_agent::ToolStatus::Done
+                && text.contains("T3-MARK") && text.contains("exit code: 0")),
+        "the full result text lands verbatim: {:?}",
+        items[2]
+    );
+    assert_eq!(
+        items[3],
+        TranscriptItem::Ask {
+            question: "Ship it?".into(),
+            choices: vec!["yes".into(), "no".into()],
+        }
+    );
+    assert_eq!(
+        items[4],
+        TranscriptItem::Answer { text: "yes".into() },
+        "the answer recorded at send time, full text"
+    );
+    assert_eq!(
+        items[5],
+        TranscriptItem::AssistantText {
+            text: "marker noted".into()
+        },
+        "the turn's deltas coalesced into one item"
+    );
+    assert_eq!(
+        items[7],
+        TranscriptItem::Task {
+            text: "say done again".into()
+        },
+        "the second task appended to the same row"
     );
 }
