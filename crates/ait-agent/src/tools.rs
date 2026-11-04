@@ -6,11 +6,15 @@
 //!
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
-//! `write_to_pty`). Every declared tool executes: the file tools
+//! `write_to_pty`; Spec R08 adds `update_plan` — §5.8's visible
+//! TODO list, gate-exempt like the ask). Every declared tool
+//! executes: the file tools
 //! live in [`files`](crate::files), `write_to_pty`'s agent-owned
 //! PTY in [`pty`](crate::pty) (R06-T7), `run_command` runs through
-//! the task's [`CommandExecutor`](crate::CommandExecutor) (R06-T4/T5)
-//! and `ask_user_question` answers on its own card channel (us-10)
+//! the task's [`CommandExecutor`](crate::CommandExecutor) (R06-T4/T5),
+//! `ask_user_question` answers on its own card channel (us-10) and
+//! `update_plan` applies through its snapshot event
+//! ([`AgentEvent::PlanUpdated`](crate::AgentEvent::PlanUpdated), us-13)
 //! — [`execute`] is the dispatcher; an unknown name is the only
 //! tool error left.
 //!
@@ -32,12 +36,21 @@ use crate::files::{EditPlan, ToolCwd, ToolOutput};
 use crate::permissions;
 use crate::pty::AgentPty;
 use crate::tool_call::ToolCall;
+use crate::transcript::PlanTodo;
 
 /// The `ask_user_question` tool's registry name — the permission
 /// engine (`permissions::evaluate`) special-cases it and the agent
 /// loop diverts it into the ask-card flow before [`execute`] is
 /// ever called.
 pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
+
+/// The `update_plan` tool's registry name (Spec R08, §5.8) —
+/// gate-exempt like `ask_user_question` (us-16): the permission
+/// engine allows it outright (§5.7 gains no profile field for it)
+/// and the agent loop diverts it into the snapshot flow — its
+/// [`PlanUpdated`](crate::AgentEvent::PlanUpdated) event IS the
+/// effect — before [`execute`] is ever called.
+pub(crate) const UPDATE_PLAN: &str = "update_plan";
 
 /// One tool, provider-neutrally: what the model sees, translated
 /// per schema by [`declare`].
@@ -197,6 +210,36 @@ fn registry() -> &'static [ToolSpec] {
                     "additionalProperties": false
                 }),
             },
+            ToolSpec {
+                name: UPDATE_PLAN,
+                description:
+                    "Update the plan shown to the user. Send the whole TODO list on every \
+                          call — each call replaces the previous plan. Keep exactly one step \
+                          `in_progress`; mark a step `done` the moment it is finished.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {"type": "string"},
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "done"]
+                                    }
+                                },
+                                "required": ["content", "status"],
+                                "additionalProperties": false
+                            },
+                            "description": "The full TODO list — every step, in order."
+                        }
+                    },
+                    "required": ["todos"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     });
     &REGISTRY
@@ -226,6 +269,27 @@ pub(crate) fn parse_question(call: &ToolCall) -> Result<(String, Vec<String>), S
         })
         .unwrap_or_default();
     Ok((question.to_string(), choices))
+}
+
+/// Parse an `update_plan` call's arguments into the whole TODO list
+/// (Spec R08-T5): `{todos: [{content, status}]}` deserializes into
+/// the transcript vocabulary's own [`PlanTodo`]s — the snapshot the
+/// [`PlanUpdated`](crate::AgentEvent::PlanUpdated) event carries
+/// verbatim, replace-whole-list semantics included (an empty list
+/// clears the plan). Anything outside that shape — bad JSON, a
+/// missing `todos`, an unknown `status` — is a tool error: model
+/// input, never a wedge.
+pub(crate) fn parse_plan(call: &ToolCall) -> Result<Vec<PlanTodo>, String> {
+    /// The `{todos: …}` envelope — `PlanTodo` carries the per-item
+    /// shape already (the transcript's serde form and the tool's
+    /// parameter schema describe the same JSON).
+    #[derive(serde::Deserialize)]
+    struct Args {
+        todos: Vec<PlanTodo>,
+    }
+    serde_json::from_str::<Args>(&call.arguments)
+        .map(|args| args.todos)
+        .map_err(|error| format!("{}: {error}", call.name))
 }
 
 /// The registry translated into `schema`'s own `Tool` IR — attached
@@ -413,6 +477,17 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
             .and_then(|v| v.as_str())
             .map(|input| format!("{input:?}"))
             .unwrap_or_default(),
+        // The scrollback card's one-liner is the count — the pinned
+        // block the snapshot produces carries the contents.
+        UPDATE_PLAN => args
+            .get("todos")
+            .and_then(|v| v.as_array())
+            .map(|todos| match todos.len() {
+                0 => String::from("no todos"),
+                1 => String::from("1 todo"),
+                n => format!("{n} todos"),
+            })
+            .unwrap_or_default(),
         _ => compact(&args),
     }
 }
@@ -479,6 +554,12 @@ pub(crate) fn execute(
             "{} answers through the ask card, not the executor",
             call.name
         )),
+        // `update_plan` applies through its snapshot event — the
+        // loop emits it; `execute` is never its path either.
+        UPDATE_PLAN => ToolOutput::error(format!(
+            "{} applies through the plan snapshot, not the executor",
+            call.name
+        )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
     }
 }
@@ -541,15 +622,16 @@ mod tests {
     //! argument-summary renderings and the executor dispatch.
 
     use super::*;
+    use crate::transcript::PlanTodoStatus;
 
-    /// Every schema's translation carries all seven tools with name,
+    /// Every schema's translation carries all eight tools with name,
     /// description and parameters — in its own `Tool` shape (§5.3).
     #[test]
     fn declare_translates_every_spec_per_schema() {
         let ToolDecls::Chat(tools) = declare(EndpointSchema::OpenAiChatCompletions, None) else {
             panic!("chat decls")
         };
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert!(tools
             .iter()
             .all(|t| t.kind == openai_chat_completions::ToolKind::Function));
@@ -664,6 +746,46 @@ mod tests {
         );
     }
 
+    /// `update_plan` joins `ask_user_question` in the exempt pair
+    /// (Spec R08 us-16): an `agent_decides` field exists for every
+    /// §5.7 level, but none for it — so under an all-`agent_decides`
+    /// stance its declaration ships exactly what the registry wrote,
+    /// `safety`-free.
+    #[test]
+    fn update_plan_declares_without_safety_under_agent_decides() {
+        let level = Some(ait_config::PermissionLevel::AgentDecides);
+        let profile = ExecutionProfile {
+            read_files: level,
+            write_to_pty: level,
+            execute_commands: level,
+            apply_code_diffs: level,
+            ask_user_question: level,
+            mcp_permissions: level,
+            ..Default::default()
+        };
+        for schema in [
+            EndpointSchema::OpenAiChatCompletions,
+            EndpointSchema::OpenAiResponses,
+            EndpointSchema::AnthropicMessages,
+        ] {
+            let (name, _, parameters) = decl_parts(&declare(schema, Some(&profile)))
+                .into_iter()
+                .find(|(name, _, _)| name == UPDATE_PLAN)
+                .expect("update_plan declares");
+            assert_eq!(name, UPDATE_PLAN);
+            assert_eq!(
+                parameters["properties"]["safety"],
+                serde_json::Value::Null,
+                "{schema:?}"
+            );
+            assert_eq!(
+                parameters["required"],
+                serde_json::json!(["todos"]),
+                "{schema:?}"
+            );
+        }
+    }
+
     /// `(name, description, parameters)` per declared tool — one
     /// comparable shape across the three wire IRs.
     fn decl_parts(decls: &ToolDecls) -> Vec<(String, Option<String>, serde_json::Value)> {
@@ -753,6 +875,77 @@ mod tests {
             summarize_args(&call("read_files", "{not json")),
             "{not json"
         );
+    }
+
+    /// `update_plan`'s argument seam (Spec R08-T5): `{todos:
+    /// [{content, status}]}` parses into the transcript vocabulary's
+    /// own `PlanTodo`s — the whole list, in call order, an empty list
+    /// included (it clears the plan). Bad JSON, a missing `todos`
+    /// array and a todo outside the three-status vocabulary are tool
+    /// errors — model input, never a wedge.
+    #[test]
+    fn parse_plan_reads_the_whole_todo_list() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: UPDATE_PLAN.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(
+            parse_plan(&call(
+                r#"{"todos":[
+                    {"content":"reproduce","status":"done"},
+                    {"content":"fix","status":"in_progress"},
+                    {"content":"verify","status":"pending"}
+                ]}"#
+            )),
+            Ok(vec![
+                PlanTodo {
+                    content: "reproduce".into(),
+                    status: PlanTodoStatus::Done,
+                },
+                PlanTodo {
+                    content: "fix".into(),
+                    status: PlanTodoStatus::InProgress,
+                },
+                PlanTodo {
+                    content: "verify".into(),
+                    status: PlanTodoStatus::Pending,
+                },
+            ])
+        );
+        assert_eq!(parse_plan(&call(r#"{"todos":[]}"#)), Ok(vec![]));
+        for args in [
+            "{not json",
+            r#"{}"#,
+            r#"{"todos":"all"}"#,
+            r#"{"todos":[{"content":"x","status":"bogus"}]}"#,
+            r#"{"todos":[{"status":"done"}]}"#,
+        ] {
+            assert!(parse_plan(&call(args)).is_err(), "{args}");
+        }
+    }
+
+    /// The card's one-line summary of a plan call: the todo count —
+    /// the block the card announces carries the contents.
+    #[test]
+    fn summarize_counts_a_plan_calls_todos() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: UPDATE_PLAN.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(
+            summarize_args(&call(r#"{"todos":[
+                {"content":"a","status":"done"},
+                {"content":"b","status":"pending"}
+            ]}"#)),
+            "2 todos"
+        );
+        assert_eq!(
+            summarize_args(&call(r#"{"todos":[{"content":"a","status":"done"}]}"#)),
+            "1 todo"
+        );
+        assert_eq!(summarize_args(&call(r#"{"todos":[]}"#)), "no todos");
     }
 
     /// The ask card's pure seam: `question` plus `choices` come out

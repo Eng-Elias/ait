@@ -13,9 +13,10 @@
 //! have no event), `TextDelta`s coalesce into one `assistant_text`
 //! per assistant turn, and `ToolUpdate` terminal statuses become
 //! `tool_result`s — `Running` is a card transition, not a record.
-//! `plan` and `summary` kinds exist for R08-T5's `update_plan`
-//! snapshots and R08-T7's summarization markers — nothing emits them
-//! yet, but consumers are designed against this enum verbatim.
+//! `plan` items mirror R08-T5's `PlanUpdated` event (one per
+//! `update_plan` call); the `summary` kind still awaits R08-T7's
+//! summarization marker — consumers are designed against this enum
+//! verbatim.
 //!
 //! The store keeps payloads as opaque JSON; the vocabulary lives
 //! here and only here.
@@ -123,8 +124,8 @@ pub enum TranscriptItem {
         covers_seq: u64,
     },
     /// An `update_plan` snapshot (Spec R08 us-13/17): the TODO list
-    /// the pinned plan block renders and the `plans` row upserts.
-    /// Nothing emits it yet — R08-T5's plan event lands here.
+    /// the pinned plan block renders and the `plans` row upserts —
+    /// one item per [`AgentEvent::PlanUpdated`](crate::AgentEvent::PlanUpdated).
     Plan {
         /// The whole TODO list — `update_plan` replaces it wholesale.
         todos: Vec<PlanTodo>,

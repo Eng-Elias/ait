@@ -47,7 +47,10 @@
 //! suspends on an [`AgentEvent::AskRequest`] — carrying the
 //! question and its choices-or-free-text — until the frontend's
 //! [`AgentSession::answer`] replies, and the answer text becomes
-//! the call's tool result. A profile that resolves to nothing —
+//! the call's tool result. `update_plan` (Spec R08 us-16) is exempt
+//! outright on the same logic: §5.7 maps no field to it, so every
+//! stance allows and its [`AgentEvent::PlanUpdated`] snapshot IS the
+//! effect. A profile that resolves to nothing —
 //! missing, renamed or zero declared — evaluates to the Round 6
 //! interim ask-everything rule: the fail-safe asks rather than
 //! silently loosening. Round 7 swapped the policy, not the
@@ -92,6 +95,7 @@ use crate::pty::AgentPty;
 use crate::redact::redact;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
+use crate::transcript::PlanTodo;
 
 /// The step budget (Spec R06, glossary): at most this many model turns
 /// per task. Configurability is a later round's decision; the constant
@@ -232,6 +236,16 @@ pub enum AgentEvent {
         /// keeps `detail`'s clipped preview. `None` on `Running`,
         /// a card transition rather than a result.
         result: Option<String>,
+    },
+    /// An `update_plan` call's snapshot (Spec R08 us-13/14): the
+    /// whole TODO list — replace semantics, never a diff — carried
+    /// in the transcript vocabulary's own [`PlanTodo`] shape. The
+    /// panel swaps its pinned plan block for this list; the store
+    /// upserts it as the conversation's `plans` row; the transcript
+    /// mirror records a `plan` item. An empty list clears the plan.
+    PlanUpdated {
+        /// The call's full TODO list, in model order.
+        todos: Vec<PlanTodo>,
     },
     /// The task finished cleanly: the model ended its turn with no
     /// tool calls and no steering queued. Terminal.
@@ -739,6 +753,14 @@ fn gate_and_execute(
     if call.name == tools::ASK_USER_QUESTION && !matches!(verdict, Verdict::Deny(_)) {
         return ask_and_answer(call, answers, cancel, events);
     }
+    // `update_plan` is exempt the same way (Spec R08 us-16): §5.7
+    // maps no profile field to it, so `verdict` is always `Allow`
+    // here — and its own snapshot IS the effect. The divert emits
+    // the ordinary ungated card plus `PlanUpdated`; nothing reaches
+    // the executor.
+    if call.name == tools::UPDATE_PLAN {
+        return update_plan(call, events);
+    }
     // `edit_files` plans BEFORE the card (Spec R06 us-22/23): the
     // plan's unified diff is the summary the user approves, and the
     // same plan is what an allow verdict writes — the rendered diff
@@ -944,6 +966,62 @@ fn ask_and_answer(
         }
         ReplyOutcome::Gone => None,
     }
+}
+
+/// The `update_plan` flow (Spec R08 us-13–16): gate-exempt — the
+/// engine always `Allow`s it — so the call opens an ordinary ungated
+/// card (us-15: its evolution stays auditable in scrollback), the
+/// parsed TODO list rides [`AgentEvent::PlanUpdated`] to the panel's
+/// pinned block and the store's `plans` upsert, and a fixed result
+/// text re-enters the conversation like every tool result. A call
+/// whose arguments carry no usable list is a tool error — model
+/// input, never a wedge. Returns `None` only when the frontend's
+/// channels are gone.
+fn update_plan(call: &ToolCall, events: &Sender<AgentEvent>) -> Option<String> {
+    if !emit(
+        events,
+        AgentEvent::ToolCall {
+            call: call.clone(),
+            summary: tools::summarize_args(call),
+        },
+    ) {
+        return None;
+    }
+    let todos = match tools::parse_plan(call) {
+        Ok(todos) => todos,
+        Err(error) => {
+            emit(
+                events,
+                AgentEvent::ToolUpdate {
+                    call_id: call.id.clone(),
+                    status: ToolStatus::Failed,
+                    detail: Some(error.clone()),
+                    result: Some(error.clone()),
+                },
+            );
+            return Some(error);
+        }
+    };
+    // The model reads a confirmation, not the list back — the
+    // snapshot itself just went out on the event.
+    let text = match todos.len() {
+        0 => String::from("plan cleared"),
+        1 => String::from("plan updated — 1 todo"),
+        n => format!("plan updated — {n} todos"),
+    };
+    if !emit(events, AgentEvent::PlanUpdated { todos }) {
+        return None;
+    }
+    emit(
+        events,
+        AgentEvent::ToolUpdate {
+            call_id: call.id.clone(),
+            status: ToolStatus::Done,
+            detail: Some(text.clone()),
+            result: Some(text.clone()),
+        },
+    );
+    Some(text)
 }
 
 /// Park on a reply channel until the answer for `call_id` arrives —
