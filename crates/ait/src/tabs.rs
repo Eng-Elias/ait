@@ -28,7 +28,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use ait_agent::{AgentRequest, ApprovalVerdict};
 use ait_config::Settings;
@@ -39,7 +39,9 @@ use ait_term::{
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::agent_panel::{context_for, edit_input, AgentPanel};
-use crate::blocks::{row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus};
+use crate::blocks::{
+    row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus, PersistedBlock,
+};
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::render::session_size;
@@ -87,6 +89,11 @@ pub struct PromptMark {
     /// When the drain recorded the mark — block duration is
     /// `D.at − C.at` (falling back to `B.at` when `C` never arrives).
     pub at: Instant,
+    /// The wall clock captured beside `at` (Spec R08): `Instant` can
+    /// never convert to `SystemTime`, so the persisted `blocks` row's
+    /// `started_at`/`ended_at` bounds come from the marks' paired
+    /// wall times, anchored at seal.
+    pub wall: SystemTime,
 }
 
 /// One tab: a [`LiveSession`] and the viewport state that belongs to it.
@@ -187,6 +194,11 @@ pub struct Tab {
     /// shell or a materialize failure.
     #[allow(dead_code)] // held for its Drop alone
     materialized: Option<ait_shell::Materialized>,
+    /// The `terminal_sessions` row `app` opened for this tab at spawn
+    /// (Spec R08) — `blocks` rows and the `ended_at` stamp key on it.
+    /// `None` while the store is off or its insert failed: the sealed-
+    /// block queue still drains so an unpersisted tab never grows it.
+    store_session: Option<i64>,
     /// This tab's agent conversation panel (Spec R06 / issue #85):
     /// `None` until the first `Alt+A` creates it — lazily, so a tab
     /// that never opens the panel never pays for the worker thread.
@@ -511,6 +523,38 @@ impl Tab {
         self.begin_selection(GridPoint::new(to_grid(*range.start()), 0));
         self.extend_selection(GridPoint::new(to_grid(*range.end()), end_column));
         self.finish_selection()
+    }
+
+    /// This tab's `terminal_sessions` row id, if `app` opened one at
+    /// spawn (Spec R08) — what `blocks` rows and the `ended_at` stamp
+    /// key on.
+    pub fn store_session(&self) -> Option<i64> {
+        self.store_session
+    }
+
+    /// Bind the `terminal_sessions` row `app` opened for this tab's
+    /// session — called once, right after the spawn insert lands.
+    pub(crate) fn set_store_session(&mut self, id: i64) {
+        self.store_session = Some(id);
+    }
+
+    /// The blocks sealed since the last call, as `blocks`-row-shaped
+    /// [`PersistedBlock`]s — the store's batched insert (Spec R08).
+    /// Each sealed entry resolves its command against the live grid
+    /// right here (the `preexec` hook's text, else the `B→C` echo
+    /// slice); the queue drains regardless of whether a store row
+    /// exists, so an unpersisted tab's queue can't grow.
+    pub(crate) fn take_persisted_blocks(&mut self) -> Vec<PersistedBlock> {
+        let sealed = self.blocks.take_sealed();
+        if sealed.is_empty() {
+            return Vec::new();
+        }
+        let grid = self.grid();
+        let extent = self.scrollback() + grid.lines();
+        sealed
+            .iter()
+            .map(|entry| entry.persisted(&grid, self.dropped_lines, extent))
+            .collect()
     }
 
     /// The last finished block's exit code and duration — the status
@@ -1063,6 +1107,7 @@ impl TabManager {
             scrollback_cap,
             inband: InBandExec::new(),
             materialized,
+            store_session: None,
             agent: None,
             bridge: None,
         });
@@ -1250,6 +1295,7 @@ impl TabManager {
                             line: scrollback + cursor.line,
                             column: cursor.column,
                             at: Instant::now(),
+                            wall: SystemTime::now(),
                         };
                         // Fingerprint the open block's echo span —
                         // final once the command runs — so `resolve`
@@ -1335,6 +1381,22 @@ impl TabManager {
             tab.service_bridge();
         }
         events
+    }
+
+    /// Every `(terminal_sessions id, persisted block)` pair sealed
+    /// since the last call — the store's per-drain batch insert
+    /// (Spec R08). Tabs without a session row (store off or the spawn
+    /// insert failed) still drain their sealed queue — it can't grow
+    /// behind an unpersisted run.
+    pub fn take_persisted_blocks(&mut self) -> Vec<(i64, PersistedBlock)> {
+        let mut rows = Vec::new();
+        for tab in &mut self.tabs {
+            let persisted = tab.take_persisted_blocks();
+            if let Some(session) = tab.store_session {
+                rows.extend(persisted.into_iter().map(|block| (session, block)));
+            }
+        }
+        rows
     }
 
     /// Drain every tab's agent session once (Spec R06): `AgentEvent`s
@@ -1674,6 +1736,84 @@ mod tests {
         for mark in marks {
             assert!(mark.line < total, "mark line out of grid: {mark:?}");
         }
+    }
+
+    /// Spec R08: each sealed block surfaces once through
+    /// `take_persisted_blocks` as a `(terminal_sessions id, row)` pair
+    /// — the store's per-drain batch — and never repeats. The scripted
+    /// `/bin/sh` emits two full `A B C D` quadruples with no `preexec`
+    /// hook, so the persisted command is the `B→C` echo slice.
+    #[test]
+    fn sealed_blocks_surface_once_as_persisted_rows() {
+        let mut manager = manager(1, "/tmp");
+        // `sleep` splits the burst so each mark's `line`/`column`
+        // records against its own chunk — mid-burst marks record the
+        // post-chunk cursor (the `block_manager` fixture's trick).
+        manager
+            .spawn_tab(sh_script(
+                "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                 printf 'first'; sleep 0.2; \
+                 printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                 printf 'out1\\n'; sleep 0.2; \
+                 printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+                 printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                 printf 'second'; sleep 0.2; \
+                 printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                 printf 'out2\\n'; sleep 0.2; \
+                 printf '\\033]133;D;7\\007'; sleep 0.5",
+            ))
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1]
+                .blocks()
+                .iter()
+                .filter(|b| b.completed())
+                .count()
+                == 2
+        });
+        // `app` binds the session row right after the spawn insert.
+        manager.active_mut().unwrap().set_store_session(7);
+
+        let rows = manager.take_persisted_blocks();
+        assert_eq!(rows.len(), 2);
+        let (id, first) = &rows[0];
+        assert_eq!(*id, 7, "the row keys on the session's store id");
+        assert_eq!(first.command, "first");
+        assert_eq!(first.exit, Some(0));
+        assert!(first.duration.is_some());
+        assert!(first.started_at.is_some());
+        assert!(first.ended_at.is_some());
+        assert!(first.started_at <= first.ended_at);
+        let (_, second) = &rows[1];
+        assert_eq!(second.command, "second");
+        assert_eq!(second.exit, Some(7));
+        // Sealed entries drain once — a second take finds nothing.
+        assert!(manager.take_persisted_blocks().is_empty());
+    }
+
+    /// Spec R08's unpersisted-tab contract: a tab with no
+    /// `terminal_sessions` row yields no pairs — but its sealed queue
+    /// still drains, so the queue can't grow behind a disabled store.
+    #[test]
+    fn unpersisted_tabs_drain_sealed_without_rows() {
+        let mut manager = manager(1, "/tmp");
+        manager
+            .spawn_tab(sh_script(
+                "printf '\\033]133;A\\007$ \\033]133;B\\007cmd\\n'; \
+                 printf '\\033]133;C\\007out\\n'; \
+                 printf '\\033]133;D;0\\007'",
+            ))
+            .unwrap();
+        // The `D` mark seals the block — waiting on marks (not
+        // resolved blocks) keeps the burst timing out of it.
+        drain_until(&mut manager, |m| m.tabs()[1].prompt_marks().count() >= 4);
+
+        // No `set_store_session` — the manager yields no rows…
+        assert!(manager.take_persisted_blocks().is_empty());
+        // …and the seal is GONE, not deferred: binding a session row
+        // afterwards can't resurrect it.
+        manager.active_mut().unwrap().set_store_session(9);
+        assert!(manager.take_persisted_blocks().is_empty());
     }
 
     /// Resize reaches every tab's session, not just the visible one.

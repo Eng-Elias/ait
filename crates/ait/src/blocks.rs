@@ -23,7 +23,7 @@
 
 use std::collections::VecDeque;
 use std::ops::RangeInclusive;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ait_shell::{HookName, ShellEvent};
 use ait_term::{GridView, PromptMarkKind, Row};
@@ -43,6 +43,12 @@ pub const BLOCK_CAP: usize = PROMPT_MARK_CAP / 4;
 pub struct BlockAssembler {
     /// Closed blocks, oldest first, bounded at [`BLOCK_CAP`].
     blocks: VecDeque<BlockEntry>,
+    /// A snapshot of every block pushed since the last
+    /// [`take_sealed`](Self::take_sealed) — the persistence seam (Spec
+    /// R08). Clones, so a `BLOCK_CAP` eviction or a
+    /// [`discard_ranges`](Self::discard_ranges) never loses metadata
+    /// that was already sealed; the caller drains it every tick.
+    sealed: VecDeque<BlockEntry>,
     /// The command still open — between `B` and `D`, or an abandoned
     /// candidate awaiting a boundary that proves the shell moved on.
     open: Option<BlockEntry>,
@@ -109,6 +115,10 @@ struct Mark {
     line: usize,
     column: usize,
     at: Instant,
+    /// The wall clock beside `at` — persistence needs `SystemTime`
+    /// bounds (`Instant` never converts), so the drain captures both
+    /// at record time (Spec R08).
+    wall: SystemTime,
 }
 
 /// One assembled block in absolute line space (Spec R05): the echo
@@ -116,7 +126,7 @@ struct Mark {
 /// when `D` never arrived). `output_start` (`C`) splits echo from
 /// output; `command` holds the `preexec` hook's report — `None`
 /// resolves to the `B→C` echo slice at [`resolve`](Self::resolve) time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlockEntry {
     /// The `B` mark — the command echo's first line and column.
     start: Mark,
@@ -146,6 +156,10 @@ pub struct BlockEntry {
     /// not coordinates — is the last word on whether the range still
     /// covers its own block. `None` (no grid at seal) skips the check.
     seal: Option<(usize, usize, u64)>,
+    /// The `D` mark's wall-clock time — the block's persisted
+    /// `ended_at` (Spec R08). `None` when no `D` ever arrived: an
+    /// abandoned block reports only what the hooks did.
+    ended_at: Option<SystemTime>,
 }
 
 /// The `(exit code, duration)` pair the status line renders for the
@@ -340,7 +354,17 @@ impl BlockAssembler {
         })
     }
 
+    /// The blocks sealed since the last call, oldest first — the
+    /// drain's persist batch (Spec R08). Each entry is a snapshot of
+    /// the block as it closed: the wall-clock bounds, the `preexec`
+    /// command (if any) and the grid coordinates `persisted` resolves
+    /// the echo-slice fallback through.
+    pub fn take_sealed(&mut self) -> Vec<BlockEntry> {
+        self.sealed.drain(..).collect()
+    }
+
     fn push_block(&mut self, entry: BlockEntry) {
+        self.sealed.push_back(entry.clone());
         if self.blocks.len() == BLOCK_CAP {
             self.blocks.pop_front();
         }
@@ -362,6 +386,7 @@ impl BlockEntry {
             duration: None,
             completed: false,
             seal: None,
+            ended_at: None,
         }
     }
 
@@ -378,6 +403,7 @@ impl BlockEntry {
         let began = self.output_start.map_or(self.start.at, |m| m.at);
         self.duration = Some(mark.at.saturating_duration_since(began));
         self.completed = true;
+        self.ended_at = Some(mark.wall);
     }
 
     /// Store the seal fingerprint — the caller hashed the block's
@@ -553,8 +579,57 @@ impl BlockEntry {
             line: mark.line.saturating_add(dropped),
             column: mark.column,
             at: mark.at,
+            wall: mark.wall,
         }
     }
+
+    /// The `blocks`-row-shaped metadata of this sealed entry (Spec
+    /// R08): the command is the resolved block's — `preexec` text or
+    /// the `B→C` echo slice — with the hook report kept when the grid
+    /// can no longer resolve (seal mismatch, evicted rows); `exit`,
+    /// `duration` and the wall-clock bounds come straight from the
+    /// marks. `ended_at` stays `None` when no `D` reported. Metadata
+    /// only — no output text, no cells.
+    pub(crate) fn persisted(
+        &self,
+        grid: &GridView<'_>,
+        dropped: usize,
+        extent: usize,
+    ) -> PersistedBlock {
+        PersistedBlock {
+            command: self
+                .resolve(grid, dropped, extent)
+                .map(|block| block.command)
+                .or_else(|| self.command.clone())
+                .unwrap_or_default(),
+            exit: self.exit.map(i64::from),
+            duration: self.duration,
+            started_at: Some(self.output_start.map_or(self.start.wall, |m| m.wall)),
+            ended_at: self.ended_at,
+        }
+    }
+}
+
+/// One sealed block's `blocks` row (Spec R08): what
+/// [`Tab::take_persisted_blocks`](crate::tabs::Tab::take_persisted_blocks)
+/// hands the store — metadata only, never output text or scrollback
+/// cells. Fields the hooks never reported stay `None`.
+#[derive(Debug)]
+pub(crate) struct PersistedBlock {
+    /// The command text — `preexec` when the shell reported one, else
+    /// the echo slice; `""` when nothing could be resolved (the
+    /// `blocks.command` column is `NOT NULL`).
+    pub command: String,
+    /// The `OSC 133;D` exit code.
+    pub exit: Option<i64>,
+    /// Execution time (`D.at − C.at`, `B.at` fallback).
+    pub duration: Option<Duration>,
+    /// Wall-clock start — the `C` mark's time (`B`'s without `C`),
+    /// matching `duration`'s basis.
+    pub started_at: Option<SystemTime>,
+    /// Wall-clock end — the `D` mark's time; `None` when `D` never
+    /// arrived (the row records what the hooks reported).
+    pub ended_at: Option<SystemTime>,
 }
 
 // The full read-side surface stays: `range`/`end_column` are consumed
@@ -636,6 +711,7 @@ mod tests {
             line,
             column,
             at,
+            wall: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -647,6 +723,7 @@ mod tests {
             line,
             column: 0,
             at,
+            wall: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -944,6 +1021,7 @@ mod tests {
                 line: 1,
                 column: 10,
                 at: t0 + 2 * MS,
+                wall: SystemTime::UNIX_EPOCH,
             },
             0,
         );
@@ -979,5 +1057,144 @@ mod tests {
 
         assert!(asm.is_empty());
         assert_eq!(asm.blocks().count(), 0);
+    }
+
+    /// Spec R08: sealing a block queues a snapshot for persistence —
+    /// `take_sealed` drains it once, and `persisted` renders the
+    /// `blocks` row's fields: the `preexec` command, the exit code and
+    /// duration, and WALL-CLOCK bounds from the marks' paired
+    /// `SystemTime`s (`started_at` is `C`'s wall — `duration`'s basis —
+    /// `ended_at` is `D`'s).
+    #[test]
+    fn sealed_blocks_snapshot_persistable_metadata() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mark = |kind, line, column, at, wall| PromptMark {
+            kind,
+            payload: None,
+            line,
+            column,
+            at,
+            wall,
+        };
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 2, t0, w0), 0);
+        asm.observe_shell(&preexec("sleep 1"));
+        asm.observe_mark(
+            &mark(PromptMarkKind::OutputStart, 1, 0, t0 + MS, w0 + MS),
+            0,
+        );
+        asm.observe_mark(
+            &PromptMark {
+                kind: PromptMarkKind::CommandEnd,
+                payload: Some("3".to_owned()),
+                line: 2,
+                column: 0,
+                at: t0 + 3 * MS,
+                wall: w0 + 3 * MS,
+            },
+            0,
+        );
+
+        let sealed = asm.take_sealed();
+        assert!(asm.take_sealed().is_empty(), "the queue drains once");
+        assert_eq!(sealed.len(), 1);
+        let session = Session::new(SessionOptions {
+            size: Size::new(40, 10),
+            ..Default::default()
+        });
+        let persisted = sealed[0].persisted(&session.grid(), 0, 10);
+        assert_eq!(persisted.command, "sleep 1");
+        assert_eq!(persisted.exit, Some(3));
+        assert_eq!(persisted.duration, Some(2 * MS));
+        assert_eq!(persisted.started_at, Some(w0 + MS), "C's wall time");
+        assert_eq!(persisted.ended_at, Some(w0 + 3 * MS), "D's wall time");
+    }
+
+    /// Spec R08's nullable contract: a block abandoned without a `D`
+    /// still persists — the row keeps what the hooks reported (`B`'s
+    /// wall-clock start, the `preexec` command) and leaves `exit`,
+    /// `duration` and `ended_at` NULL.
+    #[test]
+    fn abandoned_blocks_persist_with_null_outcome_fields() {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(
+            &PromptMark {
+                kind: PromptMarkKind::CommandStart,
+                payload: None,
+                line: 0,
+                column: 2,
+                at: t0,
+                wall: w0,
+            },
+            0,
+        );
+        asm.observe_shell(&preexec("ctrl-c'd thing"));
+        // The next prompt proves the shell moved on — no `D` ever came.
+        asm.observe_mark(&mark(PromptMarkKind::PromptStart, 5, 0, t0 + 9 * MS), 0);
+
+        let sealed = asm.take_sealed();
+        assert_eq!(sealed.len(), 1);
+        let session = Session::new(SessionOptions {
+            size: Size::new(40, 10),
+            ..Default::default()
+        });
+        let persisted = sealed[0].persisted(&session.grid(), 0, 24);
+        assert_eq!(persisted.command, "ctrl-c'd thing");
+        assert_eq!(persisted.exit, None);
+        assert_eq!(persisted.duration, None);
+        assert_eq!(persisted.started_at, Some(w0), "B's wall — no C ever came");
+        assert_eq!(persisted.ended_at, None, "the hooks never reported an end");
+    }
+
+    /// Marks-only tabs (`Absent`/`MarksOnly` integration) report no
+    /// `preexec`: the persisted command falls back to the `B→C` echo
+    /// slice resolved against the live grid — the same answer
+    /// `Block::command` gives the user.
+    #[test]
+    fn persisted_command_falls_back_to_the_echo_slice() {
+        let mut session = Session::new(SessionOptions {
+            size: Size::new(40, 10),
+            ..Default::default()
+        });
+        session.feed_bytes(b"$ echo hi\nhello\n$ ");
+        let grid = session.grid();
+        let extent = grid.scrollback() + grid.lines();
+
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 2, t0), 0);
+        asm.observe_mark(&mark(PromptMarkKind::OutputStart, 1, 0, t0 + MS), 0);
+        asm.observe_mark(&end_mark(2, t0 + 2 * MS, Some("0")), 0);
+
+        let sealed = asm.take_sealed();
+        assert_eq!(sealed.len(), 1);
+        let persisted = sealed[0].persisted(&grid, 0, extent);
+        assert_eq!(persisted.command, "echo hi");
+    }
+
+    /// A `preexec` report survives an unresolvable grid: when the
+    /// recorded rows are gone (rotation past the cap) the persisted
+    /// command is still the hook's text — metadata is never dropped
+    /// just because the echo slice can't be re-read.
+    #[test]
+    fn persisted_keeps_the_hook_command_when_the_grid_is_gone() {
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 2, t0), 0);
+        asm.observe_shell(&preexec("kept"));
+        asm.observe_mark(&end_mark(1, t0 + MS, Some("0")), 0);
+
+        let session = Session::new(SessionOptions {
+            size: Size::new(40, 10),
+            ..Default::default()
+        });
+        let sealed = asm.take_sealed();
+        // `dropped` past every recorded line: resolve finds no range.
+        let persisted = sealed[0].persisted(&session.grid(), 99, 10);
+        assert_eq!(persisted.command, "kept");
+        assert_eq!(persisted.exit, Some(0));
     }
 }

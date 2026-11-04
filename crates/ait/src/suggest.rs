@@ -1204,6 +1204,7 @@ mod tests {
             line,
             column,
             at,
+            wall: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -1215,6 +1216,7 @@ mod tests {
             line,
             column: 0,
             at,
+            wall: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 
