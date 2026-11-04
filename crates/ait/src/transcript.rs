@@ -38,15 +38,18 @@ pub(crate) struct Transcript {
 impl Transcript {
     /// A transcript adopted whole — resume's restore (R08-T6): every
     /// item is already persisted, so `flushed` starts at the end and
-    /// nothing re-appends on the next drain. `asks` starts empty: a
-    /// restored `ask` is long recorded, and no in-flight call
-    /// survives a restore (resume refuses while a task runs).
+    /// nothing re-appends on the next drain. The items seed the
+    /// mirror verbatim via `record` (the fold's asks-dedup state
+    /// starts empty: a restored `ask` is long recorded, and no
+    /// in-flight call survives a restore — resume refuses while a
+    /// task runs).
     pub(crate) fn restored(items: Vec<TranscriptItem>) -> Self {
-        Self {
-            flushed: items.len(),
-            items,
-            asks: HashSet::new(),
+        let mut mirror = ait_agent::TranscriptMirror::default();
+        for item in items {
+            mirror.record(item);
         }
+        let flushed = mirror.items().len();
+        Self { mirror, flushed }
     }
 
     /// The send-side record of a submitted task — first task of a
