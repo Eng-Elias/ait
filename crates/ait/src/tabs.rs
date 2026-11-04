@@ -2131,10 +2131,7 @@ mod tests {
         assert_eq!(rows[0].title, "fresh work");
         // …and its transcript holds only what followed the detach —
         // the deleted row's items never re-appended.
-        assert_eq!(
-            store.load_transcript(rows[0].id).unwrap()[0].kind,
-            "task"
-        );
+        assert_eq!(store.load_transcript(rows[0].id).unwrap()[0].kind, "task");
     }
 
     /// An unpersisted run (disabled handle) still drains every tab's

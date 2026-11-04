@@ -178,9 +178,7 @@ impl Store {
     /// ordering as [`list_conversations`](Self::list_conversations);
     /// the count is a per-row subquery, not a join the caller
     /// reassembles.
-    pub fn list_conversations_with_counts(
-        &self,
-    ) -> Result<Vec<ListedConversation>, StoreError> {
+    pub fn list_conversations_with_counts(&self) -> Result<Vec<ListedConversation>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title, c.created_at, c.updated_at, c.cwd, c.status,
                     (SELECT COUNT(*) FROM transcript_items t

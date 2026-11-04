@@ -503,12 +503,10 @@ mod tests {
         assert_eq!(listed[0].conversation.id, id);
         assert_eq!(listed[0].conversation.title, "fix the tests");
         assert_eq!(listed[0].items, 2);
-        assert!(
-            StoreHandle::disabled()
-                .conversations()
-                .expect("a disabled handle still answers")
-                .is_empty()
-        );
+        assert!(StoreHandle::disabled()
+            .conversations()
+            .expect("a disabled handle still answers")
+            .is_empty());
     }
 
     /// Spec R08-T6: `load_transcript` returns the stored items
@@ -553,10 +551,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            handle.load_plan(id).expect("the plan loads"),
-            Some(plan)
-        );
+        assert_eq!(handle.load_plan(id).expect("the plan loads"), Some(plan));
 
         // A payload that doesn't deserialize drops out — the resume
         // still lands with everything legible.
@@ -598,11 +593,7 @@ mod tests {
                 text: "to delete".into(),
             }],
         );
-        handle.plan_upsert(
-            &mut toast,
-            id,
-            &TranscriptItem::Plan { todos: vec![] },
-        );
+        handle.plan_upsert(&mut toast, id, &TranscriptItem::Plan { todos: vec![] });
 
         assert!(handle.delete_conversation(&mut toast, id));
         assert!(toast.is_none(), "a healthy store never toasts");

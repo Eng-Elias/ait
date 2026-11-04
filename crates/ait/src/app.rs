@@ -724,16 +724,12 @@ fn handle_event<W: Write>(
                         state.picker = None;
                         match state.store.conversations() {
                             Ok(listed) if listed.is_empty() => {
-                                state.toast = Some(Toast::new(
-                                    "no stored conversations",
-                                    Instant::now(),
-                                ));
+                                state.toast =
+                                    Some(Toast::new("no stored conversations", Instant::now()));
                             }
                             Ok(listed) => {
-                                state.conversations = Some(ConversationPicker::new(
-                                    &listed,
-                                    SystemTime::now(),
-                                ));
+                                state.conversations =
+                                    Some(ConversationPicker::new(&listed, SystemTime::now()));
                             }
                             Err(error) => {
                                 state.toast = Some(Toast::new(
@@ -3409,7 +3405,9 @@ coding_model = "coding-key"
 
     /// Seed a tempdir store with `title` + `items`, wrapped in the
     /// handle the app's picker reads through.
-    fn store_with(items: &[(&str, &[ait_agent::TranscriptItem])]) -> (tempfile::TempDir, StoreHandle) {
+    fn store_with(
+        items: &[(&str, &[ait_agent::TranscriptItem])],
+    ) -> (tempfile::TempDir, StoreHandle) {
         let dir = tempfile::tempdir().unwrap();
         let store = ait_store::Store::open(dir.path().join("store.db")).unwrap();
         for (title, items) in items {
@@ -3511,10 +3509,7 @@ coding_model = "coding-key"
             ],
             "the scrollback rebuilt from the transcript"
         );
-        assert!(
-            harness.state.toast.is_some(),
-            "the resume confirms itself"
-        );
+        assert!(harness.state.toast.is_some(), "the resume confirms itself");
     }
 
     /// us-10: Enter while the tab's task runs toasts and changes
@@ -3552,11 +3547,7 @@ coding_model = "coding-key"
         harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
 
-        let toast = harness
-            .state
-            .toast
-            .as_ref()
-            .expect("the refusal toasts");
+        let toast = harness.state.toast.as_ref().expect("the refusal toasts");
         assert!(
             toast.text().contains("still running"),
             "the toast says why: {}",

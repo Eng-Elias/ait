@@ -182,7 +182,11 @@ fn list_conversations_with_counts_pairs_each_row_with_its_item_count() {
     store
         .append_transcript_items(
             first.id,
-            &[item("task", "{}"), item("status", "{}"), item("status", "{}")],
+            &[
+                item("task", "{}"),
+                item("status", "{}"),
+                item("status", "{}"),
+            ],
         )
         .unwrap();
     thread::sleep(Duration::from_millis(2));

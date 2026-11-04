@@ -636,10 +636,7 @@ fn alt_r_lists_resumes_across_restart_and_ctrl_d_deletes() {
         done_lines(app) == 1 && panel_has_line(app, "▸ fix it")
     });
     app.press("Alt+Q");
-    assert!(
-        app.wait_for_exit().success(),
-        "the first run exits cleanly"
-    );
+    assert!(app.wait_for_exit().success(), "the first run exits cleanly");
 
     // Relaunch on the SAME data dir — the conversation outlived the
     // app (us-7).
