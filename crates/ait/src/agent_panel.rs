@@ -767,13 +767,13 @@ impl AgentPanel {
     }
 }
 
-/// `ait_agent::INTERRUPTED_RESULT` is the rebuilt card's `detail`
-/// for an `interrupted` close (Spec R08 us-9): a call that never got
-/// its result is a run that died mid-call — replay closes it with a
-/// synthetic "interrupted" result, so its card closes the same way
-/// rather than waiting forever. `ait_agent::result_preview` clips a
-/// stored `tool_result`'s full text the same way the live
-/// `ToolUpdate` did (the worker's own preview fn).
+// `ait_agent::INTERRUPTED_RESULT` is the rebuilt card's `detail`
+// for an `interrupted` close (Spec R08 us-9): a call that never got
+// its result is a run that died mid-call — replay closes it with a
+// synthetic "interrupted" result, so its card closes the same way
+// rather than waiting forever. `ait_agent::result_preview` clips a
+// stored `tool_result`'s full text the same way the live
+// `ToolUpdate` did (the worker's own preview fn).
 
 /// `transcript_items` → panel `Entry`s — resume's scrollback
 /// rebuild (Spec R08-T6): the inverse of [`Transcript::apply`]'s
