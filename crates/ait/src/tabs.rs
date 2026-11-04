@@ -1467,6 +1467,16 @@ impl TabManager {
             };
             if let Some(id) = conversation {
                 store.append_transcript(toast, id, &items);
+                // `plan` items also upsert the conversation's
+                // `plans` row (Spec R08-T5, us-17): the transcript
+                // keeps every snapshot for the audit trail while the
+                // row keeps only the newest — the last upsert in the
+                // batch wins, matching the event order.
+                for item in &items {
+                    if let ait_agent::TranscriptItem::Plan { .. } = item {
+                        store.plan_upsert(toast, id, item);
+                    }
+                }
             }
         }
     }
@@ -1945,6 +1955,62 @@ mod tests {
         assert_eq!(items[3].kind, "task");
         // The tab bound the row — resume/delete address it (T6).
         assert_eq!(manager.active().unwrap().conversation(), Some(rows[0].id));
+    }
+
+    /// Spec R08-T5/us-17: `plan` items append to the transcript like
+    /// every other kind AND upsert the conversation's `plans` row —
+    /// the row always holds the latest snapshot while the transcript
+    /// keeps every snapshot the calls produced.
+    #[test]
+    fn drain_transcripts_appends_plan_items_and_upserts_the_latest() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let mut handle = StoreHandle::from_store(ait_store::Store::open(&db).unwrap());
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+        manager.active_mut().unwrap().toggle_agent_panel();
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        let todo = |content: &str, status| ait_agent::PlanTodo {
+            content: content.into(),
+            status,
+        };
+        panel.submit(agent_request("plan the work"), &mut toast);
+        panel.apply(ait_agent::AgentEvent::PlanUpdated {
+            todos: vec![todo("reproduce", ait_agent::PlanTodoStatus::InProgress)],
+        });
+        panel.apply(ait_agent::AgentEvent::PlanUpdated {
+            todos: vec![
+                todo("reproduce", ait_agent::PlanTodoStatus::Done),
+                todo("fix", ait_agent::PlanTodoStatus::InProgress),
+            ],
+        });
+        manager.drain_transcripts(&mut handle, &mut toast);
+        assert!(toast.is_none(), "a healthy store never toasts");
+
+        let store = ait_store::Store::open(&db).unwrap();
+        let id = store.list_conversations().unwrap()[0].id;
+        // Both snapshots land as transcript items — the audit trail.
+        let items = store.load_transcript(id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "plan", "plan"]
+        );
+        // …and the `plans` row holds only the latest.
+        let payload = store.load_plan(id).unwrap().expect("a plans row");
+        let back: ait_agent::TranscriptItem =
+            serde_json::from_str(&payload).expect("the payload deserializes");
+        assert_eq!(
+            back,
+            ait_agent::TranscriptItem::Plan {
+                todos: vec![
+                    todo("reproduce", ait_agent::PlanTodoStatus::Done),
+                    todo("fix", ait_agent::PlanTodoStatus::InProgress),
+                ]
+            }
+        );
     }
 
     /// An unpersisted run (disabled handle) still drains every tab's
