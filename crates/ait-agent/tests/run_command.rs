@@ -76,6 +76,7 @@ fn task(settings: Settings, bridge: Option<Box<dyn ShellBridge>>) -> AgentReques
             os: String::from("linux"),
             output_lines: Vec::new(),
         },
+        prior: Vec::new(),
         bridge,
     }
 }
