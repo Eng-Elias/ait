@@ -29,7 +29,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// was amended pre-release to the post-v2 shape; a real v1 database
 /// reaches the same shape through `migration_v2`, which is why it is
 /// conditional). The DB schema is a one-way door.
-const MIGRATIONS: &[fn(&Connection) -> Result<(), rusqlite::Error>] = &[migration_v1, migration_v2];
+/// One migration step — entry `i` upgrades `user_version` `i` → `i + 1`.
+type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
+
+const MIGRATIONS: &[Migration] = &[migration_v1, migration_v2];
 
 /// Version 0 → 1: the Round-8 schema (Spec R08 "Implementation
 /// Decisions"). Times are milliseconds since the Unix epoch;
