@@ -287,6 +287,7 @@ impl AgentPanel {
 
     /// The current plan snapshot — what the pinned block paints
     /// (Spec R08-T5); empty while no `update_plan` has landed.
+    #[allow(dead_code)] // the paint path + tests and T6's restore read this
     pub(crate) fn plan(&self) -> &[PlanTodo] {
         &self.plan
     }

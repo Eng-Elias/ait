@@ -468,3 +468,125 @@ fn agent_tasks_leave_a_transcript_and_the_second_appends() {
         "the second task appended to the same row"
     );
 }
+
+// ─── R08-T5: update_plan — pinned block + plans row ──────────────
+
+/// Spec R08-T5 / us-13–17: two scripted `update_plan` calls in one
+/// task render the pinned plan block under the panel title — `✓`
+/// done, `▸` in progress, `○` pending — with NO approval prompt (the
+/// task completes with no verdict keypress; the card IS the effect),
+/// an ordinary tool card per call in the scrollback, and the second
+/// call replacing the block's contents. The `plans` row keeps only
+/// the latest snapshot while `plan` transcript items keep the audit
+/// trail.
+#[test]
+fn update_plan_pins_the_block_and_upserts_the_latest_snapshot() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_1",
+            "update_plan",
+            r#"{"todos":[
+                {"content":"reproduce it","status":"done"},
+                {"content":"fix it","status":"in_progress"},
+                {"content":"verify it","status":"pending"}
+            ]}"#,
+        )),
+        sse(&tool_turn(
+            "call_2",
+            "update_plan",
+            r#"{"todos":[
+                {"content":"reproduce it","status":"done"},
+                {"content":"fix it","status":"done"}
+            ]}"#,
+        )),
+        sse(&chat_text_turn("planned")),
+    ]);
+    let cfg = tempfile::tempdir().expect("config fixture tempdir");
+    let data = tempfile::tempdir().expect("data fixture tempdir");
+    write_agent_settings(cfg.path(), &agent_settings_with_fixture(&fixture.base_url));
+
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the tab bar and status line", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+
+    open_panel(&mut app);
+    submit_task(&mut app, "plan the fix");
+    // The task finishing without a single keypress IS the
+    // gate-exemption proof — a parked approve card would wait
+    // forever — and no approve prompt ever painted.
+    app.wait_for_screen("the second snapshot pinned", |app| {
+        done_lines(app) == 1
+            && panel_has_line(app, "plan")
+            && panel_has_line(app, "✓ reproduce it")
+            && panel_has_line(app, "✓ fix it")
+            && !app.screen_text().contains("approve update_plan")
+    });
+    // The block holds the LATEST list — the first call's
+    // "verify it" todo is gone — while both calls' cards audit in
+    // the scrollback (us-15).
+    assert!(
+        !panel_has_line(&app, "verify it"),
+        "the replaced list's todo left the block:\n{}",
+        app.screen_text()
+    );
+    assert!(
+        panel_has_line(&app, "✓ update_plan 3 todos")
+            && panel_has_line(&app, "✓ update_plan 2 todos"),
+        "each call's ordinary card landed in scrollback:\n{}",
+        app.screen_text()
+    );
+
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+
+    let store = open_store(data.path());
+    let id = store.list_conversations().expect("list conversations")[0].id;
+    // The `plans` row holds ONLY the latest snapshot.
+    let payload = store.load_plan(id).expect("load the plan").expect("a plans row");
+    let plan: TranscriptItem = serde_json::from_str(&payload).expect("payload deserializes");
+    assert_eq!(
+        plan,
+        TranscriptItem::Plan {
+            todos: vec![
+                ait_agent::PlanTodo {
+                    content: "reproduce it".into(),
+                    status: ait_agent::PlanTodoStatus::Done,
+                },
+                ait_agent::PlanTodo {
+                    content: "fix it".into(),
+                    status: ait_agent::PlanTodoStatus::Done,
+                },
+            ]
+        },
+        "the row is the second call's snapshot, verbatim"
+    );
+    // …while the transcript kept both snapshots plus the call/result
+    // pairs — the audit trail (us-15) mirrored like every event.
+    let kinds: Vec<String> = store
+        .load_transcript(id)
+        .expect("load the transcript")
+        .iter()
+        .map(|row| row.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "task",
+            "tool_call",
+            "plan",
+            "tool_result",
+            "tool_call",
+            "plan",
+            "tool_result",
+            "assistant_text",
+            "status",
+        ],
+        "plan items mirror in event order: {kinds:?}"
+    );
+}
