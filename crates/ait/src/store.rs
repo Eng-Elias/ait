@@ -21,23 +21,36 @@ use crate::status::Toast;
 
 /// The frontend-owned store handle. `inner: None` is an unpersisted
 /// run — the terminal works exactly as before and a toast already
-/// said why; it is reached on open failure, on the first write
-/// failure, and in every test that never needed a database.
+/// said why; it is reached on open failure and in every test that
+/// never needed a database. A WRITE failure degrades only the writes:
+/// the store stays live for reads (user story 25's unpersisted-run
+/// contract is about persistence, not about blinding the picker —
+/// a transient write error must not empty `conversations()` forever).
 pub(crate) struct StoreHandle {
     inner: Option<Store>,
+    /// Whether writes still attempt — the first write error flips
+    /// this off after one toast so a broken database can't toast-spam
+    /// the status line every 8 ms tick. Reads never consult it.
+    writes_enabled: bool,
 }
 
 impl StoreHandle {
     /// Open the default store (`$XDG_DATA_HOME/ait/store.db`); `Err`
     /// carries the failure for the caller's toast.
     pub fn open() -> Result<Self, StoreError> {
-        Store::open_default().map(|store| Self { inner: Some(store) })
+        Store::open_default().map(|store| Self {
+            inner: Some(store),
+            writes_enabled: true,
+        })
     }
 
     /// An explicitly unpersisted run — what an `open` failure (and the
     /// test `Harness`) degrades to.
     pub fn disabled() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            writes_enabled: false,
+        }
     }
 
     /// Wrap a caller-opened `Store` — the seam tests outside this
@@ -45,18 +58,25 @@ impl StoreHandle {
     /// the real XDG path.
     #[cfg(test)]
     pub(crate) fn from_store(store: Store) -> Self {
-        Self { inner: Some(store) }
+        Self {
+            inner: Some(store),
+            writes_enabled: true,
+        }
     }
 
     /// One write through the degrade rule: a success returns `Some`,
     /// a disabled handle returns `None`, and the FIRST error turns
-    /// into a toast and disables the handle — subsequent calls no-op
-    /// silently instead of re-toasting every drain.
+    /// into a toast and disables WRITES — subsequent calls no-op
+    /// silently instead of re-toasting every drain, while reads keep
+    /// the store alive underneath.
     fn write<T>(
         &mut self,
         toast: &mut Option<Toast>,
         f: impl FnOnce(&Store) -> Result<T, StoreError>,
     ) -> Option<T> {
+        if !self.writes_enabled {
+            return None;
+        }
         match self.inner.as_ref().map(f) {
             Some(Ok(value)) => Some(value),
             Some(Err(error)) => {
@@ -64,7 +84,7 @@ impl StoreHandle {
                     format!("store write failed: {error}"),
                     Instant::now(),
                 ));
-                self.inner = None;
+                self.writes_enabled = false;
                 None
             }
             None => None,
@@ -259,7 +279,13 @@ mod tests {
     fn handle() -> (tempfile::TempDir, StoreHandle) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("ait").join("store.db")).unwrap();
-        (dir, StoreHandle { inner: Some(store) })
+        (
+            dir,
+            StoreHandle {
+                inner: Some(store),
+                writes_enabled: true,
+            },
+        )
     }
 
     fn block(command: &str) -> PersistedBlock {
@@ -299,13 +325,17 @@ mod tests {
         assert_eq!(blocks[0].exit, Some(0));
     }
 
-    /// A write error toasts ONCE and disables: the failed batch is
-    /// dropped (never retried into a toast storm) and every later
-    /// call is a silent no-op — the unpersisted run's contract.
+    /// A write error toasts ONCE and disables WRITES: the failed batch
+    /// is dropped (never retried into a toast storm) and every later
+    /// write is a silent no-op — but the store stays live for reads,
+    /// so a transient failure never blinds the picker or a resume.
     #[test]
-    fn a_write_failure_toasts_once_and_disables() {
+    fn a_write_failure_toasts_once_disables_writes_and_keeps_reads() {
         let (_dir, mut handle) = handle();
         let mut toast = None;
+        let conversation = handle
+            .conversation_started(&mut toast, "fix the tests", Path::new("/w"))
+            .expect("the conversation insert lands");
 
         // A dangling session id is a foreign-key error — a write
         // failure without needing a broken disk.
@@ -317,14 +347,30 @@ mod tests {
                 .is_some_and(|t| t.text().contains("store write failed")),
             "the failure surfaced as a toast"
         );
-        assert!(handle.inner.is_none(), "the run continues unpersisted");
+        assert!(!handle.writes_enabled, "writes degrade…");
+        assert!(handle.inner.is_some(), "…but the store stays live");
+
+        // Reads survive the degraded write path — the picker still
+        // lists what already landed.
+        assert_eq!(
+            handle
+                .conversations()
+                .expect("reads keep working")
+                .len(),
+            1
+        );
+        assert_eq!(
+            handle.load_transcript(conversation).unwrap().len(),
+            0,
+            "an empty transcript still loads empty"
+        );
 
         toast.take();
         assert!(handle
             .session_started(&mut toast, "sh", Path::new("/w"))
             .is_none());
         handle.insert_blocks(&mut toast, &[(1, block("y"))]);
-        assert!(toast.is_none(), "a disabled handle never re-toasts");
+        assert!(toast.is_none(), "degraded writes never re-toast");
     }
 
     /// The `None` state itself: a disabled handle answers `None`,
@@ -438,7 +484,7 @@ mod tests {
         assert_eq!(back, second);
 
         // A dangling id is a foreign-key error — toast once, then
-        // the handle goes silent (user story 25).
+        // writes go silent (user story 25); reads stay live.
         handle.plan_upsert(&mut toast, 999, &first);
         assert!(
             toast
@@ -446,14 +492,15 @@ mod tests {
                 .is_some_and(|t| t.text().contains("store write failed")),
             "the failure surfaced as a toast"
         );
-        assert!(handle.inner.is_none(), "the run continues unpersisted");
+        assert!(!handle.writes_enabled, "writes are degraded");
+        assert!(handle.inner.is_some(), "reads keep the store");
     }
 
     /// A transcript append to a dangling conversation id is a
     /// foreign-key error — it degrades through the same toast-once-
-    /// and-disable rule every other write obeys (user story 25).
+    /// and-disable-writes rule every other write obeys (user story 25).
     #[test]
-    fn an_append_failure_toasts_once_and_disables() {
+    fn an_append_failure_toasts_once_and_disables_writes() {
         let (_dir, mut handle) = handle();
         let mut toast = None;
 
@@ -469,13 +516,14 @@ mod tests {
                 .is_some_and(|t| t.text().contains("store write failed")),
             "the failure surfaced as a toast"
         );
-        assert!(handle.inner.is_none(), "the run continues unpersisted");
+        assert!(!handle.writes_enabled, "writes are degraded");
+        assert!(handle.inner.is_some(), "reads keep the store");
 
         toast.take();
         assert!(handle
             .conversation_started(&mut toast, "t", Path::new("/w"))
             .is_none());
-        assert!(toast.is_none(), "a disabled handle never re-toasts");
+        assert!(toast.is_none(), "degraded writes never re-toast");
     }
 
     /// Spec R08-T6/us-5: `conversations` returns the picker's rows —
