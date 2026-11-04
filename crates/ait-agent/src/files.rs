@@ -1331,7 +1331,12 @@ mod tests {
 
         // A new file under the listed root gets the `/dev/null`
         // treatment — the diff labels are its own absolute path.
-        let fresh = shared.path().join("fresh.txt");
+        // (Canonical spelling: the leaf does not exist, so confine
+        // compares its lexical form against the canonical root —
+        // the same rule absolute cwd paths already live by.)
+        let fresh = std::fs::canonicalize(shared.path())
+            .expect("canonical shared")
+            .join("fresh.txt");
         let plan = cwd
             .plan_edits(&args(
                 &serde_json::json!({

@@ -683,7 +683,11 @@ fn directory_allowlist_widens_confinement_without_weakening_the_gate() {
     let outside = tempfile::tempdir().expect("outside dir");
     std::fs::write(outside.path().join("secret.txt"), "SECRET-OUTSIDE").expect("secret");
     let shared_file = shared.path().join("shared.txt");
-    let new_file = shared.path().join("fresh.txt");
+    // Canonical spelling: the leaf does not exist, so confinement
+    // compares its lexical form against the canonicalized root.
+    let new_file = std::fs::canonicalize(shared.path())
+        .expect("canonical shared")
+        .join("fresh.txt");
     let secret = outside.path().join("secret.txt");
     let fixture = Fixture::serve(vec![
         sse(&chat_tool_turn(&[(
