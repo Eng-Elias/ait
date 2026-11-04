@@ -85,6 +85,7 @@ use crate::render::{
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
 use crate::status::{notification_text, status_text, StatusLine, Toast};
+use crate::store::StoreHandle;
 use crate::suggest::{self, SuggestionPin};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
@@ -184,6 +185,11 @@ struct AppState {
     /// the selection itself — a tab switch or panel toggle never
     /// disturbs it; a settings reload drops the stale list.
     picker: Option<ProfilePicker>,
+    /// The local store (Spec R08 §5.8): one `terminal_sessions` row
+    /// per spawned tab, one `blocks` row per sealed block. Open/write
+    /// failures degrade to a toast plus an unpersisted run — the
+    /// terminal works either way.
+    store: StoreHandle,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -283,11 +289,24 @@ pub fn run() -> io::Result<ExitCode> {
     // absent so a mid-session first write still reloads — a genuine
     // watch failure still degrades to running without reload.
     let watcher = config::watcher();
+    // The store opens before the first session spawns: `terminal_sessions`
+    // rows key every later block insert (Spec R08). An open failure
+    // toasts and the run goes unpersisted — same degrade a later write
+    // failure lands in (user story 25).
+    let (store, store_error) = match StoreHandle::open() {
+        Ok(store) => (store, None),
+        Err(error) => (StoreHandle::disabled(), Some(error.to_string())),
+    };
     let mut state = AppState {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: load_error.map(|text| Toast::new(format!("config error: {text}"), Instant::now())),
+        toast: load_error
+            .map(|text| Toast::new(format!("config error: {text}"), Instant::now()))
+            .or_else(|| {
+                store_error
+                    .map(|text| Toast::new(format!("store unavailable: {text}"), Instant::now()))
+            }),
         config,
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
@@ -297,6 +316,7 @@ pub fn run() -> io::Result<ExitCode> {
         // selection is never read back from disk.
         profile: profile::DEFAULT_PROFILE.to_string(),
         picker: None,
+        store,
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
@@ -305,6 +325,16 @@ pub fn run() -> io::Result<ExitCode> {
         config::session_template(&state.config.settings().terminal),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    // The first tab's `terminal_sessions` row (Spec R08): `None` — a
+    // disabled store or a failed insert — leaves the tab unpersisted.
+    if let Some(tab) = tabs.active_mut() {
+        if let Some(id) = state
+            .store
+            .session_started(&mut state.toast, tab.title(), tab.cwd())
+        {
+            tab.set_store_session(id);
+        }
+    }
 
     let backend = StyledBackend::new(io::stdout());
     let underlines = backend.underline_overlay();
@@ -406,6 +436,11 @@ pub fn run() -> io::Result<ExitCode> {
         // stream into each tab's conversation and terminal events
         // release its running state — a background tab keeps up.
         tabs.drain_agent_events();
+        // Block metadata on the same tick (Spec R08): every block the
+        // PTY drain just sealed lands in ONE transaction, here in the
+        // drain half of the loop — never on the render path.
+        let rows = tabs.take_persisted_blocks();
+        state.store.insert_blocks(&mut state.toast, &rows);
 
         // Standard 6: the last close already exits via `Handled::Quit`;
         // this guard is the belt for any path that could empty the set —
@@ -476,6 +511,15 @@ pub fn run() -> io::Result<ExitCode> {
         }
     }
 
+    // `ended_at` on app exit (Spec R08): `Alt+W` stamped closed tabs
+    // earlier; every session row still open finishes here — still
+    // through the degrade rule, so a dead store can't wedge shutdown.
+    for tab in tabs.tabs() {
+        if let Some(id) = tab.store_session() {
+            state.store.session_ended(&mut state.toast, id);
+        }
+    }
+
     Ok(exit_code(state.last_exit.as_ref()))
 }
 
@@ -535,6 +579,17 @@ fn handle_event<W: Write>(
                             format!("new tab failed: {error}"),
                             Instant::now(),
                         ));
+                    } else if let Some(tab) = tabs.active_mut() {
+                        // The spawned tab's `terminal_sessions` row
+                        // (Spec R08) — `None` (unpersisted store or a
+                        // failed insert) leaves the tab unpersisted.
+                        if let Some(id) =
+                            state
+                                .store
+                                .session_started(&mut state.toast, tab.title(), tab.cwd())
+                        {
+                            tab.set_store_session(id);
+                        }
                     }
                 }
                 Resolution::Action(AppAction::CloseTab) => {
@@ -542,6 +597,11 @@ fn handle_event<W: Write>(
                     // the process exit code before it is removed.
                     if tabs.len() == 1 {
                         state.last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
+                    }
+                    // `ended_at` on tab close (Spec R08): the row this
+                    // tab's spawn opened finishes with the tab.
+                    if let Some(id) = tabs.active().and_then(|tab| tab.store_session()) {
+                        state.store.session_ended(&mut state.toast, id);
                     }
                     // `false` = the set is now empty: quit rather than ever
                     // indexing it (standard 6).
@@ -1266,6 +1326,7 @@ mod tests {
                     suggestion: SuggestionPin::new(),
                     profile: profile::DEFAULT_PROFILE.to_string(),
                     picker: None,
+                    store: StoreHandle::disabled(),
                 },
                 sink: Vec::new(),
             }

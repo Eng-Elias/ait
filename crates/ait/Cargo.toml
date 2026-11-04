@@ -23,6 +23,11 @@ ait-agent = { path = "../ait-agent" }
 # session spawn and the OSC 7700-series hook decode that drives each
 # tab's integration state (R05-T3).
 ait-shell = { path = "../ait-shell" }
+# Spec R08 persistence (§5.8): the binary owns the Store — one
+# `terminal_sessions` row per spawned tab, one `blocks` row per sealed
+# block, and every open/write failure degrades to a toast plus an
+# unpersisted run (user story 25).
+ait-store = { path = "../ait-store" }
 # Semver requirements per Spec R02; chosen releases are >=7 days old
 # (ADR-0002 supply-chain rule): ratatui 0.30.2 (2026-06-19),
 # crossterm 0.29.0 (2025-04-05).
