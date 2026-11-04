@@ -560,6 +560,29 @@ impl Tab {
         self.conversation = Some(id);
     }
 
+    /// Resume a stored conversation into this tab's panel (Spec
+    /// R08-T6, us-6): the panel swaps to the loaded transcript —
+    /// scrollback and pinned plan rebuilt, the mirror adopted
+    /// already-flushed so the next task's `prior` IS this
+    /// conversation — and `conversation` binds the row so every
+    /// later flush appends to IT. The panel (and its shell bridge)
+    /// is created like `Alt+A`'s first toggle when the tab never
+    /// had one. Callers refuse while a task runs — a live run is
+    /// never clobbered (us-10).
+    pub(crate) fn resume_conversation(
+        &mut self,
+        id: i64,
+        items: Vec<ait_agent::TranscriptItem>,
+        plan: Option<Vec<ait_agent::PlanTodo>>,
+    ) {
+        if self.bridge.is_none() {
+            self.bridge = Some(shell_bridge::pair().1);
+        }
+        let panel = self.agent.get_or_insert_with(AgentPanel::new);
+        panel.restore(items, plan);
+        self.conversation = Some(id);
+    }
+
     /// The blocks sealed since the last call, as `blocks`-row-shaped
     /// [`PersistedBlock`]s — the store's batched insert (Spec R08).
     /// Each sealed entry resolves its command against the live grid
@@ -1434,6 +1457,19 @@ impl TabManager {
         rows
     }
 
+    /// Detach `id` from every tab bound to it (Spec R08-T6, us-11):
+    /// the row was deleted — a later task must open a NEW row
+    /// rather than append to a deleted one. The panel's scrollback
+    /// and in-memory transcript stay: what the user sees is theirs
+    /// to keep reading; only the row binding clears.
+    pub fn detach_conversation(&mut self, id: i64) {
+        for tab in &mut self.tabs {
+            if tab.conversation == Some(id) {
+                tab.conversation = None;
+            }
+        }
+    }
+
     /// Drain every tab's agent session once (Spec R06): `AgentEvent`s
     /// land in each tab's conversation on the same tick the PTY
     /// sessions drain — a background tab's task keeps streaming too.
@@ -2023,6 +2059,81 @@ mod tests {
                     todo("fix", ait_agent::PlanTodoStatus::InProgress),
                 ]
             }
+        );
+    }
+
+    /// Spec R08-T6/us-6: `resume_conversation` binds the row and
+    /// rebuilds the panel — a fresh flush then appends to the
+    /// RESUMED row, and `detach_conversation` clears the binding so
+    /// the next flush opens a new row instead of appending to a
+    /// deleted one.
+    #[test]
+    fn resume_binds_the_row_and_detach_clears_it() {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let db = dir.path().join("store.db");
+        let store = ait_store::Store::open(&db).unwrap();
+        let stored = store
+            .create_conversation(ait_store::NewConversation {
+                title: "fix the tests",
+                cwd: "/w",
+                status: "open",
+            })
+            .unwrap();
+        let items = vec![
+            ait_agent::TranscriptItem::Task {
+                text: "fix the tests".into(),
+            },
+            ait_agent::TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ];
+        let mut handle = StoreHandle::from_store(store);
+        let mut toast = None;
+        let mut manager = manager(1, "/tmp");
+
+        // Resume into a tab that never opened a panel — the panel
+        // (and its bridge) is created like Alt+A's first toggle.
+        let tab = manager.active_mut().unwrap();
+        tab.resume_conversation(stored.id, items.clone(), None);
+        assert_eq!(tab.conversation(), Some(stored.id));
+        let panel = tab.agent_panel().expect("the resume built a panel");
+        assert!(panel.is_open());
+        assert_eq!(
+            panel.transcript_items(),
+            items.as_slice(),
+            "the next task's prior IS the resumed transcript"
+        );
+
+        // A new task's flush appends to the RESUMED row — no new
+        // conversation row is created.
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("and the lint"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let store = ait_store::Store::open(&db).unwrap();
+        assert_eq!(store.list_conversations().unwrap().len(), 1);
+        let kinds: Vec<String> = store
+            .load_transcript(stored.id)
+            .unwrap()
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect();
+        assert_eq!(kinds.last().unwrap(), "task");
+
+        // Deleting that row detaches the binding: the next flush
+        // opens a NEW row rather than appending to a deleted one.
+        manager.detach_conversation(stored.id);
+        assert_eq!(manager.active().unwrap().conversation(), None);
+        let panel = manager.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(agent_request("fresh work"), &mut toast);
+        manager.drain_transcripts(&mut handle, &mut toast);
+        let rows = store.list_conversations().unwrap();
+        assert_eq!(rows.len(), 2, "the next task opened a new row");
+        assert_eq!(rows[0].title, "fresh work");
+        // …and its transcript holds only what followed the detach —
+        // the deleted row's items never re-appended.
+        assert_eq!(
+            store.load_transcript(rows[0].id).unwrap()[0].kind,
+            "task"
         );
     }
 

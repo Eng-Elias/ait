@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use ait_agent::{
     AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, PlanTodo,
-    PlanTodoStatus, ToolStatus,
+    PlanTodoStatus, ToolStatus, TranscriptItem,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -726,12 +726,145 @@ impl AgentPanel {
         (x.min(area.right().saturating_sub(1)), area.bottom() - 1)
     }
 
+    /// Swap the panel to a stored conversation (Spec R08-T6, us-6):
+    /// the scrollback rebuilds from the loaded transcript items, the
+    /// pinned block restores the conversation's latest plan, and the
+    /// transcript mirror adopts the items already-flushed — they ARE
+    /// the store's rows, so nothing re-appends on the next drain and
+    /// the next task's `prior` IS this transcript. The split opens
+    /// focused: picking a conversation means picking it up. The
+    /// conversation this replaces is already on disk — the swap
+    /// loses nothing (us-12).
+    pub(crate) fn restore(&mut self, items: Vec<TranscriptItem>, plan: Option<Vec<PlanTodo>>) {
+        self.entries = entries_from(&items);
+        self.transcript = Transcript::restored(items);
+        self.plan = plan.unwrap_or_default();
+        self.pending = None;
+        self.pending_ask = None;
+        self.running = false;
+        self.pinned = true;
+        self.top.set(0);
+        self.open = true;
+        self.focused = true;
+        self.revision += 1;
+    }
+
     /// Push one entry and bump the revision — the single write point
     /// the scrollback has.
     fn push(&mut self, entry: Entry) {
         self.entries.push(entry);
         self.revision += 1;
     }
+}
+
+/// The rebuilt card's `detail` for an `interrupted` close (Spec R08
+/// us-9): a call that never got its result is a run that died
+/// mid-call — replay closes it with a synthetic "interrupted"
+/// result, so its card closes the same way rather than waiting
+/// forever.
+const INTERRUPTED_DETAIL: &str = "interrupted — the run ended before this call produced a result";
+
+/// A card's `detail` rebuilt from a stored `tool_result`'s full
+/// text — the same first-line clip the live `ToolUpdate` carried
+/// (the worker's `preview`, `session.rs`).
+fn result_preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 120;
+    let first = text.lines().next().unwrap_or_default();
+    if first.chars().count() > PREVIEW_CHARS {
+        format!("{}…", first.chars().take(PREVIEW_CHARS).collect::<String>())
+    } else if text.lines().nth(1).is_some() {
+        format!("{first} …")
+    } else {
+        first.to_string()
+    }
+}
+
+/// `transcript_items` → panel `Entry`s — resume's scrollback
+/// rebuild (Spec R08-T6): the inverse of [`Transcript::apply`]'s
+/// fold. Item kinds map onto their entry shapes:
+///
+/// - `task`/`steering`/`assistant_text`/`status` → their direct
+///   entries;
+/// - `tool_call`/`tool_result` → a [`ToolCard`] opened `Running`
+///   then transitioned by its result's status (the `AwaitingApproval`
+///   distinction is frontend state the transcript never kept — a
+///   call parked at exit reads interrupted, not awaiting);
+/// - `ask`/`answer` → an [`AskCard`] plus its recorded answer — the
+///   stored `ask` carries no call id (the card IS the record), so
+///   the synthetic `ask_replay_N` id mirrors replay's convention;
+/// - `summary` → the "conversation summarized" status line the
+///   live event pushes (T7's marker);
+/// - `plan` → no entry: the pinned block restores from the `plans`
+///   row, and the calls' tool cards already carry the audit trail
+///   (us-15).
+///
+/// A `tool_call` still `Running` at the end never got its result —
+/// the run died mid-call — so it closes [`INTERRUPTED_DETAIL`]
+/// rather than rendering `…` forever.
+fn entries_from(items: &[TranscriptItem]) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    let mut asks = 0usize;
+    for item in items {
+        match item {
+            TranscriptItem::Task { text } => entries.push(Entry::Task(text.clone())),
+            TranscriptItem::Steering { text } => entries.push(Entry::Steering(text.clone())),
+            TranscriptItem::AssistantText { text } => entries.push(Entry::Text(text.clone())),
+            TranscriptItem::ToolCall {
+                id, name, summary, ..
+            } => entries.push(Entry::Tool(ToolCard {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                status: CardStatus::Running,
+                detail: None,
+            })),
+            TranscriptItem::ToolResult { id, text, status } => {
+                // The newest card with the id wins — the same rule
+                // the live `ToolUpdate` applies.
+                if let Some(card) = entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Tool(card) if card.id == *id => Some(card),
+                    _ => None,
+                }) {
+                    card.status = card_status(*status);
+                    card.detail = Some(result_preview(text));
+                }
+            }
+            TranscriptItem::Ask { question, choices } => {
+                asks += 1;
+                entries.push(Entry::Ask(AskCard {
+                    id: format!("ask_replay_{asks}"),
+                    question: question.clone(),
+                    choices: choices.clone(),
+                    selected: 0,
+                    answer: None,
+                }));
+            }
+            TranscriptItem::Answer { text } => {
+                // The answer IS its ask's result — the newest
+                // unresolved ask card takes it.
+                if let Some(card) = entries.iter_mut().rev().find_map(|entry| match entry {
+                    Entry::Ask(card) if card.answer.is_none() => Some(card),
+                    _ => None,
+                }) {
+                    card.answer = Some(text.clone());
+                }
+            }
+            TranscriptItem::Status { text } => entries.push(Entry::Status(text.clone())),
+            TranscriptItem::Summary { .. } => {
+                entries.push(Entry::Status("conversation summarized".to_string()));
+            }
+            TranscriptItem::Plan { .. } => {}
+        }
+    }
+    for entry in &mut entries {
+        if let Entry::Tool(card) = entry {
+            if card.status == CardStatus::Running {
+                card.status = CardStatus::Failed;
+                card.detail = Some(INTERRUPTED_DETAIL.to_string());
+            }
+        }
+    }
+    entries
 }
 
 /// `ait_agent::ToolStatus` → [`CardStatus`] — the worker's
@@ -1389,6 +1522,152 @@ mod tests {
         assert_eq!(panel.input(), "fix");
         assert_eq!(panel.take_input(), "fix");
         assert_eq!(panel.input(), "");
+    }
+
+    /// Spec R08-T6: resume's scrollback rebuild — every item kind
+    /// maps to its entry: the tool card transitions on its result,
+    /// the ask card carries its recorded answer, statuses and the
+    /// `summary` marker land as status lines, `plan` items stay out
+    /// (the pinned block owns them).
+    #[test]
+    fn entries_from_rebuilds_the_scrollback() {
+        let entries = entries_from(&[
+            TranscriptItem::Task {
+                text: "fix it".into(),
+            },
+            TranscriptItem::ToolCall {
+                id: "call_1".into(),
+                name: "glob".into(),
+                args: "{}".into(),
+                summary: "\"*.rs\"".into(),
+            },
+            TranscriptItem::ToolResult {
+                id: "call_1".into(),
+                text: "a.rs\nb.rs".into(),
+                status: ait_agent::ToolStatus::Done,
+            },
+            TranscriptItem::Ask {
+                question: "Ship it?".into(),
+                choices: vec!["yes".into(), "no".into()],
+            },
+            TranscriptItem::Answer { text: "no".into() },
+            TranscriptItem::AssistantText {
+                text: "on it".into(),
+            },
+            TranscriptItem::Plan { todos: vec![] },
+            TranscriptItem::Summary {
+                text: "older half".into(),
+                covers_seq: 3,
+            },
+            TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ]);
+
+        assert_eq!(
+            entries,
+            vec![
+                Entry::Task("fix it".into()),
+                Entry::Tool(ToolCard {
+                    id: "call_1".into(),
+                    name: "glob".into(),
+                    summary: "\"*.rs\"".into(),
+                    status: CardStatus::Done,
+                    detail: Some("a.rs …".into()),
+                }),
+                Entry::Ask(AskCard {
+                    id: "ask_replay_1".into(),
+                    question: "Ship it?".into(),
+                    choices: vec!["yes".into(), "no".into()],
+                    selected: 0,
+                    answer: Some("no".into()),
+                }),
+                Entry::Text("on it".into()),
+                Entry::Status("conversation summarized".into()),
+                Entry::Status("done".into()),
+            ],
+            "no entry for the plan item — the pinned block owns it"
+        );
+    }
+
+    /// us-9: a call whose run died before its result closes as
+    /// interrupted — never an eternal `…` spinner or a live-looking
+    /// awaiting card.
+    #[test]
+    fn an_unanswered_call_closes_interrupted() {
+        let entries = entries_from(&[
+            TranscriptItem::ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                args: "{}".into(),
+                summary: "\"ls\"".into(),
+            },
+            TranscriptItem::Status {
+                text: "cancelled".into(),
+            },
+        ]);
+        assert_eq!(
+            entries[0],
+            Entry::Tool(ToolCard {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                summary: "\"ls\"".into(),
+                status: CardStatus::Failed,
+                detail: Some(INTERRUPTED_DETAIL.to_string()),
+            })
+        );
+    }
+
+    /// Spec R08-T6/us-6: `restore` swaps the panel to the loaded
+    /// conversation — entries rebuilt, plan pinned, transcript
+    /// adopted already-flushed (nothing re-appends on the next
+    /// drain; the next `prior` IS the restored transcript) — and
+    /// the split opens focused.
+    #[test]
+    fn restore_swaps_the_panel_to_the_loaded_conversation() {
+        let mut panel = panel();
+        panel.entries.push(Entry::Task("old work".into()));
+        panel.plan = vec![PlanTodo {
+            content: "old".into(),
+            status: PlanTodoStatus::Pending,
+        }];
+        panel.open = false;
+        panel.focused = false;
+
+        let plan = vec![PlanTodo {
+            content: "verify".into(),
+            status: PlanTodoStatus::Pending,
+        }];
+        panel.restore(
+            vec![
+                TranscriptItem::Task {
+                    text: "fix the tests".into(),
+                },
+                TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+            ],
+            Some(plan.clone()),
+        );
+
+        assert_eq!(
+            panel.entries(),
+            &[
+                Entry::Task("fix the tests".into()),
+                Entry::Text("on it".into()),
+            ]
+        );
+        assert_eq!(panel.plan(), plan.as_slice(), "the pinned block restores");
+        assert!(panel.is_open() && panel.is_focused());
+        assert!(
+            panel.take_transcript_items().is_empty(),
+            "the restored items are already persisted — nothing re-appends"
+        );
+        assert_eq!(
+            panel.transcript_items().len(),
+            2,
+            "the next task's prior IS the restored transcript"
+        );
     }
 
     /// `wrap` honors embedded newlines and hard-wraps long runs —

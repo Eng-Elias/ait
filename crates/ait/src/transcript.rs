@@ -49,6 +49,19 @@ pub(crate) struct Transcript {
 }
 
 impl Transcript {
+    /// A transcript adopted whole — resume's restore (R08-T6): every
+    /// item is already persisted, so `flushed` starts at the end and
+    /// nothing re-appends on the next drain. `asks` starts empty: a
+    /// restored `ask` is long recorded, and no in-flight call
+    /// survives a restore (resume refuses while a task runs).
+    pub(crate) fn restored(items: Vec<TranscriptItem>) -> Self {
+        Self {
+            flushed: items.len(),
+            items,
+            asks: HashSet::new(),
+        }
+    }
+
     /// The send-side record of a submitted task — first task of a
     /// flush is what [`conversation_title`] reads.
     pub(crate) fn task(&mut self, text: &str) {
@@ -412,6 +425,35 @@ mod tests {
                     text: "second".into(),
                 },
             ]
+        );
+    }
+
+    /// Spec R08-T6: a transcript adopted whole yields nothing to the
+    /// store — every item is already persisted — while `items()`
+    /// hands the whole thing to the next task's `prior`.
+    #[test]
+    fn a_restored_transcript_flushes_nothing_but_carries_everything() {
+        let items = vec![
+            TranscriptItem::Task {
+                text: "fix it".into(),
+            },
+            TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ];
+        let mut transcript = Transcript::restored(items.clone());
+        assert!(
+            transcript.take_new().is_empty(),
+            "already-persisted items never re-append"
+        );
+        assert_eq!(transcript.items(), items.as_slice());
+        // New sends record on top and DO flush.
+        transcript.task("and the lint");
+        assert_eq!(
+            transcript.take_new(),
+            vec![TranscriptItem::Task {
+                text: "and the lint".into()
+            }]
         );
     }
 
