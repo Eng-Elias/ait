@@ -3,14 +3,18 @@
 //! dependency) and all confined to the bound session's current
 //! working directory — a path that escapes returns a tool error the
 //! model can report, never a panic and never an access outside the
-//! tree.
+//! tree. §5.7's `directory_allowlist` (R07-T4) widens that tree to
+//! a union: the session cwd plus each normalized root the active
+//! profile declared. An allowlist only ever expands what the tools
+//! may touch — the permission engine's `never` floor and the
+//! approve-card flow are unaffected.
 //!
 //! Confinement ([`ToolCwd::confine`]) normalizes `..`/`.` segments
 //! lexically first, then — when the candidate exists — canonicalizes
-//! it so a symlink pointing out of the tree is still rejected. The
-//! root itself is canonicalized at construction, so the two sides
-//! compare on the same terms; a root that does not resolve falls
-//! back to its lexical form (tool errors then come from the
+//! it so a symlink pointing out of the union is still rejected. The
+//! roots themselves are canonicalized at construction, so the two
+//! sides compare on the same terms; a root that does not resolve
+//! falls back to its lexical form (tool errors then come from the
 //! filesystem, not the check).
 //!
 //! [`ToolOutput`] splits "the tool produced output" from "the tool
@@ -79,25 +83,55 @@ impl ToolOutput {
 }
 
 /// A task's working directory — the tree every file tool is confined
-/// to. Holds the root in the form [`confine`](Self::confine)
-/// canonicalizes candidates to, so both sides of the prefix check
-/// agree.
+/// to — plus any extra roots the active profile's
+/// `directory_allowlist` declared (§5.7, R07-T4). Holds the roots in
+/// the form [`confine`](Self::confine) canonicalizes candidates to,
+/// so both sides of the prefix check agree.
 pub(crate) struct ToolCwd {
+    /// The session's cwd: relative tool paths resolve against it,
+    /// `write_to_pty` spawns in it, `display` renders relative to
+    /// it — and its subtree confines like every other root's.
     root: PathBuf,
+    /// The normalized `directory_allowlist` roots — each resolved
+    /// exactly like `root` was (relative entries join `root`,
+    /// `..`/`.` normalize lexically, an existing entry
+    /// canonicalizes). An empty list is the status quo: cwd-only
+    /// confinement.
+    extra_roots: Vec<PathBuf>,
 }
 
 impl ToolCwd {
-    /// Bind the tools to `cwd` — canonicalized when it resolves, so a
-    /// `cwd` reached through a symlink compares equal to canonical
-    /// candidates.
-    pub(crate) fn new(cwd: &str) -> Self {
+    /// Bind the tools to `cwd` ∪ `allowlist` — `cwd` canonicalized
+    /// when it resolves, so a `cwd` reached through a symlink
+    /// compares equal to canonical candidates. Every `allowlist`
+    /// entry (§5.7's `directory_allowlist`, a `Vec<String>` from the
+    /// active profile) resolves the same way a tool path would:
+    /// relative entries join the session `cwd`, `..`/`.` segments
+    /// normalize lexically, then an entry that exists canonicalizes
+    /// — an entry that itself escapes (`../shared`) lands on its
+    /// true root before it can confine anything.
+    pub(crate) fn new(cwd: &str, allowlist: &[String]) -> Self {
         let path = Path::new(cwd);
         let root = fs::canonicalize(path).unwrap_or_else(|_| normalize(path));
-        Self { root }
+        let extra_roots = allowlist
+            .iter()
+            .map(|entry| {
+                let candidate = Path::new(entry);
+                let joined = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                let normalized = normalize(&joined);
+                fs::canonicalize(&normalized).unwrap_or(normalized)
+            })
+            .collect();
+        Self { root, extra_roots }
     }
 
-    /// The bound working directory — the directory `write_to_pty`
-    /// spawns the agent's interactive session in (R06-T7).
+    /// The bound working directory — the union's first root and the
+    /// directory `write_to_pty` spawns the agent's interactive
+    /// session in (R06-T7).
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -384,7 +418,7 @@ impl ToolCwd {
     }
 
     /// Where a brand-new `confined` path may be written: its parent
-    /// must exist as a directory inside the tree — canonicalized,
+    /// must exist as a directory inside the union — canonicalized,
     /// so a symlinked directory cannot smuggle the write outside
     /// (the leaf does not exist yet, so [`confine`](Self::confine)
     /// saw only its lexical form). A dangling symlink AT the path
@@ -409,7 +443,7 @@ impl ToolCwd {
         if !canonical.is_dir() {
             return Err(format!("edit_files: {display}'s parent is not a directory"));
         }
-        if !canonical.starts_with(&self.root) {
+        if !self.contains(&canonical) {
             return Err(format!(
                 "{display} is outside the working directory {}",
                 self.root.display()
@@ -422,8 +456,9 @@ impl ToolCwd {
         ))
     }
 
-    /// Resolve the optional `path` argument (a directory) against the
-    /// root — confined like every other path.
+    /// Resolve the optional `path` argument (a directory) — absent
+    /// means the session root, present confines like every other
+    /// path (so a `directory_allowlist` root is a legal base).
     fn base_dir(&self, arg: Option<&serde_json::Value>) -> Result<PathBuf, String> {
         match arg {
             None | Some(serde_json::Value::Null) => Ok(self.root.clone()),
@@ -434,10 +469,11 @@ impl ToolCwd {
         }
     }
 
-    /// Confine one model-supplied path to the root: join relative
-    /// paths, normalize `.`/`..` lexically, then — when it exists —
-    /// canonicalize so a symlink cannot smuggle the path out of the
-    /// tree. Anything still outside returns a tool error.
+    /// Confine one model-supplied path to the union: join relative
+    /// paths to the session root, normalize `.`/`..` lexically,
+    /// then — when it exists — canonicalize so a symlink cannot
+    /// smuggle the path out of the union. Anything still outside
+    /// returns a tool error.
     fn confine(&self, input: &str) -> Result<PathBuf, String> {
         let candidate = Path::new(input);
         let joined = if candidate.is_absolute() {
@@ -450,7 +486,7 @@ impl ToolCwd {
         // does not exist yet keeps its lexical form (reads of it
         // simply error below).
         let resolved = fs::canonicalize(&normalized).unwrap_or(normalized);
-        if !resolved.starts_with(&self.root) {
+        if !self.contains(&resolved) {
             return Err(format!(
                 "{input:?} is outside the working directory {}",
                 self.root.display()
@@ -459,8 +495,16 @@ impl ToolCwd {
         Ok(resolved)
     }
 
-    /// `path` shown root-relative when it sits inside the tree —
-    /// tool results read like the paths the model passed.
+    /// `path` sits inside the confinement union — under the session
+    /// root or under any `directory_allowlist` root (§5.7).
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.root) || self.extra_roots.iter().any(|root| path.starts_with(root))
+    }
+
+    /// `path` shown relative to the session root when it sits under
+    /// it — tool results read like the paths the model passed. A
+    /// path under a `directory_allowlist` root renders absolute:
+    /// the listed tree is not the session's to abbreviate.
     fn display(&self, path: &Path) -> String {
         match path.strip_prefix(&self.root) {
             Ok(relative) if relative.as_os_str().is_empty() => String::from("."),
@@ -486,7 +530,8 @@ pub(crate) struct EditPlan {
 struct PlannedEdit {
     /// The confined, canonicalized write target.
     path: PathBuf,
-    /// The root-relative name the diff's `a/`/`b/` labels show.
+    /// The display name the diff's `a/`/`b/` labels show —
+    /// session-root-relative, or absolute under an allowlist root.
     display: String,
     /// The exact bytes [`EditPlan::apply`] writes — `fs::write` of
     /// this string, nothing else.
@@ -632,7 +677,7 @@ mod tests {
             std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
             std::fs::write(&full, contents).expect("write");
         }
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"), &[]);
         (dir, cwd)
     }
 
@@ -712,7 +757,7 @@ mod tests {
     fn read_files_refuses_binary_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("bin.dat"), b"\x89PNG\x00\x01").expect("write");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"), &[]);
         let out = cwd.read_files(&args(r#"{"paths": ["bin.dat"]}"#));
         assert!(out.is_error);
         assert!(out.text.contains("binary"), "{:?}", out.text);
@@ -943,7 +988,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("bin.dat"), b"\x89PNG\x00\x01").expect("bin");
         std::fs::write(dir.path().join("bad.txt"), b"\xff\xfe invalid utf8").expect("bad");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
         let error = cwd
             .plan_edits(&args(r#"{"files": [{"path": "bin.dat", "content": "x"}]}"#))
             .expect_err("binary");
@@ -1103,5 +1148,243 @@ mod tests {
             r#"{"files": [{"path": "../x.txt", "content": "y"}]}"#,
         ));
         assert!(out.is_error, "{:?}", out.text);
+    }
+
+    /// Bind `dir` as the session root plus `entries` as verbatim
+    /// `directory_allowlist` strings — the shape the active
+    /// profile's `Vec<String>` hands [`ToolCwd::new`] (§5.7).
+    fn bind(dir: &Path, entries: &[String]) -> ToolCwd {
+        ToolCwd::new(dir.to_str().expect("utf-8 dir"), entries)
+    }
+
+    /// One allowlist entry naming `path` verbatim — an absolute
+    /// entry, the common case in `settings.toml`.
+    fn entry(path: &Path) -> String {
+        path.to_str().expect("utf-8 path").to_string()
+    }
+
+    /// §5.7 `directory_allowlist` (R07-T4): a listed root joins the
+    /// confinement union — `read_files`, `grep` and `glob` under it
+    /// behave exactly as under the cwd. Results name the listed
+    /// tree's own absolute paths (only the session root renders
+    /// relative), and a relative input still resolves against the
+    /// session cwd, never the listed root.
+    #[test]
+    fn an_allowlisted_root_reads_and_searches_like_the_cwd() {
+        let (dir, _cwd_only) = tree(&[("note.txt", "cwd note")]);
+        let shared = tempfile::tempdir().expect("shared");
+        std::fs::create_dir_all(shared.path().join("sub")).expect("mkdir");
+        std::fs::write(shared.path().join("a.rs"), "MARK top").expect("a");
+        std::fs::write(shared.path().join("sub/b.rs"), "MARK deep").expect("b");
+        std::fs::write(shared.path().join("note.txt"), "shared note").expect("note");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        // `read_files` on an absolute path inside the union.
+        let a = shared.path().join("a.rs");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [a]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert!(out.text.ends_with("MARK top"), "{:?}", out.text);
+
+        // A relative input still binds to the session cwd — the
+        // listed root's same-named file is not consulted.
+        let out = cwd.read_files(&args(r#"{"paths": ["note.txt"]}"#));
+        assert!(out.text.ends_with("cwd note"), "{:?}", out.text);
+
+        // `grep` and `glob` scope to the listed root through `path`,
+        // reporting the tree's canonical paths.
+        let out = cwd.grep(&args(
+            &serde_json::json!({"pattern": "MARK", "path": shared.path()}).to_string(),
+        ));
+        assert!(!out.is_error, "{:?}", out.text);
+        let a = std::fs::canonicalize(shared.path().join("a.rs")).expect("canonical a");
+        let b = std::fs::canonicalize(shared.path().join("sub/b.rs")).expect("canonical b");
+        assert_eq!(
+            out.text,
+            format!("{}:1: MARK top\n{}:1: MARK deep", a.display(), b.display())
+        );
+        let out = cwd.glob(&args(
+            &serde_json::json!({"pattern": "**/*.rs", "path": shared.path()}).to_string(),
+        ));
+        assert_eq!(out.text, format!("{}\n{}", a.display(), b.display()));
+    }
+
+    /// Allowlist entries get [`confine`](ToolCwd::confine)'s own
+    /// normalization before they can confine anything: a relative
+    /// entry joins the session root (`../shared` deliberately names
+    /// the sibling tree), `..`/`.` segments resolve lexically, and
+    /// a symlinked entry canonicalizes — the root the user declared
+    /// is the root the union grants, under either spelling.
+    #[test]
+    fn allowlist_entries_normalize_like_confined_paths() {
+        // Layout: `parent/proj` is the session cwd, `parent/shared`
+        // the tree a relative `..` entry declares.
+        let parent = tempfile::tempdir().expect("parent");
+        let proj = parent.path().join("proj");
+        let shared = parent.path().join("shared");
+        std::fs::create_dir_all(&proj).expect("proj");
+        std::fs::create_dir_all(shared.join("inner")).expect("shared");
+        std::fs::write(shared.join("top.txt"), "SHARED-TOP").expect("top");
+        std::fs::write(shared.join("inner/deep.txt"), "SHARED-DEEP").expect("deep");
+        let top = shared.join("top.txt");
+
+        // A relative entry escapes the session root on purpose —
+        // normalization, not the confinement check, decides it.
+        let cwd = bind(&proj, &[String::from("../shared")]);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("SHARED-TOP"));
+
+        // `..` and `.` inside entries collapse lexically: both
+        // spellings land on the same real trees.
+        let cwd = bind(
+            &proj,
+            &[
+                String::from("../shared/inner/../"),
+                format!("{}/./inner", shared.display()),
+            ],
+        );
+        let deep = shared.join("inner/deep.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [deep]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+
+        // A narrower entry grants only its own subtree.
+        let cwd = bind(&proj, &[entry(&shared.join("inner"))]);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [deep]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(
+            out.is_error,
+            "the entry's subtree, not its parent, is the root: {:?}",
+            out.text
+        );
+
+        // A symlinked entry resolves to its real root — reads under
+        // either spelling confine to it.
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&shared, &link).expect("symlink");
+        let cwd = bind(&proj, &[entry(&link)]);
+        let via_link = link.join("top.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [via_link]}).to_string()));
+        assert!(!out.is_error, "symlink spelling: {:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "real spelling: {:?}", out.text);
+    }
+
+    /// The union's edge: a path under neither the session cwd nor a
+    /// listed root still returns the unchanged escape tool error —
+    /// the allowlist widens only the declared trees.
+    #[test]
+    fn paths_outside_the_union_still_escape() {
+        let (dir, _cwd_only) = tree(&[("inside.txt", "safe")]);
+        let shared = tempfile::tempdir().expect("shared");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").expect("secret");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        let secret = outside.path().join("secret.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [secret]}).to_string()));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{:?}",
+            out.text
+        );
+        assert!(!out.text.contains("SECRET"));
+
+        // `..` from the cwd escapes the same way — under neither
+        // root.
+        let out = cwd.read_files(&args(r#"{"paths": ["../x.txt"]}"#));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("outside the working directory"));
+    }
+
+    /// `edit_files` under a listed root plans and applies exactly
+    /// as under the cwd: a rewrite diffs old against new, a new
+    /// file gets the `/dev/null` diff treatment (us-22/23) and
+    /// both write on `apply`. A path under neither root still
+    /// refuses at planning.
+    #[test]
+    fn edit_files_plans_and_applies_under_an_allowlisted_root() {
+        let (dir, _cwd_only) = tree(&[]);
+        let shared = tempfile::tempdir().expect("shared");
+        std::fs::write(shared.path().join("note.txt"), "one\ntwo\n").expect("note");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        // Rewriting an existing file under the listed root diffs.
+        let note = shared.path().join("note.txt");
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": note, "content": "one\nTWO\n"}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(summary.contains("-two\n+TWO"), "{summary}");
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(std::fs::read_to_string(&note).expect("read"), "one\nTWO\n");
+
+        // A new file under the listed root gets the `/dev/null`
+        // treatment — the diff labels are its own absolute path.
+        // (Canonical spelling: the leaf does not exist, so confine
+        // compares its lexical form against the canonical root —
+        // the same rule absolute cwd paths already live by.)
+        let fresh = std::fs::canonicalize(shared.path())
+            .expect("canonical shared")
+            .join("fresh.txt");
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": fresh, "content": "hello\n"}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(summary.starts_with("--- /dev/null\n+++ b/"), "{summary}");
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(std::fs::read_to_string(&fresh).expect("read"), "hello\n");
+
+        // A write under neither root still refuses at planning —
+        // before the card, as everywhere else.
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("evil.txt");
+        let error = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": target, "content": "x"}]
+                })
+                .to_string(),
+            ))
+            .expect_err("outside union");
+        assert!(error.contains("outside the working directory"), "{error}");
+    }
+
+    /// An empty `directory_allowlist` is the status quo verbatim:
+    /// cwd-only confinement, same escape error.
+    #[test]
+    fn an_empty_allowlist_keeps_the_cwd_only_tree() {
+        let (_dir, cwd) = tree(&[("inside.txt", "safe")]);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").expect("secret");
+        let secret = outside.path().join("secret.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [secret]}).to_string()));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("outside the working directory"));
+        let target = outside.path().join("evil.txt");
+        let error = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": target, "content": "y"}]
+                })
+                .to_string(),
+            ))
+            .expect_err("outside cwd");
+        assert!(error.contains("outside the working directory"), "{error}");
     }
 }

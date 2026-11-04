@@ -15,8 +15,10 @@
 //! declarations — [`is_agent_decided`]), and `run_command`'s
 //! `command_denylist`/`command_allowlist` consult (T3).
 //! `ask_on_first_write` degrades to `always_ask` until its
-//! first-write memory (T5) lands; the directory allowlist stays
-//! parsed-but-unconsumed (T4); `mcp_*` fields and
+//! first-write memory (T5) lands; the `directory_allowlist` (T4)
+//! widens confinement at the `ToolCwd` seam, not here — an
+//! allowlist expands what file tools may touch, never a verdict;
+//! `mcp_*` fields and
 //! `context_window_limit` stay inert (Rounds 10/8).
 
 use std::collections::HashSet;
@@ -479,7 +481,11 @@ mod tests {
     /// outright — beating `always_allow`, an allowlist hit and the
     /// allow-for-task memory alike — an allowlist hit runs without
     /// asking, and no hit falls through to memory then level like
-    /// every other call.
+    /// every other call. The `directory_allowlist` (T4) widens
+    /// `ToolCwd` confinement, never this verdict, and the
+    /// `mcp_*`/`context_window_limit` fields stay parsed-but-unconsumed
+    /// (Rounds 10/8): `mcp_permissions = "never"` forbids nothing the
+    /// registry declares today.
     #[test]
     fn the_command_lists_decide_before_memory_and_level() {
         let empty = HashSet::new();
