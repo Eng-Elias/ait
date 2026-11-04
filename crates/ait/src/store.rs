@@ -12,7 +12,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use ait_agent::TranscriptItem;
-use ait_store::{NewBlock, NewConversation, NewTranscriptItem, Store, StoreError};
+use ait_store::{
+    ListedConversation, NewBlock, NewConversation, NewTranscriptItem, Store, StoreError,
+};
 
 use crate::blocks::PersistedBlock;
 use crate::status::Toast;
@@ -167,6 +169,57 @@ impl StoreHandle {
             return;
         };
         self.write(toast, |store| store.upsert_plan(conversation_id, &payload));
+    }
+
+    /// The `Alt+R` picker's rows (Spec R08-T6, us-5): every
+    /// conversation newest-mutation first with its item count. A
+    /// read — `Err` is the caller's to toast WITHOUT disabling the
+    /// handle (only writes trip the degrade rule); a disabled handle
+    /// lists nothing, which the caller reads as "no stored
+    /// conversations".
+    pub fn conversations(&self) -> Result<Vec<ListedConversation>, StoreError> {
+        match &self.inner {
+            Some(store) => store.list_conversations_with_counts(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// One conversation's transcript items, deserialized — resume's
+    /// rebuild source for the panel scrollback and the next task's
+    /// `prior` alike (Spec R08-T6). Payloads that fail to
+    /// deserialize (the DB is local, plaintext and user-editable)
+    /// drop out rather than failing the whole resume — the verbatim
+    /// contract holds for everything the store wrote.
+    pub fn load_transcript(&self, id: i64) -> Result<Vec<TranscriptItem>, StoreError> {
+        match &self.inner {
+            Some(store) => Ok(store
+                .load_transcript(id)?
+                .iter()
+                .filter_map(|row| serde_json::from_str(&row.payload_json).ok())
+                .collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The conversation's latest `plans` snapshot, deserialized —
+    /// the pinned block's restore source (Spec R08-T6, us-17). Same
+    /// read-and-skip rule as [`load_transcript`](Self::load_transcript).
+    pub fn load_plan(&self, id: i64) -> Result<Option<TranscriptItem>, StoreError> {
+        match &self.inner {
+            Some(store) => Ok(store
+                .load_plan(id)?
+                .and_then(|payload| serde_json::from_str(&payload).ok())),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a conversation — its items and plan cascade (Spec
+    /// R08-T6, us-11). A write, so a failure toasts once and
+    /// disables the handle like every other; `true` only when the
+    /// delete actually landed.
+    pub fn delete_conversation(&mut self, toast: &mut Option<Toast>, id: i64) -> bool {
+        self.write(toast, |store| store.delete_conversation(id))
+            .is_some()
     }
 
     /// The per-drain batch: every `(session id, sealed block)` pair in
@@ -420,5 +473,146 @@ mod tests {
             .conversation_started(&mut toast, "t", Path::new("/w"))
             .is_none());
         assert!(toast.is_none(), "a disabled handle never re-toasts");
+    }
+
+    /// Spec R08-T6/us-5: `conversations` returns the picker's rows —
+    /// newest first with item counts — through the handle, and a
+    /// disabled handle lists nothing rather than erroring.
+    #[test]
+    fn conversations_lists_the_pickers_rows() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+        let id = handle
+            .conversation_started(&mut toast, "fix the tests", Path::new("/w"))
+            .expect("the conversation insert lands");
+        handle.append_transcript(
+            &mut toast,
+            id,
+            &[
+                TranscriptItem::Task {
+                    text: "fix the tests".into(),
+                },
+                TranscriptItem::Status {
+                    text: "done".into(),
+                },
+            ],
+        );
+
+        let listed = handle.conversations().expect("the list lands");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].conversation.id, id);
+        assert_eq!(listed[0].conversation.title, "fix the tests");
+        assert_eq!(listed[0].items, 2);
+        assert!(
+            StoreHandle::disabled()
+                .conversations()
+                .expect("a disabled handle still answers")
+                .is_empty()
+        );
+    }
+
+    /// Spec R08-T6: `load_transcript` returns the stored items
+    /// deserialized in `seq` order — a payload that doesn't read back
+    /// (a hand-edited row) drops out rather than failing the resume —
+    /// and `load_plan` reads the latest snapshot the same way.
+    #[test]
+    fn load_transcript_and_plan_deserialize_the_stored_payloads() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+        let id = handle
+            .conversation_started(&mut toast, "plan the work", Path::new("/w"))
+            .expect("the conversation insert lands");
+        handle.append_transcript(
+            &mut toast,
+            id,
+            &[
+                TranscriptItem::Task {
+                    text: "plan the work".into(),
+                },
+                TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+            ],
+        );
+        let plan = TranscriptItem::Plan {
+            todos: vec![ait_agent::PlanTodo {
+                content: "fix".into(),
+                status: ait_agent::PlanTodoStatus::InProgress,
+            }],
+        };
+        handle.plan_upsert(&mut toast, id, &plan);
+
+        assert_eq!(
+            handle.load_transcript(id).expect("the transcript loads"),
+            vec![
+                TranscriptItem::Task {
+                    text: "plan the work".into(),
+                },
+                TranscriptItem::AssistantText {
+                    text: "on it".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            handle.load_plan(id).expect("the plan loads"),
+            Some(plan)
+        );
+
+        // A payload that doesn't deserialize drops out — the resume
+        // still lands with everything legible.
+        let store = handle.inner.as_ref().unwrap();
+        store
+            .append_transcript_items(
+                id,
+                &[ait_store::NewTranscriptItem {
+                    kind: "bogus",
+                    payload_json: "not json",
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            handle.load_transcript(id).unwrap().len(),
+            2,
+            "the corrupt row drops rather than failing the load"
+        );
+
+        // Unknown ids read as empty, like the store itself.
+        assert!(handle.load_transcript(999).unwrap().is_empty());
+        assert!(handle.load_plan(999).unwrap().is_none());
+    }
+
+    /// Spec R08-T6/us-11: `delete_conversation` removes the row and
+    /// cascades its items and plan — `true` on the landing write —
+    /// while a disabled handle is a silent `false`.
+    #[test]
+    fn delete_conversation_cascades_items_and_plan() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+        let id = handle
+            .conversation_started(&mut toast, "to delete", Path::new("/w"))
+            .expect("the conversation insert lands");
+        handle.append_transcript(
+            &mut toast,
+            id,
+            &[TranscriptItem::Task {
+                text: "to delete".into(),
+            }],
+        );
+        handle.plan_upsert(
+            &mut toast,
+            id,
+            &TranscriptItem::Plan { todos: vec![] },
+        );
+
+        assert!(handle.delete_conversation(&mut toast, id));
+        assert!(toast.is_none(), "a healthy store never toasts");
+        let store = handle.inner.as_ref().unwrap();
+        assert!(store.list_conversations().unwrap().is_empty());
+        assert!(store.load_transcript(id).unwrap().is_empty());
+        assert!(store.load_plan(id).unwrap().is_none());
+
+        // A disabled handle is the silent no-op (us-25).
+        assert!(!StoreHandle::disabled().delete_conversation(&mut toast, id));
+        assert!(toast.is_none());
     }
 }
