@@ -32,6 +32,18 @@ pub fn default_template() -> String {
 # osc52            = false            # let child apps write the host clipboard via OSC 52
 # shell_integration = true            # inject OSC 133 + hook events into bash/zsh/fish (default: on)
 
+# SSH integration (§5.9): sessions started by `ssh` inside an
+# integrated tab get the remote shell bootstrapped with the same
+# snippet, and run_command gains the ControlMaster out-of-band tier.
+# [ssh]
+# enable_integration = true   # global off switch (default: on)
+# hosts_allowlist   = []      # OpenSSH globs (`*`, `?`, `!`-negation) on the
+#                             # destination token; empty = open
+# hosts_denylist    = []      # deny beats allow — a matching ssh stays a
+#                             # plain passthrough, never blocked
+# reuse_existing_control_master = true  # honor your own ControlMaster/
+#                                       # ControlPath config (default: on)
+
 # A declared endpoint — any OpenAI- or Anthropic-compatible server.
 [agents.custom_endpoints.local]
 name     = "Local Ollama"

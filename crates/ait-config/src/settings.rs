@@ -24,6 +24,9 @@ pub struct Settings {
     /// `[agents]` — custom endpoints (§4.1) and execution profiles (§5.7).
     #[serde(default)]
     pub agents: AgentsSettings,
+    /// `[ssh]` — the §5.9 SSH-integration policy (§4.3, Spec R09).
+    #[serde(default)]
+    pub ssh: SshSettings,
 }
 
 impl Settings {
@@ -67,7 +70,10 @@ impl Settings {
     ///   match in the permission engine, so it is a load error naming
     ///   the entry's own `…[index]` path. `directory_allowlist` holds
     ///   paths and the `mcp_*` lists are inert — neither is a regex
-    ///   list, and neither is validated here.
+    ///   list, and neither is validated here;
+    /// - every `[ssh]` `hosts_allowlist`/`hosts_denylist` entry is a
+    ///   well-formed OpenSSH `Host`-pattern glob (§5.9, Spec R09) — a
+    ///   malformed one fails load naming its `…[index]` path.
     fn validate(&self) -> Result<(), ConfigError> {
         // `config_key` -> key path of its first declaration, for duplicate
         // reporting and role-reference lookups.
@@ -89,6 +95,20 @@ impl Settings {
                     ));
                 }
                 declared.insert(model.config_key.as_str(), path);
+            }
+        }
+
+        for (list, entries) in [
+            ("hosts_allowlist", &self.ssh.hosts_allowlist),
+            ("hosts_denylist", &self.ssh.hosts_denylist),
+        ] {
+            for (index, pattern) in entries.iter().enumerate() {
+                if let Err(detail) = validate_host_pattern(pattern) {
+                    return Err(ConfigError::at(
+                        format!("ssh.{list}[{index}]"),
+                        detail,
+                    ));
+                }
             }
         }
 
@@ -140,6 +160,71 @@ pub struct TerminalSettings {
     /// Spec R05). `false` opts out: new sessions spawn as plain
     /// terminals, live ones are untouched.
     pub shell_integration: Option<bool>,
+}
+
+/// `[ssh]` (§4.3, Spec R09 / §5.9) — the per-host SSH-integration
+/// policy the armed decision renders into each spawned session's
+/// `AIT_SSH_*` environment; the snippet-side `ssh()` wrapper enforces
+/// it inside the shell.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SshSettings {
+    /// The global off switch for every SSH feature — on when unset
+    /// (§5.9). `false` restores the pre-Round-9 behavior: `ssh` stays
+    /// a plain command in every new session.
+    pub enable_integration: Option<bool>,
+    /// OpenSSH `Host`-pattern globs (`*`, `?` within the destination
+    /// token, `!`-prefixed entries negating) matched against the
+    /// destination the user typed (`user@host`, `host`, config alias).
+    /// An empty list is open — every host integrates that the denylist
+    /// doesn't refuse.
+    #[serde(default)]
+    pub hosts_allowlist: Vec<String>,
+    /// Patterns that make a matching `ssh` a plain passthrough — no
+    /// bootstrap, no ControlMaster, never blocked (Spec R09). Deny
+    /// beats allow, matching §5.7's rule.
+    #[serde(default)]
+    pub hosts_denylist: Vec<String>,
+    /// When the user's own ssh config already multiplexes a host
+    /// (`ControlMaster`/`ControlPath` in `ssh -G`), reuse that socket
+    /// rather than attaching a parallel ait-managed one — on when
+    /// unset (§5.9).
+    pub reuse_existing_control_master: Option<bool>,
+}
+
+impl SshSettings {
+    /// The armed enable flag — `true` when unset (§5.9's default-on).
+    pub fn integration_enabled(&self) -> bool {
+        self.enable_integration.unwrap_or(true)
+    }
+
+    /// The armed reuse flag — `true` when unset (Spec R09's default).
+    pub fn reuses_control_master(&self) -> bool {
+        self.reuse_existing_control_master.unwrap_or(true)
+    }
+}
+
+/// One `hosts_*` entry's shape: a single OpenSSH `Host`-pattern glob
+/// (`*`/`?`, an optional leading `!`). Empty entries, a bare `!`,
+/// embedded whitespace and commas are malformed — a comma reads like
+/// OpenSSH's in-pattern list separator, which this model spells as
+/// separate list entries instead; rejecting it keeps a misread
+/// pattern from silently never matching.
+fn validate_host_pattern(pattern: &str) -> Result<(), String> {
+    let body = pattern.strip_prefix('!').unwrap_or(pattern);
+    if body.is_empty() {
+        return Err(String::from("must be a non-empty host pattern"));
+    }
+    if body.contains(',') {
+        return Err(String::from(
+            "one glob per entry — spell `a,b` as two list entries",
+        ));
+    }
+    if body.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(String::from("must not contain whitespace"));
+    }
+    Ok(())
 }
 
 /// `[agents]` — endpoint declarations (§4.1) and execution profiles (§5.7).
