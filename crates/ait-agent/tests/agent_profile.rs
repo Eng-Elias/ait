@@ -665,3 +665,121 @@ coding_model = "coding-key"
     }
     fixture.assert_no_more_requests();
 }
+
+/// §5.7 `directory_allowlist` at the channel seam (R07-T4): the
+/// file tools' confinement is the session cwd ∪ the profile's
+/// listed roots. A `read_files` under the listed root runs and its
+/// contents reach the model; an `edit_files` under the same root
+/// still gates on the approve card — carrying its `/dev/null` diff
+/// — and an allow verdict writes it; a path under neither root
+/// answers the unchanged escape tool error. The allowlist widens
+/// only what the tools may touch: verdicts, cards and diffs are
+/// the same as inside the tree.
+#[test]
+fn directory_allowlist_widens_confinement_without_weakening_the_gate() {
+    let dir = project();
+    let shared = tempfile::tempdir().expect("shared dir");
+    std::fs::write(shared.path().join("shared.txt"), "SHARED-CONTENTS").expect("shared");
+    let outside = tempfile::tempdir().expect("outside dir");
+    std::fs::write(outside.path().join("secret.txt"), "SECRET-OUTSIDE").expect("secret");
+    let shared_file = shared.path().join("shared.txt");
+    let new_file = shared.path().join("fresh.txt");
+    let secret = outside.path().join("secret.txt");
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "read_files",
+            &serde_json::json!({"paths": [shared_file]}).to_string(),
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "edit_files",
+            &serde_json::json!({
+                "files": [{"path": new_file, "content": "FRESH\n"}]
+            })
+            .to_string(),
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "read_files",
+            &serde_json::json!({"paths": [secret]}).to_string(),
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                &format!(
+                    "read_files = \"always_allow\"\n\
+                     apply_code_diffs = \"always_ask\"\n\
+                     directory_allowlist = [{}]",
+                    json_string(shared.path().to_str().expect("utf-8 shared"))
+                ),
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // `read_files` under the listed root: `always_allow` runs it
+    // ungated, exactly as inside the tree.
+    assert_eq!(until_tool_call(&session), "call_1");
+
+    // `edit_files` under the listed root: `always_ask` still parks —
+    // the allowlist never weakens consent — and the card carries the
+    // `/dev/null` preview for the new file.
+    let (id, name, summary) = until_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_2", "edit_files"));
+    assert!(
+        summary.starts_with("--- /dev/null\n+++ b/"),
+        "new-file diff preview: {summary}"
+    );
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    // `read_files` under neither root: runs (the level allows it)
+    // and fails inside confinement — the union's edge is the
+    // unchanged escape tool error.
+    assert_eq!(until_tool_call(&session), "call_3");
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Failed,
+                detail: Some(detail),
+            } if call_id == "call_3" && detail.contains("outside the working directory")
+        )),
+        "call_3's card reads the confinement error: {events:?}"
+    );
+    // The allow verdict's plan applied — the write landed under the
+    // listed root, not the session cwd.
+    assert_eq!(
+        std::fs::read_to_string(&new_file).expect("applied edit"),
+        "FRESH\n"
+    );
+
+    // What reached the model: the listed tree's contents, the write
+    // result, and the escape error — never the outside file's bytes.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(second.body.contains("SHARED-CONTENTS"), "{}", second.body);
+    let third = fixture.captured();
+    assert!(third.body.contains("wrote"), "{}", third.body);
+    let fourth = fixture.captured();
+    assert!(
+        fourth.body.contains("outside the working directory"),
+        "{}",
+        fourth.body
+    );
+    assert!(!fourth.body.contains("SECRET-OUTSIDE"), "{}", fourth.body);
+    fixture.assert_no_more_requests();
+}
