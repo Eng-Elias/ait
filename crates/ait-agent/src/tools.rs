@@ -577,10 +577,14 @@ mod tests {
     /// a `"safe" | "unsafe"` enum with the in-house contract text —
     /// in all three wire shapes, while every other tool's
     /// description and parameters ship unchanged (Spec R07-T2).
+    /// `ask_user_question` never gains it even AT `agent_decides`:
+    /// its own card is the ask, so the flag would be a required
+    /// argument the permission engine never reads.
     #[test]
     fn declare_injects_safety_only_on_agent_decides_tools() {
         let profile = ExecutionProfile {
             read_files: Some(ait_config::PermissionLevel::AgentDecides),
+            ask_user_question: Some(ait_config::PermissionLevel::AgentDecides),
             ..Default::default()
         };
         let governed = ["read_files", "grep", "glob"];

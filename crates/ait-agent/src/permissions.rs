@@ -126,9 +126,14 @@ pub(crate) fn evaluate(
 /// `tools::declare` injects the required `safety` argument into
 /// exactly these tools' parameter schemas (Spec R07-T2). A `None`
 /// profile — the missing-profile fail-safe — declares nothing extra:
-/// every call asks anyway.
+/// every call asks anyway. `ask_user_question` is excluded even at
+/// `agent_decides`: its own card IS the ask (us-10) and [`evaluate`]
+/// allows it before the flag check, so a required `safety` argument
+/// there would be injected for nothing.
 pub(crate) fn is_agent_decided(profile: Option<&ExecutionProfile>, tool: &str) -> bool {
-    profile.and_then(|profile| level_for(profile, tool)) == Some(PermissionLevel::AgentDecides)
+    tool != ASK_USER_QUESTION
+        && profile.and_then(|profile| level_for(profile, tool))
+            == Some(PermissionLevel::AgentDecides)
 }
 
 /// The `agent_decides` flag check: `true` only when the call's own
@@ -380,6 +385,10 @@ mod tests {
     /// question — `true` only for a tool whose mapped level is
     /// `agent_decides`; a `None` profile and every other level are
     /// `false`, so their declarations ship unchanged.
+    /// `ask_user_question` is `false` even AT `agent_decides`: its
+    /// own card is the ask and `evaluate` allows before the flag
+    /// check, so a required `safety` argument there would be
+    /// injected for nothing.
     #[test]
     fn is_agent_decided_marks_only_agent_decides_tools() {
         let profile = ExecutionProfile {
@@ -401,6 +410,11 @@ mod tests {
         assert!(!is_agent_decided(None, "read_files"));
         let profile = profile_with("read_files", Some(PermissionLevel::AlwaysAllow));
         assert!(!is_agent_decided(Some(&profile), "read_files"));
+        // The ask card IS the ask — a `safety` flag on
+        // `ask_user_question` would be a required argument nothing
+        // ever reads.
+        let profile = profile_with(ASK_USER_QUESTION, Some(PermissionLevel::AgentDecides));
+        assert!(!is_agent_decided(Some(&profile), ASK_USER_QUESTION));
     }
 
     /// The denial text names the profile that refused — the model
