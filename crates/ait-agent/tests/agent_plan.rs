@@ -372,7 +372,12 @@ fn each_call_emits_a_whole_new_snapshot() {
 fn an_empty_list_clears_the_plan() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fixture = Fixture::serve(vec![
-        sse(&chat_tool_turn(0, "call_1", "update_plan", r#"{"todos":[]}"#)),
+        sse(&chat_tool_turn(
+            0,
+            "call_1",
+            "update_plan",
+            r#"{"todos":[]}"#,
+        )),
         sse(&chat_text_turn("done")),
     ]);
     let session = session();

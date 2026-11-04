@@ -856,10 +856,7 @@ pub(crate) fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel
     // the conversation scrolls beneath. The cap keeps a long plan
     // from crowding the scrollback out of the panel.
     let available = usize::from(input_y - (inner.y + 1)).saturating_sub(prompt_rows);
-    let block = plan_lines(
-        &panel.plan,
-        PLAN_BLOCK_MAX.min(available.saturating_sub(1)),
-    );
+    let block = plan_lines(&panel.plan, PLAN_BLOCK_MAX.min(available.saturating_sub(1)));
     let plan_rows = block.len() as u16;
     for (index, (text, style)) in block.iter().enumerate() {
         let y = inner.y + 1 + index as u16;
@@ -929,7 +926,10 @@ fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<(String, Style)> {
     if plan.is_empty() || cap < 3 {
         return Vec::new();
     }
-    let mut lines = vec![(String::from(" plan"), Style::default().fg(RtColor::DarkGray))];
+    let mut lines = vec![(
+        String::from(" plan"),
+        Style::default().fg(RtColor::DarkGray),
+    )];
     // `cap - 2` todo rows at most — one for the header, one for the
     // separator/overflow row.
     let visible = (cap - 2).min(plan.len());

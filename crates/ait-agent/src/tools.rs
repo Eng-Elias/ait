@@ -935,10 +935,12 @@ mod tests {
             arguments: args.into(),
         };
         assert_eq!(
-            summarize_args(&call(r#"{"todos":[
+            summarize_args(&call(
+                r#"{"todos":[
                 {"content":"a","status":"done"},
                 {"content":"b","status":"pending"}
-            ]}"#)),
+            ]}"#
+            )),
             "2 todos"
         );
         assert_eq!(

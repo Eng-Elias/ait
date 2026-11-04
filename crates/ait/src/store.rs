@@ -166,9 +166,7 @@ impl StoreHandle {
         let Ok(payload) = serde_json::to_string(item) else {
             return;
         };
-        self.write(toast, |store| {
-            store.upsert_plan(conversation_id, &payload)
-        });
+        self.write(toast, |store| store.upsert_plan(conversation_id, &payload));
     }
 
     /// The per-drain batch: every `(session id, sealed block)` pair in

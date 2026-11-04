@@ -548,7 +548,10 @@ fn update_plan_pins_the_block_and_upserts_the_latest_snapshot() {
     let store = open_store(data.path());
     let id = store.list_conversations().expect("list conversations")[0].id;
     // The `plans` row holds ONLY the latest snapshot.
-    let payload = store.load_plan(id).expect("load the plan").expect("a plans row");
+    let payload = store
+        .load_plan(id)
+        .expect("load the plan")
+        .expect("a plans row");
     let plan: TranscriptItem = serde_json::from_str(&payload).expect("payload deserializes");
     assert_eq!(
         plan,
