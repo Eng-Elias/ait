@@ -585,9 +585,8 @@ mod tests {
         };
         let governed = ["read_files", "grep", "glob"];
 
-        let ToolDecls::Chat(tools) =
-            declare(EndpointSchema::OpenAiChatCompletions, Some(&profile))
-        else {
+        let decls = declare(EndpointSchema::OpenAiChatCompletions, Some(&profile));
+        let ToolDecls::Chat(tools) = decls else {
             panic!("chat decls")
         };
         for tool in &tools {
@@ -622,9 +621,8 @@ mod tests {
             }
         }
 
-        let ToolDecls::Responses(tools) =
-            declare(EndpointSchema::OpenAiResponses, Some(&profile))
-        else {
+        let decls = declare(EndpointSchema::OpenAiResponses, Some(&profile));
+        let ToolDecls::Responses(tools) = decls else {
             panic!("responses decls")
         };
         let grep = tools.iter().find(|t| t.name == "grep").unwrap();
@@ -639,9 +637,8 @@ mod tests {
         let run = tools.iter().find(|t| t.name == "run_command").unwrap();
         assert_eq!(run.parameters["properties"]["safety"], serde_json::Value::Null);
 
-        let ToolDecls::Anthropic(tools) =
-            declare(EndpointSchema::AnthropicMessages, Some(&profile))
-        else {
+        let decls = declare(EndpointSchema::AnthropicMessages, Some(&profile));
+        let ToolDecls::Anthropic(tools) = decls else {
             panic!("anthropic decls")
         };
         let read = tools.iter().find(|t| t.name == "read_files").unwrap();
