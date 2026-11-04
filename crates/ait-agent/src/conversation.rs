@@ -460,13 +460,13 @@ impl Conversation {
     }
 }
 
-/// `INTERRUPTED_RESULT` (re-exported by the crate root from
-/// `transcript`) is the synthetic result a `tool_call` with no
-/// recorded `tool_result` gains on replay (Spec R08 us-9): a crash
-/// mid-run, or an approve/ask card parked when the session ended.
-/// Anthropic hard-requires every `tool_use` to pair with a
-/// `tool_result`, and the text tells the model why the call
-/// produced nothing.
+// `INTERRUPTED_RESULT` (re-exported by the crate root from
+// `transcript`) is the synthetic result a `tool_call` with no
+// recorded `tool_result` gains on replay (Spec R08 us-9): a crash
+// mid-run, or an approve/ask card parked when the session ended.
+// Anthropic hard-requires every `tool_use` to pair with a
+// `tool_result`, and the text tells the model why the call
+// produced nothing.
 
 /// The label on a `summary` marker's injected text — context about
 /// the earlier conversation, not a fresh user instruction.
