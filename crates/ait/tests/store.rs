@@ -397,7 +397,10 @@ fn agent_tasks_leave_a_transcript_and_the_second_appends() {
         "titled from the first task"
     );
     assert_eq!(conversation.cwd, spawn_cwd.to_string_lossy());
-    assert_eq!(conversation.status, "open");
+    assert_eq!(
+        conversation.status, "closed",
+        "the app exit closed the row (open only while a tab owns it)"
+    );
 
     let rows = store
         .load_transcript(conversation.id)

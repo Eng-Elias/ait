@@ -548,8 +548,7 @@ impl Tab {
 
     /// This tab's `conversations` row id, if a transcript flush has
     /// created one (Spec R08-T3) — what `transcript_items` rows and
-    /// `plans` upserts key on.
-    #[allow(dead_code)] // T6's picker reads it; the flush writes it
+    /// `plans` upserts key on, and what `status` closes on.
     pub fn conversation(&self) -> Option<i64> {
         self.conversation
     }

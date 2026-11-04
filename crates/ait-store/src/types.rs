@@ -16,7 +16,8 @@ pub struct Conversation {
     pub title: String,
     /// The working directory the conversation ran in.
     pub cwd: String,
-    /// Opaque lifecycle tag the caller owns ("running", "done", …).
+    /// Opaque lifecycle tag the caller owns — the `ait` binary
+    /// writes `"open"` while a tab is bound and `"closed"` after.
     pub status: String,
     /// When the row was created.
     pub created_at: SystemTime,

@@ -19,6 +19,14 @@ use ait_store::{
 use crate::blocks::PersistedBlock;
 use crate::status::Toast;
 
+/// The `conversations.status` vocabulary this handle owns (Spec
+/// R08): `"open"` while a tab is bound to the row, `"closed"` when
+/// the owning tab closed or the app exited — the same boundaries
+/// `terminal_sessions.ended_at` marks. A closed row still lists and
+/// resumes; resume re-opens it.
+const STATUS_OPEN: &str = "open";
+const STATUS_CLOSED: &str = "closed";
+
 /// The frontend-owned store handle. `inner: None` is an unpersisted
 /// run — the terminal works exactly as before and a toast already
 /// said why; it is reached on open failure and in every test that
@@ -114,9 +122,11 @@ impl StoreHandle {
     /// The `conversations` row a tab's first task creates (Spec
     /// R08-T3) — the caller binds the returned id to the tab
     /// (`Tab::set_conversation`) so every later task appends to the
-    /// same row. `status` opens as `"open"`: the picker/resume
-    /// lifecycle vocabulary is the caller's to own, and nothing
-    /// closes a conversation yet.
+    /// same row. `status` opens as `"open"` — the handle owns the
+    /// lifecycle vocabulary: `"open"` while a tab is bound,
+    /// [`conversation_closed`](Self::conversation_closed) /
+    /// [`conversation_reopened`](Self::conversation_reopened)
+    /// transition it after.
     pub fn conversation_started(
         &mut self,
         toast: &mut Option<Toast>,
@@ -127,10 +137,26 @@ impl StoreHandle {
             store.create_conversation(NewConversation {
                 title,
                 cwd: &cwd.to_string_lossy(),
-                status: "open",
+                status: STATUS_OPEN,
             })
         })
         .map(|conversation| conversation.id)
+    }
+
+    /// `status` → `"closed"` — the owning tab closed or the app
+    /// exited (the same places `terminal_sessions.ended_at` gets
+    /// stamped). A closed row can still list and resume.
+    pub fn conversation_closed(&mut self, toast: &mut Option<Toast>, id: i64) {
+        self.write(toast, |store| {
+            store.set_conversation_status(id, STATUS_CLOSED)
+        });
+    }
+
+    /// `status` → `"open"` — a resume re-bound the row to a live tab.
+    pub fn conversation_reopened(&mut self, toast: &mut Option<Toast>, id: i64) {
+        self.write(toast, |store| {
+            store.set_conversation_status(id, STATUS_OPEN)
+        });
     }
 
     /// One drain's worth of [`TranscriptItem`]s appended in the
@@ -445,6 +471,33 @@ mod tests {
                 text: "fix the tests".into()
             }
         );
+    }
+
+    /// The `status` lifecycle (Spec R08): a row opens `"open"`,
+    /// closes with its owning tab (or the app) and re-opens on
+    /// resume — all through the handle's verbs.
+    #[test]
+    fn the_status_lifecycle_opens_closes_and_reopens() {
+        let (_dir, mut handle) = handle();
+        let mut toast = None;
+        let id = handle
+            .conversation_started(&mut toast, "lifecycle", Path::new("/w"))
+            .expect("the conversation insert lands");
+
+        let status = |handle: &StoreHandle| {
+            handle
+                .conversations()
+                .unwrap()
+                .iter()
+                .find(|row| row.conversation.id == id)
+                .map(|row| row.conversation.status.clone())
+        };
+        assert_eq!(status(&handle).as_deref(), Some("open"));
+        handle.conversation_closed(&mut toast, id);
+        assert_eq!(status(&handle).as_deref(), Some("closed"));
+        handle.conversation_reopened(&mut toast, id);
+        assert_eq!(status(&handle).as_deref(), Some("open"));
+        assert!(toast.is_none(), "a healthy store never toasts");
     }
 
     /// Spec R08-T5/us-17: each `update_plan` snapshot replaces the
