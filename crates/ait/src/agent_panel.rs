@@ -247,7 +247,6 @@ impl AgentPanel {
     /// The whole accumulated transcript — the items a resumed tab's
     /// next `AgentRequest.prior` hands the worker for in-tab
     /// continuity (R08-T4).
-    #[allow(dead_code)] // T4's prior hand-off; nothing consumes it yet
     pub(crate) fn transcript_items(&self) -> &[ait_agent::TranscriptItem] {
         self.transcript.items()
     }
@@ -1163,6 +1162,7 @@ mod tests {
                     os: "test".into(),
                     output_lines: Vec::new(),
                 },
+                prior: Vec::new(),
                 bridge: None,
             },
             &mut toast,
@@ -1234,6 +1234,7 @@ mod tests {
                     os: "test".into(),
                     output_lines: Vec::new(),
                 },
+                prior: Vec::new(),
                 bridge: None,
             },
             &mut toast,

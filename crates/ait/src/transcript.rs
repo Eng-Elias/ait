@@ -142,7 +142,6 @@ impl Transcript {
 
     /// The whole accumulated transcript — what a resumed tab's next
     /// `AgentRequest.prior` hands the worker (R08-T4).
-    #[allow(dead_code)] // T4's prior hand-off; nothing consumes it yet
     pub(crate) fn items(&self) -> &[TranscriptItem] {
         &self.items
     }
