@@ -37,7 +37,10 @@
 //! of the task*, or *deny* (the denial text becomes the tool
 //! result), and `Deny` refuses the call outright — a
 //! `"denied by execution profile <name>"` text becomes the tool
-//! result and the card renders `Denied`. Prompts never time out
+//! result and the card renders `Denied`. `agent_decides` tools
+//! declare a required `safety` argument the model fills in per call
+//! (R07-T2) — `"safe"` allows, `"unsafe"`/absent/malformed asks.
+//! Prompts never time out
 //! (us-9); Esc still cancels the whole task, and
 //! `ask_user_question` at a non-`never` level keeps its exemption
 //! by design — its own card is the ask (us-10): a call to it
@@ -542,16 +545,8 @@ fn serve(
         &request.context,
         find_agents_md(Path::new(&request.context.cwd)).as_deref(),
     );
-    let mut conversation = Conversation::new(endpoint.schema());
-    conversation.push_user(request.task);
-    // Steering that queued while the worker was idle joins this task's
-    // conversation rather than being dropped.
-    drain_steering(steering, &mut conversation);
-    // The task's file tools bind to the session's cwd — every path
-    // they touch stays under it (Spec R06's confinement rule).
-    let cwd = ToolCwd::new(&request.context.cwd);
     // The §5.7 stance the permission engine consults on every tool
-    // call — the task's active profile missing, renamed or never
+    // call — the task's armed profile missing, renamed or never
     // declared resolves to `None`, and the engine's fail-safe asks
     // for every call (the Round 6 interim gate verbatim).
     let profile = request
@@ -559,6 +554,17 @@ fn serve(
         .agents
         .execution_profiles
         .get(request.profile.as_str());
+    // `declare` is profile-aware: the `agent_decides` tools of this
+    // stance gain the required `safety` argument in their schemas
+    // (R07-T2) — per task, so a profile change applies next task.
+    let mut conversation = Conversation::new(endpoint.schema(), profile);
+    conversation.push_user(request.task);
+    // Steering that queued while the worker was idle joins this task's
+    // conversation rather than being dropped.
+    drain_steering(steering, &mut conversation);
+    // The task's file tools bind to the session's cwd — every path
+    // they touch stays under it (Spec R06's confinement rule).
+    let cwd = ToolCwd::new(&request.context.cwd);
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
