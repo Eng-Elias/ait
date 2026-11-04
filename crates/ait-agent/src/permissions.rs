@@ -8,9 +8,11 @@
 //! In scope this ticket: the tool → profile-field mapping, the
 //! `always_allow`/`always_ask`/`never` levels and the
 //! `ask_user_question` special case (any non-`never` level behaves
-//! as before — its own card IS the ask). `agent_decides` and
-//! `ask_on_first_write` degrade to `always_ask` until the safety
-//! flag (T2) and the first-write memory (T5) land; the command and
+//! as before — its own card IS the ask), plus T5's
+//! `ask_on_first_write`: the first gated call asks a *first-write*
+//! ask — an allow verdict covers the tool for the rest of the task,
+//! a deny answers that call only. `agent_decides` still degrades to
+//! `always_ask` until the safety flag (T2) lands; the command and
 //! directory allow/deny lists stay parsed-but-unconsumed (T3/T4);
 //! `mcp_*` fields and `context_window_limit` stay inert (Rounds
 //! 10/8).
@@ -33,8 +35,14 @@ pub(crate) enum Verdict {
     Allow,
     /// Park on the three-option approve card — *allow once*,
     /// *allow this tool for the rest of the task*, *deny* — exactly
-    /// as the interim gate behaved.
-    Ask,
+    /// as the interim gate behaved. `first_write` marks the
+    /// `ask_on_first_write` ask (us-11/12): under it *either* allow
+    /// verdict consents to the tool for the rest of the task — the
+    /// first write's allow IS the interactive session's consent —
+    /// so the gate records the tool into the task memory on
+    /// *allow once* too. A deny records nothing either way: the
+    /// next call asks again.
+    Ask { first_write: bool },
     /// Refuse outright: the text becomes the call's tool result and
     /// the card renders `Denied`, so the model reads the refusal and
     /// can tell the user to switch profiles. The tool stays declared.
@@ -50,13 +58,15 @@ pub(crate) enum Verdict {
 /// *allow this tool for the rest of the task* verdicts populate —
 /// per tool name, never blanket (us-7).
 ///
-/// Decision order (R07-T1): `never` denies first — the hard floor no
-/// verdict memory crosses; `ask_user_question` at a non-`never`
+/// Decision order (R07-T1/T5): `never` denies first — the hard floor
+/// no verdict memory crosses; `ask_user_question` at a non-`never`
 /// level allows through to its own card; an allow-for-task memory
-/// allows; then the mapped level decides — `always_allow` allows,
-/// everything else asks (`always_ask`, an unset field, an unmapped
-/// tool name, and `agent_decides`/`ask_on_first_write` degrading
-/// until their consumers land).
+/// allows — which under `ask_on_first_write` is also what an
+/// *allow once* on the first-write ask recorded; then the mapped
+/// level decides — `always_allow` allows, everything else asks
+/// (`always_ask`, an unset field, an unmapped tool name, and
+/// `agent_decides` degrading until T2 lands — the `first_write`
+/// flag marking only the `ask_on_first_write` ask).
 pub(crate) fn evaluate(
     profile: Option<&ExecutionProfile>,
     profile_name: &str,
@@ -77,7 +87,8 @@ pub(crate) fn evaluate(
     }
     match level {
         Some(PermissionLevel::AlwaysAllow) => Verdict::Allow,
-        _ => Verdict::Ask,
+        Some(PermissionLevel::AskOnFirstWrite) => Verdict::Ask { first_write: true },
+        _ => Verdict::Ask { first_write: false },
     }
 }
 
@@ -146,8 +157,9 @@ mod tests {
     /// The full level × tool matrix: `always_allow` runs, `never`
     /// denies with the profile's name, `ask_user_question` reaches
     /// its own card on every non-`never` level — and the rest ask.
-    /// `agent_decides`, `ask_on_first_write` and unset fields all
-    /// degrade to ask (T2/T5 land their semantics).
+    /// `ask_on_first_write` asks a *first-write* ask on every field
+    /// the level lands on — the semantics are uniform; `agent_decides`
+    /// and unset fields degrade to a plain ask (T2 lands the flag).
     #[test]
     fn the_level_by_tool_matrix() {
         let gated = [
@@ -162,10 +174,19 @@ mod tests {
         for tool in gated {
             for (level, expected) in [
                 (Some(PermissionLevel::AlwaysAllow), Verdict::Allow),
-                (Some(PermissionLevel::AlwaysAsk), Verdict::Ask),
-                (Some(PermissionLevel::AgentDecides), Verdict::Ask),
-                (Some(PermissionLevel::AskOnFirstWrite), Verdict::Ask),
-                (None, Verdict::Ask),
+                (
+                    Some(PermissionLevel::AlwaysAsk),
+                    Verdict::Ask { first_write: false },
+                ),
+                (
+                    Some(PermissionLevel::AgentDecides),
+                    Verdict::Ask { first_write: false },
+                ),
+                (
+                    Some(PermissionLevel::AskOnFirstWrite),
+                    Verdict::Ask { first_write: true },
+                ),
+                (None, Verdict::Ask { first_write: false }),
                 (
                     Some(PermissionLevel::Never),
                     Verdict::Deny(String::from("denied by execution profile default")),
@@ -236,7 +257,7 @@ mod tests {
         ] {
             assert_eq!(
                 evaluate(None, "default", &call(tool), &empty),
-                Verdict::Ask,
+                Verdict::Ask { first_write: false },
                 "{tool} under no profile"
             );
         }
@@ -259,8 +280,60 @@ mod tests {
         );
         assert_eq!(
             evaluate(Some(&profile), "default", &call("grep"), &memory),
-            Verdict::Ask
+            Verdict::Ask { first_write: false }
         );
+    }
+
+    /// The `ask_on_first_write` state machine (us-11/12): the first
+    /// gated call asks a *first-write* ask — the ask the gate records
+    /// an allow verdict of either kind against; once the tool name is
+    /// in the task memory the level never asks again; a deny records
+    /// nothing, so the next call asks a first-write ask again (the
+    /// model is not locked out by one refusal).
+    #[test]
+    fn ask_on_first_write_first_ask_allow_covers_deny_reasks() {
+        let profile = profile_with("write_to_pty", Some(PermissionLevel::AskOnFirstWrite));
+        let empty = HashSet::new();
+        assert_eq!(
+            evaluate(Some(&profile), "default", &call("write_to_pty"), &empty),
+            Verdict::Ask { first_write: true },
+            "the first gated call asks"
+        );
+        let mut memory = HashSet::new();
+        memory.insert(String::from("write_to_pty"));
+        assert_eq!(
+            evaluate(Some(&profile), "default", &call("write_to_pty"), &memory),
+            Verdict::Allow,
+            "an allow's memory covers the rest of the task"
+        );
+        // A deny never inserts — the state after one is `empty` again.
+        assert_eq!(
+            evaluate(Some(&profile), "default", &call("write_to_pty"), &empty),
+            Verdict::Ask { first_write: true },
+            "a denied call asks again next time"
+        );
+    }
+
+    /// `first_write` marks only the `ask_on_first_write` ask: an
+    /// *allow once* on an `always_ask` call — or on a call whose
+    /// profile resolves to nothing — must stay once, so a plain ask
+    /// never records the covering memory.
+    #[test]
+    fn only_the_first_write_ask_carries_the_flag() {
+        for tool in ["run_command", "read_files", "edit_files", "write_to_pty"] {
+            for level in [
+                Some(PermissionLevel::AlwaysAsk),
+                Some(PermissionLevel::AgentDecides),
+                None,
+            ] {
+                let profile = profile_with(tool, level);
+                assert_eq!(
+                    evaluate(Some(&profile), "default", &call(tool), &HashSet::new()),
+                    Verdict::Ask { first_write: false },
+                    "{tool} at {level:?} is a plain ask — allow-once stays once"
+                );
+            }
+        }
     }
 
     /// `never` is the floor: even an allow-for-task memory cannot
@@ -292,7 +365,7 @@ mod tests {
                 &call("some_future_mcp_tool"),
                 &HashSet::new()
             ),
-            Verdict::Ask
+            Verdict::Ask { first_write: false }
         );
     }
 
@@ -317,7 +390,7 @@ mod tests {
         let empty = HashSet::new();
         assert_eq!(
             evaluate(Some(&profile), "default", &call("run_command"), &empty),
-            Verdict::Ask,
+            Verdict::Ask { first_write: false },
             "the lists must not relax or tighten a call in T1"
         );
         let profile = ExecutionProfile {
