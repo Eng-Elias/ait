@@ -313,12 +313,20 @@ pub fn run() -> io::Result<ExitCode> {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: load_error
-            .map(|text| Toast::new(format!("config error: {text}"), Instant::now()))
-            .or_else(|| {
-                store_error
-                    .map(|text| Toast::new(format!("store unavailable: {text}"), Instant::now()))
-            }),
+        toast: {
+            // Both failures can land on one launch — the store's
+            // signal must surface even when a config error already
+            // toasted, so they share the line.
+            let failures: Vec<String> = [
+                load_error.map(|text| format!("config error: {text}")),
+                store_error.map(|text| format!("store unavailable: {text}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (!failures.is_empty())
+                .then(|| Toast::new(failures.join(" · "), Instant::now()))
+        },
         config,
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
