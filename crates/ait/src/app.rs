@@ -970,8 +970,13 @@ fn drain_config_events(
         match event {
             Ok(settings) => {
                 tabs.set_session_template(config::session_template(&settings.terminal));
-                let vanished = profile::active_missing(&settings, &state.profile)
-                    .then(|| state.profile.clone());
+                // The OLD declared names decide "deleted" vs
+                // "never declared" — an armed `default` deleted
+                // with the whole table toasts; one that never was
+                // stays silent (us-28).
+                let vanished =
+                    profile::active_missing(state.config.settings(), &settings, &state.profile)
+                        .then(|| state.profile.clone());
                 state.config = LiveSettings::adopt(settings);
                 state.picker = None;
                 if let Some(name) = vanished {
@@ -2175,6 +2180,49 @@ base_model = "key-1"
             toast.text().contains("\"work\""),
             "the toast names the missing profile: {}",
             toast.text()
+        );
+    }
+
+    /// The whole-table deletion under an armed `default` (us-28): a
+    /// `default` the OLD file declared is gone from the new one — a
+    /// deletion the new file alone cannot distinguish from
+    /// never-declared, so the drain reads the old settings before
+    /// adopting. A `default` that was never declared stays silent:
+    /// armed-but-never-existed is not a deletion.
+    #[test]
+    fn a_reload_deleting_a_declared_default_toasts() {
+        let mut harness = Harness::new(manager());
+        let (tx, rx) = std::sync::mpsc::channel();
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml("[agents.execution_profiles.default]\n").unwrap(),
+        );
+
+        tx.send(Ok(Settings::default())).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        assert_eq!(
+            harness.state.profile, "default",
+            "the selection is never rewritten"
+        );
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("a declared default deleted with the table toasts");
+        assert!(
+            toast.text().contains("\"default\""),
+            "the toast names the missing profile: {}",
+            toast.text()
+        );
+
+        // The same empty-table reload against a file that never
+        // declared `default`: no profile was ever lost, so no toast.
+        let mut harness = Harness::new(manager());
+        tx.send(Ok(Settings::default())).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+        assert!(
+            harness.state.toast.is_none(),
+            "a never-declared default is the profile-less steady state"
         );
     }
 

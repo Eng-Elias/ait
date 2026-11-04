@@ -59,16 +59,25 @@ pub fn status_slot(active: &str) -> Option<&str> {
 }
 
 /// The reload fail-safe's toast condition (Spec R07 us-28): the armed
-/// name resolves to nothing under the freshly adopted `settings`, so
-/// every subsequent tool call asks — the Round 6 interim gate the
-/// worker evaluates a missing profile as. An entirely absent
-/// `execution_profiles` table only counts when the armed name is not
-/// `default`: a user who never declared a profile sits on the same
+/// name resolves to nothing under the freshly adopted `new` settings,
+/// so every subsequent tool call asks — the Round 6 interim gate the
+/// worker evaluates a missing profile as. `old` is the previous
+/// last-good: a name it declared that `new` no longer does is a real
+/// deletion and toasts — `default` included, since an entirely
+/// absent `execution_profiles` table cannot tell "deleted" from
+/// "never declared" on its own. When `old` never declared the name
+/// either, an empty new table only counts against a non-`default`
+/// armed name: a user who never declared a profile sits on the same
 /// fail-safe they always had, and toasting it on every save would
 /// cry wolf.
-pub fn active_missing(settings: &Settings, active: &str) -> bool {
-    let profiles = &settings.agents.execution_profiles;
-    !profiles.contains_key(active) && (!profiles.is_empty() || active != DEFAULT_PROFILE)
+pub fn active_missing(old: &Settings, new: &Settings, active: &str) -> bool {
+    let new_profiles = &new.agents.execution_profiles;
+    if new_profiles.contains_key(active) {
+        return false;
+    }
+    old.agents.execution_profiles.contains_key(active)
+        || !new_profiles.is_empty()
+        || active != DEFAULT_PROFILE
 }
 
 /// The open switcher (Spec R07 us-23): the declared names and the
@@ -195,26 +204,38 @@ mod tests {
             "[agents.execution_profiles.default]\n[agents.execution_profiles.work]\n",
         )
         .unwrap();
-        assert!(!active_missing(&declared, "work"));
-        assert!(!active_missing(&declared, DEFAULT_PROFILE));
+        assert!(!active_missing(&declared, &declared, "work"));
+        assert!(!active_missing(&declared, &declared, DEFAULT_PROFILE));
 
         let renamed = Settings::from_toml("[agents.execution_profiles.other]\n").unwrap();
         assert!(
-            active_missing(&renamed, "work"),
+            active_missing(&declared, &renamed, "work"),
             "the armed name is gone while others remain"
         );
         assert!(
-            active_missing(&renamed, DEFAULT_PROFILE),
+            active_missing(&declared, &renamed, DEFAULT_PROFILE),
             "default counts too when profiles exist without it"
         );
 
-        // Zero declared profiles: `default` armed is the same
-        // ask-everything fail-safe a profile-less user always had —
-        // silent. A user-picked name armed against an empty table
-        // means its whole section was deleted — that toasts.
+        // Zero declared profiles in the NEW file: the OLD file is
+        // what tells "the whole table was deleted" from "nothing was
+        // ever declared". An armed `default` that WAS declared
+        // toasts its deletion; a `default` that never was stays
+        // silent — a profile-less user sits on the same
+        // ask-everything fail-safe they always had, and toasting on
+        // every save would cry wolf. A user-picked name armed
+        // against an empty table toasts either way.
         let bare = Settings::default();
-        assert!(!active_missing(&bare, DEFAULT_PROFILE));
-        assert!(active_missing(&bare, "work"));
+        assert!(
+            active_missing(&declared, &bare, DEFAULT_PROFILE),
+            "a declared default deleted with the whole table toasts"
+        );
+        assert!(
+            !active_missing(&bare, &bare, DEFAULT_PROFILE),
+            "a never-declared default is not a deletion"
+        );
+        assert!(active_missing(&bare, &bare, "work"));
+        assert!(active_missing(&declared, &bare, "work"));
     }
 
     /// The picker opens on the armed name, wraps both directions, and
