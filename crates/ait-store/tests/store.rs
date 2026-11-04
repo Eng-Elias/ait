@@ -320,6 +320,102 @@ fn sessions_and_blocks_survive_reopen() {
     assert_eq!(blocks[1].ended_at, None);
 }
 
+/// A drain's worth of sealed blocks lands in ONE transaction: per-
+/// session `seq` continues across batches, and a batch spanning two
+/// sessions numbers each against its own session (Spec R08 — "writes
+/// batched per drain in one transaction").
+#[test]
+fn insert_blocks_batches_per_session_seqs() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).unwrap();
+    let first = store.insert_terminal_session("bash", "/w").unwrap();
+    let second = store.insert_terminal_session("zsh", "/w").unwrap();
+    let block = |session_id: i64, command: &str| NewBlock {
+        session_id,
+        command: command.to_owned(),
+        exit: Some(0),
+        duration: Some(Duration::from_millis(3)),
+        started_at: None,
+        ended_at: None,
+    };
+
+    // One batch spanning both sessions.
+    store
+        .insert_blocks(&[
+            block(first.id, "a1"),
+            block(second.id, "b1"),
+            block(first.id, "a2"),
+        ])
+        .unwrap();
+    // A later batch continues each session's numbering — the frontend
+    // never tracks seq itself.
+    store.insert_blocks(&[block(first.id, "a3")]).unwrap();
+
+    let a_blocks = store.list_blocks(first.id).unwrap();
+    let a: Vec<_> = a_blocks
+        .iter()
+        .map(|b| (b.seq, b.command.as_str()))
+        .collect();
+    assert_eq!(a, vec![(0, "a1"), (1, "a2"), (2, "a3")]);
+    let b_blocks = store.list_blocks(second.id).unwrap();
+    let b: Vec<_> = b_blocks
+        .iter()
+        .map(|b| (b.seq, b.command.as_str()))
+        .collect();
+    assert_eq!(b, vec![(0, "b1")]);
+}
+
+/// An empty batch is a no-op; a dangling `session_id` fails the whole
+/// batch atomically — foreign_keys=ON turns it into an error, and the
+/// one transaction means earlier rows of the same batch don't land
+/// half-written.
+#[test]
+fn insert_blocks_is_atomic_and_empty_is_a_noop() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).unwrap();
+    let session = store.insert_terminal_session("bash", "/w").unwrap();
+    let block = |session_id: i64| NewBlock {
+        session_id,
+        command: "c".to_owned(),
+        exit: None,
+        duration: None,
+        started_at: None,
+        ended_at: None,
+    };
+
+    store.insert_blocks(&[]).unwrap();
+    assert!(store
+        .insert_blocks(&[block(session.id), block(999)])
+        .is_err());
+    assert!(
+        store.list_blocks(session.id).unwrap().is_empty(),
+        "the valid row rolled back with the batch"
+    );
+}
+
+/// Every `terminal_sessions` row, oldest first — the read side that
+/// lets tests observe session persistence (the `list_blocks`
+/// precedent).
+#[test]
+fn list_terminal_sessions_returns_every_row() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).unwrap();
+    assert!(store.list_terminal_sessions().unwrap().is_empty());
+    let first = store.insert_terminal_session("bash", "/w").unwrap();
+    let second = store.insert_terminal_session("sh", "/tmp").unwrap();
+    store.finish_terminal_session(first.id).unwrap();
+
+    let sessions = store.list_terminal_sessions().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].id, first.id);
+    assert_eq!(sessions[0].shell, "bash");
+    assert_eq!(sessions[0].cwd, "/w");
+    assert!(sessions[0].ended_at.is_some());
+    assert_eq!(sessions[1].id, second.id);
+    assert_eq!(sessions[1].shell, "sh");
+    assert!(sessions[1].ended_at.is_none());
+}
+
 #[test]
 fn finish_terminal_session_stamps_ended_at() {
     let (_dir, path) = temp_db();
