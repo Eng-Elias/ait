@@ -1143,10 +1143,18 @@ fn picker_key(key: &KeyEvent, state: &mut AppState) {
 /// Arm a newly chosen execution profile (Spec R07 §5.7): the name is
 /// the active stance from the NEXT `AgentRequest`/`SuggestRequest`
 /// onward — nothing persists it, nothing rewrites an in-flight
-/// request. `default` needs no announcement (the status slot hides
-/// it); a non-default arm confirms itself in the new status slot, so
-/// no toast either way.
+/// request — and a real change confirms itself with the spec's
+/// *profile switched* toast (us-23). Re-arming the already-active
+/// name — the picker's Enter on the highlighted row — switches
+/// nothing, so it stays silent.
 fn activate_profile(state: &mut AppState, name: String) {
+    if name == state.profile {
+        return;
+    }
+    state.toast = Some(Toast::new(
+        format!("execution profile switched to \"{name}\""),
+        Instant::now(),
+    ));
     state.profile = name;
 }
 
@@ -1991,7 +1999,8 @@ base_model = "key-1"
 
     /// Exactly two declared profiles: `Alt+P` arms the other one
     /// directly — no picker ever appears — and pressing again cycles
-    /// straight back (us-23).
+    /// straight back (us-23). Each real switch confirms itself with
+    /// the spec's *profile switched* toast.
     #[test]
     fn alt_p_cycles_between_two_profiles() {
         let mut harness = Harness::new(manager());
@@ -2006,11 +2015,30 @@ base_model = "key-1"
         harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
         assert_eq!(harness.state.profile, "work");
         assert!(harness.state.picker.is_none(), "two profiles never pick");
-        assert!(harness.state.toast.is_none(), "a real switch stays silent");
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("a real switch toasts");
+        assert!(
+            toast.text().contains("\"work\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
 
         harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
         assert_eq!(harness.state.profile, "default");
         assert!(harness.state.picker.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("cycling back toasts too");
+        assert!(
+            toast.text().contains("\"default\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
     }
 
     /// Three or more open the picker (us-23): the armed name starts
@@ -2060,12 +2088,23 @@ base_model = "key-1"
         assert!(harness.state.picker.is_none());
         assert_eq!(harness.state.profile, "default");
 
-        // Enter arms the highlighted name and closes.
+        // Enter arms the highlighted name and closes — the switch
+        // toasts the armed name.
         harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
         harness.handle(key(KeyCode::Down, KeyModifiers::NONE));
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(harness.state.picker.is_none());
         assert_eq!(harness.state.profile, "scratch");
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the picker's switch toasts");
+        assert!(
+            toast.text().contains("\"scratch\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
 
         // `Alt+P` while open toggles the picker away — like `Alt+A`
         // closes the focused panel.
@@ -2076,6 +2115,17 @@ base_model = "key-1"
         assert_eq!(
             harness.state.profile, "scratch",
             "the toggle changes nothing"
+        );
+
+        // Enter on the already-armed row switches nothing, so no
+        // fresh toast fires.
+        harness.state.toast = None;
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(harness.state.profile, "scratch");
+        assert!(
+            harness.state.toast.is_none(),
+            "re-arming the armed name stays silent"
         );
     }
 
