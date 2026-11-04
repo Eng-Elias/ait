@@ -1034,3 +1034,218 @@ coding_model = "coding-key"
     }
     fixture.assert_no_more_requests();
 }
+
+/// A `command_denylist` hit refuses `run_command` exactly like a
+/// `never` level — even at `always_allow` (Spec R07's order:
+/// `never` → denylist → allowlist → level). The card opens then
+/// flips `Denied`, nothing reaches the executor, and the
+/// `"denied by execution profile <name>"` text is the tool result
+/// the model reads in the next request.
+#[test]
+fn a_denylisted_command_denies_even_at_always_allow() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"rm -rf note.txt"}"#,
+        )])),
+        sse(&chat_text_turn("understood, using read_files instead")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_allow\"\ncommand_denylist = ['^rm']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // No approve card: the profile's verdict is `Deny`, so the call
+    // opens a plain card…
+    match next(&session) {
+        AgentEvent::ToolCall { call, .. } => {
+            assert_eq!(
+                (call.id.as_str(), call.name.as_str()),
+                ("call_1", "run_command")
+            )
+        }
+        other => panic!("expected the denied call's card, got {other:?}"),
+    }
+    let events = collect(&session);
+    // …which the `Denied` update flips immediately — and nothing
+    // ever ran.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail: Some(detail),
+            } if call_id == "call_1" && detail == "denied by execution profile default"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                status: ToolStatus::Running,
+                ..
+            }
+        )),
+        "a denied call never runs: {events:?}"
+    );
+    assert!(no_approval(&events));
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The refusal text IS the tool result in the next request.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second.body.contains("denied by execution profile default"),
+        "{}",
+        second.body
+    );
+    assert!(
+        !second.body.contains("no live shell"),
+        "the call never reached the executor: {}",
+        second.body
+    );
+}
+
+/// A `command_allowlist` hit runs `run_command` without asking —
+/// even at `always_ask` — opening a `Running` card straight to the
+/// executor, whose result text re-enters the conversation as the
+/// tool result.
+#[test]
+fn an_allowlisted_command_runs_without_asking() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"ls -la"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_ask\"\ncommand_allowlist = ['^ls']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    assert_eq!(until_tool_call(&session), "call_1");
+    let events = collect(&session);
+    assert!(
+        no_approval(&events),
+        "an allowlisted command never parks on the card: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The call reached the executor — the no-bridge tier's
+    // `Unbound` text is the tool result the second request carries.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second
+            .body
+            .contains("no live shell bound to run commands in"),
+        "{}",
+        second.body
+    );
+}
+
+/// The denylist sits above the gate memory: after the user allowed
+/// `run_command` for the rest of the task, a denylisted command
+/// still refuses — no card ask, no run — while the unlisted
+/// command that earned the memory ran ungated.
+#[test]
+fn the_denylist_beats_the_allow_for_task_memory() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"ls"}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "run_command",
+            r#"{"command":"rm -rf note.txt"}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(
+                &fixture.base_url,
+                "execute_commands = \"always_ask\"\ncommand_denylist = ['^rm']",
+            ),
+            dir.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    // `ls` asks; the user allows `run_command` for the task…
+    let (id, name, _) = next_approval(&session);
+    assert_eq!((id.as_str(), name.as_str()), ("call_1", "run_command"));
+    session
+        .approve(&id, ApprovalVerdict::AllowForTask)
+        .expect("approve");
+
+    // …yet the denylisted `rm` still refuses outright.
+    let events = collect(&session);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail: Some(detail),
+            } if call_id == "call_2" && detail == "denied by execution profile default"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Running,
+                ..
+            } if call_id == "call_2"
+        )),
+        "a denied call never runs: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The first call ran (the executor's `Unbound` result rode the
+    // second request); the refusal rode the third.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second
+            .body
+            .contains("no live shell bound to run commands in"),
+        "the allow-for-task call ran ungated: {}",
+        second.body
+    );
+    let third = fixture.captured();
+    assert!(
+        third.body.contains("denied by execution profile default"),
+        "{}",
+        third.body
+    );
+}
