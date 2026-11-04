@@ -43,9 +43,29 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   the PTY of an `Integrated` tab (§5.5.1); it stays visible in the grid while
   its merged output and exit code return over OSC 7701 frames.
 - **Agent-owned PTY** — a PTY the agent drives itself via `write_to_pty`.
-- **Agent conversation** — one per-tab agent session: the user's task, the
-  model's streamed replies, tool calls and their verdicts, steering
-  messages, and a terminal status (done, cancelled, budget reached, error).
+- **Agent conversation** — the agent's durable unit of work (§5.8): one
+  per-tab conversation — the user's tasks, the model's streamed replies,
+  tool calls and their verdicts, steering messages and terminal statuses
+  (done, cancelled, budget reached, error) — as panel entries, model
+  context and one `conversations` row in the store alike. Context spans
+  tasks; resuming rebuilds all three from the transcript.
+- **Transcript** — an agent conversation's neutral persisted event log:
+  one `transcript_items` row per `TranscriptItem` (`task`, `steering`,
+  `assistant_text`, `tool_call`, `tool_result`, `ask`/`answer`,
+  `status`, `summary`, `plan`). The source of truth — replay rebuilds
+  whichever schema IR the resolved `coding_model` speaks, so a provider
+  switch strands nothing (ADR-0011).
+- **Plan block** — the TODO list pinned at the top of the agent panel,
+  fed by `update_plan` snapshots (`PlanUpdated`); the latest `plans` row
+  restores it on resume.
+- **Summary marker** — a `summary` transcript item: the worker rewrote
+  the oldest `covers_seq` items into `text` when the estimate crossed
+  `SUMMARIZE_AT` of the effective limit; it replays as leading context
+  and paints as a "conversation summarized" status entry.
+- **Store** — `ait-store`'s `Store`: the synchronous SQLite facade over
+  `$XDG_DATA_HOME/ait/store.db` (WAL, `PRAGMA user_version` migrations)
+  holding conversations, transcripts, plans, terminal sessions and block
+  metadata.
 - **Tool card** — the conversation-panel entry rendering one tool call:
   name, argument summary and status (awaiting approval, running, done,
   denied, failed).
