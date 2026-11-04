@@ -67,6 +67,7 @@ coding_model = "coding-key"
 fn task(settings: Settings, cwd: &str) -> AgentRequest {
     AgentRequest {
         settings,
+        profile: String::from("default"),
         task: String::from("look around"),
         context: AgentContext {
             cwd: cwd.to_owned(),

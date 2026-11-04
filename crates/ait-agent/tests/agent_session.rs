@@ -76,6 +76,7 @@ fn unconfigured_settings() -> Settings {
 fn task(settings: Settings, cwd: &str) -> AgentRequest {
     AgentRequest {
         settings,
+        profile: String::from("default"),
         task: String::from("find why the tests fail"),
         context: AgentContext {
             cwd: cwd.to_owned(),

@@ -68,6 +68,7 @@ coding_model = "coding-key"
 fn task(settings: Settings, bridge: Option<Box<dyn ShellBridge>>) -> AgentRequest {
     AgentRequest {
         settings,
+        profile: String::from("default"),
         task: String::from("run a command for me"),
         context: AgentContext {
             cwd: String::from("/tmp"),

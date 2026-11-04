@@ -72,6 +72,7 @@ fn unconfigured_settings() -> Settings {
 fn request(settings: Settings) -> SuggestRequest {
     SuggestRequest {
         settings,
+        profile: String::from("default"),
         cwd: String::from("/home/u/proj"),
         shell: String::from("bash"),
         os: String::from("linux"),
@@ -316,6 +317,55 @@ fn unresolvable_model_errors_without_panic_or_hang() {
     suggester.suggest(request(bare)).expect("suggest");
     match suggester.events().recv_timeout(BOUND) {
         Ok(SuggestEvent::Error(_)) => {}
+        other => panic!("expected an Error event, got {other:?}"),
+    }
+}
+
+/// Spec R07 §4.2/us-25 (issue #101): the request's `profile` field
+/// picks which execution profile's `command_model` resolves — a
+/// request armed with `work` streams where `default` (undeclared
+/// here) can only error.
+#[test]
+fn the_request_profile_resolves_its_own_command_model() {
+    let fixture = Fixture::serve(vec![sse(&sse_transcript(&["git ", "status"]))]);
+    let work_only = Settings::from_toml(&format!(
+        r#"
+[agents.custom_endpoints.local]
+name = "Fixture"
+base_url = "{}"
+schema = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name = "test-model"
+alias = "Test Model"
+config_key = "cmd-key"
+
+[agents.execution_profiles.work]
+command_model = "cmd-key"
+"#,
+        fixture.base_url
+    ))
+    .expect("test settings must parse");
+    let suggester = suggester();
+
+    let mut armed = request(work_only.clone());
+    armed.profile = String::from("work");
+    suggester.suggest(armed).expect("suggest");
+
+    let events = collect(&suggester);
+    assert_eq!(delta_text(&events), "git status");
+    assert_eq!(events.last(), Some(&SuggestEvent::Done));
+
+    // The same settings under `default` fail closed at model
+    // resolution — the armed name is what resolved, not a constant.
+    let mut missing = request(work_only);
+    missing.profile = String::from("default");
+    suggester.suggest(missing).expect("suggest");
+    match suggester.events().recv_timeout(BOUND) {
+        Ok(SuggestEvent::Error(message)) => assert!(
+            message.contains("unknown execution profile"),
+            "unexpected error {message:?}"
+        ),
         other => panic!("expected an Error event, got {other:?}"),
     }
 }

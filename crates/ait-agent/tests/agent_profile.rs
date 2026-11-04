@@ -84,6 +84,7 @@ config_key = "coding-key"
 fn task(settings: Settings, cwd: &str) -> AgentRequest {
     AgentRequest {
         settings,
+        profile: String::from("default"),
         task: String::from("look around"),
         context: AgentContext {
             cwd: cwd.to_owned(),
@@ -664,4 +665,76 @@ coding_model = "coding-key"
         other => panic!("expected a terminal Error, got {other:?}"),
     }
     fixture.assert_no_more_requests();
+}
+
+/// Spec R07 us-22/26 — the request's `profile` field IS the active
+/// profile (issue #101): a task submitted under `work` evaluates `work`'s
+/// permission levels (`never` denies `run_command` where `default`'s
+/// `always_ask` would have parked) and resolves `work`'s `coding_model`
+/// to reach the model — the denial names the armed profile.
+#[test]
+fn the_request_profile_arms_its_own_stance() {
+    let dir = project();
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "run_command",
+            r#"{"command":"rm -rf note.txt"}"#,
+        )])),
+        sse(&chat_text_turn("understood, switching approach")),
+    ]);
+    let settings = Settings::from_toml(&format!(
+        r#"
+[agents.custom_endpoints.local]
+name = "Fixture"
+base_url = "{}"
+schema = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name = "test-model"
+alias = "Test Model"
+config_key = "coding-key"
+
+[agents.execution_profiles.default]
+coding_model = "coding-key"
+execute_commands = "always_ask"
+
+[agents.execution_profiles.work]
+coding_model = "coding-key"
+execute_commands = "never"
+"#,
+        fixture.base_url
+    ))
+    .expect("test settings must parse");
+    let session = session();
+    let mut request = task(settings, dir.path().to_str().expect("utf-8 tempdir"));
+    request.profile = String::from("work");
+    session.submit(request).expect("submit");
+
+    // `work`'s `never` refused the call outright — `default`'s
+    // `always_ask` would have parked an approve card instead.
+    let events = collect(&session);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolUpdate {
+                call_id,
+                status: ToolStatus::Denied,
+                detail: Some(detail),
+            } if call_id == "call_1" && detail == "denied by execution profile work"
+        )),
+        "{events:?}"
+    );
+    assert!(no_approval(&events));
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The denial text reached the model as the call's tool result.
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        second.body.contains("denied by execution profile work"),
+        "{}",
+        second.body
+    );
 }
