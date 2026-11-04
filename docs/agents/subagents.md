@@ -25,10 +25,23 @@ subagents.
   rustup shim lives at `$HOME/.cargo/bin`. When the sandbox denies a
   subagent's cargo entirely, the parent runs `scripts/check.sh` in
   that worktree itself; a ticket that never gated doesn't merge.
-- **Shared target dir**: per-worktree `target/` dirs cost tens of GB
-  across a round's parallel tickets; point `CARGO_TARGET_DIR` at one
-  shared directory for sibling-worktree gate runs — dependencies
-  build once and incremental clippy drops to seconds.
+- **Dispatches are immutable** — a running background subagent
+  can't be resumed or messaged mid-flight; front-load every
+  pointer at dispatch. An update that lands mid-task rides the
+  notes dir (tell implementers to re-check it once mid-work) or
+  waits for the report.
+- **Notes timing**: explorers land mid-round — dispatch them
+  before or alongside the first implementer, not after. A
+  first-wave implementer's notes-dir poll may come up empty; it
+  proceeds regardless.
+- **Target dirs**: parallel ticket worktrees each keep their own
+  `target/` (the default) or a dedicated `CARGO_TARGET_DIR` — never
+  share one between siblings. Same-name crates built concurrently
+  confuse cargo's artifacts: an R08 gate ran a sibling's test
+  binary and clippy-checked a lib missing its own branch's changes.
+  Sharing is safe only for serial builds of the same content — the
+  integration branch's merge gates may share one dir. Round target
+  dirs run tens of GB: delete them at cleanup.
 - **Gate output**: run the gate teed to a log —
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis
@@ -53,7 +66,9 @@ pointers, restated per dispatch, not re-derived:
   the API/event names earlier tickets landed that it must consume
   (one short block — the parent keeps this, the implementer shouldn't
   re-explore for it), and the terse report format (what was built,
-  tests, gate results, merge state, hand-off names for later tickets).
+  tests, gate results, merge state, deviations from the ticket's
+  acceptance criteria — required, write "none" — hand-off names for
+  later tickets).
 - **Merger/explorer** dispatches stay sparse: the explorer needs only
   the notes-dir path, the spec issue, and the topic list; the merger
   only the two branches and the gate command.
