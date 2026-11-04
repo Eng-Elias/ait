@@ -22,18 +22,21 @@
 
 use std::sync::LazyLock;
 
+use ait_config::ExecutionProfile;
 use ait_llm::{anthropic_messages, openai_chat_completions, openai_responses, EndpointSchema};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::{CommandExecutor, CommandResult};
 use crate::files::{EditPlan, ToolCwd, ToolOutput};
+use crate::permissions;
 use crate::pty::AgentPty;
 use crate::tool_call::ToolCall;
 
-/// The `ask_user_question` tool's registry name — [`gate_exempt`]
-/// compares against it; the agent loop diverts it into the ask-card
-/// flow before [`execute`] is ever called.
+/// The `ask_user_question` tool's registry name — the permission
+/// engine (`permissions::evaluate`) special-cases it and the agent
+/// loop diverts it into the ask-card flow before [`execute`] is
+/// ever called.
 pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
 
 /// One tool, provider-neutrally: what the model sees, translated
@@ -199,13 +202,6 @@ fn registry() -> &'static [ToolSpec] {
     &REGISTRY
 }
 
-/// Whether the interim gate asks before `name` runs (Spec R06's
-/// ask-everything rule): every tool asks except
-/// `ask_user_question` — its own card IS the ask (us-10).
-pub(crate) fn gate_exempt(name: &str) -> bool {
-    name == ASK_USER_QUESTION
-}
-
 /// Parse an `ask_user_question` call's arguments into the card's
 /// pieces: the question to render and the offered choices — an empty
 /// list means the card takes a free-text answer. A missing or
@@ -244,43 +240,112 @@ pub(crate) enum ToolDecls {
     Anthropic(Vec<anthropic_messages::Tool>),
 }
 
-/// Translate every [`ToolSpec`] into `schema`'s wire shape. The
-/// mapping is mechanical: same name, description and JSON-Schema
-/// parameters, wrapped in the schema's own `Tool` type.
-pub(crate) fn declare(schema: EndpointSchema) -> ToolDecls {
+/// The `agent_decides` contract sentence appended to a governed
+/// tool's description (Spec R07-T2 — written in-house like every
+/// tool text, standard 10): the flag is the model's own
+/// self-assessment, declared as a real argument so the call the
+/// transcript records carries it.
+const SAFETY_CONTRACT: &str =
+    "The active permission profile requires a `safety` self-assessment on every \
+     call: mark `safe` only a call that cannot harm anything the user cares \
+     about — anything else asks the user first.";
+
+/// The `safety` argument's JSON Schema (Spec R07-T2): a required
+/// `"safe" | "unsafe"` enum the model fills in per call, its
+/// description carrying the flag's contract — `"safe"` runs unasked,
+/// `"unsafe"` asks (the permission engine reads it back in
+/// [`permissions::evaluate`](crate::permissions)).
+fn safety_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "string",
+        "enum": ["safe", "unsafe"],
+        "description": "Your self-assessment of this call: \"safe\" runs without \
+                        asking the user; \"unsafe\" asks the user first. When \
+                        unsure, mark it \"unsafe\"."
+    })
+}
+
+/// One spec's `(description, parameters)` under `profile`
+/// (Spec R07-T2): a tool whose mapped level is `agent_decides` gains
+/// the required `safety` argument — the model's declared
+/// self-assessment — and the contract sentence on its description.
+/// Every other tool declares exactly what the registry wrote, so a
+/// profile with no `agent_decides` fields ships identical
+/// declarations to Round 6.
+fn declaration_for(
+    spec: &ToolSpec,
+    profile: Option<&ExecutionProfile>,
+) -> (String, serde_json::Value) {
+    if !permissions::is_agent_decided(profile, spec.name) {
+        return (spec.description.to_string(), spec.parameters.clone());
+    }
+    let mut parameters = spec.parameters.clone();
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.insert(String::from("safety"), safety_schema());
+    }
+    if let Some(required) = parameters
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.push(serde_json::json!("safety"));
+    }
+    (
+        format!("{} {SAFETY_CONTRACT}", spec.description),
+        parameters,
+    )
+}
+
+/// Translate every [`ToolSpec`] into `schema`'s wire shape under the
+/// task's active `profile`. The mapping is mechanical: same name,
+/// description and JSON-Schema parameters, wrapped in the schema's
+/// own `Tool` type — except `agent_decides` tools, which
+/// [`declaration_for`] equips with the required `safety` argument.
+pub(crate) fn declare(schema: EndpointSchema, profile: Option<&ExecutionProfile>) -> ToolDecls {
     match schema {
         EndpointSchema::OpenAiChatCompletions => ToolDecls::Chat(
             registry()
                 .iter()
-                .map(|spec| openai_chat_completions::Tool {
-                    kind: openai_chat_completions::ToolKind::Function,
-                    function: openai_chat_completions::ToolFunction {
-                        name: spec.name.to_string(),
-                        description: Some(spec.description.to_string()),
-                        parameters: spec.parameters.clone(),
-                    },
+                .map(|spec| {
+                    let (description, parameters) = declaration_for(spec, profile);
+                    openai_chat_completions::Tool {
+                        kind: openai_chat_completions::ToolKind::Function,
+                        function: openai_chat_completions::ToolFunction {
+                            name: spec.name.to_string(),
+                            description: Some(description),
+                            parameters,
+                        },
+                    }
                 })
                 .collect(),
         ),
         EndpointSchema::OpenAiResponses => ToolDecls::Responses(
             registry()
                 .iter()
-                .map(|spec| openai_responses::Tool {
-                    kind: openai_responses::ToolKind::Function,
-                    name: spec.name.to_string(),
-                    description: Some(spec.description.to_string()),
-                    parameters: spec.parameters.clone(),
-                    strict: None,
+                .map(|spec| {
+                    let (description, parameters) = declaration_for(spec, profile);
+                    openai_responses::Tool {
+                        kind: openai_responses::ToolKind::Function,
+                        name: spec.name.to_string(),
+                        description: Some(description),
+                        parameters,
+                        strict: None,
+                    }
                 })
                 .collect(),
         ),
         EndpointSchema::AnthropicMessages => ToolDecls::Anthropic(
             registry()
                 .iter()
-                .map(|spec| anthropic_messages::Tool {
-                    name: spec.name.to_string(),
-                    description: Some(spec.description.to_string()),
-                    input_schema: spec.parameters.clone(),
+                .map(|spec| {
+                    let (description, parameters) = declaration_for(spec, profile);
+                    anthropic_messages::Tool {
+                        name: spec.name.to_string(),
+                        description: Some(description),
+                        input_schema: parameters,
+                    }
                 })
                 .collect(),
         ),
@@ -372,8 +437,8 @@ pub(crate) fn plan_edit(call: &ToolCall, cwd: &ToolCwd) -> Result<EditPlan, Stri
 }
 
 /// Run `call` against `cwd` — the sequential executor the loop
-/// calls after the gate (or directly, for gate-exempt calls). `pty`
-/// is the worker's lazily-spawned agent PTY (`write_to_pty`'s
+/// calls after the gate (or directly, for calls the engine allowed).
+/// `pty` is the worker's lazily-spawned agent PTY (`write_to_pty`'s
 /// drop-in seam, R06-T7); `executor` is the task's §5.9
 /// [`CommandExecutor`] — only `run_command` consumes it, so the
 /// file tools never notice which tier is bound; `cancel` lets a
@@ -481,7 +546,7 @@ mod tests {
     /// description and parameters — in its own `Tool` shape (§5.3).
     #[test]
     fn declare_translates_every_spec_per_schema() {
-        let ToolDecls::Chat(tools) = declare(EndpointSchema::OpenAiChatCompletions) else {
+        let ToolDecls::Chat(tools) = declare(EndpointSchema::OpenAiChatCompletions, None) else {
             panic!("chat decls")
         };
         assert_eq!(tools.len(), 7);
@@ -495,17 +560,162 @@ mod tests {
         assert!(read.function.description.is_some());
         assert_eq!(read.function.parameters["required"][0], "paths");
 
-        let ToolDecls::Responses(tools) = declare(EndpointSchema::OpenAiResponses) else {
+        let ToolDecls::Responses(tools) = declare(EndpointSchema::OpenAiResponses, None) else {
             panic!("responses decls")
         };
         let grep = tools.iter().find(|t| t.name == "grep").unwrap();
         assert_eq!(grep.parameters["properties"]["pattern"]["type"], "string");
 
-        let ToolDecls::Anthropic(tools) = declare(EndpointSchema::AnthropicMessages) else {
+        let ToolDecls::Anthropic(tools) = declare(EndpointSchema::AnthropicMessages, None) else {
             panic!("anthropic decls")
         };
         let glob = tools.iter().find(|t| t.name == "glob").unwrap();
         assert_eq!(glob.input_schema["required"][0], "pattern");
+    }
+
+    /// `agent_decides` tools gain the required `safety` argument —
+    /// a `"safe" | "unsafe"` enum with the in-house contract text —
+    /// in all three wire shapes, while every other tool's
+    /// description and parameters ship unchanged (Spec R07-T2).
+    /// `ask_user_question` never gains it even AT `agent_decides`:
+    /// its own card is the ask, so the flag would be a required
+    /// argument the permission engine never reads.
+    #[test]
+    fn declare_injects_safety_only_on_agent_decides_tools() {
+        let profile = ExecutionProfile {
+            read_files: Some(ait_config::PermissionLevel::AgentDecides),
+            ask_user_question: Some(ait_config::PermissionLevel::AgentDecides),
+            ..Default::default()
+        };
+        let governed = ["read_files", "grep", "glob"];
+
+        let decls = declare(EndpointSchema::OpenAiChatCompletions, Some(&profile));
+        let ToolDecls::Chat(tools) = decls else {
+            panic!("chat decls")
+        };
+        for tool in &tools {
+            let name = tool.function.name.as_str();
+            let (description, parameters) = (
+                tool.function.description.as_deref().expect("description"),
+                &tool.function.parameters,
+            );
+            if governed.contains(&name) {
+                assert_eq!(
+                    parameters["properties"]["safety"]["enum"],
+                    serde_json::json!(["safe", "unsafe"]),
+                    "{name}"
+                );
+                assert!(
+                    parameters["required"]
+                        .as_array()
+                        .expect("required")
+                        .contains(&serde_json::json!("safety")),
+                    "{name}"
+                );
+                assert!(
+                    description.contains("self-assessment"),
+                    "the contract sentence rode the description: {description}"
+                );
+            } else {
+                assert_eq!(
+                    parameters["properties"]["safety"],
+                    serde_json::Value::Null,
+                    "{name} must not gain the flag"
+                );
+            }
+        }
+
+        let decls = declare(EndpointSchema::OpenAiResponses, Some(&profile));
+        let ToolDecls::Responses(tools) = decls else {
+            panic!("responses decls")
+        };
+        let grep = tools.iter().find(|t| t.name == "grep").unwrap();
+        assert_eq!(
+            grep.parameters["properties"]["safety"]["enum"],
+            serde_json::json!(["safe", "unsafe"])
+        );
+        assert!(grep.parameters["required"]
+            .as_array()
+            .expect("required")
+            .contains(&serde_json::json!("safety")));
+        let run = tools.iter().find(|t| t.name == "run_command").unwrap();
+        assert_eq!(
+            run.parameters["properties"]["safety"],
+            serde_json::Value::Null
+        );
+
+        let decls = declare(EndpointSchema::AnthropicMessages, Some(&profile));
+        let ToolDecls::Anthropic(tools) = decls else {
+            panic!("anthropic decls")
+        };
+        let read = tools.iter().find(|t| t.name == "read_files").unwrap();
+        assert_eq!(
+            read.input_schema["properties"]["safety"]["enum"],
+            serde_json::json!(["safe", "unsafe"])
+        );
+        assert!(read.input_schema["required"]
+            .as_array()
+            .expect("required")
+            .contains(&serde_json::json!("safety")));
+        let ask = tools.iter().find(|t| t.name == ASK_USER_QUESTION).unwrap();
+        assert_eq!(
+            ask.input_schema["properties"]["safety"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// `(name, description, parameters)` per declared tool — one
+    /// comparable shape across the three wire IRs.
+    fn decl_parts(decls: &ToolDecls) -> Vec<(String, Option<String>, serde_json::Value)> {
+        match decls {
+            ToolDecls::Chat(tools) => tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.function.name.clone(),
+                        t.function.description.clone(),
+                        t.function.parameters.clone(),
+                    )
+                })
+                .collect(),
+            ToolDecls::Responses(tools) => tools
+                .iter()
+                .map(|t| (t.name.clone(), t.description.clone(), t.parameters.clone()))
+                .collect(),
+            ToolDecls::Anthropic(tools) => tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        t.description.clone(),
+                        t.input_schema.clone(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A profile with no `agent_decides` fields — and no profile at
+    /// all — ships identical declarations to what the registry
+    /// wrote: nothing is injected, nothing renamed.
+    #[test]
+    fn declare_without_agent_decides_ships_identical_declarations() {
+        let profile = ExecutionProfile {
+            read_files: Some(ait_config::PermissionLevel::AlwaysAllow),
+            execute_commands: Some(ait_config::PermissionLevel::AlwaysAsk),
+            ..Default::default()
+        };
+        for schema in [
+            EndpointSchema::OpenAiChatCompletions,
+            EndpointSchema::OpenAiResponses,
+            EndpointSchema::AnthropicMessages,
+        ] {
+            assert_eq!(
+                decl_parts(&declare(schema, None)),
+                decl_parts(&declare(schema, Some(&profile))),
+                "{schema:?}"
+            );
+        }
     }
 
     /// The card summary renders the argument a user recognizes —
@@ -543,23 +753,6 @@ mod tests {
             summarize_args(&call("read_files", "{not json")),
             "{not json"
         );
-    }
-
-    /// `ask_user_question` is the gate's one exemption — its card is
-    /// the ask (us-10).
-    #[test]
-    fn gate_exempts_only_ask_user_question() {
-        assert!(gate_exempt(ASK_USER_QUESTION));
-        for name in [
-            "read_files",
-            "grep",
-            "glob",
-            "run_command",
-            "edit_files",
-            "write_to_pty",
-        ] {
-            assert!(!gate_exempt(name), "{name}");
-        }
     }
 
     /// The ask card's pure seam: `question` plus `choices` come out
@@ -603,7 +796,7 @@ mod tests {
     #[test]
     fn execute_dispatches_and_errors_cleanly() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
         let mut pty = AgentPty::new();
         let cancel = CancellationToken::new();
         let call = |name: &str, args: &str| ToolCall {
@@ -708,7 +901,7 @@ mod tests {
     #[test]
     fn run_command_rejects_control_bytes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"));
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
         let mut pty = AgentPty::new();
         let cancel = CancellationToken::new();
         let call = |args: &str| ToolCall {

@@ -70,6 +70,12 @@ pub enum AppAction {
     /// active tab (`Alt+A`; Spec R06 §5.6 / issue #85): open focuses
     /// its input line, pressing it again while focused closes it.
     AgentPanel,
+    /// Switch the active execution profile (`Alt+P`; Spec R07 §5.7 /
+    /// issue #101): a picker over three or more declared profiles, a
+    /// direct cycle between two, a toast when there is nothing to
+    /// switch to — and a second press while the picker is open
+    /// dismisses it.
+    SwitchProfile,
 }
 
 /// The keymap's verdict for one key event.
@@ -263,6 +269,17 @@ const BINDINGS: &[Binding] = &[
         modifiers: ALT,
         enhanced_only: false,
         action: AppAction::AgentPanel,
+    },
+    // Spec R07 §5.7 `Alt+P` profile switch — both tiers: `ESC p` vs
+    // `p` is byte-distinct under the legacy Alt-prefix and the kitty
+    // modifier report alike, and `M-p` is unbound in default
+    // readline, so the binding steals no shell input (the same trade
+    // the `Alt+A`/`Alt+B` comments record).
+    Binding {
+        code: KeyCode::Char('p'),
+        modifiers: ALT,
+        enhanced_only: false,
+        action: AppAction::SwitchProfile,
     },
     // Enhanced-tier aliases: on these hosts Ctrl+Shift+letter arrives as
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
@@ -525,6 +542,31 @@ mod tests {
             );
             assert_pass(
                 KeyCode::Char('a'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+                tier,
+            );
+        }
+    }
+
+    /// `Alt+P` is the Spec R07 §5.7 profile switch (`SwitchProfile`):
+    /// `ESC p` vs `p` is byte-distinct on every host — no tier gate —
+    /// and `M-p` is unbound in default readline, so binding it steals
+    /// no shell input. Plain `p` still passes through, and the exact-
+    /// modifier rule keeps `Alt+Shift+P`/`Ctrl+Alt+P` for the PTY.
+    #[test]
+    fn alt_p_binds_in_both_tiers() {
+        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
+            assert_action(KeyCode::Char('p'), ALT, tier, AppAction::SwitchProfile);
+            // Case-insensitive like every letter binding.
+            assert_action(KeyCode::Char('P'), ALT, tier, AppAction::SwitchProfile);
+            assert_pass(KeyCode::Char('p'), KeyModifiers::NONE, tier);
+            assert_pass(
+                KeyCode::Char('p'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                tier,
+            );
+            assert_pass(
+                KeyCode::Char('p'),
                 KeyModifiers::ALT | KeyModifiers::CONTROL,
                 tier,
             );

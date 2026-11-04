@@ -27,8 +27,14 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   endpoints' models; model roles resolve through it (§4.1–4.2).
 - **Execution profile** — named set of per-tool permission levels plus
   allow/deny lists.
+- **Active profile** — the execution profile currently armed: `default`
+  at launch, switched with `Alt+P`, shown on the status line when it is
+  not `default`; it drives every tool call's verdict and the model-role
+  resolution for the next task or suggestion. Ephemeral — never written
+  back to `settings.toml`; a name a reload deletes stays armed and the
+  engine asks for every call until the user picks a live one.
 - **Permission level** — `always_allow`, `always_ask`, `agent_decides`,
-  `never`.
+  `ask_on_first_write`, `never`.
 - **Executor tier** — how a command reaches a shell: local PTY, in-band,
   ControlMaster, remote daemon, no-op.
 - **In-band execution** — running a command through the user's live shell and
@@ -44,8 +50,9 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   name, argument summary and status (awaiting approval, running, done,
   denied, failed).
 - **Approve card** — the prompt a tool call parks on until the user picks
-  *allow once*, *allow this tool for the rest of the task*, or *deny* — the
-  interim ask-everything gate until Round 7's execution profiles land.
+  *allow once*, *allow this tool for the rest of the task*, or *deny* —
+  what the active profile's *ask* verdict (and the missing-profile
+  fail-safe) renders.
 - **Step budget** — the cap on model turns per task (`STEP_BUDGET`, 50);
   tripping it ends the task with a `BudgetReached` status.
 - **Remote bootstrap** — injecting shell integration into a remote shell over

@@ -649,7 +649,17 @@ impl Tab {
     /// ignored, so typed text can never become a steering message
     /// mid-ask; a free-text ask edits the input line and Enter sends
     /// it as the answer. Esc still cancels the task from either card.
-    pub fn agent_key(&mut self, key: &KeyEvent, settings: &Settings, toast: &mut Option<Toast>) {
+    ///
+    /// `profile` is the app's active execution profile (Spec R07 §5.7):
+    /// the next submitted task's [`AgentRequest`] snapshots it beside
+    /// `settings` — it never rewrites a running task's stance.
+    pub fn agent_key(
+        &mut self,
+        key: &KeyEvent,
+        settings: &Settings,
+        profile: &str,
+        toast: &mut Option<Toast>,
+    ) {
         if !self.agent_focused() {
             return;
         }
@@ -698,7 +708,7 @@ impl Tab {
                 if panel.is_running() {
                     panel.steer(text, toast);
                 } else {
-                    self.submit_agent_task(settings, text, toast);
+                    self.submit_agent_task(settings, profile, text, toast);
                 }
             }
             // The parked approve card: `a`/`t` answer at once, `d`
@@ -732,9 +742,16 @@ impl Tab {
     /// this tab's bridge service (Spec R06-T4) — `None` only when the
     /// panel exists without one (a staged test tab), where
     /// `run_command` answers a clean tool error.
-    fn submit_agent_task(&mut self, settings: &Settings, task: String, toast: &mut Option<Toast>) {
+    fn submit_agent_task(
+        &mut self,
+        settings: &Settings,
+        profile: &str,
+        task: String,
+        toast: &mut Option<Toast>,
+    ) {
         let request = AgentRequest {
             settings: settings.clone(),
+            profile: profile.to_owned(),
             task,
             context: context_for(self),
             bridge: self
@@ -2946,6 +2963,7 @@ mod tests {
             .submit(
                 ait_agent::AgentRequest {
                     settings: ait_config::Settings::default(),
+                    profile: "default".to_string(),
                     task: "fix it".to_string(),
                     context: ait_agent::AgentContext {
                         cwd: "/tmp".into(),
@@ -3004,14 +3022,14 @@ mod tests {
         // `a` answers allow-once — the wait clears.
         tab.agent.as_mut().unwrap().apply(staged("call_1"));
         assert!(tab.agent.as_ref().unwrap().awaiting_verdict());
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
         assert!(toast.is_none());
 
         // `d` on an empty input opens reason mode — the card stays
         // parked and the reason can contain the verdict letters.
         tab.agent.as_mut().unwrap().apply(staged("call_2"));
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(
@@ -3021,7 +3039,7 @@ mod tests {
             assert!(panel.deny_reason_active());
         }
         for c in "don't allow".chars() {
-            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, "default", &mut toast);
         }
         {
             let panel = tab.agent.as_ref().unwrap();
@@ -3029,7 +3047,7 @@ mod tests {
             assert!(panel.awaiting_verdict(), "the card still waits");
         }
         // Enter answers `Deny` with the reason — the wait clears.
-        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_verdict());
@@ -3039,29 +3057,29 @@ mod tests {
         // `d` again — reason mode — and Enter on an EMPTY reason
         // still denies (the worker substitutes its default text).
         tab.agent.as_mut().unwrap().apply(staged("call_3"));
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
         // With input held, the same letters are ordinary editing —
         // `a`/`d` type rather than verdict; the card stays parked
         // until the input is emptied and `a` pressed again.
         tab.agent.as_mut().unwrap().apply(staged("call_4"));
-        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(panel.awaiting_verdict(), "non-empty input = editing");
             assert_eq!(panel.input(), "xda");
         }
         tab.agent.as_mut().unwrap().take_input();
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
         // And with nothing pending, `d` edits the input like any
         // other character.
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
         assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
     }
 
@@ -3095,16 +3113,16 @@ mod tests {
         let panel = tab.agent.as_mut().unwrap();
         panel.apply(ask("call_1", &["a", "b"]));
         assert!(panel.awaiting_answer());
-        tab.agent_key(&key(KeyCode::Char('x')), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Left), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Backspace), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Char('x')), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Left), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Backspace), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(panel.awaiting_answer(), "stray keys resolved nothing");
             assert_eq!(panel.input(), "", "stray keys never reached the input");
         }
-        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
-        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Down), &settings, "default", &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_answer());
@@ -3120,13 +3138,13 @@ mod tests {
         panel.apply(ask("call_2", &[]));
         assert!(!panel.ask_has_choices());
         for c in "why not".chars() {
-            tab.agent_key(&key(KeyCode::Char(c)), &settings, &mut toast);
+            tab.agent_key(&key(KeyCode::Char(c)), &settings, "default", &mut toast);
         }
         // ↓ on a free-text ask navigates nothing — the card keeps
         // waiting and the input is untouched.
-        tab.agent_key(&key(KeyCode::Down), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Down), &settings, "default", &mut toast);
         assert!(tab.agent.as_ref().unwrap().awaiting_answer());
-        tab.agent_key(&key(KeyCode::Enter), &settings, &mut toast);
+        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_answer());

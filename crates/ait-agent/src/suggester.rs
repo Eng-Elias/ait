@@ -7,9 +7,11 @@
 //! dependency tree or its synchronous poll loop.
 //!
 //! Per request the worker resolves
-//! `Settings::resolve_model("default", ModelRole::Command, store)` —
-//! the `command_model` → `base_model` fallback lives inside
-//! `resolve_model` (§4.2, us-21) — assembles the single-turn request
+//! `Settings::resolve_model(request.profile, ModelRole::Command, store)`
+//! — the active execution profile the frontend armed for that
+//! submission (§5.7), with the `command_model` → `base_model` fallback
+//! inside `resolve_model` (§4.2, us-21) — assembles the single-turn
+//! request
 //! through [`assemble_request`], and streams via
 //! `Endpoint::stream(request, CancellationToken)`. Every failure mode
 //! (unconfigured model, resolution/transport/stream error, cancelled
@@ -36,11 +38,6 @@ use tokio_util::sync::CancellationToken;
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
 use crate::{assemble_request, ReplySanitizer, SuggestContext};
 
-/// The execution profile whose model roles command requests resolve
-/// against (§4.2 — the only profile Round 4 wires; per-profile roles
-/// are Round 7).
-const PROFILE: &str = "default";
-
 /// One `# `/`Alt+Enter` request — the value the frontend sends on the
 /// suggester's channel. It carries the terminal-side context the model
 /// may see (§5.4) plus the caller's current `Settings` snapshot: the
@@ -51,6 +48,11 @@ pub struct SuggestRequest {
     /// The caller's live `Settings` — resolved per request, so the
     /// latest hot-reloaded `command_model` applies immediately.
     pub settings: Settings,
+    /// The active execution profile's name (§5.7 / Spec R07 us-26):
+    /// the stance `command_model` resolves against for THIS request,
+    /// snapshotted beside `settings` so a frontend-side switch applies
+    /// to the next submission.
+    pub profile: String,
     /// The tab's working directory (OSC 7 with a `/proc` fallback).
     pub cwd: String,
     /// The shell name — `$SHELL`'s basename, e.g. `bash` (us-17).
@@ -233,18 +235,21 @@ fn serve(
     store: &dyn SecretStore,
 ) {
     // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
-    // store's `&dyn` reference flows straight through.
+    // store's `&dyn` reference flows straight through. The request's
+    // own profile resolves the role (§4.2/§5.7) — the selection the
+    // frontend armed when it fired, never a global.
     let resolved = match request
         .settings
-        .resolve_model(PROFILE, ModelRole::Command, store)
+        .resolve_model(&request.profile, ModelRole::Command, store)
     {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
             emit(
                 events,
                 SuggestEvent::Error(format!(
-                    "profile {PROFILE:?} has no command_model configured \
-                     (and no base_model fallback) — set it in settings.toml"
+                    "profile {:?} has no command_model configured \
+                     (and no base_model fallback) — set it in settings.toml",
+                    request.profile
                 )),
             );
             return;

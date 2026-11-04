@@ -37,7 +37,11 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   registry, interim ask-everything gate, `CommandExecutor` +
   `ShellBridge`/`UserShellExecutor` for `run_command`, and the
   `write_to_pty` agent-owned PTY — new `ait-term` and `ait-shell`
-  edges; §5.7 permission profiles land in Round 7);
+  edges; Round 7: §5.7 execution profiles — the `permissions::evaluate`
+  allow/ask/deny seam under the armed profile, `command_*` list
+  matching, `directory_allowlist` roots, the `agent_decides` `safety`
+  flag and `ask_on_first_write`; the binary owns the `Alt+P` switcher
+  and the status-line profile slot);
   `crates/ait-shell` — exists (Round 5: §5.5 — OSC 7700-series
   hook/run codec, `RunAccumulator` and the in-band `__ait_run`
   emit side, rc snippets and the injection planner; `ait` wires

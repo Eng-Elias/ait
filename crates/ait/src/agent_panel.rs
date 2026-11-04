@@ -1123,6 +1123,7 @@ mod tests {
         panel.submit(
             AgentRequest {
                 settings: ait_config::Settings::default(),
+                profile: "default".to_string(),
                 task: "fix it".to_string(),
                 context: AgentContext {
                     cwd: "/tmp".into(),

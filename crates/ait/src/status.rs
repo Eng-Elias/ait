@@ -1,7 +1,9 @@
-//! The status line's model: `cwd · shell · model · state` for the
-//! active tab, overridden ~3 s at a time by notification toasts (Spec
-//! R02: "a status line shows cwd, shell, model and session state" +
-//! "notifications surface as toasts").
+//! The status line's model: `cwd · shell · model · [profile ·] state`
+//! for the active tab, overridden ~3 s at a time by notification toasts
+//! (Spec R02: "a status line shows cwd, shell, model and session
+//! state" + "notifications surface as toasts"). The `profile` segment
+//! is conditional (Spec R07 us-24): it exists only while the active
+//! execution profile is not `default`.
 //!
 //! `status` holds only presentation state — pure text and a deadline —
 //! so the whole thing is testable without a PTY (standard 11). [`app`]
@@ -64,6 +66,10 @@ pub struct StatusLine<'a> {
     /// The resolved `base_model`'s display name (`—` when unset —
     /// Spec R03 story 24).
     pub model: &'a str,
+    /// The active execution profile's name — `Some` only when it is
+    /// not `default`, which is what keeps the segment out of the R03
+    /// layout (Spec R07 us-24).
+    pub profile: Option<&'a str>,
     /// The newest finished block's status (`✓/✗ <code> · <dur>` —
     /// Spec R05 us-15; absent when no block has reported an exit code).
     pub block: Option<BlockStatus>,
@@ -72,17 +78,20 @@ pub struct StatusLine<'a> {
 }
 
 /// The status line's content at `now`: a live toast wins outright;
-/// otherwise `cwd · shell · model · [block ·] state` for the tab
-/// `line` describes.
+/// otherwise `cwd · shell · model · [profile ·] [block ·] state` for
+/// the tab `line` describes.
 pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -> String {
     if let Some(toast) = toast.filter(|toast| toast.is_live(now)) {
         return toast.text().to_string();
     }
+    let profile = line
+        .profile
+        .map_or_else(String::new, |name| format!("{name} · "));
     let block = line
         .block
         .map_or_else(String::new, |status| format!("{} · ", block_text(status)));
     format!(
-        "{} · {} · {} · {block}{}",
+        "{} · {} · {} · {profile}{block}{}",
         line.cwd.display(),
         line.shell,
         line.model,
@@ -163,6 +172,7 @@ mod tests {
                 cwd: Path::new("/home/u/project"),
                 shell: "bash",
                 model: "Qwen Coder",
+                profile: None,
                 block: None,
                 exit: None,
             },
@@ -176,6 +186,7 @@ mod tests {
                 cwd: Path::new("/home/u/project"),
                 shell: "bash",
                 model: "—",
+                profile: None,
                 block: None,
                 exit: None,
             },
@@ -201,6 +212,7 @@ mod tests {
                     cwd: Path::new("/tmp"),
                     shell: "sh",
                     model: "—",
+                    profile: None,
                     block: Some(ok),
                     exit: None,
                 },
@@ -220,6 +232,7 @@ mod tests {
                     cwd: Path::new("/tmp"),
                     shell: "sh",
                     model: "—",
+                    profile: None,
                     block: Some(failed),
                     exit: None,
                 },
@@ -254,6 +267,7 @@ mod tests {
                     cwd: Path::new("/tmp"),
                     shell: "sh",
                     model: "—",
+                    profile: None,
                     block: None,
                     exit: Some(&code3),
                 },
@@ -270,6 +284,7 @@ mod tests {
                     cwd: Path::new("/tmp"),
                     shell: "sh",
                     model: "—",
+                    profile: None,
                     block: None,
                     exit: Some(&hung_up),
                 },
@@ -292,6 +307,7 @@ mod tests {
                     cwd: Path::new("/tmp"),
                     shell: "sh",
                     model: "—",
+                    profile: None,
                     block: None,
                     exit: None,
                 },
@@ -320,6 +336,7 @@ mod tests {
                 cwd: Path::new("/tmp"),
                 shell: "sh",
                 model: "—",
+                profile: None,
                 block: None,
                 exit: None,
             },
@@ -327,6 +344,44 @@ mod tests {
             now + TOAST_DURATION,
         );
         assert_eq!(summary, "/tmp · sh · — · running");
+    }
+
+    /// Spec R07 us-24: a non-`default` active profile adds its segment
+    /// right after the model slot — `None` (the armed `default`) keeps
+    /// the R03 layout byte-for-byte.
+    #[test]
+    fn a_non_default_profile_adds_its_segment() {
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                profile: Some("work"),
+                block: None,
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/tmp · sh · — · work · running");
+
+        // …and the block segment still lands after it.
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                profile: Some("work"),
+                block: Some(BlockStatus {
+                    exit: 0,
+                    duration: Duration::from_millis(1200),
+                }),
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/tmp · sh · — · work · ✓ 0 · 1.2s · running");
     }
 
     /// OSC 9 carries only a message; OSC 777's `notify;<title>;<body>`

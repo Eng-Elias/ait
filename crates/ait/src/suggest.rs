@@ -355,9 +355,13 @@ fn reads_proc_cwd(cwd_reported: bool, integration: IntegrationState) -> bool {
 
 /// The §5.4 context bundle around a verified `request` — the tail
 /// [`request_for`] and [`line_request_for`] share (us-15–17, 23).
-fn assemble(tab: &Tab, settings: &Settings, request: String) -> SuggestRequest {
+/// `profile` is the app's active execution profile (Spec R07 §5.7):
+/// it rides the request beside the settings snapshot, so a switch
+/// applies to the NEXT submission.
+fn assemble(tab: &Tab, settings: &Settings, profile: &str, request: String) -> SuggestRequest {
     SuggestRequest {
         settings: settings.clone(),
+        profile: profile.to_owned(),
         cwd: cwd_for(tab),
         // The spawned program's basename — the same source of truth
         // the tab title uses (us-17).
@@ -373,11 +377,11 @@ fn assemble(tab: &Tab, settings: &Settings, request: String) -> SuggestRequest {
 /// caller forwards Enter to the PTY normally (us-2) and sends the
 /// returned [`SuggestRequest`] into the `CommandSuggester`; on `None`
 /// nothing about the keypress changes.
-pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+pub fn request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option<SuggestRequest> {
     let request = tab
         .shadow
         .request_text(&logical_line(&tab.grid(), tab.cursor()))?;
-    Some(assemble(tab, settings, request))
+    Some(assemble(tab, settings, profile, request))
 }
 
 /// The verified `Alt+Enter` request for `tab` — the WHOLE input line
@@ -386,11 +390,11 @@ pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
 /// typed line (us-12) and runs the shared request → stream → insert
 /// path; `None` (bare, empty, stale or unverifiable) changes nothing —
 /// the desync-is-inert rule (us-13).
-pub fn line_request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+pub fn line_request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option<SuggestRequest> {
     let request = tab
         .shadow
         .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
-    Some(assemble(tab, settings, request))
+    Some(assemble(tab, settings, profile, request))
 }
 
 /// The in-flight suggestion state machine `app` delegates to (Spec R04
@@ -513,13 +517,14 @@ impl SuggestionPin {
         &mut self,
         suggester: &CommandSuggester,
         settings: &Settings,
+        profile: &str,
         tab: &mut Tab,
         toast: &mut Option<Toast>,
     ) {
         if self.is_some() || tab.exit_status().is_some() {
             return;
         }
-        let Some(request) = line_request_for(tab, settings) else {
+        let Some(request) = line_request_for(tab, settings, profile) else {
             return;
         };
         if !self.fire(suggester, tab.id, request, toast) {
@@ -1100,9 +1105,19 @@ mod tests {
         }
 
         let settings = Settings::default();
-        let request = request_for(tabs.active().unwrap(), &settings).expect("must fire");
+        let request = request_for(tabs.active().unwrap(), &settings, "default").expect("must fire");
 
         assert_eq!(request.request, "list files");
+        assert_eq!(request.profile, "default");
+        // The armed name rides the request itself (Spec R07 us-26):
+        // whatever profile was active at submission is pinned on the
+        // snapshot — a later switch can never rewrite it.
+        assert_eq!(
+            request_for(tabs.active().unwrap(), &settings, "work")
+                .expect("must fire")
+                .profile,
+            "work"
+        );
         assert_eq!(request.shell, "sh");
         assert_eq!(request.os, std::env::consts::OS);
         assert!(!request.cwd.is_empty());
@@ -1169,7 +1184,8 @@ mod tests {
         }
 
         let settings = Settings::default();
-        let request = line_request_for(tabs.active().unwrap(), &settings).expect("must fire");
+        let request =
+            line_request_for(tabs.active().unwrap(), &settings, "default").expect("must fire");
 
         assert_eq!(request.request, "undo the last commit");
         assert_eq!(request.shell, "sh");
