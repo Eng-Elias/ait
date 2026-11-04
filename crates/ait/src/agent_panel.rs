@@ -37,8 +37,9 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use ait_agent::{
-    AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, PlanTodo,
-    PlanTodoStatus, ToolStatus, TranscriptItem,
+    ask_replay_id, result_preview, AgentContext, AgentEvent, AgentRequest, AgentSession,
+    ApprovalVerdict, PlanTodo, PlanTodoStatus, ToolStatus, TranscriptItem, INTERRUPTED_RESULT,
+    STATUS_BUDGET, STATUS_CANCELLED, STATUS_DONE,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -675,20 +676,21 @@ impl AgentPanel {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries.push(Entry::Status("done".to_string()));
+                self.entries.push(Entry::Status(STATUS_DONE.to_string()));
             }
             AgentEvent::Cancelled => {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
-                self.entries.push(Entry::Status("cancelled".to_string()));
+                self.entries
+                    .push(Entry::Status(STATUS_CANCELLED.to_string()));
             }
             AgentEvent::BudgetReached => {
                 self.running = false;
                 self.pending = None;
                 self.pending_ask = None;
                 self.entries
-                    .push(Entry::Status("step budget reached".to_string()));
+                    .push(Entry::Status(STATUS_BUDGET.to_string()));
             }
             AgentEvent::Error(message) => {
                 self.running = false;
@@ -766,27 +768,13 @@ impl AgentPanel {
     }
 }
 
-/// The rebuilt card's `detail` for an `interrupted` close (Spec R08
-/// us-9): a call that never got its result is a run that died
-/// mid-call — replay closes it with a synthetic "interrupted"
-/// result, so its card closes the same way rather than waiting
-/// forever.
-const INTERRUPTED_DETAIL: &str = "interrupted — the run ended before this call produced a result";
-
-/// A card's `detail` rebuilt from a stored `tool_result`'s full
-/// text — the same first-line clip the live `ToolUpdate` carried
-/// (the worker's `preview`, `session.rs`).
-fn result_preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
-    let first = text.lines().next().unwrap_or_default();
-    if first.chars().count() > PREVIEW_CHARS {
-        format!("{}…", first.chars().take(PREVIEW_CHARS).collect::<String>())
-    } else if text.lines().nth(1).is_some() {
-        format!("{first} …")
-    } else {
-        first.to_string()
-    }
-}
+/// `ait_agent::INTERRUPTED_RESULT` is the rebuilt card's `detail`
+/// for an `interrupted` close (Spec R08 us-9): a call that never got
+/// its result is a run that died mid-call — replay closes it with a
+/// synthetic "interrupted" result, so its card closes the same way
+/// rather than waiting forever. `ait_agent::result_preview` clips a
+/// stored `tool_result`'s full text the same way the live
+/// `ToolUpdate` did (the worker's own preview fn).
 
 /// `transcript_items` → panel `Entry`s — resume's scrollback
 /// rebuild (Spec R08-T6): the inverse of [`Transcript::apply`]'s
@@ -808,7 +796,7 @@ fn result_preview(text: &str) -> String {
 ///   (us-15).
 ///
 /// A `tool_call` still `Running` at the end never got its result —
-/// the run died mid-call — so it closes [`INTERRUPTED_DETAIL`]
+/// the run died mid-call — so it closes `INTERRUPTED_RESULT`
 /// rather than rendering `…` forever.
 fn entries_from(items: &[TranscriptItem]) -> Vec<Entry> {
     let mut entries = Vec::new();
@@ -841,7 +829,7 @@ fn entries_from(items: &[TranscriptItem]) -> Vec<Entry> {
             TranscriptItem::Ask { question, choices } => {
                 asks += 1;
                 entries.push(Entry::Ask(AskCard {
-                    id: format!("ask_replay_{asks}"),
+                    id: ask_replay_id(asks),
                     question: question.clone(),
                     choices: choices.clone(),
                     selected: 0,
@@ -869,7 +857,7 @@ fn entries_from(items: &[TranscriptItem]) -> Vec<Entry> {
         if let Entry::Tool(card) = entry {
             if card.status == CardStatus::Running {
                 card.status = CardStatus::Failed;
-                card.detail = Some(INTERRUPTED_DETAIL.to_string());
+                card.detail = Some(INTERRUPTED_RESULT.to_string());
             }
         }
     }
@@ -1622,7 +1610,7 @@ mod tests {
                 name: "run_command".into(),
                 summary: "\"ls\"".into(),
                 status: CardStatus::Failed,
-                detail: Some(INTERRUPTED_DETAIL.to_string()),
+                detail: Some(INTERRUPTED_RESULT.to_string()),
             })
         );
     }

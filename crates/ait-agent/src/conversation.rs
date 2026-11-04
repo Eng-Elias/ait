@@ -16,7 +16,7 @@ use ait_llm::{
 use crate::summarize::CHARS_PER_TOKEN;
 use crate::tool_call::ToolCall;
 use crate::tools::{self, ToolDecls};
-use crate::transcript::TranscriptItem;
+use crate::transcript::{ask_replay_id, TranscriptItem, INTERRUPTED_RESULT};
 
 /// `anthropic_messages` requires `max_tokens` — the schema has no
 /// default. Generous enough for long agent replies; the `chat` example
@@ -162,7 +162,7 @@ impl Conversation {
                     // one; its pairing with the result is what the
                     // schema requires, not the provider's original id.
                     asks += 1;
-                    let id = format!("ask_replay_{asks}");
+                    let id = ask_replay_id(asks);
                     turn.calls.push(ToolCall {
                         id: id.clone(),
                         name: tools::ASK_USER_QUESTION.to_string(),
@@ -460,12 +460,13 @@ impl Conversation {
     }
 }
 
-/// The synthetic result a `tool_call` with no recorded `tool_result`
-/// gains on replay (Spec R08 us-9): a crash mid-run, or an
-/// approve/ask card parked when the session ended. Anthropic
-/// hard-requires every `tool_use` to pair with a `tool_result`, and
-/// the text tells the model why the call produced nothing.
-const INTERRUPTED_RESULT: &str = "(interrupted — the run ended before this call produced a result)";
+/// `INTERRUPTED_RESULT` (re-exported by the crate root from
+/// `transcript`) is the synthetic result a `tool_call` with no
+/// recorded `tool_result` gains on replay (Spec R08 us-9): a crash
+/// mid-run, or an approve/ask card parked when the session ended.
+/// Anthropic hard-requires every `tool_use` to pair with a
+/// `tool_result`, and the text tells the model why the call
+/// produced nothing.
 
 /// The label on a `summary` marker's injected text — context about
 /// the earlier conversation, not a fresh user instruction.
