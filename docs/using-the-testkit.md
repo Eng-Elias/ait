@@ -124,3 +124,12 @@ and named as a constant the next ticket can tighten. (3) Retry is the
 honest last resort — mark the retry in the test name or comment so
 flakes surface in the dump instead of hiding; never weaken an
 assertion to silence drift.
+
+Known flakes — a gate failure on one of these that goes green on a
+plain re-run needs no re-diagnosis; add a name here when a new one
+surfaces, and file the real fix on the ladder above:
+
+- `agent_profile.rs::write_to_pty_first_write_asks_then_the_session_runs_free`
+  — first-write timing race (R08 merge gate; green on re-run).
+- `shell_integration.rs::bash_blocks_copy_and_inband_roundtrip`
+  — block-seal timing (R08 gate; green on re-run).

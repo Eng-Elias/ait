@@ -20,40 +20,21 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
 - `CODING_STANDARDS.md` — rules the reviewer enforces.
 - `docs/adr/` — architecture decision records.
 - `docs/agents/` — issue tracker, triage labels, domain-doc rules.
-- Crate map (ADR-0003): `crates/ait-term` — exists (Round 1: pure byte-fed
-  terminal core); `crates/ait` — exists (Round 2 TUI; Round 3 wires
-  `ait-config` into it); `crates/ait-testkit` — exists (Round E01: e2e
-  testing toolkit; dev-dependency only, no product crate may depend on
-  it; see `docs/testing-toolkit.md`);
-  `crates/ait-llm` — exists (Round 3: `LlmProvider` trait, `Endpoint`
-  dispatch, per-schema IRs, HTTP/SSE streaming adapters);
-  `crates/ait-config` — exists (Round 3: `settings.toml` model, load,
-  secrets, hot-reload watcher; wired into the `ait` binary — `--init`,
-  `--print-schema`, `[terminal]` session options, status model slot);
-  `crates/ait-agent` — exists (Round 4: §5.4 NL→command —
-  credential redaction, context assembly and reply sanitization pure
-  seams, channel-based `CommandSuggester`; Round 6: §5.6 agent mode —
-  `AgentSession` channel handle and model↔tools loop, the seven-tool
-  registry, interim ask-everything gate, `CommandExecutor` +
-  `ShellBridge`/`UserShellExecutor` for `run_command`, and the
-  `write_to_pty` agent-owned PTY — new `ait-term` and `ait-shell`
-  edges; Round 7: §5.7 execution profiles — the `permissions::evaluate`
-  allow/ask/deny seam under the armed profile, `command_*` list
-  matching, `directory_allowlist` roots, the `agent_decides` `safety`
-  flag and `ask_on_first_write`; the binary owns the `Alt+P` switcher
-  and the status-line profile slot);
-  `crates/ait-shell` — exists (Round 5: §5.5 — OSC 7700-series
-  hook/run codec, `RunAccumulator` and the in-band `__ait_run`
-  emit side, rc snippets and the injection planner; `ait` wires
-  the planner into session spawn and tracks per-tab integration
-  state — `Absent`/`MarksOnly`/`Integrated`);
-  `crates/ait-store` — exists (Round 8: §5.8 persistence — the
-  synchronous `Store` facade over bundled `rusqlite`,
-  `PRAGMA user_version` migrations, conversations /
-  transcript_items / plans / terminal_sessions / blocks under
-  `$XDG_DATA_HOME/ait`; `ait` holds the handle via the
-  `StoreHandle` degrade seam and `ait-agent` stays disk-free;
-  ADR-0011).
+- Crate map — one line per crate; each round's landed surface lives
+  in ADR-0003's table, not here:
+  `crates/ait-term` — exists (Round 1: pure byte-fed terminal core);
+  `crates/ait` — exists (Round 2 TUI);
+  `crates/ait-testkit` — exists (Round E01: e2e toolkit;
+  dev-dependency only — `docs/testing-toolkit.md`);
+  `crates/ait-llm` — exists (Round 3: provider trait + per-schema
+  IRs/adapters);
+  `crates/ait-config` — exists (Round 3: `settings.toml`, secrets,
+  hot reload);
+  `crates/ait-agent` — exists (Rounds 4/6/7/8: NL→command, agent
+  mode, execution profiles, transcript/replay/plan/summarize);
+  `crates/ait-shell` — exists (Round 5: OSC 7700 hooks + blocks);
+  `crates/ait-store` — exists (Round 8: §5.8 persistence —
+  `rusqlite` facade; ADR-0011).
 
 ## Commands
 

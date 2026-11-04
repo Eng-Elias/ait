@@ -32,4 +32,9 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
     order a real emitter produces; a convenient fictional order is a
     test bug, not a shortcut. (R06's MarksOnly `133;B→D` passed tests
     while failing every real shell, whose precmd order is `D,A,B`.)
+17. Text that crosses a crate boundary — wire strings, synthetic ids,
+    status lines, preview clips — is defined once in the library
+    crate and imported by the frontend, never re-literal'd at a
+    second site (R08's interrupted-result / replay-id duplication
+    drifted until the review single-sourced them).
 
