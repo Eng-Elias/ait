@@ -1709,6 +1709,43 @@ mod tests {
         assert_eq!(row.trim_end(), "", "no block under the title");
     }
 
+    /// Spec R08 us-22: a `Summarized` event folds into a `summary`
+    /// transcript item AND leaves a visible status entry — the
+    /// rewrite is never silent — while the task keeps running.
+    #[test]
+    fn a_summarized_event_shows_a_status_entry_and_records_the_marker() {
+        let mut panel = panel();
+        panel.running = true; // staged — a submit would set it
+        panel.apply(AgentEvent::TextDelta("on it".into()));
+        panel.apply(AgentEvent::Summarized {
+            covers_seq: 4,
+            text: "the old half".into(),
+        });
+
+        assert!(
+            matches!(
+                panel.entries().last(),
+                Some(Entry::Status(text)) if text == "conversation summarized"
+            ),
+            "{:?}",
+            panel.entries()
+        );
+        assert_eq!(
+            panel.transcript_items().last(),
+            Some(&ait_agent::TranscriptItem::Summary {
+                text: "the old half".into(),
+                covers_seq: 4,
+            })
+        );
+        // Non-terminal: the task still runs until Done.
+        assert!(panel.running);
+        panel.apply(AgentEvent::Done);
+        assert!(matches!(
+            panel.entries().last(),
+            Some(Entry::Status(text)) if text == "done"
+        ));
+    }
+
     /// An `AskRequest` opens its own card — question and choices in
     /// the scrollback — and `submit_answer` records the highlighted
     /// choice as the answer (the send travels the real channel; the
