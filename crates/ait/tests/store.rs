@@ -1,5 +1,7 @@
-//! e2e for §5.8 persistence — terminal-session + block metadata
-//! (Spec R08, ticket R08-T2). Code-first for the same reason the R03
+//! e2e for §5.8 persistence — terminal-session + block metadata,
+//! agent-conversation transcripts, `update_plan`, the `Alt+R` picker,
+//! summarization and mid-call-crash resume (Spec R08, tickets
+//! R08-T2/T3/T5/T6/T8). Code-first for the same reason the R03
 //! fixtures are: a TOML scenario's `env` values are literal strings,
 //! so `XDG_DATA_HOME` cannot be interpolated to a per-test tempdir —
 //! and the store assertions live outside the screen anyway: the rows
@@ -207,8 +209,10 @@ fn write_agent_settings(dir: &Path, contents: &str) {
 
 /// A `settings.toml` whose `coding_model` binds one model at the
 /// fixture's loopback `base_url` — no `api_key_env`, so requests go
-/// out unauthenticated.
-fn agent_settings_with_fixture(base_url: &str) -> String {
+/// out unauthenticated. `extra_profile` carries additional
+/// `[agents.execution_profiles.default]` lines (a
+/// `context_window_limit`, a tool level) when a test wants them.
+fn agent_settings_with_profile(base_url: &str, extra_profile: &str) -> String {
     format!(
         r#"
 [agents.custom_endpoints.local]
@@ -223,8 +227,14 @@ config_key = "coding-key"
 
 [agents.execution_profiles.default]
 coding_model = "coding-key"
+{extra_profile}
 "#
     )
+}
+
+/// The plain fixture binding — no extra profile fields.
+fn agent_settings_with_fixture(base_url: &str) -> String {
+    agent_settings_with_profile(base_url, "")
 }
 
 /// Spawn `ait` with `XDG_CONFIG_HOME` (settings → fixture) and
@@ -718,5 +728,222 @@ fn alt_r_lists_resumes_across_restart_and_ctrl_d_deletes() {
     assert!(
         store.list_conversations().unwrap().is_empty(),
         "the row deleted for good"
+    );
+}
+
+// ─── R08-T8: summarization entry + killed-mid-call resume ─────────
+
+/// Whether any panel-half row carries `needle` — for text whose
+/// painted row clips inside the split (a tool card's `detail`
+/// outruns the panel width).
+fn panel_contains(app: &E2e, needle: &str) -> bool {
+    app.screen_text()
+        .lines()
+        .any(|row| row.split('│').nth(1).is_some_and(|h| h.contains(needle)))
+}
+
+/// Spec R08 us-18/19/22 + ticket: a `context_window_limit`-crossing
+/// estimate fires one summarize call mid-run — the panel shows the
+/// "conversation summarized" entry (never silent), the next model
+/// request carries the marker's text where the covered items were,
+/// and the transcript persists the `summary` item.
+#[test]
+fn a_crossing_estimate_shows_and_persists_the_summary_marker() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    // Request 1 = the scripted tool turn; request 2 = the summarize
+    // call itself; request 3 = the compacted turn that ends the task.
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_1",
+            "read_files",
+            r#"{"paths":["note.txt"]}"#,
+        )),
+        sse(&chat_text_turn("SUMMARY-MARKER the oldest half")),
+        sse(&chat_text_turn("final answer")),
+    ]);
+    let cfg = tempfile::tempdir().expect("config fixture tempdir");
+    let data = tempfile::tempdir().expect("data fixture tempdir");
+    // A 200-token cap → the 0.8 threshold trips once the ~780-char
+    // read lands; `read_files` ungated keeps the run keypress-free.
+    write_agent_settings(
+        cfg.path(),
+        &agent_settings_with_profile(
+            &fixture.base_url,
+            "context_window_limit = 200\nread_files = \"always_allow\"",
+        ),
+    );
+
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the tab bar and status line", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+    fs::write(app.cwd().join("note.txt"), "NOTE-CONTENT ".repeat(60)).expect("seed the big file");
+
+    open_panel(&mut app);
+    submit_task(&mut app, "read the note");
+    app.wait_for_screen("the summarized entry and the done status", |app| {
+        done_lines(app) == 1
+            && panel_has_line(app, "conversation summarized")
+            && panel_has_line(app, "final answer")
+    });
+
+    // The summarize call is its own request — the rendered span,
+    // no tools — and the turn after it runs on the rewritten
+    // context: marker text in, the covered task item out, the
+    // newest tail (call + result) verbatim.
+    let first = fixture.captured();
+    assert!(first.body.contains("read the note"), "{}", first.body);
+    let summarize_call = fixture.captured();
+    assert!(
+        summarize_call.body.contains("<transcript>"),
+        "{}",
+        summarize_call.body
+    );
+    let compacted = fixture.captured();
+    assert!(
+        compacted.body.contains("SUMMARY-MARKER"),
+        "{}",
+        compacted.body
+    );
+    assert!(
+        !compacted.body.contains("read the note"),
+        "the covered task item left the context: {}",
+        compacted.body
+    );
+    assert!(
+        compacted.body.contains("NOTE-CONTENT"),
+        "the kept tail stayed verbatim: {}",
+        compacted.body
+    );
+
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+
+    // The marker persisted as a `summary` transcript item between
+    // the result it compacted and the reply that followed.
+    let store = open_store(data.path());
+    let id = store.list_conversations().expect("list conversations")[0].id;
+    let rows = store.load_transcript(id).expect("load the transcript");
+    let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "task",
+            "tool_call",
+            "tool_result",
+            "summary",
+            "assistant_text",
+            "status",
+        ],
+        "the summary item mirrored in event order: {kinds:?}"
+    );
+    let summary: TranscriptItem =
+        serde_json::from_str(&rows[3].payload_json).expect("payload deserializes");
+    assert!(
+        matches!(&summary, TranscriptItem::Summary { text, covers_seq }
+            if text.contains("SUMMARY-MARKER") && *covers_seq == 1),
+        "the marker covers the oldest item: {summary:?}"
+    );
+}
+
+/// Spec R08 us-9 + ticket: a task whose approve card was parked when
+/// `ait` exited leaves a `tool_call` with no `tool_result` — resume
+/// paints the card closed `interrupted`, and the next task's request
+/// carries the synthetic result so no provider sees a dangling call.
+/// The stored row itself is never rewritten: the synthetic result
+/// exists only in the replayed context.
+#[test]
+fn a_conversation_killed_mid_call_resumes_with_the_interrupted_result() {
+    if !Path::new("/bin/sh").exists() {
+        return;
+    }
+    // Run 1 takes the tool turn and parks on the approve card;
+    // run 2's resumed task takes the second script.
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_dying",
+            "run_command",
+            r#"{"command":"echo DYING"}"#,
+        )),
+        sse(&chat_text_turn("resumed answer")),
+    ]);
+    let cfg = tempfile::tempdir().expect("config fixture tempdir");
+    let data = tempfile::tempdir().expect("data fixture tempdir");
+    write_agent_settings(cfg.path(), &agent_settings_with_fixture(&fixture.base_url));
+
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the tab bar and status line", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+    open_panel(&mut app);
+    submit_task(&mut app, "run the dying command");
+    app.wait_for_screen("the parked approve card", |app| {
+        app.screen_text().contains("approve run_command")
+    });
+    // The card is still parked — the run dies mid-call.
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+
+    // Relaunch on the same data dir and resume the dead conversation.
+    let mut app = spawn_ait_for_agent(cfg.path(), data.path());
+    app.wait_for_screen("the relaunched chrome", |app| {
+        app.line(0).contains("1:sh") && app.line(STATUS_ROW).contains("· sh ·")
+    });
+    wait_fresh_prompt(&mut app, "the relaunched prompt");
+    app.press("Alt+R");
+    app.wait_for_screen("the picker row", |app| {
+        app.screen_text().contains("run the dying command")
+    });
+    app.press("Enter");
+    // The rebuilt card closed `interrupted` — never an eternal `…`
+    // spinner, never a still-awaiting approve card.
+    app.wait_for_screen("the interrupted card", |app| {
+        panel_contains(app, "run_command")
+            && panel_contains(app, "interrupted")
+            && !panel_contains(app, "approve run_command")
+    });
+
+    // The next task replays the stored transcript: the unanswered
+    // call arrives paired with the synthetic interrupted result.
+    submit_task(&mut app, "continue anyway");
+    app.wait_for_screen("the continued task's done", |app| {
+        done_lines(app) == 1 && panel_has_line(app, "resumed answer")
+    });
+    fixture.captured(); // run 1's tool turn
+    let continued = fixture.captured();
+    assert!(
+        continued
+            .body
+            .contains("interrupted — the run ended before this call produced a result"),
+        "the synthetic result rode the replay: {}",
+        continued.body
+    );
+    assert!(
+        continued.body.contains("call_dying"),
+        "the result pairs with the dead call's id: {}",
+        continued.body
+    );
+
+    app.press("Alt+Q");
+    let status = app.wait_for_exit();
+    assert!(status.success(), "expected a clean exit, got {status:?}");
+
+    // Resume never rewrote the stored row (us-12): the dead call is
+    // still unanswered on disk — the interrupted result exists only
+    // in the rebuilt model context.
+    let store = open_store(data.path());
+    let id = store.list_conversations().expect("list conversations")[0].id;
+    let rows = store.load_transcript(id).expect("load the transcript");
+    let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["task", "tool_call", "task", "assistant_text", "status"],
+        "the unanswered call stays unanswered in the record: {kinds:?}"
     );
 }

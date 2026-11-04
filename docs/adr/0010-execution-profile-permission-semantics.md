@@ -118,3 +118,9 @@ The questions the file format alone did not answer:
   allowlist" is refined, not contradicted — this ADR records the
   full order, the unanchored matching and the `never`/missing-profile
   semantics the requirement's one line left implicit.
+
+## Amendment — 2026-11-04
+
+`context_window_limit` is inert no longer: Round 8's summarization
+(Spec R08, ADR-0011) resolves it as the effective context limit ahead
+of the model's own `context_window`.
