@@ -959,6 +959,35 @@ fn handle_event<W: Write>(
                                         request,
                                         &mut state.toast,
                                     );
+                                } else if let Some((line, request)) = suggest::classified_request(
+                                    tab,
+                                    state.config.settings(),
+                                    &state.profile,
+                                ) {
+                                    // The third trigger (§5.10.4, Spec
+                                    // R11-T2): a natural-language verdict
+                                    // swallows the Enter and rewrites the
+                                    // submission — `Ctrl+U` wipes the
+                                    // typed line, `# <line>` + `\r` lands
+                                    // the request in history as a comment
+                                    // and draws the fresh prompt the
+                                    // armed suggestion streams onto
+                                    // (ADR-0007 semantics). The rewrite
+                                    // goes out ONLY once the request is
+                                    // armed: a refused `fire` falls
+                                    // through to the ordinary verbatim
+                                    // submission below — the
+                                    // erase-after-fire ordering
+                                    // `suggest_from_line` established.
+                                    if state.suggestion.fire(
+                                        &state.suggester,
+                                        tab.id,
+                                        request,
+                                        &mut state.toast,
+                                    ) {
+                                        suggest::rewrite_as_comment(tab, &line);
+                                        return Handled::Continue;
+                                    }
                                 }
                             }
                             tab.shadow.update(&key_event);
