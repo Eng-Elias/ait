@@ -81,6 +81,7 @@ use crate::agent_panel::{paint_agent_panel, AgentPanel};
 use crate::backend::StyledBackend;
 use crate::config::{self, LiveSettings};
 use crate::conversations::ConversationPicker;
+use crate::ctl;
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::profile::{self, ProfilePicker};
@@ -354,13 +355,33 @@ pub fn run() -> io::Result<ExitCode> {
         // R10-T6).
         skills: LiveSkills::new(),
     };
+    // §5.10.5's control socket (Spec R11): a nonblocking listener on
+    // `${XDG_RUNTIME_DIR}/ait/<pid>.sock`, drained on the tick beside
+    // the other channels. A bind failure degrades to running without
+    // ctl — additive surface, never a launch blocker. Its path rides
+    // the spawn template so every session's env exports
+    // `AIT_CTL_SOCKET` (surviving later config reloads —
+    // `set_session_template` carries it).
+    let mut ctl = match ctl::CtlServer::bind() {
+        Ok(server) => Some(server),
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("ctl socket unavailable: {error}"),
+                Instant::now(),
+            ));
+            None
+        }
+    };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
-    let mut tabs = TabManager::spawn_with(
-        content_size(state.screen),
-        config::session_template(state.config.settings()),
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut template = config::session_template(state.config.settings());
+    template.ctl_socket = ctl
+        .as_ref()
+        .map(|server| server.socket_path())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_path_buf());
+    let mut tabs = TabManager::spawn_with(content_size(state.screen), template)
+        .map_err(|e| io::Error::other(e.to_string()))?;
     // The first tab's `terminal_sessions` row (Spec R08): `None` — a
     // disabled store or a failed insert — leaves the tab unpersisted.
     if let Some(tab) = tabs.active_mut() {
@@ -473,6 +494,28 @@ pub fn run() -> io::Result<ExitCode> {
         state
             .suggestion
             .drain(state.suggester.events(), &tabs, &mut state.toast);
+        // The ctl socket drains on the same tick (Spec R11 §5.10.5):
+        // completed requests dispatch over `&mut TabManager` — a
+        // `send`'s bytes land in this tick's session drains, and an
+        // `open_tab`'s spawned tab (now active) gets the
+        // `terminal_sessions` row `Alt+T` registers (Spec R08).
+        if let Some(server) = ctl.as_mut() {
+            for follow in server.drain(&mut tabs) {
+                match follow {
+                    ctl::FollowUp::OpenedTab => {
+                        if let Some(tab) = tabs.active_mut() {
+                            if let Some(id) = state.store.session_started(
+                                &mut state.toast,
+                                tab.title(),
+                                tab.cwd(),
+                            ) {
+                                tab.set_store_session(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Agent sessions on the same tick (Spec R06): `TextDelta`s
         // stream into each tab's conversation and terminal events
         // release its running state — a background tab keeps up.

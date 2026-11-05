@@ -8,6 +8,15 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::sync::mpsc::{channel, Receiver};
+#[cfg(unix)]
+use std::time::Duration;
+
 use ait_testkit::ait_bin;
 
 /// Run `ait <args>` with `XDG_CONFIG_HOME` set to `xdg`.
@@ -128,4 +137,188 @@ fn bad_arguments_fail_with_usage() {
             stderr(&output)
         );
     }
+}
+
+// ------------------------------------------------------------------
+// `ait ctl` (Spec R11 §5.10.5): the client arm against a fake control
+// socket — socket resolution, the one-request wire shape, and the
+// stderr/exit-code contract. A running ait itself needs a TTY; the
+// client half provably doesn't.
+// ------------------------------------------------------------------
+
+/// `ait ctl <args>` under a controlled environment: `runtime` is the
+/// `XDG_RUNTIME_DIR` the socket scan reads and `socket` the
+/// `AIT_CTL_SOCKET` override (`None` removes an inherited one).
+#[cfg(unix)]
+fn ctl(runtime: &Path, socket: Option<&Path>, args: &[&str]) -> Output {
+    let mut command = Command::new(ait_bin!());
+    command
+        .arg("ctl")
+        .args(args)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("AIT_CTL_SOCKET");
+    if let Some(socket) = socket {
+        command.env("AIT_CTL_SOCKET", socket);
+    }
+    command.output().expect("spawn the ait binary")
+}
+
+/// A fake instance: bind `<dir>/fake.sock`, answer its one connection
+/// with `reply`, and hand the request line it received back on the
+/// returned receiver — the wire shape is part of what these tests
+/// assert.
+#[cfg(unix)]
+fn fake_socket(dir: &Path, reply: &'static str) -> (PathBuf, Receiver<String>) {
+    let socket = dir.join("fake.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the ctl client connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut request = String::new();
+        let mut buf = [0u8; 4096];
+        while !request.contains('\n') {
+            let n = stream.read(&mut buf).expect("the request reads");
+            if n == 0 {
+                break;
+            }
+            request.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        stream
+            .write_all(reply.as_bytes())
+            .expect("the reply writes");
+        tx.send(request).expect("the harness collects the request");
+    });
+    (socket, rx)
+}
+
+/// Zero sockets under the runtime dir — every verb fails with the
+/// documented message on stderr and a nonzero exit (us-32/41).
+#[cfg(unix)]
+#[test]
+fn ctl_reports_no_running_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [&["open-tab"][..], &["send", "hi"][..], &["last-block"][..]] {
+        let output = ctl(dir.path(), None, args);
+        assert!(!output.status.success(), "{args:?} must fail");
+        assert_eq!(
+            stderr(&output),
+            "ait ctl: no running ait instance\n",
+            "{args:?}"
+        );
+    }
+}
+
+/// Several `*.sock` candidates refuse to guess — the error lists each
+/// and names `AIT_CTL_SOCKET` as the disambiguator.
+#[cfg(unix)]
+#[test]
+fn ctl_lists_candidates_when_several_instances_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let ait_dir = dir.path().join("ait");
+    std::fs::create_dir_all(&ait_dir).unwrap();
+    std::fs::write(ait_dir.join("111.sock"), b"").unwrap();
+    std::fs::write(ait_dir.join("222.sock"), b"").unwrap();
+
+    let output = ctl(dir.path(), None, &["last-block"]);
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("ait ctl: several ait instances"), "{err}");
+    assert!(
+        err.contains("111.sock") && err.contains("222.sock"),
+        "{err}"
+    );
+    assert!(err.contains("AIT_CTL_SOCKET"), "{err}");
+}
+
+/// `AIT_CTL_SOCKET` wins over the dir scan: `open-tab`'s request is
+/// the verb's single-line JSON and the response line is the client's
+/// stdout — jq-composable as us-41 asks.
+#[cfg(unix)]
+#[test]
+fn ctl_open_tab_round_trips_through_the_env_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let (socket, requests) = fake_socket(dir.path(), "{\"ok\":true,\"session_id\":\"7\"}\n");
+
+    let output = ctl(runtime.path(), Some(&socket), &["open-tab"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "{\"ok\":true,\"session_id\":\"7\"}\n");
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(15)).unwrap(),
+        "{\"verb\":\"open_tab\"}\n",
+        "the wire request is one JSON line"
+    );
+}
+
+/// `send`'s flags encode on the wire — `--tab` and `--no-enter`
+/// included — and a bare `{"ok":true}` still prints.
+#[cfg(unix)]
+#[test]
+fn ctl_send_encodes_its_flags_on_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let (socket, requests) = fake_socket(dir.path(), "{\"ok\":true}\n");
+
+    let output = ctl(
+        runtime.path(),
+        Some(&socket),
+        &["send", "--tab", "4", "--no-enter", "echo", "hi"],
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "{\"ok\":true}\n");
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(15)).unwrap(),
+        "{\"verb\":\"send\",\"tab\":\"4\",\"text\":\"echo hi\",\"enter\":false}\n"
+    );
+}
+
+/// `last-block --exit` selects the field client-side (us-38); a
+/// server `{"ok":false}` relays its message to stderr and fails.
+#[cfg(unix)]
+#[test]
+fn ctl_last_block_selects_and_relays_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let (socket, _) = fake_socket(
+        dir.path(),
+        "{\"ok\":true,\"block\":{\"command\":\"echo hi\",\"output\":\"hi\",\"exit\":3}}\n",
+    );
+    let output = ctl(runtime.path(), Some(&socket), &["last-block", "--exit"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "3\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, _) = fake_socket(
+        dir.path(),
+        "{\"ok\":false,\"error\":\"the active tab has no sealed blocks\"}\n",
+    );
+    let output = ctl(runtime.path(), Some(&socket), &["last-block"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr(&output),
+        "ait ctl: the active tab has no sealed blocks\n"
+    );
+}
+
+/// A socket path nothing listens on fails naming the path — the
+/// client never hangs or reports success (us-41).
+#[cfg(unix)]
+#[test]
+fn ctl_fails_clearly_when_the_socket_is_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let dead = dir.path().join("dead.sock");
+
+    let output = ctl(runtime.path(), Some(&dead), &["open-tab"]);
+
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("ait ctl: can't reach"), "{err}");
+    assert!(err.contains("dead.sock"), "{err}");
 }

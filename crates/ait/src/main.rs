@@ -13,6 +13,7 @@ mod backend;
 mod blocks;
 mod config;
 mod conversations;
+mod ctl;
 mod inband;
 mod integration;
 mod keymap;
@@ -38,6 +39,11 @@ const USAGE: &str = "ait — AI Terminal
 
 USAGE:
     ait                    Open a full-screen terminal running $SHELL
+    ait ctl <verb>         Drive a running ait instance over its
+                           control socket:
+                               open-tab
+                               send [--tab <id>] [--no-enter] <text>
+                               last-block [--tab <id>] [--command|--exit]
     ait --init [--force]   Write a commented default settings.toml
                            (refuses to overwrite unless --force)
     ait --print-schema     Print the settings JSON Schema and exit
@@ -46,7 +52,7 @@ USAGE:
 ";
 
 /// What `argv[1..]` asks the binary to do (Spec R03 `ait` CLI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     /// Bare `ait` — the TUI.
     Run,
@@ -58,12 +64,21 @@ enum Command {
     Init { force: bool },
     /// `--print-schema`.
     PrintSchema,
+    /// `ctl <verb>` — drive a running instance over its control
+    /// socket (Spec R11 §5.10.5); the verb shape is [`ctl`]'s.
+    Ctl(ctl::CtlVerb),
 }
 
 /// `argv[1..]` → the [`Command`] to run. `--init`'s `--force` is the
 /// only two-flag form; anything unrecognized is a usage error naming
-/// the offending argument.
+/// the offending argument. A leading `ctl` hands its whole argv tail
+/// to [`ctl::parse_ctl_args`] — the subcommand surface this ticket
+/// owns (later CLI arms add variants additively, never a second
+/// leading-word parser).
 fn parse_args(args: &[String]) -> Result<Command, String> {
+    if args.first().is_some_and(|arg| arg == "ctl") {
+        return ctl::parse_ctl_args(&args[1..]).map(Command::Ctl);
+    }
     match args {
         [] => Ok(Command::Run),
         [arg] => match arg.as_str() {
@@ -122,6 +137,10 @@ fn main() -> ExitCode {
             println!("{}", ait_config::json_schema());
             ExitCode::SUCCESS
         }
+        // The ctl client arm (Spec R11): resolve the instance's
+        // socket, exchange one request, print the verb's answer —
+        // `run_client` owns stdout/stderr and the exit code.
+        Ok(Command::Ctl(verb)) => ctl::run_client(&verb),
         Err(message) => {
             eprintln!("ait: {message}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -193,5 +212,39 @@ mod tests {
             parse_args(&args(&["wat"])),
             Err("unknown argument \"wat\"".to_string())
         );
+    }
+
+    /// `ctl`'s argv tail lands on the client verbs (Spec R11 §5.10.5)
+    /// — and its own malformed shapes stay usage errors, never a
+    /// silent TUI launch.
+    #[test]
+    fn ctl_verbs_parse_to_their_commands() {
+        assert_eq!(
+            parse_args(&args(&["ctl", "open-tab"])),
+            Ok(Command::Ctl(ctl::CtlVerb::OpenTab))
+        );
+        assert_eq!(
+            parse_args(&args(&["ctl", "send", "--no-enter", "echo hi"])),
+            Ok(Command::Ctl(ctl::CtlVerb::Send {
+                tab: None,
+                enter: false,
+                text: "echo hi".to_owned(),
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["ctl", "last-block", "--tab", "2", "--exit"])),
+            Ok(Command::Ctl(ctl::CtlVerb::LastBlock {
+                tab: Some("2".to_owned()),
+                select: ctl::LastBlockSelect::Exit,
+            }))
+        );
+        for list in [
+            &["ctl"][..],
+            &["ctl", "bogus"][..],
+            &["ctl", "send"][..],
+            &["ctl", "last-block", "--command", "--exit"][..],
+        ] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
     }
 }
