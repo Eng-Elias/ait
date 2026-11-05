@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use ait_agent::{
     AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, BridgeError,
-    SkillsCatalog, ToolStatus, TranscriptItem,
+    SkillsCatalog, ToolStatus,
 };
 use ait_config::{ModelRole, Settings};
 use ait_term::{LiveSessionOptions, SpawnError};
@@ -673,7 +673,9 @@ mod tests {
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::time::Instant;
 
-    use ait_agent::{BridgeEvent, RemoteState, ShellBridge, ShellIntegration};
+    use ait_agent::{
+        BridgeEvent, RemoteState, ShellBridge, ShellIntegration, TranscriptItem,
+    };
 
     /// Generous bound for every wait below (mirrors `tabs.rs`'s live
     /// tests): tiny `/bin/bash` runs finish far under it even on a
