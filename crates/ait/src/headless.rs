@@ -1409,15 +1409,17 @@ config_key = "coding-key"
     /// flag mid-stream ends the task with `Cancelled`'s exit code —
     /// the same semantics Esc has in the TUI. The flag stands in for
     /// a delivered signal here; the handler's own wiring is proved by
-    /// `sigint_reaches_the_armed_flag`.
+    /// `sigint_reaches_the_armed_flag`. `drive` itself runs on THIS
+    /// thread — `AgentSession`'s event `Receiver` is `!Sync`, so a
+    /// helper thread owns the drip feed and the flag raise instead.
     #[test]
     fn a_raised_cancel_flag_cancels_the_in_flight_task() {
         let (drip_tx, drip_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let fixture = Fixture::serve(vec![Script::DripSse(drip_rx)]);
         let session = AgentSession::with_secret_store(NoSecrets);
         let cancel = Arc::new(AtomicBool::new(false));
-        // Share the stdout buffer so the test can wait on the first
-        // streamed delta — the signal must land while a task is
+        // Share the stdout buffer so the helper can wait on the first
+        // streamed delta — the flag must raise while a task is
         // provably in flight, not before the worker picked it up
         // (a queued-but-unstarted task still runs).
         let shared = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
@@ -1436,44 +1438,54 @@ config_key = "coding-key"
         let mut store = StoreHandle::disabled();
         let request = drive_request(&fixture.base_url, "", "work on it");
 
-        let driver = std::thread::spawn({
+        let helper = std::thread::spawn({
             let cancel = Arc::clone(&cancel);
+            let shared = Arc::clone(&shared);
             move || {
-                drive(
-                    &session,
-                    request,
-                    &mut store,
-                    Path::new("/tmp"),
-                    &mut out,
-                    &mut err,
-                    &cancel,
+                // One >8KiB write (tiny_http buffers ~8 KiB — a `:`
+                // comment is spec-legal SSE padding) so the first
+                // delta arrives, then hold the sender open: the
+                // stream stalls.
+                let mut chunk = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+                    json_string("working on it")
                 )
+                .into_bytes();
+                chunk.extend_from_slice(format!(": {}\n", "x".repeat(9 * 1024)).as_bytes());
+                drip_tx.send(chunk).expect("drip feed");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !shared
+                    .lock()
+                    .expect("out lock")
+                    .starts_with(b"working on it")
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // ALWAYS raise — a stalled delta must still unblock
+                // `drive` so the test fails instead of hanging.
+                cancel.store(true, Ordering::SeqCst);
             }
         });
 
-        // Feed one >8KiB write (tiny_http buffers ~8 KiB — a `:`
-        // comment is spec-legal SSE padding) so the first delta
-        // arrives, then hold the sender open: the stream stalls.
-        let mut chunk = format!(
-            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
-            json_string("working on it")
-        )
-        .into_bytes();
-        chunk.extend_from_slice(format!(": {}\n", "x".repeat(9 * 1024)).as_bytes());
-        drip_tx.send(chunk).expect("drip feed");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !shared
-            .lock()
-            .expect("out lock")
-            .starts_with(b"working on it")
-        {
-            assert!(Instant::now() < deadline, "the first delta streamed");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        cancel.store(true, Ordering::SeqCst);
-        let code = driver.join().expect("the drive thread finished");
+        let code = drive(
+            &session,
+            request,
+            &mut store,
+            Path::new("/tmp"),
+            &mut out,
+            &mut err,
+            &cancel,
+        );
+        helper.join().expect("the helper finished");
         assert_eq!(code, 130, "Cancelled maps to the SIGINT code");
+        assert!(
+            shared
+                .lock()
+                .expect("out lock")
+                .starts_with(b"working on it"),
+            "the flag raised with the task provably in flight"
+        );
     }
 
     /// The handler's own wiring (us-27): an armed flag observes a
