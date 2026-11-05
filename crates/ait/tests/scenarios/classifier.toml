@@ -1,0 +1,63 @@
+# Spec R11 §5.10.4: the input classifier's third submission trigger.
+# A verified natural-language line + Enter — no `# ` prefix, no chord —
+# is swallowed and rewritten (`Ctrl+U`, then `# <line>` + `\r`), so the
+# request lands in scrollback as a comment and the fresh prompt draws
+# for the suggestion (ADR-0014). The pinned env binds no model, so the
+# armed request ends in the `command_model` unconfigured toast — the
+# streamed-suggestion half lives in tests/e2e.rs, which can point
+# `command_model` at the loopback fixture (a scenario `env` cannot
+# interpolate an ephemeral port).
+#
+# A command verdict forwards verbatim instead: `echo R11T6_VERBATIM`'s
+# first word is a builtin, so the line submits untouched and its own
+# output renders.
+feature = "classifier"
+size = [80, 24]
+
+[[steps]]
+wait_text = "· sh · — · running"
+
+[[steps]]
+expect_regex = "(?m)^\\$$"
+
+# The echo gate before Enter is load-bearing: the trigger's shadow+grid
+# verification needs the typed line rendered on the grid, or it falls
+# back to an ordinary submission (desync is inert).
+[[steps]]
+text = "what is the largest file"
+
+[[steps]]
+wait_text = "what is the largest file"
+
+[[steps]]
+keys = ["Enter"]
+
+# The rewrite's evidence: the submitted `# <line>` comment row under
+# the `$ ` prompt, then a fresh bare prompt for the suggestion — and
+# with no model bound, the request's resolution error toasts on the
+# status line. The raw sentence never ran (no `not found` row).
+[[steps]]
+expect_text = "$ # what is the largest file"
+
+[[steps]]
+expect_regex = "(?m)^\\$$"
+
+[[steps]]
+expect_text = "command_model"
+
+# A builtin-led line submits verbatim: its echo row, then the output
+# row only execution produces, then the next fresh prompt.
+[[steps]]
+text = "echo R11T6_VERBATIM"
+
+[[steps]]
+wait_text = "echo R11T6_VERBATIM"
+
+[[steps]]
+keys = ["Enter"]
+
+[[steps]]
+expect_regex = "(?m)^R11T6_VERBATIM$"
+
+[[steps]]
+expect_regex = "(?m)^\\$$"
