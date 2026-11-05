@@ -466,7 +466,9 @@ pub fn classified_request(
 /// ordering `suggest_from_line` established.
 pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
     let _ = tab.session.send_bytes(b"\x15");
-    let _ = tab.session.send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
+    let _ = tab
+        .session
+        .send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
     tab.shadow.reset();
 }
 
@@ -1694,7 +1696,12 @@ mod tests {
         // Echo disagreement (history recall, a REPL, a heredoc): the
         // line on the grid is not the shadow's line.
         assert_eq!(
-            classified_line(&typed(line), "$ make install", &index, ClassifierMode::Heuristic),
+            classified_line(
+                &typed(line),
+                "$ make install",
+                &index,
+                ClassifierMode::Heuristic
+            ),
             None
         );
     }

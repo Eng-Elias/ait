@@ -2285,7 +2285,9 @@ mod tests {
         wait_until(&mut harness, |h| !logical(h).is_empty());
         let prompt = logical(&harness);
         type_keys(&mut harness, "what is the largest file");
-        wait_until(&mut harness, |h| logical(h).ends_with("what is the largest file"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
         assert!(!harness.tabs.active().unwrap().shadow.is_stale());
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -2308,7 +2310,9 @@ mod tests {
         // prompt the line was typed on (the mirror of the Alt+Enter
         // test's bare-prompt wait).
         wait_until(&mut harness, |h| {
-            rows(h).iter().any(|row| row.ends_with("# what is the largest file"))
+            rows(h)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file"))
         });
         wait_until(&mut harness, |h| logical(h) == prompt);
         // …and the typed line never executed: a forwarded Enter would
@@ -2363,9 +2367,13 @@ mod tests {
             harness.state.suggestion.is_none(),
             "a command verdict takes no pin"
         );
-        wait_until(&mut harness, |h| rows(h).iter().any(|row| row.contains("R11T2_42")));
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("R11T2_42"))
+        });
         assert!(
-            !rows(&harness).iter().any(|row| row.contains("# echo R11T2_")),
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# echo R11T2_")),
             "no `# ` rewrite row: {:?}",
             rows(&harness)
         );
@@ -2379,15 +2387,21 @@ mod tests {
     fn a_stale_shadow_submits_verbatim() {
         let mut harness = Harness::new(sh_manager());
         type_keys(&mut harness, "what is the largest file");
-        wait_until(&mut harness, |h| logical(h).ends_with("what is the largest file"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
         harness.tabs.active_mut().unwrap().shadow.mark_stale();
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(harness.state.suggestion.is_none());
-        wait_until(&mut harness, |h| rows(h).iter().any(|row| row.contains("not found")));
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
         assert!(
-            !rows(&harness).iter().any(|row| row.contains("# what is the largest file")),
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# what is the largest file")),
             "the stale line was never rewritten"
         );
     }
@@ -2399,7 +2413,9 @@ mod tests {
     fn an_unverifiable_shadow_submits_verbatim() {
         let mut harness = Harness::new(sh_manager());
         type_keys(&mut harness, "what is the largest file");
-        wait_until(&mut harness, |h| logical(h).ends_with("what is the largest file"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
         // A keystroke the PTY never saw leaves the shadow ahead of the
         // echo — `ends_with` refuses, non-stale or not.
         harness
@@ -2415,7 +2431,9 @@ mod tests {
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(harness.state.suggestion.is_none());
-        wait_until(&mut harness, |h| rows(h).iter().any(|row| row.contains("not found")));
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
     }
 
     /// us-11/13: `classifier = "off"` submits every line verbatim —
@@ -2425,22 +2443,27 @@ mod tests {
     #[test]
     fn classifier_off_submits_verbatim_until_rearmed() {
         let mut harness = Harness::new(sh_manager());
-        harness.state.config = LiveSettings::adopt(
-            Settings::from_toml("[input]\nclassifier = \"off\"\n").unwrap(),
-        );
+        harness.state.config =
+            LiveSettings::adopt(Settings::from_toml("[input]\nclassifier = \"off\"\n").unwrap());
         type_keys(&mut harness, "what is the largest file");
-        wait_until(&mut harness, |h| logical(h).ends_with("what is the largest file"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(harness.state.suggestion.is_none());
-        wait_until(&mut harness, |h| rows(h).iter().any(|row| row.contains("not found")));
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
 
         // Rearming (what a good hot-reload lands) lets the NEXT
         // natural-language submission rewrite again.
         harness.state.config = LiveSettings::adopt(Settings::default());
         type_keys(&mut harness, "where are the log files");
-        wait_until(&mut harness, |h| logical(h).ends_with("where are the log files"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("where are the log files")
+        });
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             harness.state.suggestion.pinned_id(),
@@ -2457,7 +2480,9 @@ mod tests {
     fn esc_after_the_rewrite_only_cancels_the_suggestion() {
         let mut harness = Harness::new(sh_manager());
         type_keys(&mut harness, "what is the largest file");
-        wait_until(&mut harness, |h| logical(h).ends_with("what is the largest file"));
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
@@ -2477,7 +2502,9 @@ mod tests {
             "a user-initiated cancel never toasts"
         );
         assert!(
-            rows(&harness).iter().any(|row| row.ends_with("# what is the largest file")),
+            rows(&harness)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file")),
             "the history comment outlives the cancel: {:?}",
             rows(&harness)
         );
