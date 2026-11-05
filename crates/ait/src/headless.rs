@@ -673,9 +673,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::time::Instant;
 
-    use ait_agent::{
-        BridgeEvent, RemoteState, ShellBridge, ShellIntegration, TranscriptItem,
-    };
+    use ait_agent::{BridgeEvent, RemoteState, ShellBridge, ShellIntegration, TranscriptItem};
 
     /// Generous bound for every wait below (mirrors `tabs.rs`'s live
     /// tests): tiny `/bin/bash` runs finish far under it even on a
