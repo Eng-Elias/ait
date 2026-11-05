@@ -39,6 +39,9 @@ const USAGE: &str = "ait — AI Terminal
 
 USAGE:
     ait                    Open a full-screen terminal running $SHELL
+    ait --headless "<task>" [--profile <name>]
+                           Run one agent task non-interactively
+                           (text to stdout, activity to stderr)
     ait --init [--force]   Write a commented default settings.toml
                            (refuses to overwrite unless --force)
     ait --print-schema     Print the settings JSON Schema and exit
@@ -47,23 +50,31 @@ USAGE:
 ";
 
 /// What `argv[1..]` asks the binary to do (Spec R03 `ait` CLI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     /// Bare `ait` — the TUI.
     Run,
     /// `--version` / `-V`.
     Version,
     /// `--help` / `-h`.
-    Help,
     /// `--init` — `force` spells `--init --force` (the overwrite form).
     Init { force: bool },
     /// `--print-schema`.
     PrintSchema,
+    /// `--headless "<task>" [--profile <name>]` — the non-interactive
+    /// agent run (Spec R11 §5.10.5).
+    Headless {
+        /// The task text, verbatim.
+        task: String,
+        /// The `--profile <name>` selection — `None` arms the
+        /// launch default.
+        profile: Option<String>,
+    },
 }
 
-/// `argv[1..]` → the [`Command`] to run. `--init`'s `--force` is the
-/// only two-flag form; anything unrecognized is a usage error naming
-/// the offending argument.
+/// `argv[1..]` → the [`Command`] to run. `--init`'s `--force` and
+/// `--headless`'s `--profile` are the only flag forms; anything
+/// unrecognized is a usage error naming the offending argument.
 fn parse_args(args: &[String]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Run),
@@ -72,6 +83,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--help" | "-h" => Ok(Command::Help),
             "--init" => Ok(Command::Init { force: false }),
             "--print-schema" => Ok(Command::PrintSchema),
+            "--headless" => Err("the --headless form needs a task".to_string()),
             _ => Err(format!("unknown argument {arg:?}")),
         },
         [first, second]
@@ -79,6 +91,16 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 || (first == "--force" && second == "--init") =>
         {
             Ok(Command::Init { force: true })
+        }
+        [first, task] if first == "--headless" => Ok(Command::Headless {
+            task: task.clone(),
+            profile: None,
+        }),
+        [first, task, flag, name] if first == "--headless" && flag == "--profile" => {
+            Ok(Command::Headless {
+                task: task.clone(),
+                profile: Some(name.clone()),
+            })
         }
         _ => Err(format!("unrecognized arguments {}", args.join(" "))),
     }
@@ -123,6 +145,10 @@ fn main() -> ExitCode {
             println!("{}", ait_config::json_schema());
             ExitCode::SUCCESS
         }
+        // The non-interactive agent run (Spec R11 §5.10.5) — the
+        // driver owns settings load, the hidden shell and the
+        // stdout/stderr/exit-code contract.
+        Ok(Command::Headless { task, profile }) => headless::run(&task, profile.as_deref()),
         Err(message) => {
             eprintln!("ait: {message}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -162,6 +188,53 @@ mod tests {
             parse_args(&args(&["--print-schema"])),
             Ok(Command::PrintSchema)
         );
+    }
+
+    /// Spec R11 §5.10.5: `--headless "<task>"` carries the task
+    /// verbatim; `--profile <name>` selects the profile; the task
+    /// itself may look like a flag (it is a value, not parsed).
+    #[test]
+    fn headless_parses_task_and_optional_profile() {
+        assert_eq!(
+            parse_args(&args(&["--headless", "fix the tests"])),
+            Ok(Command::Headless {
+                task: "fix the tests".to_string(),
+                profile: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["--headless", "fix the tests", "--profile", "work"])),
+            Ok(Command::Headless {
+                task: "fix the tests".to_string(),
+                profile: Some("work".to_string()),
+            })
+        );
+        // A flag-shaped task stays verbatim.
+        assert_eq!(
+            parse_args(&args(&["--headless", "--verbose"])),
+            Ok(Command::Headless {
+                task: "--verbose".to_string(),
+                profile: None,
+            })
+        );
+    }
+
+    /// The headless forms' failure modes: a bare `--headless` names
+    /// the missing task, a trailing `--profile` with no name or an
+    /// unrecognized flag is a usage error.
+    #[test]
+    fn headless_malformed_forms_are_errors() {
+        assert_eq!(
+            parse_args(&args(&["--headless"])),
+            Err("the --headless form needs a task".to_string())
+        );
+        for list in [
+            &["--headless", "task", "--profile"][..],
+            &["--headless", "task", "--bogus", "name"][..],
+            &["--headless", "task", "--profile", "name", "extra"][..],
+        ] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
     }
 
     /// `--init --force` in either order is the overwrite form (story 3).
