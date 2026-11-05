@@ -1215,14 +1215,7 @@ async fn gate_and_execute(
 /// us-9's card annotation) — `None` for non-MCP calls, undeclared
 /// servers and unparseable arguments alike.
 fn mcp_origin(call: &ToolCall, pool: &McpPool) -> Option<McpServerOrigin> {
-    if !matches!(
-        call.name.as_str(),
-        tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE
-    ) {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-    pool.origin_of(args.get("server")?.as_str()?)
+    pool.origin_of(&tools::mcp_target(call)?.server)
 }
 
 /// The `ask_user_question` flow (us-10): emit the call's own card —

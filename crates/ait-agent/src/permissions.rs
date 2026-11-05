@@ -37,7 +37,8 @@ use regex::Regex;
 
 use crate::tool_call::ToolCall;
 use crate::tools::{
-    ASK_USER_QUESTION, CALL_MCP_TOOL, INVOKE_SKILL, READ_MCP_RESOURCE, UPDATE_PLAN,
+    mcp_target, McpTarget, ASK_USER_QUESTION, CALL_MCP_TOOL, INVOKE_SKILL, READ_MCP_RESOURCE,
+    UPDATE_PLAN,
 };
 
 /// What the gate does with one tool call — the vocabulary the
@@ -213,38 +214,6 @@ fn level_for(profile: &ExecutionProfile, tool: &str) -> Option<PermissionLevel> 
 fn command_arg(call: &ToolCall) -> Option<String> {
     let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
     args.get("command")?.as_str().map(str::to_owned)
-}
-
-/// The MCP server a call targets — `None` for every non-MCP tool.
-/// `call_mcp_tool` carries `server` + `tool`; `read_mcp_resource`
-/// carries `server` alone (its `tool` stays `None`, so `server:tool`
-/// list entries can never reach a resource read — the §5.10.1
-/// "server-only entries" rule). A call whose arguments are not JSON
-/// or carry no string `server` has nothing the lists can match: the
-/// level decides and the executor reports the malformed argument as
-/// a tool error, like every other bad call.
-struct McpTarget {
-    /// The call's `server` argument.
-    server: String,
-    /// The call's `tool` argument — `call_mcp_tool` only.
-    tool: Option<String>,
-}
-
-/// Parse the MCP target out of `call` — the values the §5.7 MCP
-/// lists match literally.
-fn mcp_target(call: &ToolCall) -> Option<McpTarget> {
-    let wants_tool = match call.name.as_str() {
-        CALL_MCP_TOOL => true,
-        READ_MCP_RESOURCE => false,
-        _ => return None,
-    };
-    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-    let server = args.get("server")?.as_str()?.to_owned();
-    let tool = wants_tool
-        .then(|| args.get("tool").and_then(|v| v.as_str()))
-        .flatten()
-        .map(str::to_owned);
-    Some(McpTarget { server, tool })
 }
 
 /// `true` when any entry in `list` literally equals the target's

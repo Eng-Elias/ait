@@ -50,7 +50,7 @@ use tokio::time::timeout;
 
 use crate::files::ToolOutput;
 use crate::tool_call::ToolCall;
-use crate::tools::{CALL_MCP_TOOL, READ_MCP_RESOURCE};
+use crate::tools::{self, CALL_MCP_TOOL, READ_MCP_RESOURCE};
 
 /// One server's eager-initialization budget (Spec R10: "connect +
 /// tools/resources enumeration under a connect timeout") — spawn,
@@ -278,10 +278,10 @@ impl McpPool {
     /// model. A dead transport demotes the server to unavailable for
     /// the rest of the task (the next reconcile retries).
     async fn call_tool(&mut self, args: &serde_json::Value) -> ToolOutput {
-        let Some(server) = args.get("server").and_then(|v| v.as_str()) else {
+        let Some(server) = tools::arg_str(args, "server") else {
             return ToolOutput::error(String::from("call_mcp_tool: `server` must be a string"));
         };
-        let Some(tool) = args.get("tool").and_then(|v| v.as_str()) else {
+        let Some(tool) = tools::arg_str(args, "tool") else {
             return ToolOutput::error(String::from("call_mcp_tool: `tool` must be a string"));
         };
         let Some(slot) = self.servers.get_mut(server) else {
@@ -317,10 +317,10 @@ impl McpPool {
     /// result; a blob reports itself instead of dumping base64 into
     /// the conversation.
     async fn read_resource(&mut self, args: &serde_json::Value) -> ToolOutput {
-        let Some(server) = args.get("server").and_then(|v| v.as_str()) else {
+        let Some(server) = tools::arg_str(args, "server") else {
             return ToolOutput::error(String::from("read_mcp_resource: `server` must be a string"));
         };
-        let Some(uri) = args.get("uri").and_then(|v| v.as_str()) else {
+        let Some(uri) = tools::arg_str(args, "uri") else {
             return ToolOutput::error(String::from("read_mcp_resource: `uri` must be a string"));
         };
         let Some(slot) = self.servers.get_mut(server) else {

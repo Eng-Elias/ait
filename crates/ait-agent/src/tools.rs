@@ -341,6 +341,45 @@ fn registry() -> &'static [ToolSpec] {
     &REGISTRY
 }
 
+/// The MCP server a call targets — `None` for every non-MCP tool.
+/// `call_mcp_tool` carries `server` + `tool`; `read_mcp_resource`
+/// carries `server` alone (its `tool` stays `None`, so `server:tool`
+/// list entries can never reach a resource read — the §5.10.1
+/// "server-only entries" rule). A call whose arguments are not JSON
+/// or carry no string `server` has nothing the lists can match: the
+/// level decides and the executor reports the malformed argument as
+/// a tool error, like every other bad call.
+pub(crate) struct McpTarget {
+    /// The call's `server` argument.
+    pub(crate) server: String,
+    /// The call's `tool` argument — `call_mcp_tool` only.
+    pub(crate) tool: Option<String>,
+}
+
+/// Parse the MCP target out of `call` — the values the §5.7 MCP
+/// lists match literally, the card's origin annotation resolves and
+/// the pool's dispatch dispatches on. The ONE `server` extraction
+/// every consult site shares (CODING_STANDARDS §17).
+pub(crate) fn mcp_target(call: &ToolCall) -> Option<McpTarget> {
+    let wants_tool = match call.name.as_str() {
+        CALL_MCP_TOOL => true,
+        READ_MCP_RESOURCE => false,
+        _ => return None,
+    };
+    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    let server = arg_str(&args, "server")?.to_owned();
+    let tool = wants_tool
+        .then(|| arg_str(&args, "tool").map(str::to_owned))
+        .flatten();
+    Some(McpTarget { server, tool })
+}
+
+/// `args`' string field `key` — the `server`/`tool`/`uri` extraction
+/// the MCP tools and their card summaries share, spelled once.
+pub(crate) fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key)?.as_str()
+}
+
 /// Parse an `ask_user_question` call's arguments into the card's
 /// pieces: the question to render and the offered choices — an empty
 /// list means the card takes a free-text answer. A missing or
@@ -588,14 +627,8 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
         // in the same `server:tool` vocabulary the mcp lists use
         // (Spec R10 us-13).
         CALL_MCP_TOOL => {
-            let server = args
-                .get("server")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let tool = args
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let server = arg_str(&args, "server").unwrap_or_default();
+            let tool = arg_str(&args, "tool").unwrap_or_default();
             match args.get("arguments") {
                 Some(arguments) => format!("{server}:{tool} {}", compact(arguments)),
                 None => format!("{server}:{tool}"),
@@ -603,20 +636,13 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
         }
         // `server <uri>` — the read the user is consenting to.
         READ_MCP_RESOURCE => {
-            let server = args
-                .get("server")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let uri = args.get("uri").and_then(|v| v.as_str()).unwrap_or_default();
+            let server = arg_str(&args, "server").unwrap_or_default();
+            let uri = arg_str(&args, "uri").unwrap_or_default();
             format!("{server} {uri}").trim().to_string()
         }
         // The bare skill name — the skill the user is consenting to
         // load.
-        INVOKE_SKILL => args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        INVOKE_SKILL => arg_str(&args, "name").unwrap_or_default().to_string(),
         _ => compact(&args),
     }
 }
