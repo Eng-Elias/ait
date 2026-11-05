@@ -4,7 +4,7 @@
 //! whose text names the offending key path
 //! (`agents.custom_endpoints.local.models[0].config_key: …`).
 
-use ait_config::{EndpointSchema, PermissionLevel, Settings};
+use ait_config::{EndpointSchema, PermissionLevel, RedactionSettings, Settings};
 
 /// The §4.1 endpoint + §5.7 default-profile document, verbatim shape.
 const FULL_SPEC_DOCUMENT: &str = r#"
@@ -168,7 +168,7 @@ fn unknown_keys_at_every_level_are_rejected() {
     let cases: &[(&str, &str)] = &[
         (
             "bogus = 1",
-            "bogus: unknown field `bogus`, expected one of `terminal`, `agents`, `ssh`",
+            "bogus: unknown field `bogus`, expected one of `terminal`, `agents`, `ssh`, `redaction`",
         ),
         (
             "[terminal]\nshells = \"/bin/sh\"",
@@ -523,4 +523,121 @@ fn a_malformed_host_pattern_names_the_entry() {
             "input {input:?}\nexpected prefix {expected:?}\nactual   {message:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Spec R10-T1: the [redaction] section (§4.3 → decided, §5.10.3).
+// ---------------------------------------------------------------------------
+
+/// A `[redaction]` section loads its three lists; an absent section
+/// yields the all-off defaults — built-ins on, no PII, no extras
+/// (Spec R10: the PII categories ship disabled).
+#[test]
+fn redaction_section_parses_and_defaults_apply() {
+    let settings = Settings::from_toml(
+        r#"
+        [redaction]
+        extra = ['\btoken-[A-Z0-9]{8}']
+        enable = ["pii_email", "pii_ipv4"]
+        disable = ["jwt"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(settings.redaction.extra, [r"\btoken-[A-Z0-9]{8}"]);
+    assert_eq!(settings.redaction.enable, ["pii_email", "pii_ipv4"]);
+    assert_eq!(settings.redaction.disable, ["jwt"]);
+
+    let settings = Settings::from_toml("").unwrap();
+    assert_eq!(settings.redaction, RedactionSettings::default());
+    assert!(settings.redaction.extra.is_empty());
+    assert!(settings.redaction.enable.is_empty());
+    assert!(settings.redaction.disable.is_empty());
+}
+
+/// Enabling a name that is already on — a built-in — is a no-op, not
+/// an error: `enable` opts into the disabled categories, and naming
+/// an enabled one asks for the state it is already in.
+#[test]
+fn enabling_an_already_on_builtin_is_a_no_op() {
+    let settings = Settings::from_toml(
+        "[redaction]\nenable = [\"aws_access_key\", \"pii_mac\"]",
+    )
+    .unwrap();
+    assert_eq!(
+        settings.redaction.enable,
+        ["aws_access_key", "pii_mac"]
+    );
+}
+
+/// A broken `extra` regex fails load naming its
+/// `redaction.extra[<index>]` path — the command-list precedent: a
+/// pattern that cannot compile would silently never mask.
+#[test]
+fn a_broken_redaction_extra_regex_names_the_entry() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "[redaction]\nextra = ['(']",
+            "redaction.extra[0]:",
+        ),
+        (
+            "[redaction]\nextra = ['^ok$', '*']",
+            "redaction.extra[1]:",
+        ),
+    ];
+    for (input, expected) in cases {
+        let err = Settings::from_toml(input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(expected),
+            "input {input:?}\nexpected prefix {expected:?}\nactual   {message:?}"
+        );
+        assert!(
+            message.len() > expected.len(),
+            "the regex error itself must follow the path: {message:?}"
+        );
+    }
+}
+
+/// Every `enable`/`disable` entry must resolve to a known pattern
+/// name — an unknown one fails load naming its
+/// `redaction.<list>[<index>]` path (§5.10.3).
+#[test]
+fn an_unknown_redaction_pattern_name_names_the_entry() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "[redaction]\nenable = [\"ipv4\"]",
+            "redaction.enable[0]: unknown pattern name \"ipv4\"",
+        ),
+        (
+            "[redaction]\ndisable = [\"jwt\", \"bogus\"]",
+            "redaction.disable[1]: unknown pattern name \"bogus\"",
+        ),
+        (
+            "[redaction]\nenable = [\"pii_email\", \"PII_IPV4\"]",
+            "redaction.enable[1]: unknown pattern name \"PII_IPV4\"",
+        ),
+    ];
+    for (input, expected) in cases {
+        let err = Settings::from_toml(input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(expected),
+            "input {input:?}\nexpected prefix {expected:?}\nactual   {message:?}"
+        );
+    }
+}
+
+/// A name in both `enable` and `disable` is a contradiction — a load
+/// error naming the `disable` entry that re-states it (§5.10.3).
+#[test]
+fn a_redaction_name_in_both_lists_is_rejected() {
+    let err = Settings::from_toml(
+        "[redaction]\nenable = [\"pii_email\", \"jwt\"]\ndisable = [\"slack_token\", \"jwt\"]",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "redaction.disable[1]: \"jwt\" is in both redaction.enable and \
+         redaction.disable"
+    );
 }
