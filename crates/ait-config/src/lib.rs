@@ -70,4 +70,4 @@ pub use settings::{
 };
 pub use skills::{project_skills_dir, user_skills_dir};
 #[cfg(feature = "watch")]
-pub use watch::{watch, watch_from, SettingsWatcher};
+pub use watch::{watch, watch_dirs, watch_from, DirsWatcher, SettingsWatcher};

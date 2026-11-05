@@ -11,7 +11,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ait_config::{watch, watch_from, ConfigError, Settings, SettingsWatcher};
+use ait_config::{
+    watch, watch_dirs, watch_from, ConfigError, DirsWatcher, Settings, SettingsWatcher,
+};
 
 /// Generous bound on "the event eventually arrives" — far past the ~300 ms
 /// debounce so a loaded CI machine cannot flake.
@@ -277,4 +279,85 @@ fn file_created_after_watch_starts_emits_settings() {
     write(&path, "[terminal]\nscrollback_lines = 4_000\n");
     let settings = next_event(&_watcher).expect("created file should emit Settings, not an error");
     assert_eq!(settings.terminal.scrollback_lines, Some(4_000));
+}
+
+/// The next `()` on a directory watcher's channel — a missing event is
+/// a test failure with context, not a hang.
+fn next_dirs_event(watcher: &DirsWatcher) {
+    watcher
+        .receiver()
+        .recv_timeout(EVENT_WAIT)
+        .expect("no event arrived within the wait bound")
+}
+
+#[test]
+fn directory_watch_emits_on_a_nested_file_write() {
+    // §5.10.2 (Spec R10-T6): the skills watcher subscribes to a
+    // directory RECURSIVELY — a `SKILL.md` write nested two levels
+    // down (`<dir>/skills/demo/SKILL.md`) still settles into an event.
+    let dirs = tempfile::tempdir().unwrap();
+    let root = dirs.path().join("ait");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let _watcher = watch_dirs(std::slice::from_ref(&root)).unwrap();
+
+    let skill = root.join("skills").join("demo");
+    std::fs::create_dir_all(&skill).unwrap();
+    write(
+        &skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: d\n---\n",
+    );
+    next_dirs_event(&_watcher);
+}
+
+#[test]
+fn directory_watch_covers_every_listed_dir() {
+    // Both skills roots watch in parallel — a change under EITHER
+    // listed directory emits (the payload is "rescan now", never
+    // attribution).
+    let dirs = tempfile::tempdir().unwrap();
+    let user = dirs.path().join("user-layer");
+    let project = dirs.path().join("project-layer");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let _watcher = watch_dirs(&[user, project.clone()]).unwrap();
+
+    write(&project.join("touched"), "x");
+    next_dirs_event(&_watcher);
+}
+
+#[test]
+fn directory_watch_emits_on_delete_and_skips_missing_dirs() {
+    // Deleting a file under a watched dir is a change like any other;
+    // a listed dir that does not exist is skipped — a skills dir that
+    // has not been created yet is simply nothing to watch, not a
+    // watch failure (convergence is the caller's rescan).
+    let dirs = tempfile::tempdir().unwrap();
+    let present = dirs.path().join("present");
+    std::fs::create_dir_all(&present).unwrap();
+    let missing = dirs.path().join("missing");
+
+    let _watcher = watch_dirs(&[missing, present.clone()]).unwrap();
+
+    let file = present.join("SKILL.md");
+    write(&file, "---\nname: demo\ndescription: d\n---\n");
+    next_dirs_event(&_watcher);
+
+    std::fs::remove_file(&file).unwrap();
+    next_dirs_event(&_watcher);
+}
+
+#[test]
+fn directory_watch_with_no_watchable_dirs_stays_inert() {
+    // A set with no existing dirs yields a live-but-quiet watcher —
+    // the caller needs no empty-set special case.
+    let dirs = tempfile::tempdir().unwrap();
+
+    let watcher = watch_dirs(&[dirs.path().join("absent")]).unwrap();
+
+    watcher
+        .receiver()
+        .recv_timeout(QUIET_CHECK)
+        .expect_err("an unwatched set must not emit");
 }

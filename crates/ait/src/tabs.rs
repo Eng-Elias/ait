@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use ait_agent::{AgentRequest, ApprovalVerdict, SkillsCatalog};
+use ait_agent::{AgentRequest, ApprovalVerdict};
 use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
@@ -49,6 +49,7 @@ use crate::render::session_size;
 use crate::scroll::ScrollState;
 use crate::selection::{GridPoint, Selection, SelectionRange};
 use crate::shell_bridge::{self, BridgeRequest, BridgeService};
+use crate::skills::{skipped_text, LiveSkills};
 use crate::status::Toast;
 use crate::store::StoreHandle;
 use crate::suggest::InputShadow;
@@ -804,6 +805,7 @@ impl Tab {
         key: &KeyEvent,
         settings: &Settings,
         profile: &str,
+        skills: &mut LiveSkills,
         toast: &mut Option<Toast>,
     ) {
         if !self.agent_focused() {
@@ -854,7 +856,7 @@ impl Tab {
                 if panel.is_running() {
                     panel.steer(text, toast);
                 } else {
-                    self.submit_agent_task(settings, profile, text, toast);
+                    self.submit_agent_task(settings, profile, text, skills, toast);
                 }
             }
             // The parked approve card: `a`/`t` answer at once, `d`
@@ -893,6 +895,7 @@ impl Tab {
         settings: &Settings,
         profile: &str,
         task: String,
+        skills: &mut LiveSkills,
         toast: &mut Option<Toast>,
     ) {
         // The conversation is the continuity unit (Spec R08-T4): the
@@ -907,21 +910,16 @@ impl Tab {
             .map(|panel| panel.transcript_items().to_vec())
             .unwrap_or_default();
         let context = context_for(self);
-        // §5.10.2 (Spec R10-T5): the skills catalog is scanned at
-        // submit time and rides the request verbatim — what the
-        // model sees is what this snapshot carries (live watching
-        // is R10-T6's). A malformed SKILL.md is skipped and toasted,
+        // §5.10.2 (Spec R10-T5/T6): the skills catalog snapshot comes
+        // from the app's live catalog — refreshed by the roots
+        // watcher since the last task — re-resolved for THIS tab's
+        // cwd so a session whose nearest .ait moved picks up its own
+        // project layer. What the model sees is what the request
+        // carried; a malformed SKILL.md is skipped and toasted,
         // never silent.
-        let skills = SkillsCatalog::scan(Path::new(&context.cwd));
-        if let Some(first) = skills.errors().first() {
-            let more = skills.errors().len() - 1;
-            *toast = Some(Toast::new(
-                match more {
-                    0 => format!("skill skipped: {first}"),
-                    n => format!("skill skipped: {first} (+{n} more)"),
-                },
-                Instant::now(),
-            ));
+        let skills = skills.snapshot(Path::new(&context.cwd));
+        if !skills.errors().is_empty() {
+            *toast = Some(Toast::new(skipped_text(skills.errors()), Instant::now()));
         }
         let request = AgentRequest {
             settings: settings.clone(),
@@ -3786,14 +3784,26 @@ mod tests {
         // `a` answers allow-once — the wait clears.
         tab.agent.as_mut().unwrap().apply(staged("call_1"));
         assert!(tab.agent.as_ref().unwrap().awaiting_verdict());
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('a')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
         assert!(toast.is_none());
 
         // `d` on an empty input opens reason mode — the card stays
         // parked and the reason can contain the verdict letters.
         tab.agent.as_mut().unwrap().apply(staged("call_2"));
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('d')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(
@@ -3803,7 +3813,13 @@ mod tests {
             assert!(panel.deny_reason_active());
         }
         for c in "don't allow".chars() {
-            tab.agent_key(&key(KeyCode::Char(c)), &settings, "default", &mut toast);
+            tab.agent_key(
+                &key(KeyCode::Char(c)),
+                &settings,
+                "default",
+                &mut LiveSkills::unwatched(),
+                &mut toast,
+            );
         }
         {
             let panel = tab.agent.as_ref().unwrap();
@@ -3811,7 +3827,13 @@ mod tests {
             assert!(panel.awaiting_verdict(), "the card still waits");
         }
         // Enter answers `Deny` with the reason — the wait clears.
-        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Enter),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_verdict());
@@ -3821,29 +3843,71 @@ mod tests {
         // `d` again — reason mode — and Enter on an EMPTY reason
         // still denies (the worker substitutes its default text).
         tab.agent.as_mut().unwrap().apply(staged("call_3"));
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('d')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Enter),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
         // With input held, the same letters are ordinary editing —
         // `a`/`d` type rather than verdict; the card stays parked
         // until the input is emptied and `a` pressed again.
         tab.agent.as_mut().unwrap().apply(staged("call_4"));
-        tab.agent_key(&key(KeyCode::Char('x')), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('x')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Char('d')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Char('a')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(panel.awaiting_verdict(), "non-empty input = editing");
             assert_eq!(panel.input(), "xda");
         }
         tab.agent.as_mut().unwrap().take_input();
-        tab.agent_key(&key(KeyCode::Char('a')), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('a')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
 
         // And with nothing pending, `d` edits the input like any
         // other character.
-        tab.agent_key(&key(KeyCode::Char('d')), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('d')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
     }
 
@@ -3877,16 +3941,46 @@ mod tests {
         let panel = tab.agent.as_mut().unwrap();
         panel.apply(ask("call_1", &["a", "b"]));
         assert!(panel.awaiting_answer());
-        tab.agent_key(&key(KeyCode::Char('x')), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Left), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Backspace), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Char('x')),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Left),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Backspace),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(panel.awaiting_answer(), "stray keys resolved nothing");
             assert_eq!(panel.input(), "", "stray keys never reached the input");
         }
-        tab.agent_key(&key(KeyCode::Down), &settings, "default", &mut toast);
-        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Down),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
+        tab.agent_key(
+            &key(KeyCode::Enter),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_answer());
@@ -3902,13 +3996,31 @@ mod tests {
         panel.apply(ask("call_2", &[]));
         assert!(!panel.ask_has_choices());
         for c in "why not".chars() {
-            tab.agent_key(&key(KeyCode::Char(c)), &settings, "default", &mut toast);
+            tab.agent_key(
+                &key(KeyCode::Char(c)),
+                &settings,
+                "default",
+                &mut LiveSkills::unwatched(),
+                &mut toast,
+            );
         }
         // ↓ on a free-text ask navigates nothing — the card keeps
         // waiting and the input is untouched.
-        tab.agent_key(&key(KeyCode::Down), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Down),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         assert!(tab.agent.as_ref().unwrap().awaiting_answer());
-        tab.agent_key(&key(KeyCode::Enter), &settings, "default", &mut toast);
+        tab.agent_key(
+            &key(KeyCode::Enter),
+            &settings,
+            "default",
+            &mut LiveSkills::unwatched(),
+            &mut toast,
+        );
         {
             let panel = tab.agent.as_ref().unwrap();
             assert!(!panel.awaiting_answer());
