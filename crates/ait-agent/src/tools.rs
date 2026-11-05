@@ -7,7 +7,10 @@
 //! The v1 list is fixed (Spec R06: `run_command`, `read_files`,
 //! `edit_files`, `grep`, `glob`, `ask_user_question`,
 //! `write_to_pty`; Spec R08 adds `update_plan` — §5.8's visible
-//! TODO list, gate-exempt like the ask). Every declared tool
+//! TODO list, gate-exempt like the ask; Spec R10 adds
+//! `call_mcp_tool` and `read_mcp_resource` — §5.10.1's MCP
+//! surface — and `invoke_skill`, §5.10.2's skills loader). Every
+//! declared tool
 //! executes: the file tools
 //! live in [`files`](crate::files), `write_to_pty`'s agent-owned
 //! PTY in [`pty`](crate::pty) (R06-T7), `run_command` runs through
@@ -16,7 +19,11 @@
 //! `update_plan` applies through its snapshot event
 //! ([`AgentEvent::PlanUpdated`](crate::AgentEvent::PlanUpdated), us-13)
 //! — [`execute`] is the dispatcher; an unknown name is the only
-//! tool error left.
+//! tool error left. Two surfaces `execute` does not serve: the
+//! gate diverts the MCP tools to the session's
+//! [`McpPool`](crate::mcp::McpPool), whose rmcp clients live on the
+//! worker's runtime, and `invoke_skill` to the request's
+//! [`SkillsCatalog`](crate::SkillsCatalog) snapshot.
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
@@ -51,6 +58,27 @@ pub(crate) const ASK_USER_QUESTION: &str = "ask_user_question";
 /// [`PlanUpdated`](crate::AgentEvent::PlanUpdated) event IS the
 /// effect — before [`execute`] is ever called.
 pub(crate) const UPDATE_PLAN: &str = "update_plan";
+
+/// The `call_mcp_tool` tool's registry name (Spec R10, §5.10.1) —
+/// invokes a tool on a server declared in `mcp.json` through the
+/// session's [`McpPool`](crate::mcp::McpPool). The permission engine
+/// maps it to `mcp_permissions` and consults `mcp_denylist`/
+/// `mcp_allowlist`'s literal `server`/`server:tool` entries first.
+pub(crate) const CALL_MCP_TOOL: &str = "call_mcp_tool";
+
+/// The `read_mcp_resource` tool's registry name (Spec R10, §5.10.1)
+/// — reads a resource by URI from a named `mcp.json` server, gated
+/// by `mcp_permissions` and the lists' `server` entries like
+/// [`CALL_MCP_TOOL`].
+pub(crate) const READ_MCP_RESOURCE: &str = "read_mcp_resource";
+
+/// The `invoke_skill` tool's registry name (Spec R10, §5.10.2) —
+/// loads a `SKILL.md` skill's body plus its bundled-file manifest
+/// from the request's [`SkillsCatalog`](crate::SkillsCatalog)
+/// snapshot. The permission engine maps it to `read_files`: a
+/// `never` profile forbids skills and no new profile field is
+/// needed (us-28).
+pub(crate) const INVOKE_SKILL: &str = "invoke_skill";
 
 /// One tool, provider-neutrally: what the model sees, translated
 /// per schema by [`declare`].
@@ -240,9 +268,116 @@ fn registry() -> &'static [ToolSpec] {
                     "additionalProperties": false
                 }),
             },
+            ToolSpec {
+                name: CALL_MCP_TOOL,
+                description:
+                    "Call a tool on a configured MCP server. The MCP servers section of the \
+                          system prompt lists which servers are connected and the tools each \
+                          offers; `arguments` must match that tool's schema.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "The MCP server name as declared in mcp.json."
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": "The tool name on that server."
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "The tool's input arguments; omit when it takes none."
+                        }
+                    },
+                    "required": ["server", "tool"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolSpec {
+                name: READ_MCP_RESOURCE,
+                description:
+                    "Read a resource from a configured MCP server by URI. The MCP servers \
+                          section of the system prompt lists which servers are connected and \
+                          the resource URIs each offers.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "The MCP server name as declared in mcp.json."
+                        },
+                        "uri": {
+                            "type": "string",
+                            "description": "The resource URI to read."
+                        }
+                    },
+                    "required": ["server", "uri"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolSpec {
+                name: INVOKE_SKILL,
+                description:
+                    "Load a skill's instructions by name. The Available skills section of the \
+                          system prompt lists which skills exist; the result is the skill's \
+                          SKILL.md body plus the files bundled in its directory, which \
+                          read_files can then open.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The skill name as listed in the Available skills \
+                                            section."
+                        }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            },
         ]
     });
     &REGISTRY
+}
+
+/// The MCP server a call targets — `None` for every non-MCP tool.
+/// `call_mcp_tool` carries `server` + `tool`; `read_mcp_resource`
+/// carries `server` alone (its `tool` stays `None`, so `server:tool`
+/// list entries can never reach a resource read — the §5.10.1
+/// "server-only entries" rule). A call whose arguments are not JSON
+/// or carry no string `server` has nothing the lists can match: the
+/// level decides and the executor reports the malformed argument as
+/// a tool error, like every other bad call.
+pub(crate) struct McpTarget {
+    /// The call's `server` argument.
+    pub(crate) server: String,
+    /// The call's `tool` argument — `call_mcp_tool` only.
+    pub(crate) tool: Option<String>,
+}
+
+/// Parse the MCP target out of `call` — the values the §5.7 MCP
+/// lists match literally, the card's origin annotation resolves and
+/// the pool's dispatch dispatches on. The ONE `server` extraction
+/// every consult site shares (CODING_STANDARDS §17).
+pub(crate) fn mcp_target(call: &ToolCall) -> Option<McpTarget> {
+    let wants_tool = match call.name.as_str() {
+        CALL_MCP_TOOL => true,
+        READ_MCP_RESOURCE => false,
+        _ => return None,
+    };
+    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    let server = arg_str(&args, "server")?.to_owned();
+    let tool = wants_tool
+        .then(|| arg_str(&args, "tool").map(str::to_owned))
+        .flatten();
+    Some(McpTarget { server, tool })
+}
+
+/// `args`' string field `key` — the `server`/`tool`/`uri` extraction
+/// the MCP tools and their card summaries share, spelled once.
+pub(crate) fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key)?.as_str()
 }
 
 /// Parse an `ask_user_question` call's arguments into the card's
@@ -488,6 +623,26 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
                 n => format!("{n} todos"),
             })
             .unwrap_or_default(),
+        // `server:tool <args>` — the call the user is consenting to,
+        // in the same `server:tool` vocabulary the mcp lists use
+        // (Spec R10 us-13).
+        CALL_MCP_TOOL => {
+            let server = arg_str(&args, "server").unwrap_or_default();
+            let tool = arg_str(&args, "tool").unwrap_or_default();
+            match args.get("arguments") {
+                Some(arguments) => format!("{server}:{tool} {}", compact(arguments)),
+                None => format!("{server}:{tool}"),
+            }
+        }
+        // `server <uri>` — the read the user is consenting to.
+        READ_MCP_RESOURCE => {
+            let server = arg_str(&args, "server").unwrap_or_default();
+            let uri = arg_str(&args, "uri").unwrap_or_default();
+            format!("{server} {uri}").trim().to_string()
+        }
+        // The bare skill name — the skill the user is consenting to
+        // load.
+        INVOKE_SKILL => arg_str(&args, "name").unwrap_or_default().to_string(),
         _ => compact(&args),
     }
 }
@@ -578,6 +733,23 @@ pub(crate) fn execute(
             "{} applies through the plan snapshot, not the executor",
             call.name
         )),
+        // The MCP tools run on the session's [`McpPool`] — the gate
+        // dispatches them before `execute` is reached; a call that
+        // lands here anyway errors honestly rather than vanishing
+        // into the `unknown tool` arm.
+        //
+        // [`McpPool`]: crate::mcp::McpPool
+        CALL_MCP_TOOL | READ_MCP_RESOURCE => ToolOutput::error(format!(
+            "{} runs on the session's MCP pool, not the executor",
+            call.name
+        )),
+        // `invoke_skill` answers from the request's skills snapshot —
+        // the gate dispatches it before `execute` is reached, like
+        // the MCP pair.
+        INVOKE_SKILL => ToolOutput::error(format!(
+            "{} runs against the task's skills catalog, not the executor",
+            call.name
+        )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
     }
 }
@@ -642,14 +814,15 @@ mod tests {
     use super::*;
     use crate::transcript::PlanTodoStatus;
 
-    /// Every schema's translation carries all eight tools with name,
-    /// description and parameters — in its own `Tool` shape (§5.3).
+    /// Every schema's translation carries all eleven tools with
+    /// name, description and parameters — in its own `Tool` shape
+    /// (§5.3).
     #[test]
     fn declare_translates_every_spec_per_schema() {
         let ToolDecls::Chat(tools) = declare(EndpointSchema::OpenAiChatCompletions, None) else {
             panic!("chat decls")
         };
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
         assert!(tools
             .iter()
             .all(|t| t.kind == openai_chat_completions::ToolKind::Function));
@@ -687,7 +860,9 @@ mod tests {
             ask_user_question: Some(ait_config::PermissionLevel::AgentDecides),
             ..Default::default()
         };
-        let governed = ["read_files", "grep", "glob"];
+        // `invoke_skill` rides `read_files` (Spec R10 us-28), so it
+        // is governed here too.
+        let governed = ["read_files", "grep", "glob", INVOKE_SKILL];
 
         let decls = declare(EndpointSchema::OpenAiChatCompletions, Some(&profile));
         let ToolDecls::Chat(tools) = decls else {
@@ -893,6 +1068,50 @@ mod tests {
             summarize_args(&call("read_files", "{not json")),
             "{not json"
         );
+    }
+
+    /// The MCP tools render `server:tool <args>` / `server <uri>` —
+    /// the `server:tool` vocabulary the §5.7 mcp lists use (Spec R10
+    /// us-13). A call without `arguments` renders the pair alone.
+    #[test]
+    fn summarize_renders_mcp_arguments() {
+        let call = |name: &str, args: &str| ToolCall {
+            id: String::new(),
+            name: name.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(
+            summarize_args(&call(
+                CALL_MCP_TOOL,
+                r#"{"server":"db","tool":"query","arguments":{"sql":"select 1"}}"#
+            )),
+            r#"db:query {"sql":"select 1"}"#
+        );
+        assert_eq!(
+            summarize_args(&call(CALL_MCP_TOOL, r#"{"server":"db","tool":"ping"}"#)),
+            "db:ping"
+        );
+        assert_eq!(
+            summarize_args(&call(
+                READ_MCP_RESOURCE,
+                r#"{"server":"db","uri":"db://schema"}"#
+            )),
+            "db db://schema"
+        );
+        // Missing pieces degrade rather than rendering garbage.
+        assert_eq!(summarize_args(&call(READ_MCP_RESOURCE, "{}")), "");
+    }
+
+    /// `invoke_skill`'s card renders the bare skill name (Spec R10).
+    #[test]
+    fn summarize_renders_the_skill_name() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: INVOKE_SKILL.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(summarize_args(&call(r#"{"name":"deploy"}"#)), "deploy");
+        assert_eq!(summarize_args(&call("{}")), "");
     }
 
     /// `update_plan`'s argument seam (Spec R08-T5): `{todos:

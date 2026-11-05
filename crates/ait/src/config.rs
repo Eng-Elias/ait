@@ -107,6 +107,19 @@ pub fn session_template(settings: &Settings) -> SessionTemplate {
     }
 }
 
+/// The status-line text for a failed `mcp.json` load (Spec R10
+/// us-4's "malformed mcp-file events toast"): the [`ConfigError`]'s
+/// message already names the offending file (`<path>: <key-path>:
+/// <detail>`), so the toast only labels which file failed — defined
+/// once beside the skills' `skipped_text` precedent
+/// (CODING_STANDARDS §17), shared by the submit-seam toast and any
+/// later drain site.
+///
+/// [`ConfigError`]: ait_config::ConfigError
+pub(crate) fn mcp_error_text(error: &ait_config::ConfigError) -> String {
+    format!("mcp.json failed to load: {}", error.message())
+}
+
 /// The status line's model slot (story 24): `profile`'s resolved
 /// `base_model` display name — its alias, else the wire name — or `—`
 /// when the role is unset or unresolvable (e.g. an unknown profile).

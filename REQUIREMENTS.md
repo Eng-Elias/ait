@@ -146,7 +146,7 @@ Each role references a model `config_key`. Unset roles fall back to `base_model`
 
 - `[terminal]` shell path override, scrollback lines, `osc52` child-app clipboard opt-in, keybindings.
 - `[ssh]` `enable_integration`, `hosts_allowlist`, `hosts_denylist`, `reuse_existing_control_master` (Round 9, §5.9).
-- `[redaction]` extra user regexes, toggle per built-in pattern (proposed).
+- `[redaction]` `extra` user regexes, `enable`/`disable` per named pattern — the §5.10.3 built-ins plus opt-in PII categories (Round 10).
 
 ---
 

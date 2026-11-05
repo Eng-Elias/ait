@@ -5,10 +5,17 @@
 //! and whose user message carries the assembled context — output lines
 //! redacted, the typed request verbatim (§5.4, §5.10.3).
 
-use ait_agent::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
+use ait_agent::{assemble_request, Redactor, SuggestContext, OUTPUT_LINE_BUDGET};
+use ait_config::RedactionSettings;
 use ait_llm::{
     anthropic_messages, openai_chat_completions, openai_responses, EndpointRequest, EndpointSchema,
 };
+
+/// The default `[redaction]` configuration — the Round 4 built-ins —
+/// as a `Redactor` for `assemble_request`.
+fn builtins() -> Redactor {
+    Redactor::new(&RedactionSettings::default())
+}
 
 /// The spec's fixed system prompt (§5.4) restated here as a known-good
 /// literal — the test, not the crate's constant, is the source of
@@ -97,7 +104,7 @@ token [REDACTED] leaked
 drwxr-xr-x src
 request: list files here";
     for schema in ALL_SCHEMAS {
-        let request = assemble_request(&context, schema, "cmd-model");
+        let request = assemble_request(&context, &builtins(), schema, "cmd-model");
         assert_eq!(request.schema(), schema, "wrong variant for {schema}");
         let (system, user, model, stream) = parts(&request);
         assert_eq!(system, Some(SYSTEM_PROMPT), "wrong system for {schema}");
@@ -120,7 +127,12 @@ fn the_typed_request_is_never_redacted() {
         output_lines: &lines,
         request: "echo AKIAIOSFODNN7EXAMPLE",
     };
-    let request = assemble_request(&context, EndpointSchema::OpenAiChatCompletions, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::OpenAiChatCompletions,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert_eq!(
         user.matches("AKIAIOSFODNN7EXAMPLE").count(),
@@ -151,7 +163,12 @@ fn a_pem_block_split_across_output_lines_collapses() {
         output_lines: &lines,
         request: "what is this key",
     };
-    let request = assemble_request(&context, EndpointSchema::OpenAiChatCompletions, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::OpenAiChatCompletions,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert!(
         !user.contains("RSA PRIVATE KEY"),
@@ -176,7 +193,12 @@ fn only_the_last_budget_lines_reach_the_prompt() {
         output_lines: &lines,
         request: "retry that",
     };
-    let request = assemble_request(&context, EndpointSchema::AnthropicMessages, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::AnthropicMessages,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert!(
         !user.contains("line-6\n"),
@@ -206,10 +228,50 @@ fn no_output_lines_means_no_output_section() {
         output_lines: &[],
         request: "undo the last commit",
     };
-    let request = assemble_request(&context, EndpointSchema::OpenAiResponses, "m");
+    let request = assemble_request(&context, &builtins(), EndpointSchema::OpenAiResponses, "m");
     let (_, user, _, _) = parts(&request);
     assert_eq!(
         user,
         "cwd: /tmp\nshell: fish\nos: linux\nrequest: undo the last commit"
     );
+}
+
+/// Spec R10-T1: the `Redactor` the caller hands in drives the
+/// assembled context — an `extra` pattern masks what no built-in
+/// catches and a `disable`d built-in's specimen passes through
+/// verbatim (§5.10.3).
+#[test]
+fn the_handed_in_redactor_drives_context_redaction() {
+    let lines = vec![
+        String::from("token-A1B2C3D4 was logged"),
+        String::from("AKIAIOSFODNN7EXAMPLE is my key"),
+    ];
+    let context = SuggestContext {
+        cwd: "/tmp",
+        shell: "bash",
+        os: "linux",
+        output_lines: &lines,
+        request: "what leaked",
+    };
+    let redactor = Redactor::new(&RedactionSettings {
+        extra: vec![String::from(r"\btoken-[A-Z0-9]{8}")],
+        enable: vec![String::from("pii_email")],
+        disable: vec![String::from("aws_access_key")],
+    });
+    let request = assemble_request(
+        &context,
+        &redactor,
+        EndpointSchema::OpenAiChatCompletions,
+        "m",
+    );
+    let (_, user, _, _) = parts(&request);
+    assert!(
+        !user.contains("token-A1B2C3D4"),
+        "the extra leaked: {user:?}"
+    );
+    assert!(
+        user.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a disabled built-in must pass through: {user:?}"
+    );
+    assert_eq!(user.matches("[REDACTED]").count(), 1, "{user:?}");
 }

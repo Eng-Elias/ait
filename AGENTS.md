@@ -23,17 +23,24 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
 - Crate map — one line per crate; each round's landed surface lives
   in ADR-0003's table, not here:
   `crates/ait-term` — exists (Round 1: pure byte-fed terminal core);
-  `crates/ait` — exists (Round 2 TUI);
+  `crates/ait` — exists (Round 2 TUI;
+  Round 10: §5.10.2 `LiveSkills` — watcher on both
+  skills roots, per-task catalog snapshots);
   `crates/ait-testkit` — exists (Round E01: e2e toolkit;
   dev-dependency only — `docs/testing-toolkit.md`);
   `crates/ait-llm` — exists (Round 3: provider trait + per-schema
   IRs/adapters);
   `crates/ait-config` — exists (Round 3: `settings.toml`, secrets,
-  hot reload);
+  hot reload;
+  Round 10: `[redaction]` + `pattern_names`, the `mcp.json` model
+  and `.ait/` layer, skills roots, `watch_dirs`);
   `crates/ait-agent` — exists (Rounds 4/6/7/8: NL→command, agent
   mode, execution profiles, transcript/replay/plan/summarize;
   Round 9: §5.9 executor tiers — `RemoteState`, `select_executor`,
-  `ControlMasterExecutor`, remote read tools);
+  `ControlMasterExecutor`, remote read tools;
+  Round 10: §5.10.3 `Redactor` + §5.10.1 `McpPool` — `call_mcp_tool`,
+  `read_mcp_resource`, per-task `mcp.json` reconcile;
+  §5.10.2 `SkillsCatalog` snapshot + `invoke_skill`);
   `crates/ait-shell` — exists (Round 5: OSC 7700 hooks + blocks;
   Round 9: §5.9 — `ssh_begin`/`ssh_end` hooks, the `ssh()` wrappers
   in every snippet and the remote bootstrap renderer);

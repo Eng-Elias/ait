@@ -10,9 +10,10 @@ description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4
 # ADR-0002 supply-chain rule: regex 1.13.1 (2026-07-15) backs the
 # compiled-once credential pattern set behind `redact` (§5.10.3);
 # tokio 1.53.3 (2026-10-13; 1.54.x is too fresh) — the current-thread
-# runtime on CommandSuggester's worker thread, `rt` + `time` being the
+# runtime on the agent workers, `rt` + `time` + `process` being the
 # minimal feature set it needs (ADR-0004: tokio lives here, never in
-# `ait`; the adapters' timers want the `time` driver); tokio-util
+# `ait`; the adapters' timers want the `time` driver, and
+# `process` spawns the §5.10.1 MCP stdio servers); tokio-util
 # 0.7.20 (2026-10-09) — `sync::CancellationToken` for `Endpoint::stream`,
 # needs no feature flag and is NOT re-exported by ait-llm;
 # futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`;
@@ -23,9 +24,20 @@ description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "process"] }
 tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Release >=7 days old per ADR-0002: rmcp 3.8.0 (2026-10-26) — the
+# §5.10.1 MCP client inside the agent's `McpPool` (Spec R10-T3).
+# Exact pin on the `alacritty_terminal` precedent: rmcp ships every
+# ~1–2 weeks and the 3.x client surface still moves. Minimal
+# features — `client` + `transport-child-process` (which supplies
+# the `tokio/process` edge `tokio::process::Command` needs) — keep
+# the server/macros/schemars tree out of the build.
+rmcp = { version = "=3.8.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+] }
 # `Settings::resolve_model`, `ModelRole::Command`, `OsKeyring` /
 # `SecretStore` — per-request model resolution with the command_model →
 # base_model fallback (§4.2); the caller hands Settings in, the

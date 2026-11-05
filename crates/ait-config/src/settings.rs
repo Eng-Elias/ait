@@ -27,6 +27,11 @@ pub struct Settings {
     /// `[ssh]` — the §5.9 SSH-integration policy (§4.3, Spec R09).
     #[serde(default)]
     pub ssh: SshSettings,
+    /// `[redaction]` — the §5.10.3 pattern configuration (§4.3, Spec
+    /// R10): extra user regexes plus `enable`/`disable` toggles over
+    /// the named built-ins and opt-in PII categories.
+    #[serde(default)]
+    pub redaction: RedactionSettings,
 }
 
 impl Settings {
@@ -73,8 +78,16 @@ impl Settings {
     ///   list, and neither is validated here;
     /// - every `[ssh]` `hosts_allowlist`/`hosts_denylist` entry is a
     ///   well-formed OpenSSH `Host`-pattern glob (§5.9, Spec R09) — a
-    ///   malformed one fails load naming its `…[index]` path.
+    ///   malformed one fails load naming its `…[index]` path;
+    /// - every `[redaction]` `extra` entry compiles as a `regex`
+    ///   pattern and every `enable`/`disable` entry resolves to a
+    ///   [`pattern_names`] name (§5.10.3, Spec R10) — a broken regex
+    ///   would silently never mask and a typo'd name would silently
+    ///   no-op, so each is a load error naming its
+    ///   `redaction.<list>[index]` path; a name in both toggle lists
+    ///   is a contradiction, also a load error.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_redaction()?;
         // `config_key` -> key path of its first declaration, for duplicate
         // reporting and role-reference lookups.
         let mut declared: BTreeMap<&str, String> = BTreeMap::new();
@@ -136,6 +149,145 @@ impl Settings {
         }
         Ok(())
     }
+
+    /// The `[redaction]` rules (§5.10.3, Spec R10): `extra` entries
+    /// compile as regexes, `enable`/`disable` entries resolve to
+    /// [`pattern_names`], and no name sits in both toggle lists.
+    /// Each failure names its `redaction.<list>[index]` key path.
+    fn validate_redaction(&self) -> Result<(), ConfigError> {
+        for (index, pattern) in self.redaction.extra.iter().enumerate() {
+            if let Err(error) = regex::Regex::new(pattern) {
+                return Err(ConfigError::at(format!("redaction.extra[{index}]"), error));
+            }
+        }
+        for (list, entries) in [
+            ("enable", &self.redaction.enable),
+            ("disable", &self.redaction.disable),
+        ] {
+            for (index, name) in entries.iter().enumerate() {
+                if !pattern_names::ALL.contains(&name.as_str()) {
+                    return Err(ConfigError::at(
+                        format!("redaction.{list}[{index}]"),
+                        format!("unknown pattern name {name:?}"),
+                    ));
+                }
+            }
+        }
+        // A name in both lists is a contradiction — `disable` asks
+        // the entry off while `enable` asks it on; the `disable`
+        // entry carries the error since it re-states the name.
+        for (index, name) in self.redaction.disable.iter().enumerate() {
+            if self.redaction.enable.contains(name) {
+                return Err(ConfigError::at(
+                    format!("redaction.disable[{index}]"),
+                    format!("{name:?} is in both redaction.enable and redaction.disable"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The stable names of the §5.10.3 redaction patterns — the one place
+/// the vocabulary is defined (CODING_STANDARDS §17): `[redaction]`
+/// `enable`/`disable` entries validate against [`ALL`], and
+/// `ait-agent`'s `Redactor` table keys each pattern's compiled regex
+/// on these constants, so a rename fails to compile on one side or to
+/// validate on the other — never silently drifting apart.
+pub mod pattern_names {
+    /// AWS access key IDs (`AKIA` + 16 chars) — built-in, on.
+    pub const AWS_ACCESS_KEY: &str = "aws_access_key";
+    /// GitHub tokens (`ghp_`/`gho_`/`ghu_`/`ghs_`) — built-in, on.
+    pub const GITHUB_TOKEN: &str = "github_token";
+    /// GitHub fine-grained PATs (`github_pat_`) — built-in, on.
+    pub const GITHUB_PAT: &str = "github_pat";
+    /// OpenAI API keys (`sk-…`) — built-in, on.
+    pub const OPENAI_KEY: &str = "openai_key";
+    /// Anthropic API keys (`sk-ant-…`) — built-in, on.
+    pub const ANTHROPIC_KEY: &str = "anthropic_key";
+    /// Stripe secret keys (`sk_live_`/`sk_test_`) — built-in, on.
+    pub const STRIPE_KEY: &str = "stripe_key";
+    /// Slack tokens (`xox…`) — built-in, on.
+    pub const SLACK_TOKEN: &str = "slack_token";
+    /// Slack app-level tokens (`xapp-`) — built-in, on.
+    pub const SLACK_APP: &str = "slack_app";
+    /// JSON Web Tokens — built-in, on.
+    pub const JWT: &str = "jwt";
+    /// Private-key PEM blocks — built-in, on.
+    pub const PRIVATE_KEY_PEM: &str = "private_key_pem";
+    /// IPv4 addresses — PII, off (§5.10.3's opt-in categories: normal
+    /// terminal output is never over-masked by default).
+    pub const PII_IPV4: &str = "pii_ipv4";
+    /// IPv6 addresses — PII, off.
+    pub const PII_IPV6: &str = "pii_ipv6";
+    /// Email addresses — PII, off.
+    pub const PII_EMAIL: &str = "pii_email";
+    /// Phone numbers — PII, off.
+    pub const PII_PHONE: &str = "pii_phone";
+    /// MAC addresses — PII, off.
+    pub const PII_MAC: &str = "pii_mac";
+
+    /// The built-in credential names — the Round 4 minimal set,
+    /// enabled by default. The `--init` template's `[redaction]`
+    /// comment is generated from this list.
+    pub const BUILTINS: &[&str] = &[
+        AWS_ACCESS_KEY,
+        GITHUB_TOKEN,
+        GITHUB_PAT,
+        OPENAI_KEY,
+        ANTHROPIC_KEY,
+        STRIPE_KEY,
+        SLACK_TOKEN,
+        SLACK_APP,
+        JWT,
+        PRIVATE_KEY_PEM,
+    ];
+
+    /// The opt-in PII category names — shipped disabled. The `--init`
+    /// template's `[redaction]` comment is generated from this list.
+    pub const PII: &[&str] = &[PII_IPV4, PII_IPV6, PII_EMAIL, PII_PHONE, PII_MAC];
+
+    /// Every name `[redaction]` `enable`/`disable` may resolve to.
+    pub const ALL: &[&str] = &[
+        AWS_ACCESS_KEY,
+        GITHUB_TOKEN,
+        GITHUB_PAT,
+        OPENAI_KEY,
+        ANTHROPIC_KEY,
+        STRIPE_KEY,
+        SLACK_TOKEN,
+        SLACK_APP,
+        JWT,
+        PRIVATE_KEY_PEM,
+        PII_IPV4,
+        PII_IPV6,
+        PII_EMAIL,
+        PII_PHONE,
+        PII_MAC,
+    ];
+}
+
+/// `[redaction]` (§4.3, §5.10.3, Spec R10) — the pattern
+/// configuration `ait-agent`'s `Redactor` builds from. All three
+/// lists default empty: every built-in masks, no PII category runs,
+/// no user pattern applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RedactionSettings {
+    /// User-added regexes, applied after the built-ins and any
+    /// enabled PII categories. Every entry must compile — a broken
+    /// one fails load naming `redaction.extra[index]`.
+    #[serde(default)]
+    pub extra: Vec<String>,
+    /// Pattern names to switch on — the opt-in PII categories
+    /// (`pii_*`). Naming an already-on built-in is a no-op.
+    #[serde(default)]
+    pub enable: Vec<String>,
+    /// Built-in pattern names to switch off — for a pattern that
+    /// over-matches the user's workflow.
+    #[serde(default)]
+    pub disable: Vec<String>,
 }
 
 /// `[terminal]` (§4.3) — settings applied when spawning NEW sessions.

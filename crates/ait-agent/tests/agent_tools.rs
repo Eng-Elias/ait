@@ -77,6 +77,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
         },
         prior: Vec::new(),
         bridge: None,
+        skills: ait_agent::SkillsCatalog::default(),
     }
 }
 
@@ -652,6 +653,62 @@ fn tool_results_are_redacted_before_reentering() {
     assert!(
         !second.body.contains("AKIAIOSFODNN7EXAMPLE"),
         "{}",
+        second.body
+    );
+    assert!(second.body.contains("[REDACTED]"), "{}", second.body);
+}
+
+/// Spec R10-T1: tool results follow the request's `[redaction]`
+/// settings — an `extra` pattern masks what no built-in catches, and
+/// a `disable`d built-in's specimen re-enters verbatim.
+#[test]
+fn tool_results_follow_the_request_redaction_settings() {
+    let dir = project();
+    std::fs::write(
+        dir.path().join("key.txt"),
+        "a = token-A1B2C3D4\nb = AKIAIOSFODNN7EXAMPLE\n",
+    )
+    .expect("key");
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "read_files",
+            r#"{"paths":["key.txt"]}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let mut settings = settings(&fixture.base_url, "openai_chat_completions");
+    settings
+        .redaction
+        .extra
+        .push(String::from(r"\btoken-[A-Z0-9]{8}"));
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
+    let session = session();
+    session
+        .submit(task(settings, dir.path().to_str().expect("utf-8 tempdir")))
+        .expect("submit");
+
+    let (id, _, _) = next_approval(&session);
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    fixture.captured();
+    let second = fixture.captured();
+    assert!(
+        !second.body.contains("token-A1B2C3D4"),
+        "the extra pattern must mask: {}",
+        second.body
+    );
+    assert!(
+        second.body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a disabled built-in passes through: {}",
         second.body
     );
     assert!(second.body.contains("[REDACTED]"), "{}", second.body);

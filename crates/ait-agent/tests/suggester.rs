@@ -179,6 +179,47 @@ fn request_streams_ordered_deltas_then_done() {
     assert!(!captured.body.contains("AKIAIOSFODNN7EXAMPLE"));
 }
 
+/// Spec R10-T1: the request's `[redaction]` settings reach the
+/// suggester's context assembly — a `disable`d built-in's specimen
+/// goes to the provider verbatim while an `extra` pattern masks what
+/// no built-in catches. Per-request construction is what makes a
+/// settings hot-reload effective on the next submission (us-37).
+#[test]
+fn the_request_redaction_settings_drive_context_redaction() {
+    let fixture = Fixture::serve(vec![sse(&sse_transcript(&["ls"]))]);
+    let suggester = suggester();
+    let mut settings = settings(&fixture.base_url, "command_model");
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
+    settings
+        .redaction
+        .extra
+        .push(String::from(r"\btoken-[A-Z0-9]{8}"));
+    let mut request = request(settings);
+    request
+        .output_lines
+        .push(String::from("token-A1B2C3D4 logged"));
+    suggester.suggest(request).expect("suggest");
+
+    let events = collect(&suggester);
+    assert_eq!(events.last(), Some(&SuggestEvent::Done));
+
+    let captured = fixture.captured();
+    assert!(
+        captured.body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a disabled built-in passes through: {}",
+        captured.body
+    );
+    assert!(
+        !captured.body.contains("token-A1B2C3D4"),
+        "the extra pattern must mask: {}",
+        captured.body
+    );
+    assert!(captured.body.contains("[REDACTED]"), "{}", captured.body);
+}
+
 /// us-21: `command_model` unset falls back to `base_model` — the
 /// request still resolves and streams.
 #[test]

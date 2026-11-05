@@ -21,9 +21,14 @@
 //! allowlist expands what file tools may touch, never a verdict;
 //! Round 8's `update_plan` is gate-exempt by design (its effect IS
 //! its card — §5.7 gains no field for it, so every stance allows
-//! it outright);
-//! `mcp_*` fields and
-//! `context_window_limit` stay inert (Rounds 10/8).
+//! it outright); and Round 10 activates the `mcp_*` fields
+//! (§5.10.1): `call_mcp_tool`/`read_mcp_resource` map to
+//! `mcp_permissions`, and `mcp_denylist`/`mcp_allowlist` consult
+//! literal `server`/`server:tool` strings before the level —
+//! while §5.10.2's `invoke_skill` rides `read_files`, so a `never`
+//! profile forbids skills and `agent_decides` governs it like the
+//! other read tools (us-28). `context_window_limit` is consumed by
+//! summarization (Round 8).
 
 use std::collections::HashSet;
 
@@ -31,7 +36,10 @@ use ait_config::{ExecutionProfile, PermissionLevel};
 use regex::Regex;
 
 use crate::tool_call::ToolCall;
-use crate::tools::{ASK_USER_QUESTION, UPDATE_PLAN};
+use crate::tools::{
+    mcp_target, McpTarget, ASK_USER_QUESTION, CALL_MCP_TOOL, INVOKE_SKILL, READ_MCP_RESOURCE,
+    UPDATE_PLAN,
+};
 
 /// What the gate does with one tool call — the vocabulary the
 /// interim gate's `needs_verdict` boolean could not express.
@@ -120,6 +128,22 @@ pub(crate) fn evaluate(
             }
         }
     }
+    // The MCP tools consult the MCP lists (Spec R10, §5.10.1) in the
+    // same slot — after the `never` floor, before the memory and the
+    // level — but entries are LITERAL `server`/`server:tool` strings,
+    // not the `command_*` regexes: a `server` entry covers the whole
+    // server, `server:tool` one tool on it, and a resource read
+    // consults `server` entries only. Denylist beats allowlist.
+    if let Some(profile) = profile {
+        if let Some(target) = mcp_target(call) {
+            if mcp_listed(&profile.mcp_denylist, &target) {
+                return Verdict::Deny(format!("denied by execution profile {profile_name}"));
+            }
+            if mcp_listed(&profile.mcp_allowlist, &target) {
+                return Verdict::Allow;
+            }
+        }
+    }
     if allowed_for_task.contains(&call.name) {
         return Verdict::Allow;
     }
@@ -164,16 +188,20 @@ fn flagged_safe(call: &ToolCall) -> bool {
 /// The tool → profile-field mapping (Spec R07): `run_command` is
 /// governed by `execute_commands`, the three read-only filesystem
 /// tools share `read_files`, `edit_files` rides `apply_code_diffs`,
-/// and `write_to_pty`/`ask_user_question` read their same-named
-/// fields. An unmapped name has no level — [`evaluate`] fails safe
-/// and asks.
+/// `write_to_pty`/`ask_user_question` read their same-named fields,
+/// both MCP tools ride `mcp_permissions` (Spec R10, §5.10.1), and
+/// §5.10.2's `invoke_skill` shares `read_files` — loading a skill
+/// is a local read, so a `never` profile forbids it and no new
+/// field is needed (Spec R10 us-28).
+/// An unmapped name has no level — [`evaluate`] fails safe and asks.
 fn level_for(profile: &ExecutionProfile, tool: &str) -> Option<PermissionLevel> {
     match tool {
         "run_command" => profile.execute_commands,
-        "read_files" | "grep" | "glob" => profile.read_files,
+        "read_files" | "grep" | "glob" | INVOKE_SKILL => profile.read_files,
         "edit_files" => profile.apply_code_diffs,
         "write_to_pty" => profile.write_to_pty,
         ASK_USER_QUESTION => profile.ask_user_question,
+        CALL_MCP_TOOL | READ_MCP_RESOURCE => profile.mcp_permissions,
         _ => None,
     }
 }
@@ -186,6 +214,21 @@ fn level_for(profile: &ExecutionProfile, tool: &str) -> Option<PermissionLevel> 
 fn command_arg(call: &ToolCall) -> Option<String> {
     let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
     args.get("command")?.as_str().map(str::to_owned)
+}
+
+/// `true` when any entry in `list` literally equals the target's
+/// `server` — whole-server coverage — or, for a `call_mcp_tool`
+/// target, equals `server:tool` exactly. These entries are NOT
+/// regexes (Spec R10 us-13): `"git"` denies only a server literally
+/// named `git`, never a server whose name merely contains it.
+fn mcp_listed(list: &[String], target: &McpTarget) -> bool {
+    list.iter().any(|entry| {
+        *entry == target.server
+            || target
+                .tool
+                .as_deref()
+                .is_some_and(|tool| *entry == format!("{}:{tool}", target.server))
+    })
 }
 
 /// `true` when any entry in `list` — each a regex — matches
@@ -251,7 +294,7 @@ mod tests {
                 execute_commands: level,
                 ..Default::default()
             },
-            "read_files" | "grep" | "glob" => ExecutionProfile {
+            "read_files" | "grep" | "glob" | INVOKE_SKILL => ExecutionProfile {
                 read_files: level,
                 ..Default::default()
             },
@@ -265,6 +308,10 @@ mod tests {
             },
             ASK_USER_QUESTION => ExecutionProfile {
                 ask_user_question: level,
+                ..Default::default()
+            },
+            CALL_MCP_TOOL | READ_MCP_RESOURCE => ExecutionProfile {
+                mcp_permissions: level,
                 ..Default::default()
             },
             _ => panic!("no field for {tool}"),
@@ -287,6 +334,9 @@ mod tests {
             "glob",
             "edit_files",
             "write_to_pty",
+            CALL_MCP_TOOL,
+            READ_MCP_RESOURCE,
+            INVOKE_SKILL,
         ];
         let empty = HashSet::new();
         for tool in gated {
@@ -454,7 +504,7 @@ mod tests {
             execute_commands: Some(PermissionLevel::AlwaysAsk),
             ..Default::default()
         };
-        for tool in ["read_files", "grep", "glob"] {
+        for tool in ["read_files", "grep", "glob", INVOKE_SKILL] {
             assert!(is_agent_decided(Some(&profile), tool), "{tool}");
         }
         for tool in [
@@ -627,10 +677,8 @@ mod tests {
     /// allow-for-task memory alike — an allowlist hit runs without
     /// asking, and no hit falls through to memory then level like
     /// every other call. The `directory_allowlist` (T4) widens
-    /// `ToolCwd` confinement, never this verdict, and the
-    /// `mcp_*`/`context_window_limit` fields stay parsed-but-unconsumed
-    /// (Rounds 10/8): `mcp_permissions = "never"` forbids nothing the
-    /// registry declares today.
+    /// `ToolCwd` confinement, never this verdict; the `mcp_*` lists
+    /// get their own consult below.
     #[test]
     fn the_command_lists_decide_before_memory_and_level() {
         let empty = HashSet::new();
@@ -823,16 +871,16 @@ mod tests {
         );
     }
 
-    /// `directory_allowlist`, the `mcp_*` fields and
-    /// `context_window_limit` stay parsed-but-unconsumed (T4, Rounds
-    /// 10/8): a populated directory list neither relaxes nor
-    /// tightens `run_command` — it is a path list, not a command
-    /// list — and `mcp_permissions = "never"` forbids nothing the
-    /// registry declares today.
+    /// `directory_allowlist` and `context_window_limit` still touch
+    /// no verdict (T4, Round 8), but the `mcp_*` fields are live
+    /// (Spec R10): `mcp_permissions = "never"` forbids the two MCP
+    /// tools only — every other tool still answers to its own level,
+    /// and the MCP lists never reach a non-MCP call.
     #[test]
-    fn directory_and_mcp_lists_stay_unconsumed() {
+    fn directory_allowlist_stays_unconsumed_while_mcp_fields_govern_mcp_tools() {
         let profile = ExecutionProfile {
             execute_commands: Some(PermissionLevel::AlwaysAsk),
+            read_files: Some(PermissionLevel::AlwaysAllow),
             directory_allowlist: vec![String::from(".*"), String::from("/tmp")],
             mcp_permissions: Some(PermissionLevel::Never),
             mcp_allowlist: vec![String::from("*")],
@@ -846,15 +894,264 @@ mod tests {
             Verdict::Ask { first_write: false },
             "directory_allowlist is not a command list — the level decides"
         );
-        let profile = ExecutionProfile {
-            read_files: Some(PermissionLevel::AlwaysAllow),
-            mcp_permissions: Some(PermissionLevel::Never),
-            ..Default::default()
-        };
         assert_eq!(
             evaluate(Some(&profile), "default", &call("read_files"), &empty),
             Verdict::Allow,
-            "mcp_permissions governs no declared tool"
+            "mcp_permissions governs no non-MCP tool"
         );
+        for tool in [CALL_MCP_TOOL, READ_MCP_RESOURCE] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(tool, r#"{"server":"db"}"#),
+                    &empty
+                ),
+                Verdict::Deny(String::from("denied by execution profile default")),
+                "{tool} under mcp_permissions = never"
+            );
+        }
+    }
+
+    /// The MCP list consult (Spec R10 us-13): literal `server` and
+    /// `server:tool` strings — denylist beats allowlist, both before
+    /// the memory and the level. A `server` entry covers the whole
+    /// server, `server:tool` one tool on it — and the entries are
+    /// NOT regexes: `"db"` matches a server literally named `db`,
+    /// never `db2`, `mydb` or a `db:*` glob.
+    #[test]
+    fn mcp_lists_match_literal_server_and_server_tool_entries() {
+        let empty = HashSet::new();
+        // A whole-server denylist entry denies every call on it —
+        // beating `always_allow`, an allowlist entry and the memory.
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAllow),
+            mcp_allowlist: vec![String::from("db"), String::from("db:query")],
+            mcp_denylist: vec![String::from("db")],
+            ..Default::default()
+        };
+        let memory = HashSet::from([String::from(CALL_MCP_TOOL)]);
+        for args in [
+            r#"{"server":"db","tool":"query","arguments":{}}"#,
+            r#"{"server":"db","tool":"drop","arguments":{}}"#,
+        ] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(CALL_MCP_TOOL, args),
+                    &memory
+                ),
+                Verdict::Deny(String::from("denied by execution profile default")),
+                "{args}"
+            );
+        }
+        // A `server:tool` denylist entry covers that tool only.
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAllow),
+            mcp_denylist: vec![String::from("db:drop")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(
+                    CALL_MCP_TOOL,
+                    r#"{"server":"db","tool":"drop","arguments":{}}"#
+                ),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(
+                    CALL_MCP_TOOL,
+                    r#"{"server":"db","tool":"query","arguments":{}}"#
+                ),
+                &empty
+            ),
+            Verdict::Allow,
+            "a different tool on the same server is untouched"
+        );
+        // Entries are literal — no regex, no substring, no glob.
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAllow),
+            mcp_denylist: vec![String::from("db"), String::from("db*")],
+            ..Default::default()
+        };
+        for server in ["db2", "mydb", "db:query"] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(
+                        CALL_MCP_TOOL,
+                        &format!(r#"{{"server":"{server}","tool":"t"}}"#)
+                    ),
+                    &empty
+                ),
+                Verdict::Allow,
+                "{server:?} must not match the literal denylist"
+            );
+        }
+    }
+
+    /// `read_mcp_resource` consults `server`-only entries: a
+    /// `server:tool` entry — a tool name, not a URI — never reaches
+    /// a resource read, while a bare `server` entry covers it.
+    #[test]
+    fn read_mcp_resource_consults_server_entries_only() {
+        let empty = HashSet::new();
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAllow),
+            mcp_denylist: vec![String::from("db")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(READ_MCP_RESOURCE, r#"{"server":"db","uri":"db://x"}"#),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAsk),
+            mcp_denylist: vec![String::from("db:query")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(READ_MCP_RESOURCE, r#"{"server":"db","uri":"db://x"}"#),
+                &empty
+            ),
+            Verdict::Ask { first_write: false },
+            "a server:tool entry does not reach a resource read"
+        );
+    }
+
+    /// The MCP allowlist overrides an asking level without reaching
+    /// the memory consult — and malformed MCP arguments (no string
+    /// `server`) carry nothing for the lists to match, falling
+    /// through to the level like every other bad call.
+    #[test]
+    fn mcp_allowlist_allows_and_malformed_calls_fall_through() {
+        let empty = HashSet::new();
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::AlwaysAsk),
+            mcp_allowlist: vec![String::from("db:query")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(
+                    CALL_MCP_TOOL,
+                    r#"{"server":"db","tool":"query","arguments":{}}"#
+                ),
+                &empty
+            ),
+            Verdict::Allow,
+            "an allowlisted server:tool pair skips the ask"
+        );
+        for args in [
+            "{}",
+            "not json",
+            r#"{"server":7}"#,
+            r#"{"server":"db2","tool":"query"}"#,
+        ] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(CALL_MCP_TOOL, args),
+                    &empty
+                ),
+                Verdict::Ask { first_write: false },
+                "arguments {args:?} match nothing in the lists"
+            );
+        }
+        // `never` floors an MCP allowlist hit too.
+        let profile = ExecutionProfile {
+            mcp_permissions: Some(PermissionLevel::Never),
+            mcp_allowlist: vec![String::from("db")],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(
+                    CALL_MCP_TOOL,
+                    r#"{"server":"db","tool":"query","arguments":{}}"#
+                ),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+    }
+
+    /// `invoke_skill` rides `read_files` verbatim (Spec R10 us-28):
+    /// `never` forbids skills with the profile-denial text,
+    /// `always_allow` runs ungated, and `agent_decides` honors the
+    /// call's own `safety` flag — no new profile field exists for
+    /// it.
+    #[test]
+    fn invoke_skill_rides_the_read_files_level() {
+        let empty = HashSet::new();
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::Never));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy"}"#),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::AlwaysAllow));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy"}"#),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        // `agent_decides`: `safe` runs, `unsafe`/absent asks.
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::AgentDecides));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy","safety":"safe"}"#),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        for args in [
+            r#"{"name":"deploy","safety":"unsafe"}"#,
+            r#"{"name":"deploy"}"#,
+        ] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(INVOKE_SKILL, args),
+                    &empty
+                ),
+                Verdict::Ask { first_write: false },
+                "{args}"
+            );
+        }
     }
 }

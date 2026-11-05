@@ -1369,6 +1369,7 @@ mod tests {
                 },
                 prior: Vec::new(),
                 bridge: None,
+                skills: ait_agent::SkillsCatalog::default(),
             },
             &mut toast,
         );
@@ -1441,6 +1442,7 @@ mod tests {
                 },
                 prior: Vec::new(),
                 bridge: None,
+                skills: ait_agent::SkillsCatalog::default(),
             },
             &mut toast,
         );

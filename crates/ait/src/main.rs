@@ -23,6 +23,7 @@ mod render;
 mod scroll;
 mod selection;
 mod shell_bridge;
+mod skills;
 mod status;
 mod store;
 mod suggest;

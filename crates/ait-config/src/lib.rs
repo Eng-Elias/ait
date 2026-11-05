@@ -14,7 +14,13 @@
 //! behind the injectable [`SecretStore`] seam,
 //! [`Settings::resolve_model`] turns a profile + [`ModelRole`] into
 //! endpoint + model + secret-or-none, and [`default_template`]/
-//! `json_schema` back `ait --init`/`--print-schema`.
+//! `json_schema` back `ait --init`/`--print-schema`. The §5.10.1 MCP
+//! surface mirrors that split: [`McpConfig::from_json`] is the pure
+//! `mcp.json` seam, [`mcp_path`]/[`project_ait_dir`] resolve the user
+//! and project `.ait/` layers, and [`load_mcp`] merges them into one
+//! origin-labeled view. §5.10.2's skills loader reuses the same
+//! layers: [`user_skills_dir`]/[`project_skills_dir`] resolve the two
+//! roots ait-agent's `SkillsCatalog` scans.
 //!
 //! ## Cargo features
 //!
@@ -37,9 +43,11 @@
 mod emit;
 mod error;
 mod load;
+mod mcp;
 mod resolve;
 mod secrets;
 mod settings;
+mod skills;
 #[cfg(feature = "watch")]
 mod watch;
 
@@ -48,13 +56,18 @@ pub use emit::json_schema;
 pub use emit::{default_template, init_settings};
 pub use error::ConfigError;
 pub use load::{load, load_from, settings_path};
+pub use mcp::{
+    load_mcp, mcp_path, project_ait_dir, McpConfig, McpServer, McpServerEntry, McpServerOrigin,
+    McpServers, PROJECT_LAYER_LABEL, USER_LAYER_LABEL,
+};
 pub use resolve::{ModelRole, ResolvedModel};
 #[cfg(feature = "secrets")]
 pub use secrets::OsKeyring;
 pub use secrets::SecretStore;
 pub use settings::{
-    AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile, PermissionLevel,
-    Settings, SshSettings, TerminalSettings,
+    pattern_names, AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile,
+    PermissionLevel, RedactionSettings, Settings, SshSettings, TerminalSettings,
 };
+pub use skills::{project_skills_dir, user_skills_dir};
 #[cfg(feature = "watch")]
-pub use watch::{watch, watch_from, SettingsWatcher};
+pub use watch::{watch, watch_dirs, watch_from, DirsWatcher, SettingsWatcher};

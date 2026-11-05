@@ -75,6 +75,11 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   fail-safe) renders.
 - **Step budget** — the cap on model turns per task (`STEP_BUDGET`, 50);
   tripping it ends the task with a `BudgetReached` status.
+- **Pattern name** — a §5.10.3 redaction pattern's stable id
+  (`aws_access_key`, `pii_email`, …), defined once in
+  `ait_config::pattern_names`: the `[redaction]` `enable`/`disable`
+  lists reference it, and `ait-agent`'s `Redactor` table keys each
+  compiled regex on it (§4.3, Spec R10).
 - **Remote bootstrap** — the self-contained POSIX-sh script an integrated
   `ssh()` sends as the remote command (Spec R09): it lands the injected
   snippet file set in a private remote `mktemp -d`, exports the session env
@@ -93,6 +98,26 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   (`ssh -S <sock> <target> -- <cmd>`); a transport failure demotes the task
   permanently — the hit run errors rather than replaying (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **MCP server** — a Model Context Protocol stdio server declared in
+  `mcp.json` (`{"mcpServers": {"name": {"command", "args", "env"}}}`):
+  `ait-agent`'s per-session `McpPool` connects user-tier entries
+  eagerly per task and exposes their tools/resources to the model via
+  `call_mcp_tool`/`read_mcp_resource`, gated by `mcp_permissions` and
+  the `mcp_allowlist`/`mcp_denylist` literals (§5.10.1).
+- **Project-local config layer** — the `.ait/` directory nearest a
+  session's cwd (`project_ait_dir` walks ancestors like `AGENTS.md`):
+  its `mcp.json` entries shadow same-named user-tier ones and are
+  listed but never spawned — a cloned repo cannot run code on the
+  user's machine silently (§5.10.1, Spec R10 us-8).
+- **Skill** — a `<dir>/SKILL.md` under `~/.config/ait/skills/` or the
+  project-local `.ait/skills/` whose frontmatter `name`/`description`
+  the agent lists and whose body + bundled files `invoke_skill`
+  returns; a project skill shadows a same-named user skill (§5.10.2).
+- **Skill catalog** — the per-task `SkillsCatalog` snapshot of the
+  skills on disk (effective skills + surfaced skip errors) that rides
+  `AgentRequest.skills`; the frontend's `LiveSkills` watcher refreshes
+  it on changes under either root, keeping last-good copies of
+  entries a write left malformed (§5.10.2, ADR-0006).
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.

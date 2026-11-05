@@ -24,7 +24,9 @@ regex = "1"
 # `schema` feature: `JsonSchema` derives on the settings model back
 # `--print-schema` (REQUIREMENTS.md §4); serde_json renders the schema.
 schemars = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
+# serde_json parses `mcp.json` (§5.10.1, Spec R10) and renders the
+# emitted schema — not a heavyweight dep, so it is always on.
+serde_json = "1"
 # `secrets` feature: OS keyring lookups behind the `SecretStore` seam —
 # service "ait", account "<endpoint-key>" (§4.1, user stories 19–20).
 # Default `v1` feature set: platform stores incl. zbus Secret Service on
@@ -48,7 +50,7 @@ thiserror = "2"
 # One feature per heavy dep area (R05-T8 audit, issue #77): the `ait`
 # binary enables `schema` + `watch`; `ait-agent` (and the binary through
 # it) enables `secrets`.
-schema = ["dep:schemars", "dep:serde_json"]
+schema = ["dep:schemars"]
 secrets = ["dep:keyring"]
 watch = ["dep:notify"]
 

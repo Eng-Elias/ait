@@ -5,16 +5,17 @@
 //! command, a user message carrying the assembled context.
 //!
 //! Redaction ordering (§5.4, §5.10.3): terminal output lines pass
-//! through [`redact`](crate::redact) here, at assembly time — never
+//! through the caller's [`Redactor`] here, at assembly time — never
 //! continuously on the PTY stream, and never on the typed request
 //! itself (us-19). Blocks replace grid lines as the line source in
-//! Round 5 through this same seam.
+//! Round 5 through this same seam; the request's `[redaction]`
+//! settings pick the effective set in Round 10.
 
 use ait_llm::{
     anthropic_messages, openai_chat_completions, openai_responses, EndpointRequest, EndpointSchema,
 };
 
-use crate::redact;
+use crate::Redactor;
 
 /// How many recent output lines a request may carry — §5.4's "last N
 /// lines", a fixed budget per the spec (configurability is a later
@@ -45,8 +46,8 @@ pub struct SuggestContext<'a> {
     /// The OS name — `std::env::consts::OS`, e.g. `linux` (us-17).
     pub os: &'a str,
     /// Recent logical output lines, oldest first. Only the last
-    /// [`OUTPUT_LINE_BUDGET`] are sent; they pass through
-    /// [`redact`](crate::redact) as one joined block so a credential
+    /// [`OUTPUT_LINE_BUDGET`] are sent; they pass through the
+    /// request's [`Redactor`] as one joined block so a credential
     /// spanning lines (a PEM block) still matches (us-16, 18).
     pub output_lines: &'a [String],
     /// The typed request — sent verbatim, never redacted (us-19).
@@ -60,14 +61,17 @@ pub struct SuggestContext<'a> {
 /// (`endpoint.schema()`, `endpoint.config().model`), so the returned
 /// [`EndpointRequest`] variant can never hit
 /// [`LlmError::SchemaMismatch`](ait_llm::LlmError); the caller hands it
-/// straight to `Endpoint::stream`.
+/// straight to `Endpoint::stream`. `redactor` is the request's own —
+/// built from its `Settings` snapshot — so `[redaction]` toggles apply
+/// (§5.10.3, Spec R10).
 pub fn assemble_request(
     context: &SuggestContext,
+    redactor: &Redactor,
     schema: EndpointSchema,
     model: &str,
 ) -> EndpointRequest {
     let system = String::from(SYSTEM_PROMPT);
-    let user = user_content(context);
+    let user = user_content(context, redactor);
     match schema {
         EndpointSchema::OpenAiChatCompletions => {
             EndpointRequest::OpenAiChatCompletions(openai_chat_completions::Request {
@@ -118,7 +122,7 @@ pub fn assemble_request(
 /// The user message: labeled environment lines, the redacted output
 /// tail, then the verbatim request under `request:` — labeled rather
 /// than prose so the model reads the ask apart from the context.
-fn user_content(context: &SuggestContext) -> String {
+fn user_content(context: &SuggestContext, redactor: &Redactor) -> String {
     let mut content = format!(
         "cwd: {}\nshell: {}\nos: {}\n",
         context.cwd, context.shell, context.os
@@ -133,7 +137,7 @@ fn user_content(context: &SuggestContext) -> String {
         // Redact the joined tail, not each line: a credential spanning
         // grid lines (a PEM block) only matches the assembled block —
         // no single `output_lines` entry holds both anchors.
-        content.push_str(&redact(&tail.join("\n")));
+        content.push_str(&redactor.redact(&tail.join("\n")));
         content.push('\n');
     }
     content.push_str("request: ");

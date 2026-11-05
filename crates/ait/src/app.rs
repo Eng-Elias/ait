@@ -23,7 +23,11 @@
 //!    same tick the settings watcher's channel is drained (Spec R03):
 //!    a good reload swaps the live [`Settings`] — status line and
 //!    NEW-session `[terminal]` options included — while a broken save
-//!    toasts the error and keeps last-good. The suggester's channel
+//!    toasts the error and keeps last-good. The skills watcher drains
+//!    beside it (§5.10.2, Spec R10-T6): a `SKILL.md` change under
+//!    either root refreshes the catalog the next `AgentRequest`
+//!    snapshots, and a malformed write keeps last-good while its
+//!    error toasts. The suggester's channel
 //!    drains on that tick too (Spec R04): the `# `+Enter trigger
 //!    verified in [`suggest`] fires a request from the pass-through
 //!    key path, and `Alt+Enter` fires the same request from the whole
@@ -87,6 +91,7 @@ use crate::render::{
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
+use crate::skills::LiveSkills;
 use crate::status::{notification_text, status_text, StatusLine, Toast};
 use crate::store::StoreHandle;
 use crate::suggest::{self, SuggestionPin};
@@ -199,6 +204,13 @@ struct AppState {
     /// app-global like the profile picker; a second `Alt+R` toggles
     /// it closed, and opening one picker drops the other.
     conversations: Option<ConversationPicker>,
+    /// The live skills catalog (REQUIREMENTS.md §5.10.2, Spec
+    /// R10-T6): the frontend-owned watcher on both skills roots keeps
+    /// the last-good [`SkillsCatalog`](ait_agent::SkillsCatalog)
+    /// fresh — create/edit/delete of a `SKILL.md` lands on the NEXT
+    /// task's `AgentRequest.skills` snapshot, a malformed write
+    /// keeps its last-good copy and toasts the surfaced error.
+    skills: LiveSkills,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -337,6 +349,10 @@ pub fn run() -> io::Result<ExitCode> {
         picker: None,
         store,
         conversations: None,
+        // §5.10.2's watcher starts at launch so a skill written before
+        // the first task still lands in that task's snapshot (Spec
+        // R10-T6).
+        skills: LiveSkills::new(),
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
@@ -446,6 +462,11 @@ pub fn run() -> io::Result<ExitCode> {
         if let Some(watcher) = &watcher {
             drain_config_events(watcher.receiver(), &mut state, &mut tabs);
         }
+        // The skills watcher drains beside it (§5.10.2, Spec R10-T6):
+        // each debounced burst refreshes the catalog the next
+        // `AgentRequest` snapshots; a malformed `SKILL.md` keeps its
+        // last-good copy and toasts the surfaced error.
+        state.skills.drain(&mut state.toast);
         // Suggester events on the same tick too (Spec R04): T4 drains
         // errors to the status line and clears the in-flight pin; T5
         // streams `Delta`s into the pinned tab.
@@ -891,6 +912,7 @@ fn handle_event<W: Write>(
                             &key_event,
                             state.config.settings(),
                             &state.profile,
+                            &mut state.skills,
                             &mut state.toast,
                         );
                         return Handled::Continue;
@@ -1555,6 +1577,9 @@ mod tests {
                     picker: None,
                     store: StoreHandle::disabled(),
                     conversations: None,
+                    // No watcher and no roots — the harness never
+                    // touches the filesystem for skills.
+                    skills: LiveSkills::unwatched(),
                 },
                 sink: Vec::new(),
             }
@@ -3574,6 +3599,7 @@ coding_model = "coding-key"
                 },
                 prior: Vec::new(),
                 bridge: None,
+                skills: ait_agent::SkillsCatalog::default(),
             },
             &mut harness.state.toast,
         );

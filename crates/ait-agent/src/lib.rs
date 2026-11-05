@@ -3,9 +3,11 @@
 //! Round 4 lands the crate's pure seams (CODING_STANDARDS.md §11 —
 //! each is testable without a PTY, model or TTY):
 //!
-//! - [`redact`] — the §5.10.3 credential-redaction filter guarding
-//!   terminal output before it reaches a provider (Spec R04, user
-//!   stories 18, 26).
+//! - [`Redactor`] + [`redact`] — the §5.10.3 credential-redaction
+//!   filter guarding terminal output before it reaches a provider
+//!   (Spec R04, user stories 18, 26; Spec R10: a named pattern table
+//!   compiled per request from `[redaction]` settings — built-ins
+//!   togglable by name, opt-in PII categories, user `extra` regexes).
 //! - [`assemble_request`] + [`SuggestContext`] — §5.4 context
 //!   assembly into a schema-matched `ait_llm::EndpointRequest` the
 //!   suggester streams unchanged (user stories 15–17, 19, 27).
@@ -52,6 +54,21 @@
 //!   channel; `MarksOnly`/`Absent` type the command at the prompt
 //!   and detect completion from `133;D` or the `__AIT_END` sentinel
 //!   (R06-T5).
+//! - the §5.10.1 MCP client (Spec R10-T3): a per-session
+//!   [`mcp::McpPool`] of rmcp stdio connections reconciled against
+//!   the merged `mcp.json` at every task start — user-tier servers
+//!   connect eagerly, project-tier entries are listed but never
+//!   spawned — with `call_mcp_tool` and `read_mcp_resource` gated
+//!   by `mcp_permissions` plus the literal `server`/`server:tool`
+//!   deny/allow lists.
+//! - the §5.10.2 skills loader (Spec R10-T5): a [`SkillsCatalog`]
+//!   scanned at submit time from `~/.config/ait/skills/` and the
+//!   nearest `.ait/skills/` — malformed `SKILL.md`s skipped with
+//!   surfaced errors, project shadowing user — snapshotted onto
+//!   every `AgentRequest`, rendered into the system prompt, and
+//!   served to `invoke_skill` (gated by `read_files`) as body +
+//!   bundled-file manifest while the skill dirs join `ToolCwd`'s
+//!   read roots.
 
 mod agent_context;
 mod context;
@@ -60,11 +77,13 @@ mod diff;
 mod endpoint_bridge;
 mod executor;
 mod files;
+mod mcp;
 mod permissions;
 mod pty;
 mod redact;
 mod sanitize;
 mod session;
+mod skills;
 mod suggester;
 mod summarize;
 mod tool_call;
@@ -78,12 +97,13 @@ pub use executor::{
     CommandResult, ControlMasterExecutor, DemotingExecutor, DetachedExecutor, ExecutorError,
     RemoteState, ShellBridge, ShellIntegration, UserShellExecutor,
 };
-pub use redact::redact;
+pub use redact::{redact, Redactor};
 pub use sanitize::{sanitize_reply, ReplySanitizer};
 pub use session::{
     result_preview, AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict,
     STEP_BUDGET, SUMMARIZE_AT,
 };
+pub use skills::{Skill, SkillError, SkillOrigin, SkillsCatalog};
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
 pub use tool_call::{ToolCall, ToolStatus};
 pub use transcript::{
