@@ -159,6 +159,30 @@ fn request_openers_are_natural_language() {
     ]);
 }
 
+/// A `'` between word characters is an apostrophe, not a quote open:
+/// `what's`/`how's` stay single tokens and normalize onto the
+/// `whats`/`hows` openers (previously the apostrophe opened
+/// single-quote state and the whole line folded into ONE token —
+/// `Command` by rule 1). Quoting elsewhere keeps its POSIX semantics:
+/// a real quote still swallows metachars and the line resolves by
+/// the unquoted words around it.
+#[test]
+fn contractions_are_sentence_text_not_quotes() {
+    assert_class(&[
+        ("what's the time", InputClass::NaturalLanguage),
+        ("how's it going", InputClass::NaturalLanguage),
+        // A contracted non-opener still gets no evidence — `its`,
+        // `dont`, `cant` are in neither table, so the conservative
+        // Command default holds.
+        ("it's done now", InputClass::Command),
+        // Real quoting is untouched: a resolvable first word is a
+        // command at rule 2 whatever the quotes carry, and quoted
+        // metachars never count as syntax.
+        ("echo 'a|b'", InputClass::Command),
+        ("foo 'bar|baz'", InputClass::Command),
+    ]);
+}
+
 /// Rule 4's stopword and trailing-punctuation evidence: a `?`/`.`
 /// closer or an English stopword marks a sentence.
 #[test]
