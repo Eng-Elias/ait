@@ -369,7 +369,12 @@ fn arm_sigint() -> SigintArm {
     ONCE.call_once(|| {
         // Installed once per process — `signal`'s plain handler model
         // is all a flag store needs.
-        unsafe { libc::signal(libc::SIGINT, catch_sigint as libc::sighandler_t) };
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                catch_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
     });
     let arm = SigintArm {
         flag: Arc::new(AtomicBool::new(false)),
