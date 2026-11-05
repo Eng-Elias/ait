@@ -104,6 +104,9 @@ pub fn session_template(settings: &Settings) -> SessionTemplate {
         options,
         shell_integration: terminal.shell_integration.unwrap_or(true),
         ssh: crate::remote::SshSpawn::armed(&settings.ssh),
+        // Instance state, not a setting — `TabManager::set_session_template`
+        // carries the bound one across reloads (Spec R11).
+        ctl_socket: None,
     }
 }
 
