@@ -1473,6 +1473,10 @@ config_key = "coding-key"
                 // ALWAYS raise — a stalled delta must still unblock
                 // `drive` so the test fails instead of hanging.
                 cancel.store(true, Ordering::SeqCst);
+                // …then hold the sender open a beat: dropping it ends
+                // the SSE stream into `Done`, and a Done racing the
+                // 50 ms flag poll makes the exit code nondeterministic.
+                std::thread::sleep(Duration::from_millis(500));
             }
         });
 
