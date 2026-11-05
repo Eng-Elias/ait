@@ -9,7 +9,8 @@
 //! `write_to_pty`; Spec R08 adds `update_plan` — §5.8's visible
 //! TODO list, gate-exempt like the ask; Spec R10 adds
 //! `call_mcp_tool` and `read_mcp_resource` — §5.10.1's MCP
-//! surface). Every declared tool
+//! surface — and `invoke_skill`, §5.10.2's skills loader). Every
+//! declared tool
 //! executes: the file tools
 //! live in [`files`](crate::files), `write_to_pty`'s agent-owned
 //! PTY in [`pty`](crate::pty) (R06-T7), `run_command` runs through
@@ -18,10 +19,11 @@
 //! `update_plan` applies through its snapshot event
 //! ([`AgentEvent::PlanUpdated`](crate::AgentEvent::PlanUpdated), us-13)
 //! — [`execute`] is the dispatcher; an unknown name is the only
-//! tool error left. The MCP tools are the one pair `execute` does
-//! not serve: the gate diverts them to the session's
+//! tool error left. Two surfaces `execute` does not serve: the
+//! gate diverts the MCP tools to the session's
 //! [`McpPool`](crate::mcp::McpPool), whose rmcp clients live on the
-//! worker's runtime.
+//! worker's runtime, and `invoke_skill` to the request's
+//! [`SkillsCatalog`](crate::SkillsCatalog) snapshot.
 //!
 //! [`summarize_args`] renders a call's arguments for the approve
 //! card — the frontend never parses tool JSON (standard 9).
@@ -69,6 +71,14 @@ pub(crate) const CALL_MCP_TOOL: &str = "call_mcp_tool";
 /// by `mcp_permissions` and the lists' `server` entries like
 /// [`CALL_MCP_TOOL`].
 pub(crate) const READ_MCP_RESOURCE: &str = "read_mcp_resource";
+
+/// The `invoke_skill` tool's registry name (Spec R10, §5.10.2) —
+/// loads a `SKILL.md` skill's body plus its bundled-file manifest
+/// from the request's [`SkillsCatalog`](crate::SkillsCatalog)
+/// snapshot. The permission engine maps it to `read_files`: a
+/// `never` profile forbids skills and no new profile field is
+/// needed (us-28).
+pub(crate) const INVOKE_SKILL: &str = "invoke_skill";
 
 /// One tool, provider-neutrally: what the model sees, translated
 /// per schema by [`declare`].
@@ -303,6 +313,26 @@ fn registry() -> &'static [ToolSpec] {
                         }
                     },
                     "required": ["server", "uri"],
+                    "additionalProperties": false
+                }),
+            },
+            ToolSpec {
+                name: INVOKE_SKILL,
+                description:
+                    "Load a skill's instructions by name. The Available skills section of the \
+                          system prompt lists which skills exist; the result is the skill's \
+                          SKILL.md body plus the files bundled in its directory, which \
+                          read_files can then open.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The skill name as listed in the Available skills \
+                                            section."
+                        }
+                    },
+                    "required": ["name"],
                     "additionalProperties": false
                 }),
             },
@@ -580,6 +610,13 @@ pub(crate) fn summarize_args(call: &ToolCall) -> String {
             let uri = args.get("uri").and_then(|v| v.as_str()).unwrap_or_default();
             format!("{server} {uri}").trim().to_string()
         }
+        // The bare skill name — the skill the user is consenting to
+        // load.
+        INVOKE_SKILL => args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
         _ => compact(&args),
     }
 }
@@ -680,6 +717,13 @@ pub(crate) fn execute(
             "{} runs on the session's MCP pool, not the executor",
             call.name
         )),
+        // `invoke_skill` answers from the request's skills snapshot —
+        // the gate dispatches it before `execute` is reached, like
+        // the MCP pair.
+        INVOKE_SKILL => ToolOutput::error(format!(
+            "{} runs against the task's skills catalog, not the executor",
+            call.name
+        )),
         other => ToolOutput::error(format!("unknown tool {other:?}")),
     }
 }
@@ -744,14 +788,15 @@ mod tests {
     use super::*;
     use crate::transcript::PlanTodoStatus;
 
-    /// Every schema's translation carries all ten tools with name,
-    /// description and parameters — in its own `Tool` shape (§5.3).
+    /// Every schema's translation carries all eleven tools with
+    /// name, description and parameters — in its own `Tool` shape
+    /// (§5.3).
     #[test]
     fn declare_translates_every_spec_per_schema() {
         let ToolDecls::Chat(tools) = declare(EndpointSchema::OpenAiChatCompletions, None) else {
             panic!("chat decls")
         };
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         assert!(tools
             .iter()
             .all(|t| t.kind == openai_chat_completions::ToolKind::Function));
@@ -789,7 +834,9 @@ mod tests {
             ask_user_question: Some(ait_config::PermissionLevel::AgentDecides),
             ..Default::default()
         };
-        let governed = ["read_files", "grep", "glob"];
+        // `invoke_skill` rides `read_files` (Spec R10 us-28), so it
+        // is governed here too.
+        let governed = ["read_files", "grep", "glob", INVOKE_SKILL];
 
         let decls = declare(EndpointSchema::OpenAiChatCompletions, Some(&profile));
         let ToolDecls::Chat(tools) = decls else {
@@ -1027,6 +1074,18 @@ mod tests {
         );
         // Missing pieces degrade rather than rendering garbage.
         assert_eq!(summarize_args(&call(READ_MCP_RESOURCE, "{}")), "");
+    }
+
+    /// `invoke_skill`'s card renders the bare skill name (Spec R10).
+    #[test]
+    fn summarize_renders_the_skill_name() {
+        let call = |args: &str| ToolCall {
+            id: String::new(),
+            name: INVOKE_SKILL.into(),
+            arguments: args.into(),
+        };
+        assert_eq!(summarize_args(&call(r#"{"name":"deploy"}"#)), "deploy");
+        assert_eq!(summarize_args(&call("{}")), "");
     }
 
     /// `update_plan`'s argument seam (Spec R08-T5): `{todos:

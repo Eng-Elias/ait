@@ -18,7 +18,9 @@
 //! surface mirrors that split: [`McpConfig::from_json`] is the pure
 //! `mcp.json` seam, [`mcp_path`]/[`project_ait_dir`] resolve the user
 //! and project `.ait/` layers, and [`load_mcp`] merges them into one
-//! origin-labeled view.
+//! origin-labeled view. §5.10.2's skills loader reuses the same
+//! layers: [`user_skills_dir`]/[`project_skills_dir`] resolve the two
+//! roots ait-agent's `SkillsCatalog` scans.
 //!
 //! ## Cargo features
 //!
@@ -45,6 +47,7 @@ mod mcp;
 mod resolve;
 mod secrets;
 mod settings;
+mod skills;
 #[cfg(feature = "watch")]
 mod watch;
 
@@ -65,5 +68,6 @@ pub use settings::{
     pattern_names, AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile,
     PermissionLevel, RedactionSettings, Settings, SshSettings, TerminalSettings,
 };
+pub use skills::{project_skills_dir, user_skills_dir};
 #[cfg(feature = "watch")]
 pub use watch::{watch, watch_from, SettingsWatcher};

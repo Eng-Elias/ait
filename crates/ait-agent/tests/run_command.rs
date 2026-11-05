@@ -78,6 +78,7 @@ fn task(settings: Settings, bridge: Option<Box<dyn ShellBridge>>) -> AgentReques
         },
         prior: Vec::new(),
         bridge,
+        skills: ait_agent::SkillsCatalog::default(),
     }
 }
 

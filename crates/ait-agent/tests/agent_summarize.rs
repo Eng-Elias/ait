@@ -73,6 +73,7 @@ fn task(settings: Settings, cwd: &str, text: &str, prior: Vec<TranscriptItem>) -
             output_lines: Vec::new(),
         },
         bridge: None,
+        skills: ait_agent::SkillsCatalog::default(),
     }
 }
 

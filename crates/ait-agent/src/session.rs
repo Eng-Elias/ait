@@ -95,6 +95,7 @@ use crate::mcp::McpPool;
 use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
 use crate::redact::Redactor;
+use crate::skills::SkillsCatalog;
 use crate::summarize;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
@@ -157,12 +158,21 @@ pub struct AgentRequest {
     /// conversation; a resumed conversation's stored items ride the
     /// same field — the worker never touches disk either way.
     pub prior: Vec<TranscriptItem>,
+    /// The task's §5.10.2 skills snapshot (Spec R10-T5): the caller
+    /// scans both skills roots at submit time and the catalog rides
+    /// the request verbatim — the system prompt's "Available skills"
+    /// section, `invoke_skill`'s answers and the skill directories
+    /// the `ToolCwd` adds to its read roots all come from THIS
+    /// value, so task-time behavior is deterministic no matter what
+    /// changes on disk mid-run (live watching is R10-T6's).
+    pub skills: SkillsCatalog,
     /// The terminal-side context — cwd, shell, OS and recent output
     /// lines; assembled into the system prompt by
     /// [`assemble_system_prompt`]. `cwd` also binds the file tools:
     /// every path the agent reads or searches stays under it —
     /// plus under any `directory_allowlist` root the active profile
-    /// declares (§5.7, R07-T4).
+    /// declares (§5.7, R07-T4) and any loaded skill's directory
+    /// (§5.10.2).
     pub context: AgentContext,
     /// The shell binding `run_command` executes against (Spec R06-T4):
     /// the frontend hands each task the `ShellBridge` its `Tab`
@@ -683,6 +693,7 @@ fn serve(
         find_agents_md(Path::new(&request.context.cwd)).as_deref(),
         &redactor,
         mcp_catalog.prompt_section().as_deref(),
+        request.skills.prompt_section().as_deref(),
     );
     // The §5.7 stance the permission engine consults on every tool
     // call — the task's armed profile missing, renamed or never
@@ -711,12 +722,17 @@ fn serve(
     // The task's file tools bind to the session's cwd ∪ the active
     // profile's normalized `directory_allowlist` roots (§5.7,
     // R07-T4): a missing profile or an empty list confines to cwd
-    // exactly (Spec R06's confinement rule). The union only widens
-    // what the tools may touch — the engine's verdicts, cards and
-    // diffs are unaffected.
-    let allowlist: &[String] = profile
-        .map(|profile| profile.directory_allowlist.as_slice())
-        .unwrap_or(&[]);
+    // exactly (Spec R06's confinement rule). On a LOCAL task every
+    // loaded skill's directory joins the union too (Spec R10 us-25)
+    // — `read_files` reaches a skill's bundled files with no
+    // allowlist editing; on a remote task they stay out, since the
+    // read tools would look for them on the wrong machine (skills
+    // are local-only this round). The union only widens what the
+    // tools may touch — the engine's verdicts, cards and diffs are
+    // unaffected.
+    let mut allowlist: Vec<String> = profile
+        .map(|profile| profile.directory_allowlist.clone())
+        .unwrap_or_default();
     // §5.9 (Spec R09-T5/T6): the bridge's remote state is the task's
     // one read of where commands land — `Remote` confines the file
     // tools lexically (their commands run through the executor) and
@@ -728,9 +744,10 @@ fn serve(
         .and_then(|bridge| bridge.remote_state().ok())
         .is_some_and(|state| matches!(state, crate::RemoteState::Remote { .. }));
     let cwd = if remote {
-        ToolCwd::new_remote(&request.context.cwd, allowlist)
+        ToolCwd::new_remote(&request.context.cwd, &allowlist)
     } else {
-        ToolCwd::new(&request.context.cwd, allowlist)
+        allowlist.extend(request.skills.skill_dirs());
+        ToolCwd::new(&request.context.cwd, &allowlist)
     };
 
     let token = CancellationToken::new();
@@ -764,6 +781,7 @@ fn serve(
         agent_pty,
         executor.as_mut(),
         mcp_pool,
+        &request.skills,
         remote,
         &redactor,
         token,
@@ -801,6 +819,7 @@ async fn run_loop(
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     mcp_pool: &mut McpPool,
+    skills: &SkillsCatalog,
     remote: bool,
     redactor: &Redactor,
     cancel: CancellationToken,
@@ -885,6 +904,7 @@ async fn run_loop(
                         agent_pty,
                         executor,
                         mcp_pool,
+                        skills,
                         remote,
                         redactor,
                         &cancel,
@@ -1021,6 +1041,7 @@ async fn gate_and_execute(
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     mcp_pool: &mut McpPool,
+    skills: &SkillsCatalog,
     remote: bool,
     redactor: &Redactor,
     cancel: &CancellationToken,
@@ -1154,13 +1175,15 @@ async fn gate_and_execute(
     // Apply the plan the card showed (edit_files); MCP calls ride the
     // session's pool — local to ait's own process even on a remote
     // task (Spec R10 us-16: MCP is not shell execution, the §5.9
-    // executor tiers never see it); every other call dispatches
-    // through the executor.
+    // executor tiers never see it); `invoke_skill` answers from the
+    // request's catalog snapshot — a local read, no executor (Spec
+    // R10 us-24); every other call dispatches through the executor.
     let output = match plan {
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
         None => match call.name.as_str() {
             tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE => mcp_pool.execute(call).await,
+            tools::INVOKE_SKILL => skills.invoke_call(call),
             _ => tools::execute(call, cwd, agent_pty, executor, remote, cancel),
         },
     };

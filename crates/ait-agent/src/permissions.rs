@@ -25,7 +25,10 @@
 //! (§5.10.1): `call_mcp_tool`/`read_mcp_resource` map to
 //! `mcp_permissions`, and `mcp_denylist`/`mcp_allowlist` consult
 //! literal `server`/`server:tool` strings before the level —
-//! `context_window_limit` is consumed by summarization (Round 8).
+//! while §5.10.2's `invoke_skill` rides `read_files`, so a `never`
+//! profile forbids skills and `agent_decides` governs it like the
+//! other read tools (us-28). `context_window_limit` is consumed by
+//! summarization (Round 8).
 
 use std::collections::HashSet;
 
@@ -33,7 +36,9 @@ use ait_config::{ExecutionProfile, PermissionLevel};
 use regex::Regex;
 
 use crate::tool_call::ToolCall;
-use crate::tools::{ASK_USER_QUESTION, CALL_MCP_TOOL, READ_MCP_RESOURCE, UPDATE_PLAN};
+use crate::tools::{
+    ASK_USER_QUESTION, CALL_MCP_TOOL, INVOKE_SKILL, READ_MCP_RESOURCE, UPDATE_PLAN,
+};
 
 /// What the gate does with one tool call — the vocabulary the
 /// interim gate's `needs_verdict` boolean could not express.
@@ -183,12 +188,15 @@ fn flagged_safe(call: &ToolCall) -> bool {
 /// governed by `execute_commands`, the three read-only filesystem
 /// tools share `read_files`, `edit_files` rides `apply_code_diffs`,
 /// `write_to_pty`/`ask_user_question` read their same-named fields,
-/// and both MCP tools ride `mcp_permissions` (Spec R10, §5.10.1).
+/// both MCP tools ride `mcp_permissions` (Spec R10, §5.10.1), and
+/// §5.10.2's `invoke_skill` shares `read_files` — loading a skill
+/// is a local read, so a `never` profile forbids it and no new
+/// field is needed (Spec R10 us-28).
 /// An unmapped name has no level — [`evaluate`] fails safe and asks.
 fn level_for(profile: &ExecutionProfile, tool: &str) -> Option<PermissionLevel> {
     match tool {
         "run_command" => profile.execute_commands,
-        "read_files" | "grep" | "glob" => profile.read_files,
+        "read_files" | "grep" | "glob" | INVOKE_SKILL => profile.read_files,
         "edit_files" => profile.apply_code_diffs,
         "write_to_pty" => profile.write_to_pty,
         ASK_USER_QUESTION => profile.ask_user_question,
@@ -317,7 +325,7 @@ mod tests {
                 execute_commands: level,
                 ..Default::default()
             },
-            "read_files" | "grep" | "glob" => ExecutionProfile {
+            "read_files" | "grep" | "glob" | INVOKE_SKILL => ExecutionProfile {
                 read_files: level,
                 ..Default::default()
             },
@@ -359,6 +367,7 @@ mod tests {
             "write_to_pty",
             CALL_MCP_TOOL,
             READ_MCP_RESOURCE,
+            INVOKE_SKILL,
         ];
         let empty = HashSet::new();
         for tool in gated {
@@ -526,7 +535,7 @@ mod tests {
             execute_commands: Some(PermissionLevel::AlwaysAsk),
             ..Default::default()
         };
-        for tool in ["read_files", "grep", "glob"] {
+        for tool in ["read_files", "grep", "glob", INVOKE_SKILL] {
             assert!(is_agent_decided(Some(&profile), tool), "{tool}");
         }
         for tool in [
@@ -1119,5 +1128,61 @@ mod tests {
             ),
             Verdict::Deny(String::from("denied by execution profile default"))
         );
+    }
+
+    /// `invoke_skill` rides `read_files` verbatim (Spec R10 us-28):
+    /// `never` forbids skills with the profile-denial text,
+    /// `always_allow` runs ungated, and `agent_decides` honors the
+    /// call's own `safety` flag — no new profile field exists for
+    /// it.
+    #[test]
+    fn invoke_skill_rides_the_read_files_level() {
+        let empty = HashSet::new();
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::Never));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy"}"#),
+                &empty
+            ),
+            Verdict::Deny(String::from("denied by execution profile default"))
+        );
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::AlwaysAllow));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy"}"#),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        // `agent_decides`: `safe` runs, `unsafe`/absent asks.
+        let profile = profile_with(INVOKE_SKILL, Some(PermissionLevel::AgentDecides));
+        assert_eq!(
+            evaluate(
+                Some(&profile),
+                "default",
+                &call_with(INVOKE_SKILL, r#"{"name":"deploy","safety":"safe"}"#),
+                &empty
+            ),
+            Verdict::Allow
+        );
+        for args in [
+            r#"{"name":"deploy","safety":"unsafe"}"#,
+            r#"{"name":"deploy"}"#,
+        ] {
+            assert_eq!(
+                evaluate(
+                    Some(&profile),
+                    "default",
+                    &call_with(INVOKE_SKILL, args),
+                    &empty
+                ),
+                Verdict::Ask { first_write: false },
+                "{args}"
+            );
+        }
     }
 }
