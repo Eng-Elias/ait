@@ -27,6 +27,7 @@
 //!   current and their exits/OSC events surface.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -48,7 +49,7 @@ use crate::integration::{self, IntegrationState};
 use crate::remote::RemoteContext;
 use crate::render::session_size;
 use crate::scroll::ScrollState;
-use crate::selection::{GridPoint, Selection, SelectionRange};
+use crate::selection::{extract, GridPoint, Selection, SelectionRange};
 use crate::shell_bridge::{self, BridgeRequest, BridgeService};
 use crate::skills::{skipped_text, LiveSkills};
 use crate::status::Toast;
@@ -280,6 +281,17 @@ impl Tab {
             .shell_integration
             .then(|| integration::inject(&mut options, &id.to_string(), &template.ssh))
             .flatten();
+        // §5.10.5: `ait ctl` inside a spawned session drives this
+        // instance — the bound control socket rides the same
+        // `options.env` seam as `AIT_SESSION_ID`, and lands on EVERY
+        // spawn (uninjected shells too: the ctl verbs need no
+        // integration).
+        if let Some(socket) = &template.ctl_socket {
+            options.env.push((
+                OsString::from(crate::ctl::ENV_CTL_SOCKET),
+                socket.clone().into_os_string(),
+            ));
+        }
         let scrollback_cap = options.session.scrollback;
         let session = LiveSession::spawn(options)?;
         Ok(Self {
@@ -360,6 +372,42 @@ impl Tab {
             .blocks()
             .filter_map(|entry| entry.resolve(&grid, self.dropped_lines, extent))
             .collect()
+    }
+
+    /// The text of `block`'s output rows — `output_start..=range.end`
+    /// in the live coordinates [`blocks()`](Self::blocks) resolves,
+    /// honoring the mid-row `D` column bound so the prompt and next
+    /// echo that share `D`'s row stay out — extracted with the same
+    /// copy semantics [`select_block`](Self::select_block) programs
+    /// (Spec R11 `last-block`). Empty when the block's `C` mark never
+    /// arrived: nothing is then *known* to be output, and a
+    /// range-clamped `start > end` means the output rows left the grid
+    /// entirely.
+    pub(crate) fn block_output(&self, block: &Block) -> String {
+        let Some(start) = block.output_start() else {
+            return String::new();
+        };
+        let end = *block.range().end();
+        if start > end {
+            return String::new();
+        }
+        let grid = self.grid();
+        let scrollback = i32::try_from(self.scrollback()).unwrap_or(i32::MAX);
+        let to_grid = |line: usize| i32::try_from(line).unwrap_or(i32::MAX) - scrollback;
+        // `end_column` narrows `D`'s mid-row landing; absent it the row
+        // is selected whole (extract trims its trailing blanks).
+        let end_column = block
+            .end_column()
+            .unwrap_or_else(|| grid.columns().saturating_sub(1));
+        extract(
+            &grid,
+            SelectionRange {
+                start: GridPoint::new(to_grid(start), 0),
+                end: GridPoint::new(to_grid(end), end_column),
+            },
+        )
+        .trim_end_matches('\n')
+        .to_string()
     }
 
     /// The shell-integration state this tab's session has reported
@@ -1314,6 +1362,13 @@ pub struct SessionTemplate {
     /// env (Spec R09-T1/T2) — the wrapper's allow/deny/reuse rules
     /// plus the remote bootstrap command.
     pub ssh: crate::remote::SshSpawn,
+    /// The running instance's control socket (Spec R11 §5.10.5):
+    /// spawned sessions get it exported as `AIT_CTL_SOCKET` so
+    /// `ait ctl` inside a tab drives this instance. `None` while no
+    /// ctl server is bound — instance state, not a setting, so
+    /// [`set_session_template`](TabManager::set_session_template)
+    /// carries it across reloads.
+    pub ctl_socket: Option<PathBuf>,
 }
 
 impl Default for SessionTemplate {
@@ -1324,6 +1379,7 @@ impl Default for SessionTemplate {
             options: LiveSessionOptions::default(),
             shell_integration: true,
             ssh: Default::default(),
+            ctl_socket: None,
         }
     }
 }
@@ -1388,8 +1444,14 @@ impl TabManager {
     /// Replace the spawn template: sessions spawned from now on get
     /// `template` — the `[terminal]` half of a settings reload —
     /// while live tabs keep their spawn-time program and scrollback
-    /// (Spec R03 user story 14).
-    pub fn set_session_template(&mut self, template: SessionTemplate) {
+    /// (Spec R03 user story 14). The instance's `ctl_socket` is not a
+    /// setting: a reload builds its template with `None`, so the live
+    /// one carries over rather than disarming `AIT_CTL_SOCKET` on
+    /// later spawns (Spec R11).
+    pub fn set_session_template(&mut self, mut template: SessionTemplate) {
+        template.ctl_socket = template
+            .ctl_socket
+            .or_else(|| self.session_template.ctl_socket.clone());
         self.session_template = template;
     }
 
@@ -1511,6 +1573,26 @@ impl TabManager {
     /// All tabs, in tab-bar order.
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
+    }
+
+    /// The tab whose `AIT_SESSION_ID` is `session_id` — `ait ctl`'s
+    /// `--tab` targeting (Spec R11 §5.10.5). The env-exported identity
+    /// IS the stable [`Tab::id`] as text, so the lookup resolves the
+    /// same value `ctl`'s `open-tab` response hands out, and reaches
+    /// uninjected tabs too (they answer to their id even without the
+    /// env var landing).
+    pub(crate) fn session_tab(&self, session_id: &str) -> Option<&Tab> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id.to_string() == session_id)
+    }
+
+    /// [`session_tab`](Self::session_tab), mutably — the `send` verb's
+    /// target resolution.
+    pub(crate) fn session_tab_mut(&mut self, session_id: &str) -> Option<&mut Tab> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id.to_string() == session_id)
     }
 
     /// How many tabs are open.
@@ -2932,6 +3014,7 @@ mod tests {
                 options: echo_sid(),
                 shell_integration: false,
                 ssh: Default::default(),
+                ctl_socket: None,
             },
         )
         .unwrap();
@@ -4122,6 +4205,87 @@ mod tests {
             toast.text().contains(".ait"),
             "the toast names the offending path: {}",
             toast.text()
+        );
+    }
+
+    /// `--tab`'s resolution (Spec R11 §5.10.5): the session id is the
+    /// tab's stable `id` as text — the same value `ctl`'s `open-tab`
+    /// response hands out — resolving injected and uninjected tabs
+    /// alike; an unknown id resolves to nothing.
+    #[test]
+    fn session_tab_resolves_by_tab_id() {
+        let mut manager = manager(2, "/tmp");
+        // `/bin/sh` spawns are never injected — the id still names the tab.
+        assert!(manager.session_tab("0").is_some());
+        assert!(manager.session_tab("1").is_some());
+        assert!(manager.session_tab("9").is_none());
+        let id = manager.session_tab("1").unwrap().id;
+        assert_eq!(manager.session_tab_mut("1").unwrap().id, id);
+    }
+
+    /// Spec R11 §5.10.5: a template carrying `ctl_socket` exports it
+    /// as `AIT_CTL_SOCKET` into every spawned session — the plain
+    /// uninjected `/bin/sh` included, since the ctl verbs need no
+    /// integration — and a settings reload (a fresh template built
+    /// with `None`) keeps it armed rather than dropping the export.
+    #[test]
+    fn ctl_socket_exports_into_spawned_sessions() {
+        let socket = PathBuf::from("/tmp/ait-test-ctl.sock");
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: sh(),
+                ctl_socket: Some(socket.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"echo SOCK=${AIT_CTL_SOCKET:-none}\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[0].session).contains("SOCK=/tmp/ait-test-ctl.sock")
+        });
+
+        // What a config reload does: a fresh template with `None`.
+        manager.set_session_template(SessionTemplate {
+            options: sh(),
+            ..Default::default()
+        });
+        manager.new_tab().unwrap();
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"echo SOCK2=${AIT_CTL_SOCKET:-none}\n")
+            .unwrap();
+        drain_until(&mut manager, |m| {
+            grid_text(&m.tabs()[1].session).contains("SOCK2=/tmp/ait-test-ctl.sock")
+        });
+    }
+
+    /// `last-block`'s read-back (Spec R11): `block_output` yields the
+    /// block's `C`→`D` rows only — the echo row and `D`'s own row stay
+    /// out — in the same extraction semantics the copy path uses.
+    #[test]
+    fn block_output_slices_the_output_rows() {
+        let mut manager = manager(1, "/tmp");
+        manager.spawn_tab(scripted_marks(None)).unwrap();
+        drain_until(&mut manager, |m| {
+            m.tabs()[1].blocks().iter().any(|b| b.completed())
+        });
+
+        let tab = &manager.tabs()[1];
+        let blocks = tab.blocks();
+        let block = &blocks[0];
+        assert_eq!(
+            tab.block_output(block),
+            "hi",
+            "just the output rows — echo and D's row excluded"
         );
     }
 }

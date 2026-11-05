@@ -37,6 +37,7 @@ dependencies = [
  "insta",
  "libc",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
 ]
