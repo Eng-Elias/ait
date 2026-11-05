@@ -3790,6 +3790,7 @@ mod tests {
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
+        let mut skills = LiveSkills::unwatched();
         let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         let staged = |id: &str| ait_agent::AgentEvent::ApprovalRequest {
             call: ait_agent::ToolCall {
@@ -3810,7 +3811,7 @@ mod tests {
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3823,7 +3824,7 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3839,7 +3840,7 @@ mod tests {
                 &key(KeyCode::Char(c)),
                 &settings,
                 "default",
-                &mut LiveSkills::unwatched(),
+                &mut skills,
                 &mut toast,
             );
         }
@@ -3853,7 +3854,7 @@ mod tests {
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3869,14 +3870,14 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3889,21 +3890,21 @@ mod tests {
             &key(KeyCode::Char('x')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3916,7 +3917,7 @@ mod tests {
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3927,7 +3928,7 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
@@ -3944,6 +3945,7 @@ mod tests {
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
+        let mut skills = LiveSkills::unwatched();
         let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         let ask = |id: &str, choices: &[&str]| ait_agent::AgentEvent::AskRequest {
             call: ait_agent::ToolCall {
@@ -3967,21 +3969,21 @@ mod tests {
             &key(KeyCode::Char('x')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Left),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Backspace),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3993,14 +3995,14 @@ mod tests {
             &key(KeyCode::Down),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -4022,7 +4024,7 @@ mod tests {
                 &key(KeyCode::Char(c)),
                 &settings,
                 "default",
-                &mut LiveSkills::unwatched(),
+                &mut skills,
                 &mut toast,
             );
         }
@@ -4032,7 +4034,7 @@ mod tests {
             &key(KeyCode::Down),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(tab.agent.as_ref().unwrap().awaiting_answer());
@@ -4040,7 +4042,7 @@ mod tests {
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {

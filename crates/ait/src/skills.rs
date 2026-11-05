@@ -126,15 +126,17 @@ impl LiveSkills {
     /// unchanged root set serves the watcher-refreshed cache.
     pub fn snapshot(&mut self, cwd: &Path) -> SkillsCatalog {
         let project_root = (self.discover)(cwd);
-        if project_root != self.project_root {
+        let root_changed = project_root != self.project_root;
+        if root_changed {
             self.project_root = project_root;
             self.rescan(false);
         }
         self.ensure_watcher();
-        if self.watcher.is_none() {
+        if self.watcher.is_none() && !root_changed {
             // No live refresh — rescan so the snapshot can never go
             // stale; last-good still merges in case the read caught
-            // a mid-write file.
+            // a mid-write file. A root change already rescanned
+            // fresh above — no second read.
             self.rescan(true);
         }
         self.catalog.clone()
