@@ -77,8 +77,10 @@ pub(crate) struct McpPool {
     servers: BTreeMap<String, ServerSlot>,
     /// The last `mcp.json` load failure — carried into the catalog so
     /// a malformed file surfaces in the prompt rather than silently
-    /// behaving as "no servers" (Spec R10 us-4's visibility rule; the
-    /// frontend's toast seam has no worker path).
+    /// behaving as "no servers" (Spec R10 us-4's visibility rule).
+    /// The pool keeps its last-good connections on an error
+    /// (ADR-0006); the user-side toast for the same `ConfigError`
+    /// fires at the frontend's submit seam.
     load_error: Option<String>,
 }
 
@@ -135,15 +137,17 @@ impl McpPool {
     /// lazy path, and a project server that already connected keeps
     /// its slot like a user-tier one.
     ///
-    /// A malformed or unreadable `mcp.json` drains the pool — the
-    /// config layer's view is gone — and the [`McpCatalog`]'s
-    /// `load_error` carries the `ConfigError` text into the prompt;
-    /// the task continues either way.
+    /// A malformed or unreadable `mcp.json` keeps the last working
+    /// pool (ADR-0006's keep-last-good — a bad save must not drop
+    /// healthy connections mid-session, Spec R10 us-4's "the
+    /// terminal keeps working"): the [`McpCatalog`]'s `load_error`
+    /// carries the `ConfigError` text into the prompt, and the
+    /// frontend toasts the same error at its submit seam. The task
+    /// continues either way.
     pub(crate) async fn reconcile(&mut self, cwd: &Path) -> McpCatalog {
         let merged = match load_mcp(cwd) {
             Ok(merged) => merged,
             Err(error) => {
-                self.drain().await;
                 self.load_error = Some(error.message().to_string());
                 return self.catalog();
             }
@@ -531,9 +535,9 @@ fn render_tool_result(result: CallToolResult) -> ToolOutput {
 pub(crate) struct McpCatalog {
     /// One entry per declared server, sorted by name.
     pub(crate) entries: Vec<McpCatalogEntry>,
-    /// `mcp.json` failed to load this task — the pool was drained;
-    /// the section renders the error rather than pretending no
-    /// servers exist.
+    /// `mcp.json` failed to load this task — the pool kept its
+    /// last-good connections (ADR-0006); the section renders the
+    /// error rather than pretending no servers exist.
     pub(crate) load_error: Option<String>,
 }
 
@@ -584,7 +588,7 @@ impl McpCatalog {
         );
         if let Some(error) = &self.load_error {
             text.push_str(&format!(
-                "\n- mcp.json failed to load: {error} — no MCP servers are connected"
+                "\n- mcp.json failed to load: {error} — the last working set stays in effect"
             ));
         }
         for entry in &self.entries {
