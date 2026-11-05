@@ -106,6 +106,14 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   rewrites the submission into the `# ` suggestion flow. Conservative:
   shell syntax, resolvable first words and anything without positive
   sentence evidence stay commands; `[input] classifier` arms it.
+- **Headless mode** — `ait --headless "<task>" [--profile <name>]`
+  (§5.10.5): a non-interactive agent run that spawns a hidden,
+  fully-integrated shell, auto-denies approval gates, answers
+  `ask_user_question` with a canned no-interactive reply, streams
+  assistant text to stdout and tool/status activity to stderr, and
+  persists the conversation like a TUI task. `Done` exits 0;
+  `Error`/`BudgetReached`/`Cancelled` exit non-zero; SIGINT is the
+  headless Esc (`session.cancel()`).
 - **MCP server** — a Model Context Protocol stdio server declared in
   `mcp.json` (`{"mcpServers": {"name": {"command", "args", "env"}}}`):
   `ait-agent`'s per-session `McpPool` connects user-tier entries

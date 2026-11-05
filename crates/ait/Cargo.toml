@@ -49,8 +49,10 @@ crossterm = { version = "0.29", features = ["osc52"] }
 
 [target.'cfg(unix)'.dependencies]
 # libc 0.2.191 (2026-10-16), already in the tree via `ait-term` —
-# `getuid` names the ctl socket dir's per-user `$TMPDIR` fallback
-# (Spec R11, the same rule `ait_shell::ssh_control_dir` uses).
+# `signal`/`raise` for `ait --headless`'s SIGINT→cancel wiring
+# (Spec R11 us-27) and `getuid` naming the ctl socket dir's per-user
+# `$TMPDIR` fallback (Spec R11, the same rule
+# `ait_shell::ssh_control_dir` uses).
 libc = "0.2"
 
 [dev-dependencies]
