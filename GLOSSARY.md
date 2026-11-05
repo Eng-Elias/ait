@@ -75,6 +75,11 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   fail-safe) renders.
 - **Step budget** — the cap on model turns per task (`STEP_BUDGET`, 50);
   tripping it ends the task with a `BudgetReached` status.
+- **Pattern name** — a §5.10.3 redaction pattern's stable id
+  (`aws_access_key`, `pii_email`, …), defined once in
+  `ait_config::pattern_names`: the `[redaction]` `enable`/`disable`
+  lists reference it, and `ait-agent`'s `Redactor` table keys each
+  compiled regex on it (§4.3, Spec R10).
 - **Remote bootstrap** — the self-contained POSIX-sh script an integrated
   `ssh()` sends as the remote command (Spec R09): it lands the injected
   snippet file set in a private remote `mktemp -d`, exports the session env

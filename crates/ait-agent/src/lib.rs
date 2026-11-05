@@ -3,9 +3,11 @@
 //! Round 4 lands the crate's pure seams (CODING_STANDARDS.md §11 —
 //! each is testable without a PTY, model or TTY):
 //!
-//! - [`redact`] — the §5.10.3 credential-redaction filter guarding
-//!   terminal output before it reaches a provider (Spec R04, user
-//!   stories 18, 26).
+//! - [`Redactor`] + [`redact`] — the §5.10.3 credential-redaction
+//!   filter guarding terminal output before it reaches a provider
+//!   (Spec R04, user stories 18, 26; Spec R10: a named pattern table
+//!   compiled per request from `[redaction]` settings — built-ins
+//!   togglable by name, opt-in PII categories, user `extra` regexes).
 //! - [`assemble_request`] + [`SuggestContext`] — §5.4 context
 //!   assembly into a schema-matched `ait_llm::EndpointRequest` the
 //!   suggester streams unchanged (user stories 15–17, 19, 27).
@@ -78,7 +80,7 @@ pub use executor::{
     CommandResult, ControlMasterExecutor, DemotingExecutor, DetachedExecutor, ExecutorError,
     RemoteState, ShellBridge, ShellIntegration, UserShellExecutor,
 };
-pub use redact::redact;
+pub use redact::{redact, Redactor};
 pub use sanitize::{sanitize_reply, ReplySanitizer};
 pub use session::{
     result_preview, AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict,
