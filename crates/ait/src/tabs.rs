@@ -1735,55 +1735,30 @@ impl TabManager {
     /// (Spec R08-T3, user story 28): the first flush creates the
     /// tab's `conversations` row — titled from its first task — and
     /// every later flush appends to the SAME row, so task two in a
-    /// tab continues task one's transcript. Each append is the
-    /// store's own transaction; every write goes through the degrade
-    /// rule, so a disabled store just drops the items — the panel's
-    /// in-memory transcript keeps them regardless (T4's `prior`).
+    /// tab continues task one's transcript. The fold itself is
+    /// [`StoreHandle::flush_transcript`] — the headless driver runs
+    /// the same one over its single transcript; every write goes
+    /// through the degrade rule, so a disabled store just drops the
+    /// items — the panel's in-memory transcript keeps them
+    /// regardless (T4's `prior`).
     pub fn drain_transcripts(&mut self, store: &mut StoreHandle, toast: &mut Option<Toast>) {
         for tab in &mut self.tabs {
             let items = match tab.agent.as_mut() {
                 Some(panel) => panel.take_transcript_items(),
                 None => continue,
             };
-            if items.is_empty() {
-                continue;
-            }
-            let conversation = match tab.conversation {
-                Some(id) => Some(id),
-                None => {
-                    // The title reads the batch's first task, falling
-                    // back through the panel's whole transcript — a
-                    // post-detach batch can start mid-conversation,
-                    // and the detached row's first task still names
-                    // the same conversation (Spec R08 us-5).
-                    let history = tab
-                        .agent
-                        .as_ref()
-                        .map(|panel| panel.transcript_items())
-                        .unwrap_or(&[]);
-                    let id = store.conversation_started(
-                        toast,
-                        &crate::transcript::conversation_title(&items, history),
-                        &tab.cwd,
-                    );
-                    if let Some(id) = id {
-                        tab.set_conversation(id);
-                    }
-                    id
-                }
-            };
-            if let Some(id) = conversation {
-                store.append_transcript(toast, id, &items);
-                // `plan` items also upsert the conversation's
-                // `plans` row (Spec R08-T5, us-17): the transcript
-                // keeps every snapshot for the audit trail while the
-                // row keeps only the newest — the last upsert in the
-                // batch wins, matching the event order.
-                for item in &items {
-                    if let ait_agent::TranscriptItem::Plan { .. } = item {
-                        store.plan_upsert(toast, id, item);
-                    }
-                }
+            // The title reads the batch's first task, falling back
+            // through the panel's whole transcript — a post-detach
+            // batch can start mid-conversation (Spec R08 us-5).
+            let history = tab
+                .agent
+                .as_ref()
+                .map(|panel| panel.transcript_items())
+                .unwrap_or(&[]);
+            if let Some(id) =
+                store.flush_transcript(toast, tab.conversation, &items, history, &tab.cwd)
+            {
+                tab.set_conversation(id);
             }
         }
     }
