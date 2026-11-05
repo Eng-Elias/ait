@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use ait_agent::{AgentRequest, ApprovalVerdict};
+use ait_agent::{AgentRequest, ApprovalVerdict, ProgramIndex};
 use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
@@ -130,6 +130,13 @@ pub struct Tab {
     /// `pub(crate)` test seam; production drives it through
     /// `crate::suggest` from the keypress path.
     pub(crate) shadow: InputShadow,
+    /// The §5.10.4 program index — this session's shell builtins
+    /// merged with the executable basenames on `$PATH`, harvested ONCE
+    /// at spawn (Spec R11 us-15): the classifier's per-Enter check is
+    /// a set lookup, never a `$PATH` walk. Keyed on the same program
+    /// basename the title resolves. Same `pub(crate)` test seam as
+    /// `shadow` — tests stage `ProgramIndex::with_path_entries`.
+    pub(crate) program_index: ProgramIndex,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
     cwd: PathBuf,
@@ -1240,6 +1247,10 @@ impl TabManager {
             scroll: ScrollState::new(),
             selection: Selection::default(),
             shadow: InputShadow::new(),
+            // §5.10.4: one `$PATH` walk per session spawn (us-15) —
+            // keyed on the resolved program's basename, the same name
+            // the tab title and request context report.
+            program_index: ProgramIndex::harvest(&title),
             cwd,
             cwd_reported: false,
             exit: None,

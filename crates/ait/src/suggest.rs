@@ -47,8 +47,11 @@
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use ait_agent::{CommandSuggester, SuggestEvent, SuggestRequest, OUTPUT_LINE_BUDGET};
-use ait_config::Settings;
+use ait_agent::{
+    classify, CommandSuggester, InputClass, ProgramIndex, SuggestEvent, SuggestRequest,
+    OUTPUT_LINE_BUDGET,
+};
+use ait_config::{ClassifierMode, Settings};
 use ait_term::{Cursor, GridView, Key, KeyEvent, Keypad, Modifiers};
 
 use crate::blocks::Block;
@@ -395,6 +398,78 @@ pub fn line_request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option
         .shadow
         .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
     Some(assemble(tab, settings, profile, request))
+}
+
+/// The verdict half of the §5.10.4 classifier trigger (Spec R11-T2):
+/// `mode` armed AND `shadow` verifying against `logical_line` — the
+/// same echo-agreement check both explicit triggers run — hands the
+/// line to [`classify`]. `NaturalLanguage` returns the verified line
+/// for the [`rewrite_as_comment`] path; every other outcome — `off`,
+/// a `Command` verdict, a stale shadow, echo disagreement — is `None`
+/// and the submission stays ordinary: the desync-is-inert rule, and
+/// the reason input that never passed through keystrokes (`ait ctl
+/// send`, which marks the shadow stale) is never classified
+/// (us-10/11/16). The pure half of the trigger: byte-fed `Session`s
+/// and `with_path_entries` indexes drive it without a PTY or a `$PATH`
+/// walk.
+fn classified_line(
+    shadow: &InputShadow,
+    logical_line: &str,
+    index: &ProgramIndex,
+    mode: ClassifierMode,
+) -> Option<String> {
+    if mode == ClassifierMode::Off {
+        return None;
+    }
+    let line = shadow.verified_line(logical_line)?;
+    (classify(&line, index) == InputClass::NaturalLanguage).then_some(line)
+}
+
+/// The third submission trigger (§5.10.4, Spec R11-T2) — the check
+/// `app`'s submission arm runs after the `# ` request refuses, while
+/// the shadow still holds the line and the grid still echoes it. On
+/// `Some` the caller swallows the Enter, arms the returned
+/// [`SuggestRequest`] — the `Alt+Enter` whole-line form, so the
+/// request lands on the model exactly as if the user had typed the
+/// `# ` prefix — and submits [`rewrite_as_comment`]'s bytes instead.
+/// `None` changes nothing: `Command` verdicts, `classifier = "off"`,
+/// stale shadows and echo disagreement all forward verbatim
+/// (us-10/11/13). The index lives on the tab — harvested once per
+/// session spawn — so the lookup costs a set probe, never a `$PATH`
+/// walk (us-15).
+pub fn classified_request(
+    tab: &Tab,
+    settings: &Settings,
+    profile: &str,
+) -> Option<(String, SuggestRequest)> {
+    let line = classified_line(
+        &tab.shadow,
+        &logical_line(&tab.grid(), tab.cursor()),
+        &tab.program_index,
+        settings.input.classifier,
+    )?;
+    let request = assemble(tab, settings, profile, line.clone());
+    Some((line, request))
+}
+
+/// The natural-language verdict's rewrite (Spec R11-T2, ADR-0014):
+/// `Ctrl+U` (`\x15` — readline's kill-to-start-of-line, the same byte
+/// [`SuggestionPin::cancel`] wipes with) erases the typed line, then
+/// `# <line>` + `\r` submits the request through the shell as a
+/// comment — it lands in history and scrollback exactly like an
+/// explicit `# ` request (ADR-0007 semantics) and the fresh prompt
+/// that follows is where the armed suggestion streams (us-2/3). The
+/// shadow resets rather than going stale: the input line really is
+/// empty, so the next line's shadow starts honest. Called only AFTER
+/// `fire` accepted the request — a refused request leaves the typed
+/// line alone and the Enter forwards verbatim: the erase-after-fire
+/// ordering `suggest_from_line` established.
+pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
+    let _ = tab.session.send_bytes(b"\x15");
+    let _ = tab
+        .session
+        .send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
+    tab.shadow.reset();
 }
 
 /// The in-flight suggestion state machine `app` delegates to (Spec R04
