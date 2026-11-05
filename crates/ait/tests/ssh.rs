@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ait_testkit::{ait_bin, wait_fresh_prompt, E2e, Size, SpawnConfig};
+use ait_llm::testing::{assert_post, sse, Fixture};
+use ait_testkit::{
+    ait_bin, json_string, panel_has_line, terminal_half, wait_fresh_prompt, E2e, Size, SpawnConfig,
+};
 
 /// 80x24: row 0 is the tab bar, row 23 the status line.
 const SIZE: Size = Size {
@@ -216,13 +219,16 @@ fn provision_local_sshd() -> Option<SshTarget> {
 /// Spawn `ait` on real bash (the wrapper lives in the snippet) with a
 /// `[ssh]` deny fixture for the passthrough case.
 fn spawn_ait(dir: &Path) -> E2e {
+    spawn_ait_with_settings(dir, "[ssh]\nhosts_denylist = [\"*.internal\"]\n")
+}
+
+/// [`spawn_ait`] with the whole `settings.toml` body supplied — the
+/// evidence generator layers the scripted-provider `[agents]` tables
+/// on top of the `[ssh]` fixture.
+fn spawn_ait_with_settings(dir: &Path, settings: &str) -> E2e {
     let ait_dir = dir.join("ait");
     std::fs::create_dir_all(&ait_dir).expect("create the fixture config dir");
-    std::fs::write(
-        ait_dir.join("settings.toml"),
-        "[ssh]\nhosts_denylist = [\"*.internal\"]\n",
-    )
-    .expect("write fixture settings.toml");
+    std::fs::write(ait_dir.join("settings.toml"), settings).expect("write fixture settings.toml");
 
     let mut config = SpawnConfig::new(ait_bin!(), &[], SIZE);
     config.env.push((
@@ -340,4 +346,201 @@ fn ssh_remote_loop_against_a_real_sshd() {
             .lines()
             .any(|line| line.trim() == "R09LOCAL")
     });
+}
+
+/// One `chat.completion.chunk` `data:` frame carrying a content
+/// delta — a plain end turn (the `agent_panel.rs` helpers' shape,
+/// duplicated here so this file stays self-contained).
+fn chat_text_turn(text: &str) -> String {
+    format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+        json_string(text)
+    )
+}
+
+/// A `chat.completion.chunk` turn calling `name` once with `args` —
+/// the wire shape the `openai_chat_completions` adapter decodes into
+/// one complete tool call (same helper as `agent_panel.rs`).
+fn tool_turn(call_id: &str, name: &str, args: &str) -> String {
+    let mut body = format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":{},\"type\":\"function\",\"function\":{{\"name\":{},\"arguments\":\"\"}}}}],\"finish_reason\":null}}}}]}}\n\n",
+        json_string(call_id),
+        json_string(name),
+    );
+    body.push_str(&format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{}}}}}]}}}}]}}\n\n",
+        json_string(args)
+    ));
+    body.push_str(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    );
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// Manual PR-evidence generator (the `pr_evidence_*` precedent in
+/// `agent_panel.rs`): the real-sshd loop PLUS the agent's remote
+/// `read_files` — the scripted fixture model calls the tool while the
+/// user's shell sits inside the wrapped `ssh`, so the remote tier
+/// (`RemoteState::Remote` → `ToolCwd::new_remote` → `select_executor`)
+/// serves it through the live ControlMaster socket while the user
+/// keeps typing. Prints the screen at each beat:
+///
+/// ```text
+/// AIT_E2E_SSH=1 cargo test -p ait --test ssh pr_evidence -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual evidence generator — needs a real sshd (AIT_E2E_SSH=1)"]
+fn pr_evidence_ssh_remote_transcript() {
+    if std::env::var_os("AIT_E2E_SSH").is_none() || !Path::new("/bin/bash").exists() {
+        return;
+    }
+    let Some(target) = container_target().or_else(provision_local_sshd) else {
+        eprintln!("AIT_E2E_SSH set but no sshd target: see scripts/ssh-e2e.sh");
+        return;
+    };
+
+    let fixture = Fixture::serve(vec![
+        sse(&tool_turn(
+            "call_1",
+            "read_files",
+            r#"{"paths":["remote-marker.txt"]}"#,
+        )),
+        sse(&chat_text_turn("the remote file reads R09-REMOTE-FILE-OK")),
+    ]);
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    let settings = format!(
+        "[ssh]\nhosts_denylist = [\"*.internal\"]\n\n\
+         [agents.custom_endpoints.local]\n\
+         name     = \"Fixture\"\n\
+         base_url = \"{}\"\n\
+         schema   = \"openai_chat_completions\"\n\n\
+         [[agents.custom_endpoints.local.models]]\n\
+         name       = \"fixture-model\"\n\
+         alias      = \"Fixture Model\"\n\
+         config_key = \"coding-key\"\n\n\
+         [agents.execution_profiles.default]\n\
+         coding_model = \"coding-key\"\n",
+        fixture.base_url
+    );
+    let mut app = spawn_ait_with_settings(dir.path(), &settings);
+    app.wait_for_screen("the bash chrome", |app| {
+        app.line(STATUS_ROW).contains("· bash ·")
+    });
+    wait_fresh_prompt(&mut app, "the first prompt");
+
+    // Beat 1: the wrapped connect — `ssh_begin` fires, the bootstrap
+    // lands, the remote shell integrates and the `ssh:` status
+    // segment opens the remote context.
+    app.type_text(&format!("{}\n", target.command));
+    app.wait_for_screen("the ssh: status segment", |app| {
+        app.line(STATUS_ROW)
+            .contains(&format!("ssh:{}", target.dest))
+    });
+    println!(
+        "--- beat 1: wrapped ssh, remote context open ---\n{}",
+        app.screen_text()
+    );
+
+    // Beat 2: remote blocks — commands run on the remote host, their
+    // marks flow back and the status carries the exit code beside the
+    // ssh segment. The second block seeds the marker file on the
+    // REMOTE side of the connection — under the remote cwd the task's
+    // `ToolCwd::new_remote` confines to — so `read_files` has bytes
+    // only the remote channel can serve.
+    app.type_text("echo R09REMOTE\n");
+    app.wait_for_screen("the remote block's output + exit", |app| {
+        app.screen_text()
+            .lines()
+            .any(|line| line.trim() == "R09REMOTE")
+            && app.line(STATUS_ROW).contains("✓ 0")
+    });
+    app.type_text("echo R09-REMOTE-FILE-OK > remote-marker.txt && echo R09SEEDED\n");
+    app.wait_for_screen("the marker seeded on the remote host", |app| {
+        app.screen_text()
+            .lines()
+            .any(|line| line.trim() == "R09SEEDED")
+    });
+    println!(
+        "--- beat 2: remote blocks sealed on the remote host ---\n{}",
+        app.screen_text()
+    );
+
+    // Beat 3: the panel opens while the shell is still remote.
+    app.press("Alt+A");
+    app.wait_for_screen("the open, focused agent panel", |app| {
+        app.screen_text().contains('│') && app.screen_text().contains(" agent")
+    });
+
+    // Beat 4: the task submits; the fixture calls `read_files`, which
+    // parks on the approve card (the fixture profile leaves
+    // `read_files` unset → Ask). The input line is ~30 columns, so
+    // the probe keys on what stays visible.
+    app.type_text("read remote-marker.txt");
+    app.wait_for_screen("the task on the input line", |app| {
+        app.screen_text().contains("remote-marker.txt")
+    });
+    app.press("Enter");
+    app.wait_for_screen("the parked read_files approve card", |app| {
+        app.screen_text().contains("approve read_files")
+    });
+    println!(
+        "--- beat 4: read_files approve card, session still remote ---\n{}",
+        app.screen_text()
+    );
+
+    // Beat 5: approved — the remote tier serves the read through the
+    // ControlMaster socket; the file's bytes land in the result card
+    // and the loop ends `done`.
+    app.type_text("a");
+    app.wait_for_screen("the remote read's result + done", |app| {
+        app.screen_text().contains("✓ read_files") && panel_has_line(app, "done")
+    });
+    println!(
+        "--- beat 5: agent read the remote file; task done ---\n{}",
+        app.screen_text()
+    );
+
+    // The bytes' proof: the second request the adapter sent carries
+    // the tool result — the marker that exists only on the remote
+    // side — back into the conversation.
+    let first = fixture.captured();
+    assert_post(&first);
+    let second = fixture.captured();
+    assert_post(&second);
+    assert!(
+        second.body.contains("R09-REMOTE-FILE-OK"),
+        "the remote read's bytes should round-trip in the turn-2 body: {}",
+        second.body
+    );
+    println!(
+        "--- turn-2 request body carries the remote file's bytes ---\n{}",
+        second.body
+    );
+
+    // Beat 6: `Alt+A` on the focused panel closes it (the documented
+    // three-state cycle) — a deterministic return of keystrokes to
+    // the PTY that `Esc`-unfocus can't give the very next bytes —
+    // then `exit` reaches the remote shell: remote `exit_shell` +
+    // `ssh_end` close the context.
+    app.press("Alt+A");
+    app.wait_for_screen("the panel closed, terminal full-width", |app| {
+        !app.screen_text().contains('│')
+    });
+    app.type_text("exit\n");
+    app.wait_for_screen("the local session back", |app| {
+        !app.line(STATUS_ROW).contains("ssh:")
+    });
+    println!(
+        "--- beat 6: exit unwound the remote context ---\n{}",
+        app.screen_text()
+    );
+
+    app.type_text("echo R09LOCAL\n");
+    app.wait_for_screen("local echo after the return", |app| {
+        app.screen_text()
+            .lines()
+            .any(|line| terminal_half(line).trim() == "R09LOCAL")
+    });
+    println!("--- beat 7: local blocks resume ---\n{}", app.screen_text());
 }
