@@ -11,11 +11,11 @@
 //! `ToolCwd` adds to its read roots so `read_files` reaches a
 //! skill's bundled files without `directory_allowlist` edits.
 //!
-//! The catalog is a SNAPSHOT — the caller builds it (the frontend at
-//! submit time) and it rides
+//! The catalog is a SNAPSHOT — the caller builds it (the frontend
+//! snapshots its watcher-refreshed live catalog at submit time,
+//! Spec R10-T6) and it rides
 //! [`AgentRequest`](crate::AgentRequest) verbatim: what the model
-//! sees is exactly what the request carried. Live watching of the
-//! roots is a later ticket's (R10-T6). A `SKILL.md` that is
+//! sees is exactly what the request carried. A `SKILL.md` that is
 //! unreadable or whose frontmatter is missing or malformed is
 //! skipped and recorded in [`SkillsCatalog::errors`] — a surfaced,
 //! toast-ready [`SkillError`], never a silent load and never a task
@@ -44,7 +44,7 @@ const MANIFEST_CAP: usize = 200;
 /// env-aware constructor — or [`SkillsCatalog::scan_roots`], the
 /// explicit-roots seam tests and callers with their own discovery
 /// use.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SkillsCatalog {
     /// Effective skills by frontmatter `name` — post-shadowing, so
     /// this is also the set of directories `read_files` reaches.
@@ -150,6 +150,32 @@ impl SkillsCatalog {
     /// Every entry the scan skipped — surfaced, toast-ready.
     pub fn errors(&self) -> &[SkillError] {
         &self.errors
+    }
+
+    /// ADR-0006 keep-last-good (Spec R10-T6): for every entry THIS
+    /// scan skipped as unreadable, reinsert `previous`'s copy when it
+    /// lived in the same directory — a `SKILL.md` that can no longer
+    /// be parsed serves its last-good version instead of dropping the
+    /// skill mid-session. Only parse/read failures merge: a deleted
+    /// `SKILL.md` is absent rather than errored (deletion drops the
+    /// skill for real), and `or_insert` means a fresh same-named
+    /// skill loaded from another directory always beats the stale
+    /// copy. The surfaced errors stay recorded — the toast and the
+    /// prompt section still name the bad file.
+    pub fn keep_last_good(&mut self, previous: &SkillsCatalog) {
+        for error in &self.errors {
+            if error.path.file_name().and_then(|name| name.to_str()) != Some(SKILL_MD) {
+                continue;
+            }
+            let Some(dir) = error.path.parent() else {
+                continue;
+            };
+            for skill in previous.iter().filter(|skill| skill.dir == dir) {
+                self.skills
+                    .entry(skill.name.clone())
+                    .or_insert_with(|| skill.clone());
+            }
+        }
     }
 
     /// One layer's skills: each `<dir>/SKILL.md` under `root`.
@@ -750,5 +776,83 @@ mod tests {
         .collect::<Vec<_>>();
         expected.sort();
         assert_eq!(dirs, expected);
+    }
+
+    /// Spec R10-T6's keep-last-good (ADR-0006's spirit): a `SKILL.md`
+    /// that can no longer be parsed must not drop the skill
+    /// mid-session — the merged catalog serves the previous scan's
+    /// copy AND keeps the surfaced error (the toast and the prompt
+    /// section still name the bad file).
+    #[test]
+    fn keep_last_good_restores_a_skill_whose_write_went_malformed() {
+        let root = tempfile::tempdir().expect("root");
+        write_skill(root.path(), "demo", &skill_md("demo", "the good version"));
+        let previous = SkillsCatalog::scan_roots(root.path(), None);
+        assert!(previous.errors().is_empty());
+
+        fs::write(root.path().join("demo").join(SKILL_MD), "no markers here\n")
+            .expect("malformed write");
+
+        let mut scan = SkillsCatalog::scan_roots(root.path(), None);
+        assert!(scan.get("demo").is_none(), "the malformed parse skipped");
+        assert_eq!(scan.errors().len(), 1);
+
+        scan.keep_last_good(&previous);
+        let skill = scan.get("demo").expect("last-good copy serves");
+        assert_eq!(skill.description, "the good version");
+        assert_eq!(
+            scan.errors().len(),
+            1,
+            "the surfaced error survives the merge"
+        );
+    }
+
+    /// Only PARSE failures merge: a deleted `SKILL.md` — absent, not
+    /// errored — drops the skill for real, and a fresh same-named
+    /// skill loaded from another directory always beats the stale
+    /// copy.
+    #[test]
+    fn keep_last_good_never_revives_a_deleted_or_outcompeted_skill() {
+        let root = tempfile::tempdir().expect("root");
+        write_skill(root.path(), "demo", &skill_md("demo", "the good version"));
+        let previous = SkillsCatalog::scan_roots(root.path(), None);
+
+        // Deletion is not a parse failure — no error, no merge.
+        fs::remove_dir_all(root.path().join("demo")).expect("delete");
+        let mut scan = SkillsCatalog::scan_roots(root.path(), None);
+        assert!(scan.errors().is_empty());
+        scan.keep_last_good(&previous);
+        assert!(
+            scan.get("demo").is_none(),
+            "a deleted skill must not come back"
+        );
+
+        // A fresh same-named skill wins: the project's `shared` goes
+        // malformed, the fresh scan still carries the user's copy —
+        // restoring the stale project version would re-shadow it.
+        let user = tempfile::tempdir().expect("user root");
+        let project = tempfile::tempdir().expect("project root");
+        write_skill(user.path(), "shared", &skill_md("shared", "user copy"));
+        write_skill(
+            project.path(),
+            "shared",
+            &skill_md("shared", "project copy"),
+        );
+        let previous = SkillsCatalog::scan_roots(user.path(), Some(project.path()));
+        assert_eq!(previous.get("shared").unwrap().description, "project copy");
+
+        fs::write(
+            project.path().join("shared").join(SKILL_MD),
+            "no markers here\n",
+        )
+        .expect("malformed write");
+        let mut scan = SkillsCatalog::scan_roots(user.path(), Some(project.path()));
+        scan.keep_last_good(&previous);
+        assert_eq!(
+            scan.get("shared").unwrap().description,
+            "user copy",
+            "the fresh same-named skill keeps the slot"
+        );
+        assert_eq!(scan.errors().len(), 1);
     }
 }
