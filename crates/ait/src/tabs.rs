@@ -262,6 +262,66 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    /// Spawn a session for `options` as a fresh `Tab` — the shared
+    /// spawn half [`TabManager::spawn_tab`] and the headless driver
+    /// (Spec R11 §5.10.5) both use: `options.cwd` is set to `cwd`,
+    /// the grid takes `options.session.size` as given (the manager
+    /// overrides it with the content band before calling; the hidden
+    /// session passes its own), and when the template allows it an
+    /// `ait_shell` injection is planned + materialized on the resolved
+    /// program — its `Materialized` guard rides on the `Tab` so the
+    /// `0700` snippet dir dies with it (Spec R05 us-30).
+    /// `AIT_SESSION_ID` is `id`'s text: hook payloads echo it back so
+    /// events stay attributable (CODING_STANDARDS.md 14 — never an
+    /// index or a pid). Opt-out, unknown shells and materialize
+    /// failures all degrade to a plain spawn (standard 1).
+    pub(crate) fn spawn(
+        mut options: LiveSessionOptions,
+        cwd: PathBuf,
+        id: u64,
+        template: &SessionTemplate,
+    ) -> Result<Self, SpawnError> {
+        options.cwd = Some(cwd.clone());
+        let title = title_for(&options);
+        let materialized = template
+            .shell_integration
+            .then(|| integration::inject(&mut options, &id.to_string(), &template.ssh))
+            .flatten();
+        let scrollback_cap = options.session.scrollback;
+        let session = LiveSession::spawn(options)?;
+        Ok(Self {
+            id,
+            session,
+            scroll: ScrollState::new(),
+            selection: Selection::default(),
+            shadow: InputShadow::new(),
+            // §5.10.4: one `$PATH` walk per session spawn (us-15) —
+            // keyed on the resolved program's basename, the same name
+            // the tab title and request context report.
+            program_index: ProgramIndex::harvest(&title),
+            cwd,
+            cwd_reported: false,
+            exit: None,
+            title,
+            prompt_marks: VecDeque::new(),
+            integration: IntegrationState::Absent,
+            blocks: BlockAssembler::new(),
+            dropped_lines: 0,
+            last_scrollback: 0,
+            anchor: Vec::new(),
+            session_id: materialized.as_ref().map(|_| id.to_string()),
+            scrollback_cap,
+            inband: InBandExec::new(),
+            materialized,
+            store_session: None,
+            conversation: None,
+            agent: None,
+            bridge: None,
+            remote: Vec::new(),
+            ssh_control_dir: template.ssh.control_dir().map(Path::to_path_buf),
+        })
+    }
+
     /// The cwd this tab tracks: OSC-7 reported, else the spawn cwd.
     pub fn cwd(&self) -> &Path {
         &self.cwd
@@ -368,6 +428,141 @@ impl Tab {
         })
     }
 
+    /// Fold one drained [`LiveEvent`] into this tab's bookkeeping — the
+    /// per-event half of [`TabManager::drain_events`], also the hidden
+    /// session's drain body (Spec R11 §5.10.5). Order matters:
+    /// `observe_scrollback` keeps `dropped_lines` current FIRST so a
+    /// mark recorded mid-batch maps with a post-eviction offset; then
+    /// cwd/exit/mark recording; then the shared `ait_shell::decode`
+    /// feeds integration state, the block assembler, the remote
+    /// context stack, the in-band accumulator and bridge subscribers.
+    pub(crate) fn observe_event(&mut self, event: &LiveEvent) {
+        // Keeps `dropped_lines` current — shrinkage directly, cap
+        // rotation via the anchor window — so a mark recorded
+        // mid-batch maps into absolute space with a post-eviction
+        // offset.
+        let scrollback = self.observe_scrollback();
+        match event {
+            LiveEvent::Osc(SessionEvent::CwdChanged(cwd)) => {
+                self.cwd = cwd.clone();
+                self.cwd_reported = true;
+            }
+            LiveEvent::Osc(SessionEvent::PromptMark { kind, payload }) => {
+                let cursor = self.session.cursor();
+                let mark = PromptMark {
+                    kind: *kind,
+                    payload: payload.clone(),
+                    // The line the cursor sits on as the drain surfaces
+                    // the mark — the whole feeding chunk is already in
+                    // the grid — indexed in scrollback-then-viewport
+                    // coordinates.
+                    line: scrollback + cursor.line,
+                    column: cursor.column,
+                    at: Instant::now(),
+                    wall: SystemTime::now(),
+                };
+                // Fingerprint the open block's echo span — final once
+                // the command runs — so `resolve` can prove the
+                // recorded range still covers its own content,
+                // dropping (never mis-selecting) on unmeasured
+                // rotation (us-20).
+                let seal = self.blocks.open_seal_range().and_then(|range| {
+                    seal_fingerprint(&self.session.grid(), self.dropped_lines, scrollback, range)
+                        .map(|(hash, rows)| (range.0, rows, hash))
+                });
+                // blocks.host stamps at SEAL: the local blocks from
+                // before ssh_begin keep NULL; the ones sealed under
+                // the open context carry the target (Spec R09-T7).
+                self.blocks.set_remote_host(
+                    self.remote
+                        .last()
+                        .map(RemoteContext::target)
+                        .map(str::to_owned),
+                );
+                self.blocks
+                    .observe_mark_row(&mark, self.dropped_lines, seal);
+                if self.prompt_marks.len() == PROMPT_MARK_CAP {
+                    self.prompt_marks.pop_front();
+                }
+                self.prompt_marks.push_back(mark);
+            }
+            LiveEvent::Exited(status) => {
+                self.exit = Some(status.clone());
+                // Spec R06-T4: a dead session answers no `__ait_run` —
+                // every pending waiter's channel disconnects so the
+                // executor fails cleanly instead of hanging (us-34);
+                // bridge subscribers see the exit too.
+                self.inband.fail_pending();
+                if let Some(service) = self.bridge.as_mut() {
+                    service.publish(ait_agent::BridgeEvent::Exited);
+                }
+            }
+            _ => {}
+        }
+        // Shell-integration bookkeeping (Spec R05): marks move `Absent`
+        // → `MarksOnly`, *vetted* decoded 7700 hooks move to and from
+        // `Integrated` — the state machine in `crate::integration`
+        // never panics on malformed sequences. One `ait_shell::decode`
+        // per `Private` event, shared by all three observers.
+        if let LiveEvent::Osc(osc) = event {
+            let decoded = match osc {
+                SessionEvent::Private { code, params } => ait_shell::decode(code, params),
+                _ => None,
+            };
+            self.integration
+                .observe(osc, decoded.as_ref(), self.session_id.as_deref());
+            if let Some(shell_event) = &decoded {
+                self.blocks.observe_shell(shell_event);
+                // §5.9 (Spec R09-T4): a vetted `ssh_begin` pushes a
+                // level on this tab's remote stack; `ssh_end` or a
+                // remote `exit_shell` closes the level its `hop`
+                // names — and every closed level retires its
+                // ait-managed control socket best-effort.
+                if let ait_shell::ShellEvent::Hook { name, value } = shell_event {
+                    // The tab's ALLOCATED id must exist to match —
+                    // `None == None` would otherwise vet every
+                    // ssh_begin on an uninjected tab (the
+                    // IntegrationState vet's own rule).
+                    if ait_shell::session_id(value).as_deref() == self.session_id.as_deref()
+                        && self.session_id.is_some()
+                    {
+                        for closed in RemoteContext::fold(
+                            &mut self.remote,
+                            name,
+                            value,
+                            self.ssh_control_dir.as_deref(),
+                        ) {
+                            crate::remote::retire_control_socket(&closed);
+                        }
+                    }
+                }
+                // §5.5.1: `OSC 7701` frames resolve pending `__ait_run`
+                // requests by their payload id.
+                self.inband.observe(shell_event);
+                // R06-T4: bridge subscribers (the typed tiers' feed)
+                // see the same decoded event.
+                if let Some(service) = self.bridge.as_mut() {
+                    service.publish(ait_agent::BridgeEvent::Shell(shell_event.clone()));
+                }
+            }
+            // R06-T5's feed: prompt marks reach subscribers with their
+            // ABSOLUTE line — the record-time scrollback-then-viewport
+            // index plus the lines dropped so far (the block
+            // assembler's own space, `observe_mark_row`'s
+            // `line + dropped`) — so a `B` recorded before a scroll
+            // still names its row when `grid_lines` converts it back.
+            if let (Some(service), SessionEvent::PromptMark { kind, payload }) =
+                (self.bridge.as_mut(), osc)
+            {
+                service.publish(ait_agent::BridgeEvent::PromptMark {
+                    kind: shell_bridge::mark_letter(*kind),
+                    payload: payload.clone(),
+                    line: scrollback + self.session.cursor().line + self.dropped_lines,
+                });
+            }
+        }
+    }
+
     /// Answer every queued `ShellBridge` request — the `drain_events`
     /// bookkeeping the agent worker's bridge calls land on (Spec
     /// R06-T4). `run_in_band` delegates to
@@ -472,6 +667,11 @@ impl Tab {
                     None => ait_agent::RemoteState::Local,
                 };
                 let _ = reply.send(state);
+            }
+            BridgeRequest::Context(reply) => {
+                // Spec R11 us-30: the headless driver's §5.6 context —
+                // the same assembly the panel runs for a visible tab.
+                let _ = reply.send(context_for(self));
             }
         }
     }
@@ -1221,61 +1421,15 @@ impl TabManager {
         self.clear_active_selection();
         options.session.size = self.size;
         let cwd = options.cwd.take().unwrap_or_else(|| self.spawn_cwd());
-        options.cwd = Some(cwd.clone());
-        let title = title_for(&options);
-        let id = self.next_id;
         // Shell integration (Spec R05): when the template allows it,
-        // plan + materialize an injection on the resolved program and
-        // apply its argv/env rewrite; the `Materialized` guard rides on
-        // the `Tab` so the `0700` snippet dir dies with it (us-30).
-        // `AIT_SESSION_ID` is the tab's stable id — hook payloads echo
-        // it back so events stay attributable to this tab
-        // (CODING_STANDARDS.md 14). Opt-out, unknown shells and
-        // materialize failures all return `None` — the session then
-        // spawns exactly as without integration (standard 1).
-        let materialized = self
-            .session_template
-            .shell_integration
-            .then(|| integration::inject(&mut options, &id.to_string(), &self.session_template.ssh))
-            .flatten();
-        let scrollback_cap = options.session.scrollback;
-        let session = LiveSession::spawn(options)?;
+        // `Tab::spawn` plans + materializes an injection on the
+        // resolved program — `AIT_SESSION_ID` is the tab's stable id
+        // (CODING_STANDARDS.md 14); opt-out, unknown shells and
+        // materialize failures degrade to a plain spawn (standard 1).
+        let id = self.next_id;
+        let tab = Tab::spawn(options, cwd, id, &self.session_template)?;
         self.next_id += 1;
-        self.tabs.push(Tab {
-            id,
-            session,
-            scroll: ScrollState::new(),
-            selection: Selection::default(),
-            shadow: InputShadow::new(),
-            // §5.10.4: one `$PATH` walk per session spawn (us-15) —
-            // keyed on the resolved program's basename, the same name
-            // the tab title and request context report.
-            program_index: ProgramIndex::harvest(&title),
-            cwd,
-            cwd_reported: false,
-            exit: None,
-            title,
-            prompt_marks: VecDeque::new(),
-            integration: IntegrationState::Absent,
-            blocks: BlockAssembler::new(),
-            dropped_lines: 0,
-            last_scrollback: 0,
-            anchor: Vec::new(),
-            session_id: materialized.as_ref().map(|_| id.to_string()),
-            scrollback_cap,
-            inband: InBandExec::new(),
-            materialized,
-            store_session: None,
-            conversation: None,
-            agent: None,
-            bridge: None,
-            remote: Vec::new(),
-            ssh_control_dir: self
-                .session_template
-                .ssh
-                .control_dir()
-                .map(Path::to_path_buf),
-        });
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
     }
@@ -1438,139 +1592,11 @@ impl TabManager {
         let mut events = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             for event in tab.session.drain_events() {
-                // Keeps `dropped_lines` current — shrinkage directly,
-                // cap rotation via the anchor window — so a mark
-                // recorded mid-batch maps into absolute space with a
-                // post-eviction offset.
-                let scrollback = tab.observe_scrollback();
-                match &event {
-                    LiveEvent::Osc(SessionEvent::CwdChanged(cwd)) => {
-                        tab.cwd = cwd.clone();
-                        tab.cwd_reported = true;
-                    }
-                    LiveEvent::Osc(SessionEvent::PromptMark { kind, payload }) => {
-                        let cursor = tab.session.cursor();
-                        let mark = PromptMark {
-                            kind: *kind,
-                            payload: payload.clone(),
-                            // The line the cursor sits on as the drain
-                            // surfaces the mark — the whole feeding
-                            // chunk is already in the grid — indexed in
-                            // scrollback-then-viewport coordinates.
-                            line: scrollback + cursor.line,
-                            column: cursor.column,
-                            at: Instant::now(),
-                            wall: SystemTime::now(),
-                        };
-                        // Fingerprint the open block's echo span —
-                        // final once the command runs — so `resolve`
-                        // can prove the recorded range still covers
-                        // its own content, dropping (never mis-
-                        // selecting) on unmeasured rotation (us-20).
-                        let seal = tab.blocks.open_seal_range().and_then(|range| {
-                            seal_fingerprint(
-                                &tab.session.grid(),
-                                tab.dropped_lines,
-                                scrollback,
-                                range,
-                            )
-                            .map(|(hash, rows)| (range.0, rows, hash))
-                        });
-                        // blocks.host stamps at SEAL — refreshed per
-                        // mark so a block records the remote session
-                        // it actually ran under (Spec R09-T7).
-                        tab.blocks.set_remote_host(
-                            tab.remote
-                                .last()
-                                .map(RemoteContext::target)
-                                .map(str::to_owned),
-                        );
-                        tab.blocks.observe_mark_row(&mark, tab.dropped_lines, seal);
-                        if tab.prompt_marks.len() == PROMPT_MARK_CAP {
-                            tab.prompt_marks.pop_front();
-                        }
-                        tab.prompt_marks.push_back(mark);
-                    }
-                    LiveEvent::Exited(status) => {
-                        tab.exit = Some(status.clone());
-                        // Spec R06-T4: a dead session answers no
-                        // `__ait_run` — every pending waiter's channel
-                        // disconnects so the executor fails cleanly
-                        // instead of hanging (us-34); bridge
-                        // subscribers see the exit too.
-                        tab.inband.fail_pending();
-                        if let Some(service) = tab.bridge.as_mut() {
-                            service.publish(ait_agent::BridgeEvent::Exited);
-                        }
-                    }
-                    _ => {}
-                }
-                // Shell-integration bookkeeping (Spec R05): marks move
-                // `Absent` → `MarksOnly`, *vetted* decoded 7700 hooks
-                // move to and from `Integrated` — the state machine in
-                // `crate::integration` never panics on malformed
-                // sequences. One `ait_shell::decode` per `Private`
-                // event, shared by all three observers.
-                if let LiveEvent::Osc(osc) = &event {
-                    let decoded = match osc {
-                        SessionEvent::Private { code, params } => ait_shell::decode(code, params),
-                        _ => None,
-                    };
-                    tab.integration
-                        .observe(osc, decoded.as_ref(), tab.session_id.as_deref());
-                    if let Some(shell_event) = &decoded {
-                        tab.blocks.observe_shell(shell_event);
-                        // §5.9 (Spec R09-T4): a vetted `ssh_begin`
-                        // pushes a level on this tab's remote stack;
-                        // `ssh_end` or a remote `exit_shell` closes
-                        // the level its `hop` names — and every closed
-                        // level retires its ait-managed control socket
-                        // best-effort.
-                        if let ait_shell::ShellEvent::Hook { name, value } = shell_event {
-                            // The tab's ALLOCATED id must exist to
-                            // match — `None == None` would otherwise
-                            // vet every ssh_begin on an uninjected
-                            // tab (the IntegrationState vet's own
-                            // rule).
-                            if ait_shell::session_id(value).as_deref() == tab.session_id.as_deref()
-                                && tab.session_id.is_some()
-                            {
-                                for closed in RemoteContext::fold(
-                                    &mut tab.remote,
-                                    name,
-                                    value,
-                                    tab.ssh_control_dir.as_deref(),
-                                ) {
-                                    crate::remote::retire_control_socket(&closed);
-                                }
-                            }
-                        }
-                        // §5.5.1: `OSC 7701` frames resolve pending
-                        // `__ait_run` requests by their payload id.
-                        tab.inband.observe(shell_event);
-                        // R06-T4: bridge subscribers (the typed tiers'
-                        // feed) see the same decoded event.
-                        if let Some(service) = tab.bridge.as_mut() {
-                            service.publish(ait_agent::BridgeEvent::Shell(shell_event.clone()));
-                        }
-                    }
-                    // R06-T5's feed: prompt marks reach subscribers
-                    // with their ABSOLUTE line — the record-time
-                    // scrollback-then-viewport index plus the lines
-                    // dropped so far (the block assembler's own space,
-                    // `observe_mark_row`'s `line + dropped`) — so a `B`
-                    // recorded before a scroll still names its row
-                    // when `grid_lines` converts it back.
-                    if let (Some(service), SessionEvent::PromptMark { kind, payload }) =
-                        (tab.bridge.as_mut(), osc)
-                    {
-                        service.publish(ait_agent::BridgeEvent::PromptMark {
-                            kind: shell_bridge::mark_letter(*kind),
-                            payload: payload.clone(),
-                            line: scrollback + tab.session.cursor().line + tab.dropped_lines,
-                        });
-                    }
-                }
+                // The tab's own bookkeeping — integration state, marks,
+                // blocks, the remote stack, the in-band accumulator and
+                // bridge publishes; the same fold the headless driver's
+                // drain thread runs (Spec R11 §5.10.5).
+                tab.observe_event(&event);
                 events.push(TabEvent { tab: index, event });
             }
             tab.on_output();

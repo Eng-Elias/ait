@@ -13,6 +13,7 @@ mod backend;
 mod blocks;
 mod config;
 mod conversations;
+mod headless;
 mod inband;
 mod integration;
 mod keymap;
