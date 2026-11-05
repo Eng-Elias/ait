@@ -12,7 +12,7 @@
 //!   `send`, `last_block`);
 //! - [`CtlServer`] — a nonblocking `UnixListener` on
 //!   `${XDG_RUNTIME_DIR}/ait/<pid>.sock` (`$TMPDIR/ait-<uid>` fallback,
-//!   the same rule `ait_shell::ssh_control_dir` uses): parent dir
+//!   the shared `ait_shell::ait_runtime_dir` rule): parent dir
 //!   `0700`, socket `0600`, unlinked on clean exit and re-bound over a
 //!   stale file on start. Accepted connections buffer across app
 //!   ticks, so a request line can never wedge the UI;
@@ -108,8 +108,9 @@ fn send_enter() -> bool {
 }
 
 /// One sealed block's read-back payload — the `last_block` response
-/// body and the client's `--command`/`--exit`/`--output` source.
-/// `exit` is the `OSC 133;D` code: `null` when `D` carried none.
+/// body and the source of the client's `--command`/`--exit` selectors
+/// (no flag prints `output`). `exit` is the `OSC 133;D` code: `null`
+/// when `D` carried none.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockReadout {
@@ -316,11 +317,6 @@ fn which_tab(named: bool, tab: &Tab, what: &str) -> String {
 // Server: the per-instance control socket drained on the app tick.
 // ------------------------------------------------------------------
 
-/// The `ait` dir under `$XDG_RUNTIME_DIR` every ait-owned runtime dir
-/// shares (`ait/ssh` for ControlMaster sockets, `<pid>.sock` here).
-#[cfg(unix)]
-const SOCKET_DIR_NAME: &str = "ait";
-
 /// Bound on one buffered request/response line — a peer that never
 /// finishes its line can't grow memory unboundedly; past this the
 /// connection gets a `{"ok":false}` and closes.
@@ -338,27 +334,13 @@ const PENDING_TTL: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The dir this instance's socket lives under — `$XDG_RUNTIME_DIR/ait`
-/// when the runtime dir is set and non-empty, else
-/// `$TMPDIR/ait-<uid>` — the same per-user fallback
-/// `ait_shell::ssh_control_dir` uses (a shared `/tmp/ait` would lock
-/// every later user out at `0700`).
+/// The dir this instance's socket lives under — the shared runtime-dir
+/// rule [`ait_shell::ait_runtime_dir`] owns (`$XDG_RUNTIME_DIR/ait`,
+/// else the per-user `$TMPDIR/ait-<uid>`): the same `ait` dir
+/// `ait/ssh` ControlMaster sockets live beside.
 #[cfg(unix)]
 fn ctl_dir(runtime_dir: Option<&OsStr>) -> PathBuf {
-    runtime_dir
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .map(|dir| dir.join(SOCKET_DIR_NAME))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("ait-{}", owner_uid())))
-}
-
-/// The owning uid for the fallback dir name — the real uid on unix;
-/// `$USER`/`$USERNAME` elsewhere (the path only needs a stable
-/// per-user token, never a security check).
-#[cfg(unix)]
-fn owner_uid() -> u32 {
-    // SAFETY: getuid is always safe to call.
-    unsafe { libc::getuid() }
+    ait_shell::ait_runtime_dir(runtime_dir, None)
 }
 
 /// `path` at `mode` — the spec's permissions (dir `0700`, socket

@@ -20,6 +20,7 @@
 //!
 //! [`Injection::files`]: crate::Injection::files
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 /// Per-session opt-out: `AIT_SSH_OFF=1` makes `ssh()` a plain
@@ -285,6 +286,30 @@ fn sh_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The per-user runtime-dir rule every ait-owned runtime dir shares
+/// (CODING_STANDARDS §17 — one definition, named once):
+/// `$XDG_RUNTIME_DIR/ait` — plus `subdir` when given — while the
+/// runtime dir is set and non-empty, else `$TMPDIR/ait[-<subdir>]-<uid>`.
+/// A shared `/tmp/ait` is NOT safe: the first creator wins at `0700`
+/// and every later user is silently shut out, so the fallback carries
+/// the owner's uid in its name. `ssh_control_dir` (`subdir` `"ssh"`)
+/// and the frontend's ctl socket dir (no subdir) both resolve here so
+/// every consumer names the same place.
+pub fn ait_runtime_dir(runtime_dir: Option<&OsStr>, subdir: Option<&str>) -> PathBuf {
+    match runtime_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
+        Some(dir) => match subdir {
+            Some(subdir) => dir.join("ait").join(subdir),
+            None => dir.join("ait"),
+        },
+        // The fallback folds `subdir` into the dir name — a bare
+        // `$TMPDIR/ait` would lock every later user out at `0700`.
+        None => std::env::temp_dir().join(match subdir {
+            Some(subdir) => format!("ait-{subdir}-{}", owner_uid()),
+            None => format!("ait-{}", owner_uid()),
+        }),
+    }
+}
+
 /// The per-user dir ait-managed control sockets live under —
 /// `ssh()`'s `ControlPath` base and the frontend's "did WE create
 /// this socket" check, so both sides name the same place. Prefers
@@ -296,11 +321,7 @@ fn sh_single_quote(value: &str) -> String {
 /// the integration still works (the same degrade every other
 /// optional piece gets).
 pub fn ssh_control_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .map(|dir| dir.join("ait").join("ssh"))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("ait-ssh-{}", owner_uid())));
+    let base = ait_runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), Some("ssh"));
     if std::fs::create_dir_all(&base).is_err() {
         return None;
     }
@@ -312,7 +333,7 @@ pub fn ssh_control_dir() -> Option<PathBuf> {
     Some(base)
 }
 
-/// The owning uid for [`ssh_control_dir`]'s fallback name — the real
+/// The owning uid for [`ait_runtime_dir`]'s fallback name — the real
 /// uid on unix; `$USER`/`$USERNAME` elsewhere (the path only needs a
 /// stable per-user token, never a security check).
 #[cfg(unix)]
