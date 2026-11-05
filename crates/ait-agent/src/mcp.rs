@@ -515,12 +515,12 @@ fn render_resource_result(result: ReadResourceResult) -> ToolOutput {
             rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
                 parts.push(text.clone())
             }
-            rmcp::model::ResourceContents::BlobResourceContents { uri, blob, .. } => parts.push(
-                format!(
+            rmcp::model::ResourceContents::BlobResourceContents { uri, blob, .. } => {
+                parts.push(format!(
                     "[binary resource {uri} — {} base64 characters, contents omitted]",
                     blob.len()
-                ),
-            ),
+                ))
+            }
             _ => parts.push(String::from("[unsupported resource content]")),
         }
     }

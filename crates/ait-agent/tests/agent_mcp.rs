@@ -1103,8 +1103,7 @@ fn a_malformed_mcp_json_keeps_the_healthy_connections() {
 
     // Break the file mid-session — the next task's reconcile fails
     // `load_mcp`.
-    std::fs::write(xdg.path().join("ait").join("mcp.json"), "{not json")
-        .expect("corrupt mcp.json");
+    std::fs::write(xdg.path().join("ait").join("mcp.json"), "{not json").expect("corrupt mcp.json");
 
     session
         .submit(task(

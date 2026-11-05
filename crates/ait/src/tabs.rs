@@ -39,10 +39,10 @@ use ait_term::{
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::agent_panel::{context_for, edit_input, AgentPanel};
-use crate::config::mcp_error_text;
 use crate::blocks::{
     row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus, PersistedBlock,
 };
+use crate::config::mcp_error_text;
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::remote::RemoteContext;

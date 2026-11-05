@@ -739,8 +739,7 @@ fn serve(
     // catalog it returns feeds the system prompt's "MCP servers"
     // section; a malformed file or a failed connect degrades to the
     // catalog, never to a task error.
-    let mcp_catalog =
-        runtime.block_on(owned.mcp_pool.reconcile(Path::new(&request.context.cwd)));
+    let mcp_catalog = runtime.block_on(owned.mcp_pool.reconcile(Path::new(&request.context.cwd)));
     // The task's §5.10.3 redactor (Spec R10): built once from the
     // request's `[redaction]` snapshot, applied at context assembly
     // and to every tool result — a settings hot-reload takes effect
@@ -776,7 +775,11 @@ fn serve(
     conversation.push_user(request.task);
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
-    drain_steering(replies.steering, &mut conversation, &mut events.mirror.borrow_mut());
+    drain_steering(
+        replies.steering,
+        &mut conversation,
+        &mut events.mirror.borrow_mut(),
+    );
     // The task's file tools bind to the session's cwd ∪ the active
     // profile's normalized `directory_allowlist` roots (§5.7,
     // R07-T4): a missing profile or an empty list confines to cwd
@@ -957,7 +960,11 @@ async fn run_loop(
                 conversation.push_tool_results(&calls, &results);
                 // Steering queued during the tool turn rides the next
                 // request beside the results.
-                drain_steering(replies.steering, conversation, &mut events.mirror.borrow_mut());
+                drain_steering(
+                    replies.steering,
+                    conversation,
+                    &mut events.mirror.borrow_mut(),
+                );
             }
             TurnOutcome::Cancelled => {
                 events.emit(AgentEvent::Cancelled);
