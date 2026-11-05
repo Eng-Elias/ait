@@ -1,17 +1,16 @@
 name: CI
 
-# Actions-minute budget (private repo): open PRs as drafts — draft PRs
-# skip every job below; mark "ready for review" to run the suite once
-# before merge (AGENTS.md documents the flow). `dev` is intentionally
-# absent from `push:` — it only receives PR merges whose head already
-# passed; `main` keeps a post-merge safety net for promotions.
+# Actions-minute budget (private repo): CI exists for `main` only —
+# the dev→main promotion PR and the post-merge push. Every check
+# during development is local via scripts/check.sh (see AGENTS.md);
+# PRs to `dev` never trigger this workflow.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
     # `ready_for_review` is not a default type — without it, un-drafting
-    # a PR would never fire CI.
+    # a promotion PR would never fire CI.
     types: [opened, synchronize, reopened, ready_for_review]
 
 # A superseded run keeps billing to completion; cancel it when a newer
