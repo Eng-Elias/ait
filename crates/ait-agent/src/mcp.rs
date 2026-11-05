@@ -592,10 +592,7 @@ impl McpCatalog {
             ));
         }
         for entry in &self.entries {
-            let origin = match entry.origin {
-                McpServerOrigin::User => "user config",
-                McpServerOrigin::Project => "project .ait/",
-            };
+            let origin = entry.origin.label();
             match &entry.availability {
                 McpAvailability::Available { tools, resources } => {
                     text.push_str(&format!("\n- {} ({origin}): available", entry.name));

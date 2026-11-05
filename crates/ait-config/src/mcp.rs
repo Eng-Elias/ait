@@ -226,6 +226,27 @@ pub enum McpServerOrigin {
     Project,
 }
 
+/// The "which layer declared it" phrases the prompt and the approve
+/// cards render (Spec R10 us-9) — shared by the MCP catalog and
+/// ait-agent's skills catalog, whose `SkillOrigin` mirrors this enum
+/// (CODING_STANDARDS §17: one phrase, one definition site).
+pub const USER_LAYER_LABEL: &str = "user config";
+
+/// The project-local `.ait/` layer's phrase — see
+/// [`USER_LAYER_LABEL`].
+pub const PROJECT_LAYER_LABEL: &str = "project .ait/";
+
+impl McpServerOrigin {
+    /// The rendered layer phrase — [`USER_LAYER_LABEL`] or
+    /// [`PROJECT_LAYER_LABEL`].
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => USER_LAYER_LABEL,
+            Self::Project => PROJECT_LAYER_LABEL,
+        }
+    }
+}
+
 impl McpServers {
     /// Fold one layer's `mcp.json` into the merged view: a missing file
     /// contributes nothing, an invalid one fails naming its path, and

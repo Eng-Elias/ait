@@ -92,6 +92,19 @@ pub enum SkillOrigin {
     Project,
 }
 
+impl SkillOrigin {
+    /// The prompt's layer phrase — the same labels
+    /// [`McpServerOrigin::label`](ait_config::McpServerOrigin::label)
+    /// renders for `mcp.json` entries (§17: one phrase, one
+    /// definition site — ait-config's layer-label constants).
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => ait_config::USER_LAYER_LABEL,
+            Self::Project => ait_config::PROJECT_LAYER_LABEL,
+        }
+    }
+}
+
 /// A `SKILL.md` the scan skipped: the file that failed plus why —
 /// the toast-ready text the frontend renders (`{path}: {message}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,10 +301,7 @@ impl SkillsCatalog {
         let mut text =
             String::from("Available skills — load one with invoke_skill to get its instructions:");
         for skill in self.skills.values() {
-            let origin = match skill.origin {
-                SkillOrigin::User => "user config",
-                SkillOrigin::Project => "project .ait/",
-            };
+            let origin = skill.origin.label();
             // One line per skill — collapse any whitespace in the
             // description so a verbose value cannot break the list.
             let description = skill
