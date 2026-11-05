@@ -253,7 +253,10 @@ fn redaction_settings_drive_the_output_tail() {
     let fixture = Fixture::serve(vec![sse(&sse_transcript(&["ok"]))]);
     let session = session();
     let mut settings = chat_settings(&fixture.base_url, "coding_model");
-    settings.redaction.disable.push(String::from("aws_access_key"));
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
     settings.redaction.enable.push(String::from("pii_email"));
     let mut task = task(settings, "/home/u/proj");
     task.context

@@ -559,14 +559,9 @@ fn redaction_section_parses_and_defaults_apply() {
 /// an enabled one asks for the state it is already in.
 #[test]
 fn enabling_an_already_on_builtin_is_a_no_op() {
-    let settings = Settings::from_toml(
-        "[redaction]\nenable = [\"aws_access_key\", \"pii_mac\"]",
-    )
-    .unwrap();
-    assert_eq!(
-        settings.redaction.enable,
-        ["aws_access_key", "pii_mac"]
-    );
+    let settings =
+        Settings::from_toml("[redaction]\nenable = [\"aws_access_key\", \"pii_mac\"]").unwrap();
+    assert_eq!(settings.redaction.enable, ["aws_access_key", "pii_mac"]);
 }
 
 /// A broken `extra` regex fails load naming its
@@ -575,14 +570,8 @@ fn enabling_an_already_on_builtin_is_a_no_op() {
 #[test]
 fn a_broken_redaction_extra_regex_names_the_entry() {
     let cases: &[(&str, &str)] = &[
-        (
-            "[redaction]\nextra = ['(']",
-            "redaction.extra[0]:",
-        ),
-        (
-            "[redaction]\nextra = ['^ok$', '*']",
-            "redaction.extra[1]:",
-        ),
+        ("[redaction]\nextra = ['(']", "redaction.extra[0]:"),
+        ("[redaction]\nextra = ['^ok$', '*']", "redaction.extra[1]:"),
     ];
     for (input, expected) in cases {
         let err = Settings::from_toml(input).unwrap_err();

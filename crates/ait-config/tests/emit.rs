@@ -170,7 +170,10 @@ fn template_documents_the_ssh_section() {
 fn template_documents_the_redaction_section() {
     let template = default_template();
     for key in ["extra", "enable", "disable"] {
-        assert!(template.contains(key), "template missing [redaction] key {key}");
+        assert!(
+            template.contains(key),
+            "template missing [redaction] key {key}"
+        );
     }
     for name in ["aws_access_key", "pii_email"] {
         assert!(

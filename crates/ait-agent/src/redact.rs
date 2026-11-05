@@ -161,8 +161,7 @@ impl Redactor {
             };
             if on {
                 patterns.push(
-                    Regex::new(entry.pattern)
-                        .expect("built-in redaction patterns must compile"),
+                    Regex::new(entry.pattern).expect("built-in redaction patterns must compile"),
                 );
             }
         }

@@ -189,7 +189,10 @@ fn the_request_redaction_settings_drive_context_redaction() {
     let fixture = Fixture::serve(vec![sse(&sse_transcript(&["ls"]))]);
     let suggester = suggester();
     let mut settings = settings(&fixture.base_url, "command_model");
-    settings.redaction.disable.push(String::from("aws_access_key"));
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
     settings
         .redaction
         .extra

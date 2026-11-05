@@ -337,21 +337,9 @@ fn each_pii_category_masks_its_specimen() {
     let cases: &[(&str, &str, &str)] = &[
         ("pii_ipv4", "ping 192.168.1.1", "ping [REDACTED]"),
         ("pii_ipv6", "route via fe80::1", "route via [REDACTED]"),
-        (
-            "pii_ipv6",
-            "2001:db8::ff00:42:8329",
-            "[REDACTED]",
-        ),
-        (
-            "pii_email",
-            "mail alerts@example.com",
-            "mail [REDACTED]",
-        ),
-        (
-            "pii_phone",
-            "call +1 (415) 555-0132",
-            "call [REDACTED]",
-        ),
+        ("pii_ipv6", "2001:db8::ff00:42:8329", "[REDACTED]"),
+        ("pii_email", "mail alerts@example.com", "mail [REDACTED]"),
+        ("pii_phone", "call +1 (415) 555-0132", "call [REDACTED]"),
         ("pii_phone", "dial 415-555-0132", "dial [REDACTED]"),
         ("pii_mac", "arp 00:1B:44:11:3A:B7", "arp [REDACTED]"),
         ("pii_mac", "arp 00-1B-44-11-3A-B7", "arp [REDACTED]"),
@@ -380,6 +368,10 @@ fn extra_patterns_mask_alongside_the_builtins() {
 fn a_default_redactor_matches_the_static_redact() {
     let settings_driven = redactor(&[], &[], &[]);
     for (_, input, expected) in CASES {
-        assert_eq!(&settings_driven.redact(input), expected, "case failed: {input}");
+        assert_eq!(
+            &settings_driven.redact(input),
+            expected,
+            "case failed: {input}"
+        );
     }
 }

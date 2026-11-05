@@ -682,7 +682,10 @@ fn tool_results_follow_the_request_redaction_settings() {
         .redaction
         .extra
         .push(String::from(r"\btoken-[A-Z0-9]{8}"));
-    settings.redaction.disable.push(String::from("aws_access_key"));
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
     let session = session();
     session
         .submit(task(settings, dir.path().to_str().expect("utf-8 tempdir")))

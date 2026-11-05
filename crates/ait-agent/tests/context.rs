@@ -127,7 +127,12 @@ fn the_typed_request_is_never_redacted() {
         output_lines: &lines,
         request: "echo AKIAIOSFODNN7EXAMPLE",
     };
-    let request = assemble_request(&context, &builtins(), EndpointSchema::OpenAiChatCompletions, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::OpenAiChatCompletions,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert_eq!(
         user.matches("AKIAIOSFODNN7EXAMPLE").count(),
@@ -158,7 +163,12 @@ fn a_pem_block_split_across_output_lines_collapses() {
         output_lines: &lines,
         request: "what is this key",
     };
-    let request = assemble_request(&context, &builtins(), EndpointSchema::OpenAiChatCompletions, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::OpenAiChatCompletions,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert!(
         !user.contains("RSA PRIVATE KEY"),
@@ -183,7 +193,12 @@ fn only_the_last_budget_lines_reach_the_prompt() {
         output_lines: &lines,
         request: "retry that",
     };
-    let request = assemble_request(&context, &builtins(), EndpointSchema::AnthropicMessages, "m");
+    let request = assemble_request(
+        &context,
+        &builtins(),
+        EndpointSchema::AnthropicMessages,
+        "m",
+    );
     let (_, user, _, _) = parts(&request);
     assert!(
         !user.contains("line-6\n"),
@@ -250,7 +265,10 @@ fn the_handed_in_redactor_drives_context_redaction() {
         "m",
     );
     let (_, user, _, _) = parts(&request);
-    assert!(!user.contains("token-A1B2C3D4"), "the extra leaked: {user:?}");
+    assert!(
+        !user.contains("token-A1B2C3D4"),
+        "the extra leaked: {user:?}"
+    );
     assert!(
         user.contains("AKIAIOSFODNN7EXAMPLE"),
         "a disabled built-in must pass through: {user:?}"
