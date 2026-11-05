@@ -81,6 +81,12 @@ jobs:
       - name: Build
         run: cargo build -p ait
 
+      # tests/mcp_skills.rs spawns ait-agent's committed `mcp_fixture`
+      # example as the stdio MCP server — `-p ait` doesn't build a
+      # dependency's examples, so build it explicitly.
+      - name: Build the mcp_fixture example
+        run: cargo build -p ait-agent --example mcp_fixture
+
       - name: E2E tests
         run: cargo test -p ait -p ait-testkit
 
