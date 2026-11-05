@@ -375,3 +375,39 @@ fn a_default_redactor_matches_the_static_redact() {
         );
     }
 }
+
+/// Manual PR-evidence generator (the `pr_evidence_*` precedent in
+/// `agent_panel.rs`/`ssh.rs`): the §5.10.3 redaction sample — every
+/// enabled built-in's specimen in, the masked text out — for the
+/// round-closeout PR body. Excluded from the suite; run it on
+/// demand:
+///
+/// ```text
+/// cargo test -p ait-agent --test redact pr_evidence -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "manual evidence generator for PR bodies"]
+fn pr_evidence_redaction_sample() {
+    let specimens: Vec<(&str, &str)> = BUILTIN_SPECIMENS
+        .iter()
+        .copied()
+        .chain([(
+            "anthropic_key",
+            "sk-ant-api03-Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz",
+        )])
+        .collect();
+    println!("--- §5.10.3 redaction sample: every enabled built-in masked ---");
+    for (name, specimen) in &specimens {
+        let redacted = redact(specimen);
+        println!("{name:<16} {specimen}  ->  {redacted}");
+        assert!(
+            redacted.contains("[REDACTED]") && !redacted.contains(specimen),
+            "{name} must mask its specimen in the shipped default"
+        );
+    }
+    // The opt-in PII categories stay off — ordinary addresses pass
+    // through untouched in the same default.
+    let pii_free = "ping 192.168.1.1 and mail alerts@example.com";
+    println!("{:<16} {pii_free}  ->  {}", "pii (off)", redact(pii_free));
+    assert_eq!(redact(pii_free), pii_free, "PII ships disabled");
+}
