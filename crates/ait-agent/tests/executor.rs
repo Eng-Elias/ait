@@ -854,30 +854,47 @@ fn executor_tiers_need_no_bridge() {
 // argv — the ControlMaster tier, demotion and `select_executor`'s
 // probe all run without a network.
 
-/// A stub `ssh`: `-O check` answers from `AIT_STUB_CHECK_RC` (0 =
-/// live socket); every invocation's argv lands one line per call in
-/// `AIT_STUB_ARGV`; the command form exits `AIT_STUB_RUN_RC` after
-/// printing `AIT_STUB_OUT`.
+/// A stub `ssh` with its answers baked in: `-O check` exits
+/// `@CHECK_RC@` (0 = live socket); every invocation's argv lands one
+/// line per call in `@ARGV@`; the command form `cat`s `@OUT_FILE@`
+/// and exits `@RUN_RC@`. The values live inside each test's own
+/// script — `std::env::set_var` would leak them across the parallel
+/// tests sharing this process (the R09 retro CI flake: one test's
+/// run logged into another's argv file, another's RC answered as
+/// transport).
 const SSH_STUB: &str = r#"#!/bin/sh
 {
     printf 'stub:'
     for a in "$@"; do printf ' <%s>' "$a"; done
     printf '\n'
-} >>"$AIT_STUB_ARGV"
+} >>"@ARGV@"
 for a in "$@"; do
-    if [ "$a" = check ]; then exit "${AIT_STUB_CHECK_RC:-0}"; fi
+    if [ "$a" = check ]; then exit @CHECK_RC@; fi
 done
-printf '%s' "${AIT_STUB_OUT:-}"
-exit "${AIT_STUB_RUN_RC:-0}"
+cat "@OUT_FILE@"
+exit @RUN_RC@
 "#;
 
-/// Install [`SSH_STUB`] in a scratch dir; returns the stub's path
-/// and the argv log it writes.
-fn install_ssh_stub(tag: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+/// Install [`SSH_STUB`] in a scratch dir with `check_rc`/`run_rc`/`out`
+/// baked into the script; returns the stub's path and the argv log
+/// it writes.
+fn install_ssh_stub(
+    tag: &str,
+    check_rc: u8,
+    run_rc: u8,
+    out: &[u8],
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let program = dir.path().join(format!("ssh-{tag}"));
     let log = dir.path().join("argv.log");
-    std::fs::write(&program, SSH_STUB).expect("write stub");
+    let out_file = dir.path().join("stdout");
+    std::fs::write(&out_file, out).expect("write stub stdout");
+    let script = SSH_STUB
+        .replace("@ARGV@", log.to_str().expect("utf-8 log"))
+        .replace("@CHECK_RC@", &check_rc.to_string())
+        .replace("@OUT_FILE@", out_file.to_str().expect("utf-8 out"))
+        .replace("@RUN_RC@", &run_rc.to_string());
+    std::fs::write(&program, script).expect("write stub");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -899,16 +916,13 @@ fn stub_calls(log: &std::path::Path) -> String {
 /// flag, and the remote shell merges stderr like `__ait_run` does.
 #[test]
 fn control_master_runs_commands_over_the_socket() {
-    let (_dir, program, log) = install_ssh_stub("cm");
+    let (_dir, program, log) = install_ssh_stub("cm", 0, 3, b"merged remote output");
     let mut executor = ait_agent::ControlMasterExecutor::with_program(
         program.to_str().expect("utf-8").to_owned(),
         "/run/ait/ssh/cm".to_owned(),
         "prod".to_owned(),
         CancellationToken::new(),
     );
-    std::env::set_var("AIT_STUB_ARGV", &log);
-    std::env::set_var("AIT_STUB_OUT", "merged remote output");
-    std::env::set_var("AIT_STUB_RUN_RC", "3");
 
     let result = executor
         .run("-ls --flags")
@@ -928,15 +942,13 @@ fn control_master_runs_commands_over_the_socket() {
 /// surfaces as `Transport`, never as the remote command's exit code.
 #[test]
 fn control_master_255_is_transport_not_an_exit_code() {
-    let (_dir, program, _log) = install_ssh_stub("cm-255");
+    let (_dir, program, _log) = install_ssh_stub("cm-255", 0, 255, b"");
     let mut executor = ait_agent::ControlMasterExecutor::with_program(
         program.to_str().expect("utf-8").to_owned(),
         "/run/ait/ssh/cm".to_owned(),
         "prod".to_owned(),
         CancellationToken::new(),
     );
-    std::env::set_var("AIT_STUB_RUN_RC", "255");
-    std::env::set_var("AIT_STUB_ARGV", "/dev/null");
     let error = executor.run("true").expect_err("255 = transport");
     assert!(matches!(error, ExecutorError::Transport(_)), "{error:?}");
 }
@@ -948,7 +960,7 @@ fn control_master_255_is_transport_not_an_exit_code() {
 /// demotion replaced never runs again.
 #[test]
 fn demotion_never_replays_and_never_recovers() {
-    let (_dir, program, log) = install_ssh_stub("demote");
+    let (_dir, program, log) = install_ssh_stub("demote", 0, 255, b"");
     let (bridge, shares) = scripted(ShellIntegration::Absent);
     let primary = ait_agent::ControlMasterExecutor::with_program(
         program.to_str().expect("utf-8").to_owned(),
@@ -958,8 +970,6 @@ fn demotion_never_replays_and_never_recovers() {
     );
     let fallback = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
     let mut executor = ait_agent::DemotingExecutor::new(primary, fallback);
-    std::env::set_var("AIT_STUB_ARGV", &log);
-    std::env::set_var("AIT_STUB_RUN_RC", "255");
 
     // The failing run returns the transport error itself — no
     // silent replay through the typed tier.
@@ -973,7 +983,6 @@ fn demotion_never_replays_and_never_recovers() {
 
     // The next command answers through the fallback (typed tier —
     // the Absent sentinel path), never touching ssh again.
-    std::env::set_var("AIT_STUB_RUN_RC", "0"); // irrelevant: ssh is never called
     let driver = std::thread::spawn({
         let shares = shares.clone();
         move || {
@@ -1006,12 +1015,15 @@ fn demotion_never_replays_and_never_recovers() {
 /// tiers; no bridge selects `DetachedExecutor`.
 #[test]
 fn select_executor_picks_the_tier_the_socket_proves() {
-    let (dir, program, _log) = install_ssh_stub("select");
-    let program = program.to_str().expect("utf-8").to_owned();
-    std::env::set_var("AIT_STUB_ARGV", "/dev/null");
+    // Two stubs: the live one answers `-O check` 0 and `via socket`
+    // to a run; the dead one answers check 255.
+    let (live_dir, live_program, live_log) = install_ssh_stub("select-live", 0, 0, b"via socket");
+    let (dead_dir, dead_program, _dead_log) = install_ssh_stub("select-dead", 255, 0, b"");
+    let live_program = live_program.to_str().expect("utf-8").to_owned();
+    let dead_program = dead_program.to_str().expect("utf-8").to_owned();
 
     // No bridge → the no-op tier.
-    let mut executor = select_executor_with_program(None, CancellationToken::new(), &program);
+    let mut executor = select_executor_with_program(None, CancellationToken::new(), &live_program);
     assert!(matches!(executor.run("x"), Err(ExecutorError::Unbound)));
 
     // Remote + a live socket (stub answers check 0) → the
@@ -1023,11 +1035,11 @@ fn select_executor_picks_the_tier_the_socket_proves() {
         control_path: Some("/run/ait/ssh/cm".to_owned()),
         bootstrapped: true,
     };
-    std::env::set_var("AIT_STUB_CHECK_RC", "0");
-    std::env::set_var("AIT_STUB_RUN_RC", "0");
-    std::env::set_var("AIT_STUB_OUT", "via socket");
-    let mut executor =
-        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
+    let mut executor = select_executor_with_program(
+        Some(Box::new(bridge)),
+        CancellationToken::new(),
+        &live_program,
+    );
     let result = executor.run("echo hi").expect("the socket runs");
     assert_eq!(result.output, b"via socket");
     assert!(shares.sent().is_empty(), "nothing typed at the PTY");
@@ -1039,9 +1051,11 @@ fn select_executor_picks_the_tier_the_socket_proves() {
         control_path: Some("/run/ait/ssh/cm".to_owned()),
         bootstrapped: true,
     };
-    std::env::set_var("AIT_STUB_CHECK_RC", "255");
-    let mut executor =
-        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
+    let mut executor = select_executor_with_program(
+        Some(Box::new(bridge)),
+        CancellationToken::new(),
+        &dead_program,
+    );
     let driver = std::thread::spawn({
         let shares = shares.clone();
         move || {
@@ -1060,19 +1074,20 @@ fn select_executor_picks_the_tier_the_socket_proves() {
     driver.join().expect("driver");
     assert_eq!(result.exit_code, Some(0));
 
-    // Remote with NO control path → same user-shell selection.
+    // Remote with NO control path → same user-shell selection — and
+    // the dead-socket probe is never even paid: the live stub's argv
+    // still holds only the `-O check` + the one `ssh -S` run above.
     let (bridge, _shares) = scripted(ShellIntegration::Absent);
     *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
         target: "prod".to_owned(),
         control_path: None,
         bootstrapped: true,
     };
-    std::env::set_var("AIT_STUB_CHECK_RC", "0");
-    let mut executor =
-        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
-    // A dead-socket probe is never even paid: run resolves through
-    // the typed tier's subscription (the sentinel script above's
-    // shape — the same bridge answers).
+    let mut executor = select_executor_with_program(
+        Some(Box::new(bridge)),
+        CancellationToken::new(),
+        &live_program,
+    );
     let driver = std::thread::spawn({
         let shares = _shares.clone();
         move || {
@@ -1090,7 +1105,13 @@ fn select_executor_picks_the_tier_the_socket_proves() {
     let result = executor.run("echo hi").expect("the typed tier runs");
     driver.join().expect("driver");
     assert_eq!(result.exit_code, Some(0));
-    drop(dir);
+    assert_eq!(
+        stub_calls(&live_log).lines().count(),
+        2,
+        "the no-control-path selection paid no probe: {}",
+        stub_calls(&live_log)
+    );
+    drop((live_dir, dead_dir));
 }
 
 /// Spec R09 us-18: a remote session whose remote shell never
