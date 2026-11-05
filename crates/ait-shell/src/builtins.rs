@@ -147,6 +147,19 @@ pub const FISH: &[&str] = &[
     "vared",
 ];
 
+/// Whether `shell_name` is a shell the §5.10.4 classifier may arm
+/// on: the family whose line editing wipes the input on `Ctrl+U`
+/// (`\x15`, kill-to-start-of-line) and reads `# ` as a comment —
+/// what `rewrite_as_comment`'s NL rewrite relies on. A REPL or any
+/// other program that merely echoes input fails this check, so the
+/// trigger degrades to a verbatim submission instead of appending
+/// `# <line>` onto an un-wiped line (the same desync-is-inert rule
+/// unverifiable lines already get). Deliberately the narrow list —
+/// a missed shell only ever costs the rewrite, never corrupts input.
+pub fn is_known_shell(shell_name: &str) -> bool {
+    matches!(shell_name, "bash" | "zsh" | "fish" | "sh" | "dash")
+}
+
 /// The words `shell_name` interprets itself: the shared [`POSIX`] set
 /// chained with the shell's extras. `shell_name` is the session
 /// program's basename (`bash`, `zsh`, `fish`, …) — the same string

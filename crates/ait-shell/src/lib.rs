@@ -33,7 +33,7 @@ mod remote;
 mod run;
 mod snippets;
 
-pub use builtins::builtins_for;
+pub use builtins::{builtins_for, is_known_shell};
 pub use codec::{
     decode, session_id, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE,
 };
