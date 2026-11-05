@@ -35,6 +35,7 @@ dependencies = [
  "ait-testkit",
  "crossterm",
  "insta",
+ "libc",
  "ratatui",
  "serde_json",
  "tempfile",

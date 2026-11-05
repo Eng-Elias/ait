@@ -1702,7 +1702,7 @@ impl TabManager {
 /// [`LiveSessionOptions::resolved_program`] — the same resolution
 /// [`LiveSession::spawn`] applies — so the title can never drift from
 /// what actually spawned.
-fn title_for(options: &LiveSessionOptions) -> String {
+pub(crate) fn title_for(options: &LiveSessionOptions) -> String {
     Path::new(&options.resolved_program())
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

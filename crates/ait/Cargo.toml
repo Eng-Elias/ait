@@ -43,6 +43,12 @@ ratatui = { version = "0.30", default-features = false, features = [
 # stays off in ait-term's `SessionOptions`.
 crossterm = { version = "0.29", features = ["osc52"] }
 
+[target.'cfg(unix)'.dependencies]
+# libc 0.2.191 (2026-10-16), already in the tree via `ait-term` —
+# `signal`/`raise` for `ait --headless`'s SIGINT→cancel wiring
+# (Spec R11 us-27), nothing else from the crate is used.
+libc = "0.2"
+
 [dev-dependencies]
 # Test-only e2e harness over ait-term's LiveSession (Spec E01) — never a
 # dependency of any product crate.
