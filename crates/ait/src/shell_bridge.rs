@@ -90,7 +90,6 @@ impl TabBridge {
     /// `ShellBridge` (the TUI reads its tab directly): the headless
     /// driver's surface for Spec R11 us-30 — the model sees the
     /// hidden shell's own commands' results the way it does in a tab.
-    #[allow(dead_code)] // only `headless::HiddenSession` calls it today
     pub(crate) fn context(&self) -> Result<AgentContext, BridgeError> {
         self.ask(BridgeRequest::Context)
     }
@@ -164,9 +163,8 @@ pub(crate) enum BridgeRequest {
     Remote(Sender<RemoteState>),
     /// `context` — the §5.6 `AgentContext` the session's task requests
     /// carry (cwd, shell, OS, output lines): the same answer
-    /// `agent_panel::context_for` assembles for a visible tab.
-    #[allow(dead_code)] // sent only through `TabBridge::context`, which
-    // only the headless driver calls until R11-T5.
+    /// `agent_panel::context_for` assembles for a visible tab. Sent
+    /// through `TabBridge::context`, which the headless driver calls.
     Context(Sender<AgentContext>),
 }
 
