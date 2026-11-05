@@ -57,27 +57,43 @@ decisions were hard to reverse and worth recording:
   remote `exit_shell` is lost when the link dies).
 
 - **Two new hook names bracket the session** — `ssh_begin` before the
-  connect, `ssh_end` after `ssh` returns (ADR-0008 amendment). The
-  frontend folds vetted ones into a per-tab `RemoteContext`: the
+  connect, `ssh_end` after `ssh` returns (ADR-0008 amendment). Every
+  hook the wrapper emits carries a minted `hop` id
+  (`<session>.<pid>.<seq>`) — every level of a nested `ssh` chain
+  shares `AIT_SESSION_ID`, so `hop` is the only attribution — and the
+  frontend folds vetted hooks into a per-tab **stack** of
+  `RemoteContext`: `ssh_begin` pushes, an `ssh_end` or remote
+  `exit_shell` closes the level its `hop` names *and every level
+  above it* (a dead shell takes its nested sessions down). The
   `ssh:<target>` status segment, the bridge's `remote_state()`, and
-  `blocks.host` all read it. An ait-managed control socket is retired
-  best-effort (`ssh -S <sock> -O exit`) when the context closes;
-  `ControlPersist` covers whatever outlives that.
+  `blocks.host` all read the innermost level. An ait-managed control
+  socket is retired best-effort (`ssh -S <sock> -O exit`) when a
+  context closes; `ControlPersist` covers whatever outlives that.
 
 - **`select_executor` picks the tier per task**: remote + a live
   control socket (`ssh -S <sock> -O check`, probed once at task
   start) → `ControlMasterExecutor` wrapped in `DemotingExecutor`;
   otherwise `UserShellExecutor` — whose in-band `__ait_run` reaches
   the bootstrapped remote shell identically — and `DetachedExecutor`
-  with no bridge. A transport failure (`ssh`'s own 255 band) demotes
-  the task to the in-band tier permanently: **demote, never hang.**
+  with no bridge. `remote_state().bootstrapped` is the REMOTE shell's
+  own integration proof, never the local tab's: a remote session that
+  never integrated clamps off the in-band tier to the `Absent`
+  sentinel path. A transport failure (`ssh`'s own 255 band) demotes
+  the task permanently — **demote, never hang, never replay:** the
+  run that took the hit returns the transport error rather than
+  re-executing through the fallback, because it may have partially
+  run on the remote host already.
 
 - **Remote read tools ride the executor**: on a `Remote` task,
   `read_files`/`grep`/`glob` compose remote commands through the same
   `CommandExecutor` `run_command` uses, with `ToolCwd`'s path
-  confinement applied lexically before composition. `edit_files`
-  reports "remote editing unsupported" honestly rather than writing
-  through an unauthenticated channel.
+  confinement applied lexically before composition. Remote `grep`
+  prefers `grep -P` where the remote host has it — every pattern the
+  local `regex` check admits is PCRE-valid, so matching tracks the
+  local tool's dialect — with `grep -E` the documented degrade;
+  remote `glob`'s `**` spans zero or more components exactly like the
+  local matcher. `edit_files` reports "remote editing unsupported"
+  honestly rather than writing through an unauthenticated channel.
 
 ## Consequences
 
@@ -99,5 +115,14 @@ decisions were hard to reverse and worth recording:
   all pass through unchanged — the spec's accepted out-of-scope.
 - `blocks.host` stamped at seal time means a block records the
   session it ran under; blocks sealed before `ssh_begin` stays NULL.
+- ait's control dir is per-user — `$XDG_RUNTIME_DIR/ait/ssh`, falling
+  back to `$TMPDIR/ait-ssh-<uid>` at `0700` — created lazily and only
+  when the armed integration is on; a socket is `managed` (and so
+  retired on teardown) only while it sits under that dir, which is
+  what keeps a user's own `ControlPath` out of our teardown.
+- The agent-owned PTY (`write_to_pty`) arms the same `AIT_SSH_*`
+  policy at spawn — refreshed per task from the request's settings —
+  so an `ssh` the model drives integrates identically to one the
+  user types.
 - `REQUIREMENTS.md` §5.9 gains the decided mechanism notes and §4.3's
   `[ssh]` row stops being proposed.

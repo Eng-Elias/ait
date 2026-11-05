@@ -133,8 +133,13 @@ pub enum RemoteState {
         /// (`ssh -G`-resolved, `%C`-tokened) — `None` when the
         /// connection carries no multiplexing at all.
         control_path: Option<String>,
-        /// `true` once the remote shell's `init_shell` integrated —
-        /// the in-band tier reaches it exactly like a local one.
+        /// `true` once the REMOTE shell proved its own integration —
+        /// a remote `init_shell`/lifecycle hook landed through the
+        /// channel — NOT the tab's local state. `false` means the
+        /// remote shell never integrated (no bootstrap sent, or a
+        /// degraded plain `-l` shell): in-band `__ait_run` can never
+        /// answer there, so [`UserShellExecutor`] drives the typed
+        /// tiers instead (Spec R09 us-18).
         bootstrapped: bool,
     },
 }
@@ -625,7 +630,26 @@ impl CommandExecutor for UserShellExecutor {
         if self.cancel.is_cancelled() {
             return Err(ExecutorError::Cancelled);
         }
-        match self.bridge.integration_state()? {
+        let mut state = self.bridge.integration_state()?;
+        // Spec R09 us-18: a remote session whose shell never
+        // confirmed integration answers no `__ait_run` — typing it
+        // would park the wait on frames that can never arrive (the
+        // tab's `Integrated` state is the LOCAL shell's leftover,
+        // not the remote's). Clamp it to `Absent` so the sentinel
+        // tier drives the remote shell through the visible channel
+        // exactly like an unintegrated local one.
+        if state == ShellIntegration::Integrated
+            && matches!(
+                self.bridge.remote_state()?,
+                RemoteState::Remote {
+                    bootstrapped: false,
+                    ..
+                }
+            )
+        {
+            state = ShellIntegration::Absent;
+        }
+        match state {
             ShellIntegration::Integrated => {}
             ShellIntegration::MarksOnly => return self.run_marks_only(command),
             ShellIntegration::Absent => return self.run_absent(command),
@@ -801,7 +825,7 @@ impl ControlMasterExecutor {
     /// An executor multiplexing over `socket` to `target`, spawning
     /// `ssh` from PATH, cancelled by `cancel`.
     pub fn new(socket: String, target: String, cancel: CancellationToken) -> Self {
-        Self::with_program("ssh".to_owned(), socket, target, cancel)
+        Self::with_program(ait_shell::SSH_PROGRAM.to_owned(), socket, target, cancel)
     }
 
     /// [`new`](Self::new) with the ssh program pinned — the stub seam
@@ -831,6 +855,11 @@ impl CommandExecutor for ControlMasterExecutor {
                 OsStr::new("-o"),
                 OsStr::new("BatchMode=yes"),
                 OsStr::new(&self.target),
+                // `--` ends ssh's own option parsing — a command
+                // text that starts with `-` can never be read as a
+                // client flag (OpenSSH strips it before the remote
+                // string is sent).
+                OsStr::new("--"),
                 OsStr::new(command),
                 // The remote shell merges stderr into stdout — the
                 // same shape `__ait_run` reports in-band.
@@ -891,7 +920,10 @@ impl CommandExecutor for ControlMasterExecutor {
 /// through `fallback` (the user-shell executor) permanently. A dead
 /// socket never recovers, so the task doesn't pay a failing probe
 /// per call; non-transport results — remote commands' own exits —
-/// never demote.
+/// never demote. The run that took the transport hit errors out
+/// honestly rather than replaying — after partial remote execution
+/// a blind re-run is the worse failure (demote, never hang, never
+/// double-run).
 pub struct DemotingExecutor {
     /// The out-of-band tier, tried first until demotion.
     primary: ControlMasterExecutor,
@@ -913,9 +945,8 @@ impl DemotingExecutor {
         }
     }
 
-    /// Whether the out-of-band tier already failed over — the test
-    /// seam's assertion.
-    #[cfg(test)]
+    /// Whether the out-of-band tier already failed over — the
+    /// observation seam the tier-selection tests assert on.
     pub fn demoted(&self) -> bool {
         self.demoted
     }
@@ -925,7 +956,16 @@ impl CommandExecutor for DemotingExecutor {
     fn run(&mut self, command: &str) -> Result<CommandResult, ExecutorError> {
         if !self.demoted {
             match self.primary.run(command) {
-                Err(ExecutorError::Transport(_)) => self.demoted = true,
+                // A transport failure means the command may have
+                // partially run on the remote host — demote the task
+                // permanently but report THIS run's failure honestly
+                // rather than replaying it through the fallback (a
+                // double-run is the one thing worse than an error:
+                // non-idempotent commands execute twice).
+                Err(error @ ExecutorError::Transport(_)) => {
+                    self.demoted = true;
+                    return Err(error);
+                }
                 result => return result,
             }
         }
@@ -948,6 +988,18 @@ pub fn select_executor(
     bridge: Option<Box<dyn ShellBridge>>,
     cancel: CancellationToken,
 ) -> Box<dyn CommandExecutor> {
+    select_executor_with_program(bridge, cancel, ait_shell::SSH_PROGRAM)
+}
+
+/// [`select_executor`] with the ssh client pinned — the test seam:
+/// a stub `ssh` that answers `-O check` and records command
+/// invocations lets the whole selection matrix run without a
+/// network.
+pub fn select_executor_with_program(
+    bridge: Option<Box<dyn ShellBridge>>,
+    cancel: CancellationToken,
+    program: &str,
+) -> Box<dyn CommandExecutor> {
     let Some(bridge) = bridge else {
         return Box::new(DetachedExecutor);
     };
@@ -957,9 +1009,14 @@ pub fn select_executor(
         ..
     }) = bridge.remote_state()
     {
-        if socket_alive("ssh", &socket, &target) {
+        if socket_alive(program, &socket, &target) {
             return Box::new(DemotingExecutor::new(
-                ControlMasterExecutor::new(socket, target, cancel.clone()),
+                ControlMasterExecutor::with_program(
+                    program.to_owned(),
+                    socket,
+                    target,
+                    cancel.clone(),
+                ),
                 UserShellExecutor::new(bridge, cancel),
             ));
         }

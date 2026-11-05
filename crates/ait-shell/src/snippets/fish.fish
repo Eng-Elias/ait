@@ -39,10 +39,21 @@ function __ait_sid
     end
 end
 
-# A named hook whose value is just the session id.
+# The `,"hop":"<id>"` tail a remote shell's hooks carry — the
+# wrapping ssh() exported AIT_SSH_HOP into this session so every
+# nested level's emissions attribute to their level (§5.9). Empty on
+# a local shell.
+function __ait_hop
+    if set -q AIT_SSH_HOP; and test -n "$AIT_SSH_HOP"
+        printf ',"hop":"%s"' (__ait_json_escape "$AIT_SSH_HOP")
+    end
+end
+
+# A named hook whose value is just the session id (plus the hop
+# attribution a remote shell adds).
 function __ait_hook -a name
     set -l sid (__ait_sid)
-    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":$sid}}"
+    __ait_emit "{\"hook\":\"$name\",\"value\":{\"session_id\":$sid(__ait_hop)}}"
 end
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -64,7 +75,7 @@ end
 function __ait_hook_preexec -a command
     set -l escaped (__ait_json_escape "$command")
     set -l sid (__ait_sid)
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$sid,\"command\":\"$escaped\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$sid(__ait_hop),\"command\":\"$escaped\"}}"
 end
 
 # --- §5.5.1 in-band exec ------------------------------------------------
@@ -158,7 +169,9 @@ function __ait_ssh_dest
                 # forms like -p22 fall to -* → ignored).
                 set expects 1
             case -- '-*'
-                # A flag option or end-of-options.
+                # A flag AFTER the destination is remote-command
+                # argv (`ssh host -v`) → not interactive.
+                test -n "$dest"; and return 1
             case '*'
                 # A second positional is the remote command → not
                 # interactive.
@@ -170,21 +183,24 @@ function __ait_ssh_dest
     printf '%s' "$dest"
 end
 
-# Does the user's own ssh config already multiplex `dest`? `ssh -G`
-# answers with a real ControlPath and a multiplexing ControlMaster —
-# reuse_existing_control_master=1 then adds nothing.
-function __ait_ssh_user_master -a dest
-    set -l conf (command ssh -G "$dest" 2>/dev/null)
-    or return 1
-    set -l master ""
-    set -l path ""
-    for line in $conf
-        if string match -q 'controlmaster *' -- "$line"
-            set master (string replace 'controlmaster ' '' -- "$line")
-        else if string match -q 'controlpath *' -- "$line"
-            set path (string replace 'controlpath ' '' -- "$line")
+# Extract a `ssh -G` field's value from the captured output $argv —
+# $argv[1] is the field name, the rest the `-G` lines.
+function __ait_ssh_conf -a field
+    if test (count $argv) -gt 1
+        for line in $argv[2..-1]
+            if string match -q "$field *" -- "$line"
+                string replace "$field " '' -- "$line"
+                return 0
+            end
         end
     end
+    return 1
+end
+
+# Does a `ssh -G` result already multiplex the host? controlmaster
+# says a multiplexing mode AND controlpath resolves to a real socket
+# — reuse_existing_control_master=1 then adds nothing.
+function __ait_ssh_mastered -a master path
     switch $master
         case auto autoask yes ask true 1
             test -n "$path"; and test "$path" != none
@@ -193,28 +209,35 @@ function __ait_ssh_user_master -a dest
     end
 end
 
-function __ait_ssh_begin -a dest control_path
+function __ait_ssh_begin -a dest control_path hop
     set -l bootstrapped false
     set -q AIT_SSH_BOOTSTRAP; and set bootstrapped true
     set -l cp ""
-    test -n "$control_path"; and set cp ",\"control_path\":\"$control_path\""
+    if test -n "$control_path"; and test "$control_path" != none
+        set -l cp_escaped (__ait_json_escape "$control_path")
+        set cp ",\"control_path\":\"$cp_escaped\""
+    end
     set -l escaped (__ait_json_escape "$dest")
+    set -l hop_escaped (__ait_json_escape "$hop")
     set -l sid (__ait_sid)
-    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$sid,\"target\":\"$escaped\",\"bootstrapped\":$bootstrapped$cp}}"
+    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$sid,\"target\":\"$escaped\",\"hop\":\"$hop_escaped\",\"bootstrapped\":$bootstrapped$cp}}"
 end
 
-function __ait_ssh_end -a dest
+function __ait_ssh_end -a dest hop
     set -l escaped (__ait_json_escape "$dest")
+    set -l hop_escaped (__ait_json_escape "$hop")
     set -l sid (__ait_sid)
-    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$sid,\"target\":\"$escaped\"}}"
+    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$sid,\"target\":\"$escaped\",\"hop\":\"$hop_escaped\"}}"
 end
 
-# The remote command: re-export AIT_SSH_BOOTSTRAP into the remote
-# session (a nested ssh() sends the same script one hop further),
-# then run it.
-function __ait_ssh_remote_cmd
+# The remote command: export this hop's id and re-export
+# AIT_SSH_BOOTSTRAP into the remote session (a nested ssh() sends
+# the same script one hop further), then run it.
+function __ait_ssh_remote_cmd -a hop
     set -l quoted (string replace -a "'" "'\\''" -- "$AIT_SSH_BOOTSTRAP")
-    printf '%s' "export AIT_SSH_BOOTSTRAP='$quoted'
+    set -l hopq (string replace -a "'" "'\\''" -- "$hop")
+    printf '%s' "export AIT_SSH_HOP='$hopq'
+export AIT_SSH_BOOTSTRAP='$quoted'
 $AIT_SSH_BOOTSTRAP"
 end
 
@@ -243,25 +266,38 @@ function ssh
     set -q AIT_SSH_REUSE_CM; and set reuse $AIT_SSH_REUSE_CM
     set -l persist 10m
     set -q AIT_SSH_CONTROL_PERSIST; and set persist $AIT_SSH_CONTROL_PERSIST
+    # One `ssh -G` answers both ControlMaster questions: whether the
+    # user's own config already multiplexes `dest` (reuse attaches
+    # nothing) and, when it does not, the ControlPath the session
+    # still reports so the executor can try it.
+    set -l conf (command ssh -G "$dest" 2>/dev/null)
+    set -l master (__ait_ssh_conf controlmaster $conf)
+    set -l control_path (__ait_ssh_conf controlpath $conf)
     set -l extra
-    if test "$reuse" = 1; and __ait_ssh_user_master "$dest"
+    if test "$reuse" = 1; and __ait_ssh_mastered "$master" "$control_path"
         set extra
     else if test -n "$AIT_SSH_CONTROL_DIR"
         set extra -o ControlMaster=auto -o "ControlPath=$AIT_SSH_CONTROL_DIR/%C" -o "ControlPersist=$persist"
+        # The effective path with our -o adds and any of the user's
+        # own -o overrides — a second -G only when the attach
+        # actually changes argv.
+        set -l gconf (command ssh -G $extra $argv 2>/dev/null)
+        set control_path (__ait_ssh_conf controlpath $gconf)
     end
-    set -l gconf (command ssh -G $extra "$dest" 2>/dev/null)
-    set -l control_path ""
-    for line in $gconf
-        string match -q 'controlpath *' -- "$line"; and set control_path (string replace 'controlpath ' '' -- "$line")
-    end
-    __ait_ssh_begin "$dest" "$control_path"
+    # This hop's identity — attributes ssh_begin/ssh_end and (via the
+    # remote env) the remote shell's own hooks to this level of a
+    # possibly-nested chain. $fish_pid is this shell's own pid.
+    set -g __AIT_SSH_SEQ (math "$__AIT_SSH_SEQ" + 1)
+    set -q AIT_SESSION_ID; or set -l AIT_SESSION_ID 0
+    set -l hop "$AIT_SESSION_ID.$fish_pid.$__AIT_SSH_SEQ"
+    __ait_ssh_begin "$dest" "$control_path" "$hop"
     if set -q AIT_SSH_BOOTSTRAP; and test -n "$AIT_SSH_BOOTSTRAP"
-        command ssh -t $extra $argv (__ait_ssh_remote_cmd)
+        command ssh -t $extra $argv (__ait_ssh_remote_cmd "$hop")
     else
         command ssh -t $extra $argv
     end
     set -l rc $status
-    __ait_ssh_end "$dest"
+    __ait_ssh_end "$dest" "$hop"
     # The remote session demoted this tab when its exit_shell landed;
     # the local shell is back — re-integrate it.
     __ait_hook bootstrapped
@@ -294,15 +330,12 @@ function __ait_fish_exit --on-event fish_exit
     __ait_hook exit_shell
 end
 
-# Spec R09-T3: `exit_shell` on a hangup too — a dropped connection
-# lands at SIGHUP, not fish_exit.
-function __ait_fish_hup --on-signal SIGHUP
-    __ait_hook exit_shell
-    exit
-end
-
 # --- install ------------------------------------------------------------
 
+# Local snippets hook exit only — remote-session HUP coverage is the
+# remote bootstrap script's own trap (§5.9).
+set -g __AIT_SSH_SEQ 0
+
 set -l sid (__ait_sid)
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$sid,\"shell\":\"fish\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$sid,\"shell\":\"fish\"(__ait_hop)}}"
 set -g __AIT_INTEGRATED_FISH 1

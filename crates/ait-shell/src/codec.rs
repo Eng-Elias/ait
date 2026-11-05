@@ -75,13 +75,13 @@ pub enum HookName {
     /// The integrated shell is exiting.
     ExitShell,
     /// The `ssh()` wrapper is about to exec an integrated `ssh`
-    /// (Spec R09 §5.9) — `value` names the destination and the
-    /// negotiated ControlPath; the frontend opens the tab's remote
-    /// context.
+    /// (Spec R09 §5.9) — `value` names the destination, the
+    /// wrapper-minted `hop` id and the negotiated ControlPath; the
+    /// frontend pushes the tab's remote context.
     SshBegin,
     /// The wrapped `ssh` returned — the remote session ended (cleanly
-    /// or by a dropped connection); the frontend closes the remote
-    /// context and retires the control socket.
+    /// or by a dropped connection); `value.hop` attributes the close
+    /// to one level of a possibly-nested chain.
     SshEnd,
     /// A hook name this version doesn't know.
     Unknown(String),
@@ -218,5 +218,181 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The wire contract's read side (Spec R05 us-25, Spec R09-T4):
+    //! every hook name the snippets emit decodes to its `HookName`,
+    //! the `ssh_begin`/`ssh_end` payloads — `hop`, `target`,
+    //! `control_path`, `bootstrapped` — survive verbatim, and every
+    //! malformed shape degrades to `None` instead of a partial event.
+
+    use super::*;
+
+    /// `7700 ; <hex(json)>` — the exact frame the snippets emit.
+    fn hook_frame(json: &str) -> Option<ShellEvent> {
+        decode(b"7700", &[hex_encode(json.as_bytes())])
+    }
+
+    /// Every emitted hook name round-trips to its variant — the
+    /// decode side of the vocabulary standard 17 single-sources here.
+    #[test]
+    fn every_hook_name_decodes() {
+        for (wire, expected) in [
+            ("init_shell", HookName::InitShell),
+            ("bootstrapped", HookName::Bootstrapped),
+            ("precmd", HookName::Precmd),
+            ("preexec", HookName::Preexec),
+            ("exit_shell", HookName::ExitShell),
+            ("ssh_begin", HookName::SshBegin),
+            ("ssh_end", HookName::SshEnd),
+        ] {
+            let json = format!(r#"{{"hook":"{wire}","value":{{"session_id":"1"}}}}"#);
+            assert_eq!(
+                hook_frame(&json),
+                Some(ShellEvent::Hook {
+                    name: expected,
+                    value: serde_json::json!({"session_id": "1"}),
+                }),
+                "{wire}"
+            );
+        }
+    }
+
+    /// `ssh_begin`'s payload — target, hop, bootstrapped, the
+    /// negotiated ControlPath — arrives verbatim (Spec R09-T4: the
+    /// frontend folds it into a remote context).
+    #[test]
+    fn ssh_begin_decodes_its_full_payload() {
+        let Some(ShellEvent::Hook { name, value }) = hook_frame(
+            r#"{"hook":"ssh_begin","value":{"session_id":"1","target":"prod",
+             "hop":"1.4242.1","bootstrapped":true,"control_path":"/run/ait/ssh/%C"}}"#,
+        ) else {
+            panic!("ssh_begin must decode");
+        };
+        assert_eq!(name, HookName::SshBegin);
+        assert_eq!(value["target"], "prod");
+        assert_eq!(value["hop"], "1.4242.1");
+        assert_eq!(value["bootstrapped"], true);
+        assert_eq!(value["control_path"], "/run/ait/ssh/%C");
+    }
+
+    /// `ssh_end` carries target + hop — the attribution the nested
+    /// fold needs.
+    #[test]
+    fn ssh_end_decodes_target_and_hop() {
+        let Some(ShellEvent::Hook { name, value }) = hook_frame(
+            r#"{"hook":"ssh_end","value":{"session_id":"1","target":"prod","hop":"1.4242.1"}}"#,
+        ) else {
+            panic!("ssh_end must decode");
+        };
+        assert_eq!(name, HookName::SshEnd);
+        assert_eq!(value["target"], "prod");
+        assert_eq!(value["hop"], "1.4242.1");
+    }
+
+    /// A remote shell's `exit_shell` carries its `hop` attribution —
+    /// decoded the same as every other hook's value.
+    #[test]
+    fn a_remote_exit_shell_keeps_its_hop() {
+        let Some(ShellEvent::Hook { name, value }) =
+            hook_frame(r#"{"hook":"exit_shell","value":{"session_id":"1","hop":"1.4242.1"}}"#)
+        else {
+            panic!("exit_shell must decode");
+        };
+        assert_eq!(name, HookName::ExitShell);
+        assert_eq!(value["hop"], "1.4242.1");
+    }
+
+    /// `session_id` normalizes string and numeric emitters to one
+    /// comparison surface; empty/absent/non-scalar read as `None`.
+    #[test]
+    fn session_id_normalizes_emitters() {
+        assert_eq!(
+            session_id(&serde_json::json!({"session_id": "7"})),
+            Some("7".to_owned())
+        );
+        assert_eq!(
+            session_id(&serde_json::json!({"session_id": 7})),
+            Some("7".to_owned())
+        );
+        for bad in [
+            serde_json::json!({"session_id": ""}),
+            serde_json::json!({"session_id": null}),
+            serde_json::json!({"session_id": {"x": 1}}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(session_id(&bad), None, "{bad}");
+        }
+    }
+
+    /// A forward-compatible unknown name still decodes — a newer
+    /// snippet's hooks degrade, never error.
+    #[test]
+    fn an_unknown_hook_decodes_as_unknown() {
+        assert_eq!(
+            hook_frame(r#"{"hook":"future_hook","value":{"x":1}}"#),
+            Some(ShellEvent::Hook {
+                name: HookName::Unknown("future_hook".to_owned()),
+                value: serde_json::json!({"x": 1}),
+            })
+        );
+    }
+
+    /// Every malformed 7700 shape degrades to `None` — never a
+    /// partial event.
+    #[test]
+    fn malformed_hook_frames_decode_to_none() {
+        // Not hex, not UTF-8-after-hex, not JSON, not an object,
+        // missing "hook", non-string "hook", missing "value".
+        for params in [
+            vec![b"zz".to_vec()],
+            vec![hex_encode(b"\xff\xfe")],
+            vec![hex_encode(b"not json")],
+            vec![hex_encode(b"[]")],
+            vec![hex_encode(br#"{"value":{}}"#)],
+            vec![hex_encode(br#"{"hook":1,"value":{}}"#)],
+            vec![hex_encode(br#"{"hook":"precmd"}"#)],
+            // Two params — the frame carries exactly one.
+            vec![hex_encode(br#"{"hook":"x","value":{}}"#), b"extra".to_vec()],
+        ] {
+            assert_eq!(decode(b"7700", &params), None, "{params:?}");
+        }
+    }
+
+    /// The 7701 frames and the reserved family decode; a foreign
+    /// code and a bad `<len>` do not.
+    #[test]
+    fn run_frames_and_reserved_codes() {
+        assert_eq!(
+            decode(b"7701", &[b"A".to_vec()]),
+            Some(ShellEvent::RunBegin)
+        );
+        assert_eq!(decode(b"7701", &[b"B".to_vec()]), Some(ShellEvent::RunEnd));
+        assert_eq!(
+            decode(
+                b"7701",
+                &[b"R".to_vec(), b"4".to_vec(), hex_encode(b"abcd")],
+            ),
+            Some(ShellEvent::RunChunk {
+                payload: b"abcd".to_vec()
+            })
+        );
+        // A lying <len> is malformed, not truncated.
+        assert_eq!(
+            decode(
+                b"7701",
+                &[b"R".to_vec(), b"9".to_vec(), hex_encode(b"abcd")],
+            ),
+            None
+        );
+        assert_eq!(
+            decode(b"7703", &[]),
+            Some(ShellEvent::Reserved { code: 7703 })
+        );
+        assert_eq!(decode(b"133", &[]), None, "OSC 133 is not ours");
+        assert_eq!(decode(b"7700x", &[]), None);
     }
 }

@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ait_agent::{
-    BridgeError, BridgeEvent, CommandExecutor, DetachedExecutor, ExecutorError, ShellBridge,
-    ShellIntegration, UserShellExecutor,
+    select_executor_with_program, BridgeError, BridgeEvent, CommandExecutor, DetachedExecutor,
+    ExecutorError, RemoteState, ShellBridge, ShellIntegration, UserShellExecutor,
 };
 use ait_shell::{RunAccumulator, RunResult, ShellEvent};
 use tokio_util::sync::CancellationToken;
@@ -171,6 +171,9 @@ struct ScriptedBridge {
     /// What [`integration_state`](ShellBridge::integration_state)
     /// reports — the executor's tier selector reads it per call.
     state: ShellIntegration,
+    /// What [`remote_state`](ShellBridge::remote_state) reports —
+    /// `Local` by default; the remote-session tests arm a `Remote`.
+    remote: Mutex<RemoteState>,
     /// The recorded traffic.
     shares: Shares,
     /// When `Some`, `run_in_band` fails with this error instead of
@@ -183,6 +186,7 @@ fn scripted(state: ShellIntegration) -> (ScriptedBridge, Shares) {
     let shares = Shares::default();
     let bridge = ScriptedBridge {
         state,
+        remote: Mutex::new(RemoteState::Local),
         shares: shares.clone(),
         fail_run: Mutex::new(None),
     };
@@ -192,6 +196,10 @@ fn scripted(state: ShellIntegration) -> (ScriptedBridge, Shares) {
 impl ShellBridge for ScriptedBridge {
     fn integration_state(&self) -> Result<ShellIntegration, BridgeError> {
         Ok(self.state)
+    }
+
+    fn remote_state(&self) -> Result<RemoteState, BridgeError> {
+        Ok(self.remote.lock().expect("remote lock").clone())
     }
 
     fn run_in_band(&self, command: &[u8]) -> Result<Receiver<RunResult>, BridgeError> {
@@ -838,4 +846,314 @@ fn executor_tiers_need_no_bridge() {
     let mut control_master: Box<dyn CommandExecutor> = Box::new(ControlMasterExecutor);
     let result = control_master.run("true").expect("the sketch runs");
     assert_eq!(result.exit_code, Some(0));
+}
+
+// ── Spec R09 §5.9: the executor tiers against a stub ssh ─────────
+//
+// A POSIX `ssh` stub on disk answers `-O check` and records every
+// argv — the ControlMaster tier, demotion and `select_executor`'s
+// probe all run without a network.
+
+/// A stub `ssh`: `-O check` answers from `AIT_STUB_CHECK_RC` (0 =
+/// live socket); every invocation's argv lands one line per call in
+/// `AIT_STUB_ARGV`; the command form exits `AIT_STUB_RUN_RC` after
+/// printing `AIT_STUB_OUT`.
+const SSH_STUB: &str = r#"#!/bin/sh
+{
+    printf 'stub:'
+    for a in "$@"; do printf ' <%s>' "$a"; done
+    printf '\n'
+} >>"$AIT_STUB_ARGV"
+for a in "$@"; do
+    if [ "$a" = check ]; then exit "${AIT_STUB_CHECK_RC:-0}"; fi
+done
+printf '%s' "${AIT_STUB_OUT:-}"
+exit "${AIT_STUB_RUN_RC:-0}"
+"#;
+
+/// Install [`SSH_STUB`] in a scratch dir; returns the stub's path
+/// and the argv log it writes.
+fn install_ssh_stub(tag: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let program = dir.path().join(format!("ssh-{tag}"));
+    let log = dir.path().join("argv.log");
+    std::fs::write(&program, SSH_STUB).expect("write stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions).unwrap();
+    }
+    (dir, program, log)
+}
+
+/// The recorded argv lines `log` holds.
+fn stub_calls(log: &std::path::Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// Spec R09-T5: the ControlMaster tier spawns `ssh -S <sock>
+/// -o BatchMode=yes <target> -- <cmd> 2>&1` — `--` ends ssh's own
+/// option parsing so a command starting with `-` is never a client
+/// flag, and the remote shell merges stderr like `__ait_run` does.
+#[test]
+fn control_master_runs_commands_over_the_socket() {
+    let (_dir, program, log) = install_ssh_stub("cm");
+    let mut executor = ait_agent::ControlMasterExecutor::with_program(
+        program.to_str().expect("utf-8").to_owned(),
+        "/run/ait/ssh/cm".to_owned(),
+        "prod".to_owned(),
+        CancellationToken::new(),
+    );
+    std::env::set_var("AIT_STUB_ARGV", &log);
+    std::env::set_var("AIT_STUB_OUT", "merged remote output");
+    std::env::set_var("AIT_STUB_RUN_RC", "3");
+
+    let result = executor
+        .run("-ls --flags")
+        .expect("the remote command resolves");
+    assert_eq!(result.output, b"merged remote output");
+    assert_eq!(result.exit_code, Some(3));
+    let calls = stub_calls(&log);
+    assert!(
+        calls.contains(
+            "stub: <-S> </run/ait/ssh/cm> <-o> <BatchMode=yes> <prod> <--> <-ls --flags> <2>&1>"
+        ),
+        "the argv shape, `--` before the command: {calls}"
+    );
+}
+
+/// Spec R09-T5: a `255` exit is ssh's transport-failure band — it
+/// surfaces as `Transport`, never as the remote command's exit code.
+#[test]
+fn control_master_255_is_transport_not_an_exit_code() {
+    let (_dir, program, _log) = install_ssh_stub("cm-255");
+    let mut executor = ait_agent::ControlMasterExecutor::with_program(
+        program.to_str().expect("utf-8").to_owned(),
+        "/run/ait/ssh/cm".to_owned(),
+        "prod".to_owned(),
+        CancellationToken::new(),
+    );
+    std::env::set_var("AIT_STUB_RUN_RC", "255");
+    std::env::set_var("AIT_STUB_ARGV", "/dev/null");
+    let error = executor.run("true").expect_err("255 = transport");
+    assert!(matches!(error, ExecutorError::Transport(_)), "{error:?}");
+}
+
+/// Spec R09-T5's demote rule: a transport failure flips the tier
+/// permanently — THIS run returns the failure (never replayed — the
+/// command may have partially run remote-side), and every LATER run
+/// goes straight to the user-shell fallback. The probe the
+/// demotion replaced never runs again.
+#[test]
+fn demotion_never_replays_and_never_recovers() {
+    let (_dir, program, log) = install_ssh_stub("demote");
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    let primary = ait_agent::ControlMasterExecutor::with_program(
+        program.to_str().expect("utf-8").to_owned(),
+        "/run/ait/ssh/cm".to_owned(),
+        "prod".to_owned(),
+        CancellationToken::new(),
+    );
+    let fallback = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+    let mut executor = ait_agent::DemotingExecutor::new(primary, fallback);
+    std::env::set_var("AIT_STUB_ARGV", &log);
+    std::env::set_var("AIT_STUB_RUN_RC", "255");
+
+    // The failing run returns the transport error itself — no
+    // silent replay through the typed tier.
+    let error = executor.run("rm -rf /x").expect_err("the hit errors");
+    assert!(matches!(error, ExecutorError::Transport(_)), "{error:?}");
+    assert!(executor.demoted(), "demoted after the transport hit");
+    assert!(
+        shares.sent().is_empty(),
+        "the failed command was never retyped through the fallback"
+    );
+
+    // The next command answers through the fallback (typed tier —
+    // the Absent sentinel path), never touching ssh again.
+    std::env::set_var("AIT_STUB_RUN_RC", "0"); // irrelevant: ssh is never called
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\nok\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=0\r\n");
+            shares.emit(&stream);
+        }
+    });
+    let result = executor.run("echo ok").expect("the fallback runs");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(0));
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "ssh answered exactly the one failed run: {calls}"
+    );
+}
+
+/// Spec R09-T5's selection matrix through the real
+/// [`select_executor_with_program`] seam: `Remote` + a live socket
+/// selects ControlMaster (demotion-wrapped); a dead socket, no
+/// control path, and a non-remote session all stay on the user-shell
+/// tiers; no bridge selects `DetachedExecutor`.
+#[test]
+fn select_executor_picks_the_tier_the_socket_proves() {
+    let (dir, program, _log) = install_ssh_stub("select");
+    let program = program.to_str().expect("utf-8").to_owned();
+    std::env::set_var("AIT_STUB_ARGV", "/dev/null");
+
+    // No bridge → the no-op tier.
+    let mut executor = select_executor_with_program(None, CancellationToken::new(), &program);
+    assert!(matches!(executor.run("x"), Err(ExecutorError::Unbound)));
+
+    // Remote + a live socket (stub answers check 0) → the
+    // ControlMaster tier: a command spawns `ssh -S`, never the
+    // typed/in-band path.
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: Some("/run/ait/ssh/cm".to_owned()),
+        bootstrapped: true,
+    };
+    std::env::set_var("AIT_STUB_CHECK_RC", "0");
+    std::env::set_var("AIT_STUB_RUN_RC", "0");
+    std::env::set_var("AIT_STUB_OUT", "via socket");
+    let mut executor =
+        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
+    let result = executor.run("echo hi").expect("the socket runs");
+    assert_eq!(result.output, b"via socket");
+    assert!(shares.sent().is_empty(), "nothing typed at the PTY");
+
+    // Remote + a DEAD socket (check 255) → the user-shell tiers.
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: Some("/run/ait/ssh/cm".to_owned()),
+        bootstrapped: true,
+    };
+    std::env::set_var("AIT_STUB_CHECK_RC", "255");
+    let mut executor =
+        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\n\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=0\r\n");
+            shares.emit(&stream);
+        }
+    });
+    let result = executor.run("echo hi").expect("the typed tier runs");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(0));
+
+    // Remote with NO control path → same user-shell selection.
+    let (bridge, _shares) = scripted(ShellIntegration::Absent);
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: None,
+        bootstrapped: true,
+    };
+    std::env::set_var("AIT_STUB_CHECK_RC", "0");
+    let mut executor =
+        select_executor_with_program(Some(Box::new(bridge)), CancellationToken::new(), &program);
+    // A dead-socket probe is never even paid: run resolves through
+    // the typed tier's subscription (the sentinel script above's
+    // shape — the same bridge answers).
+    let driver = std::thread::spawn({
+        let shares = _shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\n\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=0\r\n");
+            shares.emit(&stream);
+        }
+    });
+    let result = executor.run("echo hi").expect("the typed tier runs");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(0));
+    drop(dir);
+}
+
+/// Spec R09 us-18: a remote session whose remote shell never
+/// bootstrapped — `Remote { bootstrapped: false }` over a locally
+/// `Integrated` tab — must NOT park on `__ait_run` frames that can
+/// never arrive: the executor clamps to the `Absent` sentinel tier.
+#[test]
+fn an_unbootstrapped_remote_clamps_off_the_in_band_tier() {
+    let (bridge, shares) = scripted(ShellIntegration::Integrated);
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: None,
+        bootstrapped: false,
+    };
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\nremote-out\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=2\r\n");
+            shares.emit(&stream);
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the sentinel tier runs");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(2));
+    assert!(
+        shares.commands().is_empty(),
+        "an unbootstrapped remote never issues run_in_band"
+    );
+    assert!(
+        !shares.sent().is_empty(),
+        "the command typed through the visible channel"
+    );
+}
+
+/// The mirror: `bootstrapped: true` keeps the remote session on the
+/// in-band tier — the remote shell's `__ait_run` answers.
+#[test]
+fn a_bootstrapped_remote_stays_in_band() {
+    let (bridge, shares) = scripted(ShellIntegration::Integrated);
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: Some("/run/ait/ssh/cm".to_owned()),
+        bootstrapped: true,
+    };
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let responder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        shares.respond(b"0;remote answer;9");
+    });
+
+    let result = executor.run("echo hi").expect("the in-band run resolves");
+    responder.join().expect("responder");
+    assert_eq!(result.output, b"remote answer");
+    assert_eq!(result.exit_code, Some(9));
 }

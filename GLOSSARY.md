@@ -84,10 +84,14 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 - **Remote session** — a tab whose foreground shell is a bootstrapped
   remote shell; `ssh_begin` opens it, `ssh_end` or a remote `exit_shell`
   closes it, and the status line marks it `ssh:<target>` (§5.9).
+- **Hop** — the wrapper-minted id (`<session>.<pid>.<seq>`) every SSH
+  lifecycle hook carries, attributing it to one level of a possibly-nested
+  `ssh` chain; every level shares `AIT_SESSION_ID`, so `hop` is what a
+  remote `exit_shell` or inner `ssh_end` is told apart by (§5.9).
 - **ControlMaster tier** — the executor tier that multiplexes `run_command`
   out-of-band over the SSH control socket the `ssh()` wrapper attached
-  (`ssh -S <sock> <target> <cmd>`); a transport failure demotes the task to
-  the in-band tier for good (§5.9).
+  (`ssh -S <sock> <target> -- <cmd>`); a transport failure demotes the task
+  permanently — the hit run errors rather than replaying (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.

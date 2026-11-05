@@ -226,12 +226,14 @@ pub struct Tab {
     /// submitted `AgentRequest`; `pub(crate)` so tests can attach a
     /// service to a staged tab.
     pub(crate) bridge: Option<BridgeService>,
-    /// This tab's live remote context (Spec R09-T4): `Some` while an
-    /// `ssh()`-wrapped session is open — `ssh_begin` sets it,
-    /// `ssh_end`/remote `exit_shell` clears it. The status line, the
-    /// bridge's `remote_state` and `blocks.host` all read it;
+    /// This tab's live remote-context stack (Spec R09-T4): nonempty
+    /// while `ssh()`-wrapped sessions are open — `ssh_begin` pushes a
+    /// level, a hop-attributed `ssh_end`/remote `exit_shell` closes
+    /// it (and everything above it — a dead shell kills its nested
+    /// sessions). The LAST level is the innermost: the status line,
+    /// the bridge's `remote_state` and `blocks.host` all read it;
     /// `pub(crate)` so tests stage remote hooks without a real ssh.
-    pub(crate) remote: Option<RemoteContext>,
+    pub(crate) remote: Vec<RemoteContext>,
     /// The ait control dir this spawn armed (the template's at spawn
     /// time) — `RemoteContext::fold`'s "is this socket ours" check:
     /// only sockets under it retire on teardown.
@@ -239,12 +241,12 @@ pub struct Tab {
 }
 
 impl Drop for Tab {
-    /// Retire an ait-managed ControlMaster socket still live at tab
-    /// close (Spec R09-T4: `ssh -S <sock> -O exit` on `ssh_end` or tab
-    /// close). Best-effort — the socket dies with `ControlPersist`
-    /// regardless.
+    /// Retire every ait-managed ControlMaster socket still live at
+    /// tab close (Spec R09-T4: `ssh -S <sock> -O exit` on `ssh_end` or
+    /// tab close). Best-effort — the socket dies with `ControlPersist`
+    /// regardless, and the retire never blocks the drop.
     fn drop(&mut self) {
-        if let Some(context) = self.remote.take() {
+        for context in self.remote.drain(..) {
             crate::remote::retire_control_socket(&context);
         }
     }
@@ -317,7 +319,7 @@ impl Tab {
     /// on a local shell (Spec R09-T4). The status line's `ssh:` segment
     /// renders it.
     pub fn remote_target(&self) -> Option<&str> {
-        self.remote.as_ref().map(RemoteContext::target)
+        self.remote.last().map(RemoteContext::target)
     }
 
     /// Read-only view of the session's grid (viewport + scrollback) —
@@ -444,14 +446,19 @@ impl Tab {
                 let _ = reply.send(self.session.output_tail().to_vec());
             }
             BridgeRequest::Remote(reply) => {
-                // Spec R09-T5's tier input: the live remote context —
-                // target + negotiated control path while an `ssh()`
-                // session is open, `Local` otherwise.
-                let state = match &self.remote {
+                // Spec R09-T5's tier input: the innermost live remote
+                // context — target + negotiated control path while an
+                // `ssh()` session is open, `Local` otherwise.
+                // `bootstrapped` reports the remote shell's OWN
+                // confirmed integration, never the tab's local state —
+                // a remote shell that never integrated can't answer
+                // `__ait_run`, and the executor's typed tiers need to
+                // know that (us-18).
+                let state = match self.remote.last() {
                     Some(context) => ait_agent::RemoteState::Remote {
                         target: context.target().to_owned(),
                         control_path: context.control_path().map(str::to_owned),
-                        bootstrapped: self.integration == IntegrationState::Integrated,
+                        bootstrapped: context.integrated(),
                     },
                     None => ait_agent::RemoteState::Local,
                 };
@@ -1223,7 +1230,7 @@ impl TabManager {
             conversation: None,
             agent: None,
             bridge: None,
-            remote: None,
+            remote: Vec::new(),
             ssh_control_dir: self
                 .session_template
                 .ssh
@@ -1435,7 +1442,7 @@ impl TabManager {
                         // it actually ran under (Spec R09-T7).
                         tab.blocks.set_remote_host(
                             tab.remote
-                                .as_ref()
+                                .last()
                                 .map(RemoteContext::target)
                                 .map(str::to_owned),
                         );
@@ -1475,10 +1482,11 @@ impl TabManager {
                     if let Some(shell_event) = &decoded {
                         tab.blocks.observe_shell(shell_event);
                         // §5.9 (Spec R09-T4): a vetted `ssh_begin`
-                        // opens this tab's remote context; `ssh_end`
-                        // or a remote `exit_shell` closes it — and a
-                        // closed context retires its ait-managed
-                        // control socket best-effort.
+                        // pushes a level on this tab's remote stack;
+                        // `ssh_end` or a remote `exit_shell` closes
+                        // the level its `hop` names — and every closed
+                        // level retires its ait-managed control socket
+                        // best-effort.
                         if let ait_shell::ShellEvent::Hook { name, value } = shell_event {
                             // The tab's ALLOCATED id must exist to
                             // match — `None == None` would otherwise
@@ -1488,7 +1496,7 @@ impl TabManager {
                             if ait_shell::session_id(value).as_deref() == tab.session_id.as_deref()
                                 && tab.session_id.is_some()
                             {
-                                if let Some(closed) = RemoteContext::fold(
+                                for closed in RemoteContext::fold(
                                     &mut tab.remote,
                                     name,
                                     value,
@@ -3199,15 +3207,32 @@ mod tests {
         });
         assert_eq!(manager.active().unwrap().remote_target(), None);
 
-        // The vetted begin opens the context.
+        // The vetted begin opens the context — carrying its hop id.
         emit(
             &manager,
             &hook_line(&format!(
-                r#"{{"hook":"ssh_begin","value":{{"session_id":"{sid}","target":"u@prod","bootstrapped":true,"control_path":"/tmp/ait-ssh-foreign/%C"}}}}"#
+                r#"{{"hook":"ssh_begin","value":{{"session_id":"{sid}","target":"u@prod","hop":"{sid}.1.1","control_path":"/tmp/ait-ssh-foreign/%C"}}}}"#
             )),
         );
         drain_until(&mut manager, |m| {
             m.active().unwrap().remote_target() == Some("u@prod")
+        });
+        // `bootstrapped` is the REMOTE shell's own proof — a remote
+        // `init_shell` attributed to this hop marks the context
+        // integrated; the ssh_begin payload's `bootstrapped` field
+        // only means the wrapper SENT the bootstrap.
+        emit(
+            &manager,
+            &hook_line(&format!(
+                r#"{{"hook":"init_shell","value":{{"session_id":"{sid}","hop":"{sid}.1.1"}}}}"#
+            )),
+        );
+        drain_until(&mut manager, |m| {
+            m.active()
+                .unwrap()
+                .remote
+                .last()
+                .is_some_and(RemoteContext::integrated)
         });
 
         // The bridge's remote_state answers the live context — the
@@ -3264,7 +3289,7 @@ mod tests {
         emit(
             &manager,
             &hook_line(&format!(
-                r#"{{"hook":"ssh_end","value":{{"session_id":"{sid}","target":"u@prod"}}}}"#
+                r#"{{"hook":"ssh_end","value":{{"session_id":"{sid}","target":"u@prod","hop":"{sid}.1.1"}}}}"#
             )),
         );
         drain_until(&mut manager, |m| {

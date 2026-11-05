@@ -34,9 +34,20 @@ __ait_sid() {
     printf '"%s"' "$(__ait_json_escape "${AIT_SESSION_ID:-}")"
 }
 
-# A named hook whose value is just the session id.
+# The `,"hop":"<id>"` tail a remote shell's hooks carry — the
+# wrapping ssh() exported AIT_SSH_HOP into this session so every
+# nested level's emissions attribute to their level (§5.9). Empty on
+# a local shell.
+__ait_hop() {
+    if [[ -n ${AIT_SSH_HOP:-} ]]; then
+        printf ',"hop":"%s"' "$(__ait_json_escape "$AIT_SSH_HOP")"
+    fi
+}
+
+# A named hook whose value is just the session id (plus the hop
+# attribution a remote shell adds).
 __ait_hook() {
-    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":$(__ait_sid)}}"
+    __ait_emit "{\"hook\":\"$1\",\"value\":{\"session_id\":$(__ait_sid)$(__ait_hop)}}"
 }
 
 # Escape a command string for JSON: quote, backslash and the named
@@ -59,7 +70,7 @@ __ait_json_escape() {
 __ait_hook_preexec() {
     local command
     command=$(__ait_json_escape "$1")
-    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$(__ait_sid),\"command\":\"$command\"}}"
+    __ait_emit "{\"hook\":\"preexec\",\"value\":{\"session_id\":$(__ait_sid)$(__ait_hop),\"command\":\"$command\"}}"
 }
 
 # --- §5.5.1 in-band exec ------------------------------------------------
@@ -170,44 +181,43 @@ __ait_ssh_dest() {
     return 1
 }
 
-# Does the user's own ssh config already multiplex `dest`? `ssh -G`
-# answers with a real ControlPath and a multiplexing ControlMaster —
-# reuse_existing_control_master=1 then adds nothing (the user's socket
-# is reused, so no second authentication ever happens).
-__ait_ssh_user_master() {
-    local conf master path
-    conf=$(command ssh -G "$1" 2>/dev/null) || return 1
-    master=$(printf '%s\n' "$conf" | sed -n 's/^controlmaster //p' | head -n1)
-    path=$(printf '%s\n' "$conf" | sed -n 's/^controlpath //p' | head -n1)
-    case $master in
+# Does a `ssh -G` result already multiplex the host? controlmaster
+# says a multiplexing mode AND controlpath resolves to a real socket
+# — reuse_existing_control_master=1 then adds nothing (the user's
+# socket is reused, so no second authentication ever happens).
+__ait_ssh_mastered() { # $1 = controlmaster value, $2 = controlpath value
+    case $1 in
         auto|autoask|yes|ask|true|1)
-            [[ -n $path && $path != none ]] ;;
+            [[ -n $2 && $2 != none ]] ;;
         *)
             return 1 ;;
     esac
 }
 
-# ssh_begin: session id, the typed destination, whether a bootstrap is
-# sent and the negotiated ControlPath pattern.
+# ssh_begin: session id, the typed destination, this hop's id,
+# whether a bootstrap is sent and the negotiated ControlPath pattern.
 __ait_ssh_begin() {
     local bootstrapped=false cp=""
     [[ -n ${AIT_SSH_BOOTSTRAP:-} ]] && bootstrapped=true
-    [[ -n $2 ]] && cp=",\"control_path\":\"$(__ait_json_escape "$2")\""
-    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\",\"bootstrapped\":$bootstrapped$cp}}"
+    [[ -n $2 && $2 != none ]] && cp=",\"control_path\":\"$(__ait_json_escape "$2")\""
+    __ait_emit "{\"hook\":\"ssh_begin\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\",\"hop\":\"$(__ait_json_escape "$3")\",\"bootstrapped\":$bootstrapped$cp}}"
 }
 
 # ssh_end: the local `ssh` returned — the remote session is over
 # (cleanly or by a dropped connection).
 __ait_ssh_end() {
-    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\"}}"
+    __ait_emit "{\"hook\":\"ssh_end\",\"value\":{\"session_id\":$(__ait_sid),\"target\":\"$(__ait_json_escape "$1")\",\"hop\":\"$(__ait_json_escape "$2")\"}}"
 }
 
-# The remote command: re-export AIT_SSH_BOOTSTRAP into the remote
-# session (single-quoted, the only self-reference the protocol needs —
-# a nested ssh() sends the same script one hop further), then run it.
-__ait_ssh_remote_cmd() {
+# The remote command: export this hop's id and re-export
+# AIT_SSH_BOOTSTRAP into the remote session (single-quoted, the only
+# self-reference the protocol needs — a nested ssh() sends the same
+# script one hop further), then run it.
+__ait_ssh_remote_cmd() { # $1 = this hop's id
     local quoted=${AIT_SSH_BOOTSTRAP//"'"/"'\\''"}
-    printf '%s' "export AIT_SSH_BOOTSTRAP='$quoted'
+    local hop=${1//"'"/"'\\''"}
+    printf '%s' "export AIT_SSH_HOP='$hop'
+export AIT_SSH_BOOTSTRAP='$quoted'
 $AIT_SSH_BOOTSTRAP"
 }
 
@@ -227,31 +237,40 @@ ssh() {
         command ssh "$@"
         return
     fi
-    # ControlMaster attach: reuse the user's own multiplexed socket when
-    # their config manages one and policy honors it (no second auth);
-    # otherwise point ControlPath at the ait control dir.
+    # One `ssh -G` answers both ControlMaster questions: whether the
+    # user's own config already multiplexes `dest` (reuse attaches
+    # nothing — their socket carries the commands) and, when it does
+    # not, the ControlPath the session still reports so the executor
+    # can try it.
+    local conf master control_path
+    conf=$(command ssh -G "$dest" 2>/dev/null)
+    master=$(printf '%s\n' "$conf" | sed -n 's/^controlmaster //p' | head -n1)
+    control_path=$(printf '%s\n' "$conf" | sed -n 's/^controlpath //p' | head -n1)
     local -a extra=()
-    if [[ ${AIT_SSH_REUSE_CM:-1} == 1 ]] && __ait_ssh_user_master "$dest"; then
+    if [[ ${AIT_SSH_REUSE_CM:-1} == 1 ]] && __ait_ssh_mastered "$master" "$control_path"; then
         :
     elif [[ -n ${AIT_SSH_CONTROL_DIR:-} ]]; then
         extra=(-o "ControlMaster=auto"
                -o "ControlPath=${AIT_SSH_CONTROL_DIR}/%C"
                -o "ControlPersist=${AIT_SSH_CONTROL_PERSIST:-10m}")
+        # The effective path with our -o adds and any of the user's
+        # own -o overrides applied — a second -G only when the attach
+        # actually changes argv.
+        control_path=$(command ssh -G "${extra[@]}" "$@" 2>/dev/null \
+            | sed -n 's/^controlpath //p' | head -n1)
     fi
-    # The ControlPath the attach lands on — `ssh -G` resolves the user
-    # config plus our -o adds; reported on ssh_begin for the executor
-    # tiers and teardown.
-    local control_path
-    control_path=$(command ssh -G "${extra[@]}" "$dest" 2>/dev/null \
-        | sed -n 's/^controlpath //p' | head -n1)
-    __ait_ssh_begin "$dest" "$control_path"
+    # This hop's identity — attributes this session's ssh_begin /
+    # ssh_end and (via the remote env) the remote shell's own hooks
+    # to this level of a possibly-nested chain.
+    local hop="${AIT_SESSION_ID:-0}.$$.$((__AIT_SSH_SEQ += 1))"
+    __ait_ssh_begin "$dest" "$control_path" "$hop"
     if [[ -n ${AIT_SSH_BOOTSTRAP:-} ]]; then
-        command ssh -t "${extra[@]}" "$@" "$(__ait_ssh_remote_cmd)"
+        command ssh -t "${extra[@]}" "$@" "$(__ait_ssh_remote_cmd "$hop")"
     else
         command ssh -t "${extra[@]}" "$@"
     fi
     local status=$?
-    __ait_ssh_end "$dest"
+    __ait_ssh_end "$dest" "$hop"
     # The remote session demoted this tab when its exit_shell landed
     # (or a drop killed it); the local shell is back at the prompt —
     # re-integrate it.
@@ -310,9 +329,9 @@ fi
 PROMPT_COMMAND=__ait_precmd
 trap '__ait_preexec' DEBUG
 trap '__ait_exit_shell' EXIT
-# Spec R09-T2: `exit_shell` on a hangup too — a dropped connection
-# (or a remote sshd dying) lands here, not at EXIT.
-trap '__ait_exit_shell; exit' HUP
+# Local snippets trap EXIT only — remote-session HUP coverage is the
+# remote bootstrap script's own trap (§5.9).
+__AIT_SSH_SEQ=0
 
-__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"bash\"}}"
+__ait_emit "{\"hook\":\"init_shell\",\"value\":{\"session_id\":$(__ait_sid),\"shell\":\"bash\"$(__ait_hop)}}"
 __AIT_INTEGRATED_BASH=1

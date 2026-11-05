@@ -118,6 +118,13 @@ pub(crate) struct AgentPty {
     /// [`LiveSessionOptions::resolved_program`]; tests pin a known
     /// shell instead.
     program: Option<OsString>,
+    /// The `[ssh]` policy armed for the NEXT spawn (Spec R09): an
+    /// `ssh` typed through `write_to_pty` wraps, bootstraps and hooks
+    /// exactly like one in the user's tab. Refreshed per task from
+    /// the request's settings — a live session keeps its spawn env
+    /// (the session-template precedent), so a settings change lands
+    /// on the next spawn.
+    ssh: ait_config::SshSettings,
 }
 
 impl AgentPty {
@@ -129,7 +136,16 @@ impl AgentPty {
             reported_row: 0,
             reported_tail: String::new(),
             program: None,
+            ssh: ait_config::SshSettings::default(),
         }
+    }
+
+    /// Re-arm the `[ssh]` policy for later spawns — the worker calls
+    /// this per task with the request's settings (Spec R09-T3: the
+    /// agent-owned shell's `ssh()` reads the same `AIT_SSH_*` env the
+    /// tab's does).
+    pub(crate) fn arm_ssh(&mut self, ssh: &ait_config::SshSettings) {
+        self.ssh = ssh.clone();
     }
 
     /// `new` with the spawned program pinned — the test seam (CI
@@ -254,11 +270,33 @@ impl AgentPty {
         self.injection = ait_shell::plan(Path::new(&options.resolved_program()))
             .and_then(|injection| injection.materialize().ok())
             .map(|mut materialized| {
-                materialized.set_session_id(agent_session_id());
+                let session_id = agent_session_id();
+                materialized.set_session_id(session_id.clone());
                 let mut args = materialized.args().to_vec();
                 args.append(&mut options.args);
                 options.args = args;
                 options.env.extend(materialized.env().iter().cloned());
+                // Spec R09-T3: the injected agent shell also arms the
+                // `[ssh]` policy — `ssh` inside `write_to_pty` wraps
+                // and bootstraps exactly like the tab's wrapper, so
+                // agent-driven remote sessions integrate too. The
+                // bootstrap script renders against this spawn's own
+                // session id; the control dir is per-user, created
+                // lazily and only when integration is on.
+                let enabled = self.ssh.integration_enabled();
+                options.env.extend(
+                    ait_shell::policy_env(&ait_shell::SshPolicy {
+                        enabled,
+                        allowlist: self.ssh.hosts_allowlist.clone(),
+                        denylist: self.ssh.hosts_denylist.clone(),
+                        reuse_control_master: self.ssh.reuses_control_master(),
+                        control_dir: enabled.then(ait_shell::ssh_control_dir).flatten(),
+                        control_persist: ait_shell::DEFAULT_CONTROL_PERSIST.to_owned(),
+                        session_id,
+                    })
+                    .into_iter()
+                    .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+                );
                 materialized
             });
         self.session = Some(
@@ -593,6 +631,49 @@ mod tests {
         write(&mut bash, "read v; echo READ-$v\n", dir.path());
         let out = write(&mut bash, "MARKED\n", dir.path());
         assert!(out.text.contains("READ-MARKED"), "{:?}", out.text);
+    }
+
+    /// Spec R09-T3: the injected agent shell arms the same `[ssh]`
+    /// policy the tab's does — `AIT_SSH_*` lands in its env so the
+    /// snippet's `ssh()` wraps `write_to_pty`-driven sessions too.
+    /// A policy-armed-off spawn exports `0`, never omits the var.
+    #[test]
+    fn the_agent_shell_arms_the_ssh_policy() {
+        if !Path::new("/bin/bash").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pty = AgentPty::with_program("/bin/bash");
+        let ssh = ait_config::SshSettings {
+            hosts_allowlist: vec!["*.prod".to_owned()],
+            ..Default::default()
+        };
+        pty.arm_ssh(&ssh);
+
+        let out = write(
+            &mut pty,
+            "echo SSHENV-$AIT_SSH_ENABLED-$AIT_SSH_ALLOW\n",
+            dir.path(),
+        );
+        assert!(
+            out.text.contains("SSHENV-1-*.prod"),
+            "the [ssh] policy reaches the spawned shell: {:?}",
+            out.text
+        );
+
+        // Armed off → `AIT_SSH_ENABLED=0` and no control dir.
+        let off = ait_config::SshSettings {
+            enable_integration: Some(false),
+            ..Default::default()
+        };
+        pty.arm_ssh(&off);
+        pty.teardown(); // respawn under the new policy
+        let out = write(&mut pty, "echo SSHOFF-$AIT_SSH_ENABLED\n", dir.path());
+        assert!(
+            out.text.contains("SSHOFF-0"),
+            "a disabled policy exports 0: {:?}",
+            out.text
+        );
     }
 
     /// Malformed arguments are tool errors — before any spawn.

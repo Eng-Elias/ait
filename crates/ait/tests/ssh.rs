@@ -235,14 +235,15 @@ fn spawn_ait(dir: &Path) -> E2e {
     E2e::spawn(config).expect("spawn the ait binary")
 }
 
-/// Type `command` + Enter and wait out its execution — the same
-/// echo-then-prompt pair `run_line` uses in shell_integration.rs.
-fn run_line(app: &mut E2e, command: &str, echo_probe: &str) {
+/// Type `command` + Enter and wait out its execution — gated on
+/// `output_probe`, text only execution produces (std.15: never the
+/// typed echo).
+fn run_line(app: &mut E2e, command: &str, output_probe: &str) {
     app.type_text(&format!("{command}\n"));
-    app.wait_for_screen(&format!("the echo of `{command}`"), |app| {
+    app.wait_for_screen(&format!("the output of `{command}`"), |app| {
         app.screen_text()
             .lines()
-            .any(|line| line.contains(echo_probe))
+            .any(|line| line.contains(output_probe))
     });
     wait_fresh_prompt(app, "the prompt back");
 }
@@ -276,13 +277,12 @@ fn ssh_remote_loop_against_a_real_sshd() {
 
     // Denied passthrough first: `ssh host.internal` matches the
     // armed `*.internal` deny — plain `command ssh`, no wrap, no
-    // segment, just ssh's own resolution error.
-    run_line(&mut app, "ssh host.internal", "ssh host.internal");
-    assert!(
-        app.screen_text()
-            .contains("Could not resolve hostname host.internal"),
-        "plain ssh reached the resolver: {}",
-        app.screen_text()
+    // segment, just ssh's own resolution error (the probe is the
+    // resolver output — execution-produced, never the typed echo).
+    run_line(
+        &mut app,
+        "ssh host.internal",
+        "Could not resolve hostname host.internal",
     );
     assert!(
         !app.line(STATUS_ROW).contains("ssh:"),
@@ -320,7 +320,11 @@ fn ssh_remote_loop_against_a_real_sshd() {
     });
     app.type_text("echo R09REMOTE\n");
     app.wait_for_screen("remote echo output", |app| {
-        app.screen_text().contains("R09REMOTE")
+        // `trim() == ` — the marker as a whole line, so the typed
+        // `echo R09REMOTE` echo can never satisfy the wait (std.15).
+        app.screen_text()
+            .lines()
+            .any(|line| line.trim() == "R09REMOTE")
     });
 
     // `exit` unwinds: the remote shell's exit_shell + the wrapper's
@@ -332,6 +336,8 @@ fn ssh_remote_loop_against_a_real_sshd() {
     });
     app.type_text("echo R09LOCAL\n");
     app.wait_for_screen("local echo after the return", |app| {
-        app.screen_text().contains("R09LOCAL")
+        app.screen_text()
+            .lines()
+            .any(|line| line.trim() == "R09LOCAL")
     });
 }

@@ -342,15 +342,21 @@ attaching `-o ControlMaster=auto -o ControlPath=<control-dir>/%C -o
 ControlPersist=<dur>` unless the user's own config already manages a socket
 (`reuse_existing_control_master`). All other shapes pass through to
 `command ssh` — deny means no wrap, never a block. The wrapper emits
-`ssh_begin` before connect and `ssh_end` after return; the remote bootstrap
+`ssh_begin` before connect and `ssh_end` after return — every wrapper hook
+carrying a minted `hop` id so nested `ssh` levels attribute correctly;
+the remote bootstrap
 (a self-contained POSIX-sh script, never a dotfile) lands the snippet file
 set in a private `mktemp -d`, exports `AIT_IS_SSH=1` + the `AIT_SSH_*`
 policy so nested hops re-wrap, traps EXIT/HUP for `exit_shell` and cleanup,
 then runs the remote `$SHELL` as a child. The frontend folds vetted hooks
-into a per-tab remote context (`ssh:<target>` status segment, bridge
-`remote_state`, `blocks.host` at seal) and retires ait-owned control
-sockets on close. `select_executor` prefers a live ControlMaster socket —
-demoting to the in-band tier on transport failure — and remote
+into a per-tab remote-context stack — a close event retires the level its
+`hop` names and everything above — feeding the `ssh:<target>` status
+segment, bridge `remote_state` (whose `bootstrapped` is the remote shell's
+own integration proof — an unbootstrapped remote clamps off the in-band
+tier), and `blocks.host` at seal; ait-owned control sockets retire on
+close. `select_executor` prefers a live ControlMaster socket — demoting
+permanently on transport failure, the hit run erroring rather than
+replaying — and remote
 `read_files`/`grep`/`glob` compose through the task's executor while
 `edit_files` reports "unsupported" honestly.
 

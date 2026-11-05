@@ -74,9 +74,9 @@ mod transcript;
 pub use agent_context::AgentContext;
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
 pub use executor::{
-    select_executor, BridgeError, BridgeEvent, CommandExecutor, CommandResult,
-    ControlMasterExecutor, DemotingExecutor, DetachedExecutor, ExecutorError, RemoteState,
-    ShellBridge, ShellIntegration, UserShellExecutor,
+    select_executor, select_executor_with_program, BridgeError, BridgeEvent, CommandExecutor,
+    CommandResult, ControlMasterExecutor, DemotingExecutor, DetachedExecutor, ExecutorError,
+    RemoteState, ShellBridge, ShellIntegration, UserShellExecutor,
 };
 pub use redact::redact;
 pub use sanitize::{sanitize_reply, ReplySanitizer};

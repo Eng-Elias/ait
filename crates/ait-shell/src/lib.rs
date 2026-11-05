@@ -32,8 +32,9 @@ pub use codec::{
 };
 pub use inject::{plan, plan_with_zdotdir, Injection, Materialized, ShellKind, ENV_SESSION_ID};
 pub use remote::{
-    bootstrap_script, policy_env, SshPolicy, ENV_SSH_ALLOW, ENV_SSH_BOOTSTRAP, ENV_SSH_CONTROL_DIR,
-    ENV_SSH_CONTROL_PERSIST, ENV_SSH_DENY, ENV_SSH_ENABLED, ENV_SSH_OFF, ENV_SSH_REUSE_CM,
+    bootstrap_script, policy_env, ssh_control_dir, SshPolicy, DEFAULT_CONTROL_PERSIST,
+    ENV_SSH_ALLOW, ENV_SSH_BOOTSTRAP, ENV_SSH_CONTROL_DIR, ENV_SSH_CONTROL_PERSIST, ENV_SSH_DENY,
+    ENV_SSH_ENABLED, ENV_SSH_HOP, ENV_SSH_OFF, ENV_SSH_REUSE_CM, SSH_PROGRAM,
 };
 pub use run::{
     chunk_run_payload, run_begin_sequence, run_end_sequence, run_request, RunAccumulator, RunResult,

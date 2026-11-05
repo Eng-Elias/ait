@@ -563,6 +563,10 @@ fn worker(
     // Drop closes these channels and joins this thread.
     let mut agent_pty = AgentPty::new();
     while let Ok(request) = requests.recv() {
+        // Spec R09-T3: the agent-owned shell's `ssh()` reads the
+        // task's armed `[ssh]` policy — refreshed per request so a
+        // hot-reloaded settings file reaches the next spawn.
+        agent_pty.arm_ssh(&request.settings.ssh);
         serve(
             &runtime,
             request,
