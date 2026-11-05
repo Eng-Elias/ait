@@ -65,8 +65,9 @@ pub use resolve::{ModelRole, ResolvedModel};
 pub use secrets::OsKeyring;
 pub use secrets::SecretStore;
 pub use settings::{
-    pattern_names, AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile,
-    PermissionLevel, RedactionSettings, Settings, SshSettings, TerminalSettings,
+    pattern_names, AgentsSettings, ClassifierMode, Endpoint, EndpointModel, EndpointSchema,
+    ExecutionProfile, InputSettings, PermissionLevel, RedactionSettings, Settings, SshSettings,
+    TerminalSettings,
 };
 pub use skills::{project_skills_dir, user_skills_dir};
 #[cfg(feature = "watch")]
