@@ -75,6 +75,7 @@ mod pty;
 mod redact;
 mod sanitize;
 mod session;
+mod skills;
 mod suggester;
 mod summarize;
 mod tool_call;
@@ -94,6 +95,7 @@ pub use session::{
     result_preview, AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict,
     STEP_BUDGET, SUMMARIZE_AT,
 };
+pub use skills::{Skill, SkillError, SkillOrigin, SkillsCatalog};
 pub use suggester::{CommandSuggester, SuggestError, SuggestEvent, SuggestRequest};
 pub use tool_call::{ToolCall, ToolStatus};
 pub use transcript::{
