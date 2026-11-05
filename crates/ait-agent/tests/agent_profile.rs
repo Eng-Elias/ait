@@ -793,7 +793,9 @@ fn agent_decides_governs_every_mapped_field() {
 /// sends back is recorded verbatim in the assistant-call item.
 #[test]
 fn safety_schema_ships_only_on_agent_decides_tools_per_schema() {
-    let governed = ["read_files", "grep", "glob"];
+    // `invoke_skill` rides `read_files` (Spec R10 us-28) — governed
+    // like the other read tools.
+    let governed = ["read_files", "grep", "glob", "invoke_skill"];
     for schema in [
         "openai_chat_completions",
         "openai_responses",
