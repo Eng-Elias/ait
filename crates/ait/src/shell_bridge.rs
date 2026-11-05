@@ -26,7 +26,9 @@
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use ait_agent::{BridgeError, BridgeEvent, RemoteState, ShellBridge, ShellIntegration};
+use ait_agent::{
+    AgentContext, BridgeError, BridgeEvent, RemoteState, ShellBridge, ShellIntegration,
+};
 use ait_shell::RunResult;
 use ait_term::PromptMarkKind;
 
@@ -83,6 +85,16 @@ impl ShellBridge for TabBridge {
 }
 
 impl TabBridge {
+    /// The §5.6 `AgentContext` of the session behind the service —
+    /// answered on the drain like every other request. Not part of
+    /// `ShellBridge` (the TUI reads its tab directly): the headless
+    /// driver's surface for Spec R11 us-30 — the model sees the
+    /// hidden shell's own commands' results the way it does in a tab.
+    #[allow(dead_code)] // only `headless::HiddenSession` calls it today
+    pub(crate) fn context(&self) -> Result<AgentContext, BridgeError> {
+        self.ask(BridgeRequest::Context)
+    }
+
     /// The request→reply round trip every bridge method performs:
     /// post the request, park on its reply channel — the frontend
     /// answers on the next drain tick; a dropped service side means
@@ -150,6 +162,12 @@ pub(crate) enum BridgeRequest {
     /// the `ssh()`-wrapped session's target and ControlPath while one
     /// is open, `Local` otherwise — `select_executor`'s tier input.
     Remote(Sender<RemoteState>),
+    /// `context` — the §5.6 `AgentContext` the session's task requests
+    /// carry (cwd, shell, OS, output lines): the same answer
+    /// `agent_panel::context_for` assembles for a visible tab.
+    #[allow(dead_code)] // sent only through `TabBridge::context`, which
+    // only the headless driver calls until R11-T5.
+    Context(Sender<AgentContext>),
 }
 
 /// The service side of a [`TabBridge`] — owned by its `Tab`, pumped
