@@ -4,7 +4,7 @@
 //! whose text names the offending key path
 //! (`agents.custom_endpoints.local.models[0].config_key: …`).
 
-use ait_config::{EndpointSchema, PermissionLevel, RedactionSettings, Settings};
+use ait_config::{ClassifierMode, EndpointSchema, PermissionLevel, RedactionSettings, Settings};
 
 /// The §4.1 endpoint + §5.7 default-profile document, verbatim shape.
 const FULL_SPEC_DOCUMENT: &str = r#"
@@ -628,5 +628,62 @@ fn a_redaction_name_in_both_lists_is_rejected() {
         err.to_string(),
         "redaction.disable[1]: \"jwt\" is in both redaction.enable and \
          redaction.disable"
+    );
+}
+
+/// Spec R11-T1 (§5.10.4): `[input]` parses with defaults — an absent
+/// section or an empty one arms the heuristic classifier.
+#[test]
+fn input_section_defaults_to_the_heuristic_classifier() {
+    for input in ["", "[input]\n"] {
+        let settings = Settings::from_toml(input).unwrap();
+        assert_eq!(
+            settings.input.classifier,
+            ClassifierMode::Heuristic,
+            "input {input:?}"
+        );
+    }
+}
+
+/// `classifier = "heuristic"` and `"off"` are the two live modes.
+#[test]
+fn input_classifier_modes_parse() {
+    let cases: &[(&str, ClassifierMode)] = &[
+        ("heuristic", ClassifierMode::Heuristic),
+        ("off", ClassifierMode::Off),
+    ];
+    for (value, want) in cases {
+        let input = format!("[input]\nclassifier = \"{value}\"\n");
+        let settings = Settings::from_toml(&input).unwrap();
+        assert_eq!(settings.input.classifier, *want, "input {input:?}");
+    }
+}
+
+/// An unrecognized `classifier` value fails load naming the
+/// `input.classifier` key path (Spec us-12, ADR-0006 style) — a
+/// typo'd mode must surface, not silently no-op. `local_model` is
+/// reserved for a later cargo feature and is a load error today.
+#[test]
+fn an_unknown_classifier_value_names_input_classifier() {
+    for value in ["local_model", "heuristics", "fuzzy", "Heuristic"] {
+        let input = format!("[input]\nclassifier = \"{value}\"\n");
+        let err = Settings::from_toml(&input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with("input.classifier:"),
+            "input {input:?}\nactual {message:?}"
+        );
+    }
+}
+
+/// `deny_unknown_fields` stands under `[input]` too — a typo'd key is
+/// a load error naming it.
+#[test]
+fn input_rejects_unknown_keys() {
+    let err = Settings::from_toml("[input]\nclassifer = \"off\"\n").unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("classifer"),
+        "the typo'd key must be named: {message:?}"
     );
 }

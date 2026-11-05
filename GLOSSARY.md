@@ -98,6 +98,14 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   (`ssh -S <sock> <target> -- <cmd>`); a transport failure demotes the task
   permanently — the hit run errors rather than replaying (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **Input classifier** — the §5.10.4 decision on Enter (`classify` in
+  `ait-agent`): the verified input line plus a `ProgramIndex` — the
+  detected shell's builtin table (`ait-shell`'s `builtins_for`, keyed
+  on the program basename) merged with `$PATH` executable basenames —
+  classifies `Command` or `NaturalLanguage`; a natural-language verdict
+  rewrites the submission into the `# ` suggestion flow. Conservative:
+  shell syntax, resolvable first words and anything without positive
+  sentence evidence stay commands; `[input] classifier` arms it.
 - **MCP server** — a Model Context Protocol stdio server declared in
   `mcp.json` (`{"mcpServers": {"name": {"command", "args", "env"}}}`):
   `ait-agent`'s per-session `McpPool` connects user-tier entries
