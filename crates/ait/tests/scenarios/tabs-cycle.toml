@@ -9,8 +9,10 @@ wait_text = "$"
 [[steps]]
 text = "echo TAB-ONE-MARK\n"
 
+# `^…$` — the marker as a whole output row; the typed echo carries
+# `echo ` and can never satisfy the wait (std.15).
 [[steps]]
-wait_text = "TAB-ONE-MARK"
+expect_regex = "(?m)^TAB-ONE-MARK$"
 
 [[steps]]
 keys = ["Alt+T"]
@@ -22,25 +24,25 @@ wait_text = "2:sh"
 text = "echo TAB-TWO-MARK\n"
 
 [[steps]]
-wait_text = "TAB-TWO-MARK"
+expect_regex = "(?m)^TAB-TWO-MARK$"
 
 # To tab 1.
 [[steps]]
 keys = ["Ctrl+PageUp"]
 
 [[steps]]
-expect_text = "TAB-ONE-MARK"
+expect_regex = "(?m)^TAB-ONE-MARK$"
 
 # Back to tab 2.
 [[steps]]
 keys = ["Ctrl+PageDown"]
 
 [[steps]]
-expect_text = "TAB-TWO-MARK"
+expect_regex = "(?m)^TAB-TWO-MARK$"
 
 # `Ctrl+PageDown` wraps: tab 2 -> tab 1.
 [[steps]]
 keys = ["Ctrl+PageDown"]
 
 [[steps]]
-expect_text = "TAB-ONE-MARK"
+expect_regex = "(?m)^TAB-ONE-MARK$"

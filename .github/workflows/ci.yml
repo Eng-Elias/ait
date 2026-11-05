@@ -28,6 +28,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # R09 retro: ait-shell's snippet tests (tests/remote.rs) exec the
+      # committed snippets/{bash,zsh,fish} against a stub ssh and skip a
+      # shell's leg silently when it isn't installed — install them so
+      # `cargo test --workspace` covers all three here too, not just in
+      # the e2e job.
+      - name: Install zsh and fish
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+
       - name: Test
         run: cargo test --workspace
 
@@ -41,6 +49,12 @@ jobs:
       # the CLI's own stderr.
       - name: Source hygiene
         run: scripts/check-src-hygiene.sh
+
+      # std.15's mechanical floor: a substring probe whose literal also
+      # appears mid-line inside a typed-input literal keys on the
+      # shell's echo, not the command's output.
+      - name: E2E sentinel probes
+        run: python3 scripts/check-e2e-sentinels.py
 
   # The e2e suite (Spec E01): the real `ait` binary in a real PTY plus
   # the testkit's own PTY self-tests. Needs no TTY and no network (§6) —
@@ -77,3 +91,25 @@ jobs:
           name: e2e-failures
           path: target/e2e-failures/
           if-no-files-found: ignore
+
+  # Spec R09 §5.9: the AIT_E2E_SSH-gated suite (tests/ssh.rs — the real
+  # remote loop end to end) runs nowhere else in CI. ubuntu-latest has
+  # docker, so scripts/ssh-e2e.sh provisions its throwaway sshd
+  # container and tears it down itself.
+  ssh-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read toolchain pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
+
+      - name: Build
+        run: cargo build -p ait
+
+      - name: SSH e2e against a throwaway sshd container
+        run: scripts/ssh-e2e.sh run

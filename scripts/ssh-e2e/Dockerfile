@@ -4,12 +4,18 @@
 # removes the container afterwards. Nothing here is reused across runs.
 FROM alpine:3.20
 
+# `adduser -D` leaves `testuser:!:` in /etc/shadow — a LOCKED account,
+# and Alpine's openssh is built without PAM so sshd's own shadow check
+# denies pubkey auth for it ("Permission denied (publickey)"). `*` is
+# the service-account value: no password login, account usable.
+# VERBOSE so `docker logs` names the auth-denial reason.
 RUN apk add --no-cache openssh bash \
  && adduser -D -s /bin/bash testuser \
+ && sed -i 's/^testuser:!:/testuser:*:/' /etc/shadow \
  && mkdir -p /home/testuser/.ssh /run/sshd \
  && chmod 700 /home/testuser/.ssh \
  && ssh-keygen -A \
- && printf 'PubkeyAuthentication yes\nPasswordAuthentication no\nLogLevel ERROR\n' \
+ && printf 'PubkeyAuthentication yes\nPasswordAuthentication no\nLogLevel VERBOSE\n' \
       >> /etc/ssh/sshd_config
 
 # Baked per run by scripts/ssh-e2e.sh — a generated one-shot keypair.

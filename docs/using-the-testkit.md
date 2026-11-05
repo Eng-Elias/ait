@@ -75,6 +75,33 @@ cargo run -p ait-testkit --example drive   # interactive manual driving
 `target/e2e-failures/<test>/` → `screen.txt`, `pty-tail.bin`,
 `actions.log`. A stuck terminal after a headed run: `reset`.
 
+## Driving the agent panel and remote sessions
+
+Three traps from the R09 ssh transcript test — each costs a debug
+cycle when learned from a timeout dump instead:
+
+- **The task input is ~30 columns.** `type_text` into a focused panel
+  scrolls long input — a `contains` wait on your task text never
+  fires (only the tail stays visible). Gate on what the panel does
+  next — the `approve <tool>` card, a `✓ <tool>` result, the `done`
+  status via `panel_has_line` — or probe the input's *tail*
+  (`contains("remote-marker.txt")` for a task ending in that name,
+  marked `sentinel-ok` since it keys on echo by design).
+- **`Esc` unfocus races queued input.** `Esc` hands focus back to the
+  terminal, but bytes typed in the same breath can still land in the
+  panel's input (`exit` became `xit` mid-flight). `Alt+A` toggles the
+  panel itself — on a focused panel it closes it (the documented
+  three-state cycle) — a deterministic return of keystrokes to the
+  PTY, and a full-width terminal for any `terminal_half` probes after
+  it.
+- **Remote confinement roots at the *remote* cwd.** With remote
+  context open, the agent's file tools resolve through the remote
+  shell's cwd — `/root` on a loopback sshd — not the spawn's local
+  tempdir; `fs::write(app.cwd(), …)` seeds a file the remote read
+  can't see. Seed fixtures over the remote channel itself (an
+  `echo MARKER > file` block run inside the wrapped session) so the
+  agent's read exercises the real path.
+
 ## For AI agents
 
 Two ready prompts — paste either into an agent session that has the
