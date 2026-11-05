@@ -122,8 +122,7 @@ fn send_then_last_block_round_trips_outside_a_session() {
 
     // `✓ 0` lands with the sealing `D` mark — the block is readable.
     app.wait_for_screen("the sent command sealed", |app| {
-        app.screen_text().contains("R11T6_OUTSIDE")
-            && app.line(STATUS_ROW).contains("✓ 0")
+        app.screen_text().contains("R11T6_OUTSIDE") && app.line(STATUS_ROW).contains("✓ 0")
     });
 
     let output = ctl(runtime.path(), &["last-block"]);
@@ -222,11 +221,10 @@ fn ctl_inside_a_session_drives_its_own_instance() {
     let bin = ait_bin!().to_string_lossy().into_owned();
     app.type_text(&format!("{bin} ctl send echo R11T6_INSIDE\n"));
     app.wait_for_screen("the inside send answered and ran", |app| {
-        app.screen_text().lines().any(|line| line == "{\"ok\":true}")
-            && app
-                .screen_text()
-                .lines()
-                .any(|line| line == "R11T6_INSIDE")
+        app.screen_text()
+            .lines()
+            .any(|line| line == "{\"ok\":true}")
+            && app.screen_text().lines().any(|line| line == "R11T6_INSIDE")
     });
     wait_fresh_prompt(&mut app, "the prompt after the sent command");
 
@@ -267,13 +265,10 @@ fn sent_input_is_never_classified() {
     // The shell ran the line itself — bash's `command not found` and
     // the `✗ 127` seal — and no `# # <line>` rewrite row exists.
     app.wait_for_screen("the verbatim failure sealed", |app| {
-        app.screen_text().contains("command not found")
-            && app.line(STATUS_ROW).contains("✗ 127")
+        app.screen_text().contains("command not found") && app.line(STATUS_ROW).contains("✗ 127")
     });
     assert!(
-        !app
-            .screen_text()
-            .contains("# # what is the largest file"),
+        !app.screen_text().contains("# # what is the largest file"),
         "the sent line was never rewritten: {}",
         app.screen_text()
     );

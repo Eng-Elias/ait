@@ -204,10 +204,7 @@ fn an_endpoint_error_exits_one_with_stdout_clean() {
 #[test]
 fn an_unknown_profile_is_a_startup_failure() {
     let (xdg, data, work) = dirs();
-    write_settings(
-        xdg.path(),
-        &settings_with_fixture("http://127.0.0.1:1", ""),
-    );
+    write_settings(xdg.path(), &settings_with_fixture("http://127.0.0.1:1", ""));
 
     let output = headless(
         xdg.path(),
@@ -221,7 +218,10 @@ fn an_unknown_profile_is_a_startup_failure() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty(), "stdout: {}", stdout(&output));
     let err = stderr(&output);
-    assert!(err.contains("ait: unknown execution profile"), "stderr: {err}");
+    assert!(
+        err.contains("ait: unknown execution profile"),
+        "stderr: {err}"
+    );
     assert!(err.contains("ghost"), "stderr: {err}");
 }
 
@@ -247,16 +247,16 @@ fn the_step_budget_exits_two() {
         &settings_with_fixture(&stub.base_url, "read_files = \"always_ask\""),
     );
 
-    let output = headless(xdg.path(), data.path(), work.path(), &["summarize the file"])
-        .output()
-        .expect("the headless run completes");
+    let output = headless(
+        xdg.path(),
+        data.path(),
+        work.path(),
+        &["summarize the file"],
+    )
+    .output()
+    .expect("the headless run completes");
 
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "stderr: {}",
-        stderr(&output)
-    );
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
     assert!(
         stderr(&output).contains("ait: step budget reached"),
         "stderr: {}",
@@ -287,10 +287,7 @@ fn sigint_cancels_the_in_flight_task() {
     // flight — the signal must reach a live task, not a queued one.
     let deadline = Instant::now() + Duration::from_secs(15);
     while stub.captured_count() == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the model request never arrived"
-        );
+        assert!(Instant::now() < deadline, "the model request never arrived");
         std::thread::sleep(Duration::from_millis(10));
     }
     // SAFETY: `kill` on our own child delivering SIGINT — the headless
