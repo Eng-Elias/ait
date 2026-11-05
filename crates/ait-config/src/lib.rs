@@ -54,7 +54,7 @@ pub use secrets::OsKeyring;
 pub use secrets::SecretStore;
 pub use settings::{
     AgentsSettings, Endpoint, EndpointModel, EndpointSchema, ExecutionProfile, PermissionLevel,
-    Settings, TerminalSettings,
+    Settings, SshSettings, TerminalSettings,
 };
 #[cfg(feature = "watch")]
 pub use watch::{watch, watch_from, SettingsWatcher};

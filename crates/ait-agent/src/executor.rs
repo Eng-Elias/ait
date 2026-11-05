@@ -61,8 +61,10 @@
 //! same token the session's Esc path cancels — so a `run` parked on a
 //! slow command still stops promptly.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::io;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -107,6 +109,39 @@ pub enum ShellIntegration {
     MarksOnly,
     /// The injected snippet is live — `__ait_run`/`7701` work.
     Integrated,
+}
+
+/// Where the bridged session's commands actually run (Spec R09 §5.9):
+/// the frontend's per-tab remote-context tracking distilled for the
+/// executor tiers. `Remote` carries everything a transport needs —
+/// the destination token and the ControlPath the `ssh()` wrapper
+/// negotiated — because the executor owns no SSH state of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoteState {
+    /// A plain local session — every tier targets the user's machine.
+    Local,
+    /// The tab's user is inside an integrated `ssh` session: `ssh()`
+    /// emitted a vetted `ssh_begin`. Read per call — `ssh_end` or a
+    /// remote `exit_shell` flips it back mid-task.
+    Remote {
+        /// The destination token the user typed (`user@host`,
+        /// `host`, config alias) — ssh's `-O check`/command
+        /// destination.
+        target: String,
+        /// The ControlPath pattern the attach negotiated
+        /// (`ssh -G`-resolved, `%C`-tokened) — `None` when the
+        /// connection carries no multiplexing at all.
+        control_path: Option<String>,
+        /// `true` once the REMOTE shell proved its own integration —
+        /// a remote `init_shell`/lifecycle hook landed through the
+        /// channel — NOT the tab's local state. `false` means the
+        /// remote shell never integrated (no bootstrap sent, or a
+        /// degraded plain `-l` shell): in-band `__ait_run` can never
+        /// answer there, so [`UserShellExecutor`] drives the typed
+        /// tiers instead (Spec R09 us-18).
+        bootstrapped: bool,
+    },
 }
 
 /// One observation from the bridged session — the subscription
@@ -246,6 +281,15 @@ pub trait ShellBridge: Send {
     /// stripped) — the `Absent` tier's sentinel-scan surface
     /// (R06-T5).
     fn output_tail(&self) -> Result<Vec<u8>, BridgeError>;
+
+    /// Where commands land (Spec R09-T5): the tab's remote context —
+    /// `Local` for every session that never entered an integrated
+    /// `ssh`. The default answers `Local`, so bridges that predate the
+    /// remote tier (and every scripted test bridge) need no change;
+    /// the frontend's per-tab implementation tracks the real state.
+    fn remote_state(&self) -> Result<RemoteState, BridgeError> {
+        Ok(RemoteState::Local)
+    }
 }
 
 /// One command's outcome — the §5.9 contract: `{merged output, exit
@@ -296,6 +340,14 @@ pub enum ExecutorError {
     /// The task's cancellation token fired while the run was in
     /// flight — the frontend's Esc path.
     Cancelled,
+    /// The out-of-band transport itself failed — `ssh` never spawned
+    /// or answered `255` (its own error band: a dead socket, a
+    /// severed connection, an unreachable host). Distinct from a
+    /// remote command's own exit code, which lands in
+    /// [`CommandResult::exit_code`]; this is the failure
+    /// [`DemotingExecutor`] reads as "the tier is unusable — drop to
+    /// the in-band path".
+    Transport(String),
 }
 
 impl fmt::Display for ExecutorError {
@@ -323,6 +375,9 @@ impl fmt::Display for ExecutorError {
                 "the session exited before the command's result arrived — it may have partially run"
             ),
             Self::Cancelled => write!(f, "cancelled"),
+            Self::Transport(detail) => {
+                write!(f, "the remote connection's transport failed: {detail}")
+            }
         }
     }
 }
@@ -575,7 +630,26 @@ impl CommandExecutor for UserShellExecutor {
         if self.cancel.is_cancelled() {
             return Err(ExecutorError::Cancelled);
         }
-        match self.bridge.integration_state()? {
+        let mut state = self.bridge.integration_state()?;
+        // Spec R09 us-18: a remote session whose shell never
+        // confirmed integration answers no `__ait_run` — typing it
+        // would park the wait on frames that can never arrive (the
+        // tab's `Integrated` state is the LOCAL shell's leftover,
+        // not the remote's). Clamp it to `Absent` so the sentinel
+        // tier drives the remote shell through the visible channel
+        // exactly like an unintegrated local one.
+        if state == ShellIntegration::Integrated
+            && matches!(
+                self.bridge.remote_state()?,
+                RemoteState::Remote {
+                    bootstrapped: false,
+                    ..
+                }
+            )
+        {
+            state = ShellIntegration::Absent;
+        }
+        match state {
             ShellIntegration::Integrated => {}
             ShellIntegration::MarksOnly => return self.run_marks_only(command),
             ShellIntegration::Absent => return self.run_absent(command),
@@ -714,5 +788,276 @@ pub struct DetachedExecutor;
 impl CommandExecutor for DetachedExecutor {
     fn run(&mut self, _command: &str) -> Result<CommandResult, ExecutorError> {
         Err(ExecutorError::Unbound)
+    }
+}
+
+/// `ssh`'s own failure band (Spec R09-T5): the client reports
+/// transport trouble — a dead control socket, a severed connection —
+/// as exit code `255`, and remote commands' own codes stay below it.
+/// The overlap is OpenSSH's documented ambiguity (a remote command
+/// legitimately exiting `255` reads as transport trouble); the
+/// demotion it triggers lands on the in-band tier, never on nothing.
+const SSH_TRANSPORT_CODE: i32 = 255;
+
+/// The ControlMaster tier (Spec R09-T5, §5.9): `run_command`
+/// multiplexed out-of-band over the SSH control socket the `ssh()`
+/// wrapper attached — `ssh -S <sock> -o BatchMode=yes <target> -- <cmd>`
+/// — so the agent's commands never share the terminal byte stream the
+/// user is typing on. The remote command runs under the remote user's
+/// login shell with `2>&1` appended (the `__ait_run` merge's mirror),
+/// so [`CommandResult::output`] is the same merged stream every tier
+/// reports.
+pub struct ControlMasterExecutor {
+    /// The ssh client to spawn — `ssh` on PATH in production; the test
+    /// seam substitutes a stub that records argv.
+    program: String,
+    /// The ControlPath the `ssh()` wrapper negotiated — `%C`-tokened
+    /// patterns pass verbatim; ssh expands them to the same socket.
+    socket: String,
+    /// The destination token — remote commands and `-O check` share it.
+    target: String,
+    /// The task's cancellation token — a parked `ssh` is killed on
+    /// the [`RUN_POLL`] cadence like every other tier's wait.
+    cancel: CancellationToken,
+}
+
+impl ControlMasterExecutor {
+    /// An executor multiplexing over `socket` to `target`, spawning
+    /// `ssh` from PATH, cancelled by `cancel`.
+    pub fn new(socket: String, target: String, cancel: CancellationToken) -> Self {
+        Self::with_program(ait_shell::SSH_PROGRAM.to_owned(), socket, target, cancel)
+    }
+
+    /// [`new`](Self::new) with the ssh program pinned — the stub seam
+    /// the tests drive (`ssh -S`/`-O check` and the command form land
+    /// in a recorded argv log instead of a network).
+    pub fn with_program(
+        program: String,
+        socket: String,
+        target: String,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            program,
+            socket,
+            target,
+            cancel,
+        }
+    }
+}
+
+impl CommandExecutor for ControlMasterExecutor {
+    fn run(&mut self, command: &str) -> Result<CommandResult, ExecutorError> {
+        let mut child = Command::new(&self.program)
+            .args([
+                OsStr::new("-S"),
+                OsStr::new(&self.socket),
+                OsStr::new("-o"),
+                OsStr::new("BatchMode=yes"),
+                OsStr::new(&self.target),
+                // `--` ends ssh's own option parsing — a command
+                // text that starts with `-` can never be read as a
+                // client flag (OpenSSH strips it before the remote
+                // string is sent).
+                OsStr::new("--"),
+                OsStr::new(command),
+                // The remote shell merges stderr into stdout — the
+                // same shape `__ait_run` reports in-band.
+                OsStr::new("2>&1"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                ExecutorError::Transport(format!(
+                    "could not spawn {} over {}: {error}",
+                    self.program, self.socket
+                ))
+            })?;
+        // Both pipes drain on threads — a large output (or a chatty
+        // ssh) can never deadlock the poll loop on a full pipe.
+        let stdout = child.stdout.take().map(drain_pipe);
+        let stderr = child.stderr.take().map(drain_pipe);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if self.cancel.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ExecutorError::Cancelled);
+                    }
+                    std::thread::sleep(RUN_POLL);
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ExecutorError::Transport(format!(
+                        "waiting on the remote command failed: {error}"
+                    )));
+                }
+            }
+        };
+        let output = stdout.map_or_else(Vec::new, |drain| drain.join().unwrap_or_default());
+        let detail = stderr.map_or_else(Vec::new, |drain| drain.join().unwrap_or_default());
+        match status.code() {
+            Some(code) if code == SSH_TRANSPORT_CODE => Err(ExecutorError::Transport(format!(
+                "ssh reported transport failure{}",
+                tail_detail(&detail)
+            ))),
+            code => Ok(CommandResult {
+                output,
+                exit_code: code,
+            }),
+        }
+    }
+}
+
+/// The demotion wrapper (Spec R09-T5): runs `primary` — the
+/// ControlMaster tier — until a [`ExecutorError::Transport`] proves
+/// the out-of-band channel dead, then answers every later command
+/// through `fallback` (the user-shell executor) permanently. A dead
+/// socket never recovers, so the task doesn't pay a failing probe
+/// per call; non-transport results — remote commands' own exits —
+/// never demote. The run that took the transport hit errors out
+/// honestly rather than replaying — after partial remote execution
+/// a blind re-run is the worse failure (demote, never hang, never
+/// double-run).
+pub struct DemotingExecutor {
+    /// The out-of-band tier, tried first until demotion.
+    primary: ControlMasterExecutor,
+    /// The in-band path the task drops to — it shares the user's
+    /// terminal stream, which is exactly what the remote tier exists
+    /// to avoid; demotion keeps it the last resort, not the default.
+    fallback: UserShellExecutor,
+    /// `true` once a transport failure retired the primary.
+    demoted: bool,
+}
+
+impl DemotingExecutor {
+    /// Pair `primary` with the `fallback` it demotes into.
+    pub fn new(primary: ControlMasterExecutor, fallback: UserShellExecutor) -> Self {
+        Self {
+            primary,
+            fallback,
+            demoted: false,
+        }
+    }
+
+    /// Whether the out-of-band tier already failed over — the
+    /// observation seam the tier-selection tests assert on.
+    pub fn demoted(&self) -> bool {
+        self.demoted
+    }
+}
+
+impl CommandExecutor for DemotingExecutor {
+    fn run(&mut self, command: &str) -> Result<CommandResult, ExecutorError> {
+        if !self.demoted {
+            match self.primary.run(command) {
+                // A transport failure means the command may have
+                // partially run on the remote host — demote the task
+                // permanently but report THIS run's failure honestly
+                // rather than replaying it through the fallback (a
+                // double-run is the one thing worse than an error:
+                // non-idempotent commands execute twice).
+                Err(error @ ExecutorError::Transport(_)) => {
+                    self.demoted = true;
+                    return Err(error);
+                }
+                result => return result,
+            }
+        }
+        self.fallback.run(command)
+    }
+}
+
+/// §5.9's tier selection (Spec R09-T5), in preference order:
+///
+/// 1. The remote-daemon slot is deferred (Backlog R09) — nothing to
+///    select this round.
+/// 2. A `Remote` remote state with a control path whose socket
+///    answers `ssh -S <sock> -O check` → the ControlMaster tier,
+///    demoting into the in-band path on transport failure.
+/// 3. Any other bridged session → the user-shell executor (in-band
+///    `__ait_run` — remote through the bootstrapped shell — else the
+///    typed tiers).
+/// 4. No bridge at all → the detached no-op tier.
+pub fn select_executor(
+    bridge: Option<Box<dyn ShellBridge>>,
+    cancel: CancellationToken,
+) -> Box<dyn CommandExecutor> {
+    select_executor_with_program(bridge, cancel, ait_shell::SSH_PROGRAM)
+}
+
+/// [`select_executor`] with the ssh client pinned — the test seam:
+/// a stub `ssh` that answers `-O check` and records command
+/// invocations lets the whole selection matrix run without a
+/// network.
+pub fn select_executor_with_program(
+    bridge: Option<Box<dyn ShellBridge>>,
+    cancel: CancellationToken,
+    program: &str,
+) -> Box<dyn CommandExecutor> {
+    let Some(bridge) = bridge else {
+        return Box::new(DetachedExecutor);
+    };
+    if let Ok(RemoteState::Remote {
+        target,
+        control_path: Some(socket),
+        ..
+    }) = bridge.remote_state()
+    {
+        if socket_alive(program, &socket, &target) {
+            return Box::new(DemotingExecutor::new(
+                ControlMasterExecutor::with_program(
+                    program.to_owned(),
+                    socket,
+                    target,
+                    cancel.clone(),
+                ),
+                UserShellExecutor::new(bridge, cancel),
+            ));
+        }
+    }
+    Box::new(UserShellExecutor::new(bridge, cancel))
+}
+
+/// Does `program -S <socket> -O check <target>` answer — the live
+/// probe `select_executor` pays ONCE per task start (Spec R09-T5:
+/// `Remote` + a live socket selects ControlMaster). `BatchMode=yes`
+/// keeps a stale socket from prompting. Anything but a clean `0`
+/// counts as dead — including a spawn failure, which simply selects
+/// the in-band tier.
+fn socket_alive(program: &str, socket: &str, target: &str) -> bool {
+    Command::new(program)
+        .args(["-S", socket, "-o", "BatchMode=yes", "-O", "check", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Read `pipe` to EOF on its own thread — a full pipe can never
+/// deadlock the caller's `try_wait` poll.
+fn drain_pipe(mut pipe: impl io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// The ssh stderr tail for a transport error's detail — trimmed,
+/// empty-tolerant.
+fn tail_detail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(": {text}")
     }
 }

@@ -73,13 +73,17 @@ pub struct StatusLine<'a> {
     /// The newest finished block's status (`✓/✗ <code> · <dur>` —
     /// Spec R05 us-15; absent when no block has reported an exit code).
     pub block: Option<BlockStatus>,
+    /// The live remote session's destination token (Spec R09-T4:
+    /// `ssh:<target>` while an `ssh()`-wrapped session is open;
+    /// absent on a local shell — the R03 layout is unchanged).
+    pub remote: Option<&'a str>,
     /// The session's exit status once `LiveEvent::Exited` surfaced.
     pub exit: Option<&'a ExitStatus>,
 }
 
 /// The status line's content at `now`: a live toast wins outright;
-/// otherwise `cwd · shell · model · [profile ·] [block ·] state` for
-/// the tab `line` describes.
+/// otherwise `cwd · shell · model · [profile ·] [block ·] [ssh:·]
+/// state` for the tab `line` describes.
 pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -> String {
     if let Some(toast) = toast.filter(|toast| toast.is_live(now)) {
         return toast.text().to_string();
@@ -90,8 +94,11 @@ pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -
     let block = line
         .block
         .map_or_else(String::new, |status| format!("{} · ", block_text(status)));
+    let remote = line
+        .remote
+        .map_or_else(String::new, |target| format!("ssh:{target} · "));
     format!(
-        "{} · {} · {} · {profile}{block}{}",
+        "{} · {} · {} · {profile}{block}{remote}{}",
         line.cwd.display(),
         line.shell,
         line.model,
@@ -174,6 +181,7 @@ mod tests {
                 model: "Qwen Coder",
                 profile: None,
                 block: None,
+                remote: None,
                 exit: None,
             },
             None,
@@ -188,6 +196,7 @@ mod tests {
                 model: "—",
                 profile: None,
                 block: None,
+                remote: None,
                 exit: None,
             },
             None,
@@ -214,6 +223,7 @@ mod tests {
                     model: "—",
                     profile: None,
                     block: Some(ok),
+                    remote: None,
                     exit: None,
                 },
                 None,
@@ -234,6 +244,7 @@ mod tests {
                     model: "—",
                     profile: None,
                     block: Some(failed),
+                    remote: None,
                     exit: None,
                 },
                 None,
@@ -269,6 +280,7 @@ mod tests {
                     model: "—",
                     profile: None,
                     block: None,
+                    remote: None,
                     exit: Some(&code3),
                 },
                 None,
@@ -286,6 +298,7 @@ mod tests {
                     model: "—",
                     profile: None,
                     block: None,
+                    remote: None,
                     exit: Some(&hung_up),
                 },
                 None,
@@ -309,6 +322,7 @@ mod tests {
                     model: "—",
                     profile: None,
                     block: None,
+                    remote: None,
                     exit: None,
                 },
                 Some(&toast),
@@ -338,6 +352,7 @@ mod tests {
                 model: "—",
                 profile: None,
                 block: None,
+                remote: None,
                 exit: None,
             },
             Some(&toast),
@@ -358,6 +373,7 @@ mod tests {
                 model: "—",
                 profile: Some("work"),
                 block: None,
+                remote: None,
                 exit: None,
             },
             None,
@@ -376,12 +392,34 @@ mod tests {
                     exit: 0,
                     duration: Duration::from_millis(1200),
                 }),
+                remote: None,
                 exit: None,
             },
             None,
             Instant::now(),
         );
         assert_eq!(text, "/tmp · sh · — · work · ✓ 0 · 1.2s · running");
+    }
+
+    /// Spec R09-T4: a live remote session adds its `ssh:<target>`
+    /// segment right before the state slot — `None` (a local shell)
+    /// keeps the R03 layout byte-for-byte.
+    #[test]
+    fn a_remote_session_adds_its_ssh_segment() {
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/home/u"),
+                shell: "bash",
+                model: "—",
+                profile: None,
+                block: None,
+                remote: Some("user@prod"),
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/home/u · bash · — · ssh:user@prod · running");
     }
 
     /// OSC 9 carries only a message; OSC 777's `notify;<title>;<body>`

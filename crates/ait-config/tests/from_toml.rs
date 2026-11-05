@@ -168,7 +168,7 @@ fn unknown_keys_at_every_level_are_rejected() {
     let cases: &[(&str, &str)] = &[
         (
             "bogus = 1",
-            "bogus: unknown field `bogus`, expected `terminal` or `agents`",
+            "bogus: unknown field `bogus`, expected one of `terminal`, `agents`, `ssh`",
         ),
         (
             "[terminal]\nshells = \"/bin/sh\"",
@@ -454,4 +454,73 @@ fn directory_and_mcp_lists_are_not_regex_validated() {
     assert_eq!(profile.directory_allowlist, ["(", "/tmp"]);
     assert_eq!(profile.mcp_allowlist, ["("]);
     assert_eq!(profile.mcp_denylist, ["*"]);
+}
+
+// ---------------------------------------------------------------------------
+// Spec R09-T1: the [ssh] section (§4.3 → decided, §5.9).
+// ---------------------------------------------------------------------------
+
+/// A `[ssh]` section loads every key typed; an absent section yields
+/// the documented defaults — integration on, open allowlist, empty
+/// denylist, control-master reuse on (Spec R09-T1).
+#[test]
+fn ssh_section_parses_and_defaults_apply() {
+    let settings = Settings::from_toml(
+        r#"
+        [ssh]
+        enable_integration = false
+        hosts_allowlist = ["*.prod.example.com", "!bastion.prod.example.com"]
+        hosts_denylist = ["*.internal"]
+        reuse_existing_control_master = false
+        "#,
+    )
+    .unwrap();
+    assert_eq!(settings.ssh.enable_integration, Some(false));
+    assert!(!settings.ssh.integration_enabled());
+    assert_eq!(
+        settings.ssh.hosts_allowlist,
+        ["*.prod.example.com", "!bastion.prod.example.com"]
+    );
+    assert_eq!(settings.ssh.hosts_denylist, ["*.internal"]);
+    assert_eq!(settings.ssh.reuse_existing_control_master, Some(false));
+    assert!(!settings.ssh.reuses_control_master());
+
+    // Absent [ssh] ⇒ the documented defaults: on, open, none, reuse.
+    let settings = Settings::from_toml("").unwrap();
+    assert!(settings.ssh.integration_enabled());
+    assert!(settings.ssh.hosts_allowlist.is_empty());
+    assert!(settings.ssh.hosts_denylist.is_empty());
+    assert!(settings.ssh.reuses_control_master());
+}
+
+/// A malformed host pattern fails load naming the offending
+/// `ssh.<list>[<index>]` path — the profile-regex precedent (Spec
+/// R09-T1). Empty entries, a bare `!`, commas (OpenSSH's in-pattern
+/// list separator reads as a misconfig here) and whitespace are all
+/// rejected.
+#[test]
+fn a_malformed_host_pattern_names_the_entry() {
+    let cases: &[(&str, &str)] = &[
+        ("[ssh]\nhosts_denylist = [\"\"]", "ssh.hosts_denylist[0]:"),
+        (
+            "[ssh]\nhosts_allowlist = [\"!\"]",
+            "ssh.hosts_allowlist[0]:",
+        ),
+        (
+            "[ssh]\nhosts_denylist = [\"a,b\"]",
+            "ssh.hosts_denylist[0]:",
+        ),
+        (
+            "[ssh]\nhosts_allowlist = [\"web ?.x\"]",
+            "ssh.hosts_allowlist[0]:",
+        ),
+    ];
+    for (input, expected) in cases {
+        let err = Settings::from_toml(input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(expected),
+            "input {input:?}\nexpected prefix {expected:?}\nactual   {message:?}"
+        );
+    }
 }

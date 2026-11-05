@@ -281,6 +281,7 @@ impl StoreHandle {
                 session_id: *session_id,
                 command: block.command.clone(),
                 cwd: Some(block.cwd.clone()),
+                host: block.host.clone(),
                 exit: block.exit,
                 duration: block.duration,
                 started_at: block.started_at,
@@ -318,6 +319,7 @@ mod tests {
         PersistedBlock {
             command: Some(command.to_owned()),
             cwd: "/w".to_owned(),
+            host: None,
             exit: Some(0),
             duration: Some(Duration::from_millis(4)),
             started_at: Some(SystemTime::now()),

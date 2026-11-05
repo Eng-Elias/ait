@@ -55,6 +55,13 @@ pub struct BlockAssembler {
     /// A `preexec` command that arrived before its `B` mark — held for
     /// the next block, cleared when a new prompt starts instead.
     pending_command: Option<String>,
+    /// The remote host stamped on blocks sealed now — the tab's live
+    /// remote context (`blocks.host`, Spec R09-T7), `None` for local
+    /// blocks. The drain refreshes it per event so a seal mid-batch
+    /// gets the context live when the mark landed — stamping at take
+    /// time would mislabel blocks that ran locally but drained after
+    /// `ssh_begin`.
+    remote_host: Option<String>,
 }
 
 /// FNV-1a offset basis — shared by [`row_hash`] and the multi-row
@@ -160,6 +167,11 @@ pub struct BlockEntry {
     /// `ended_at` (Spec R08). `None` when no `D` ever arrived: an
     /// abandoned block reports only what the hooks did.
     ended_at: Option<SystemTime>,
+    /// The remote host live when the block sealed — `blocks.host`
+    /// (Spec R09-T7), `None` for a block that ran locally. Stamped at
+    /// seal, never at drain time, so the host is the session the
+    /// command actually ran under.
+    host: Option<String>,
 }
 
 /// The `(exit code, duration)` pair the status line renders for the
@@ -363,7 +375,14 @@ impl BlockAssembler {
         self.sealed.drain(..).collect()
     }
 
-    fn push_block(&mut self, entry: BlockEntry) {
+    /// The remote host newly sealed blocks carry — `Some` while the
+    /// tab sits in an `ssh()` session, `None` local (Spec R09-T7).
+    pub fn set_remote_host(&mut self, host: Option<String>) {
+        self.remote_host = host;
+    }
+
+    fn push_block(&mut self, mut entry: BlockEntry) {
+        entry.host.clone_from(&self.remote_host);
         self.sealed.push_back(entry.clone());
         if self.blocks.len() == BLOCK_CAP {
             self.blocks.pop_front();
@@ -387,6 +406,7 @@ impl BlockEntry {
             completed: false,
             seal: None,
             ended_at: None,
+            host: None,
         }
     }
 
@@ -603,6 +623,7 @@ impl BlockEntry {
                 .map(|block| block.command)
                 .or_else(|| self.command.clone()),
             cwd,
+            host: self.host.clone(),
             exit: self.exit.map(i64::from),
             duration: self.duration,
             started_at: Some(self.output_start.map_or(self.start.wall, |m| m.wall)),
@@ -626,6 +647,11 @@ pub(crate) struct PersistedBlock {
     /// R08: the tab's cwd at `preexec`). Filled by the tab, the only
     /// side that knows it.
     pub cwd: String,
+    /// The remote host the block ran under — the `blocks.host` column
+    /// (Spec R09-T7): the destination token of the tab's live remote
+    /// context at seal, `None` for a local block. Filled by the tab —
+    /// the only side that tracks remote context.
+    pub host: Option<String>,
     /// The `OSC 133;D` exit code.
     pub exit: Option<i64>,
     /// Execution time (`D.at − C.at`, `B.at` fallback).

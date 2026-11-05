@@ -342,7 +342,7 @@ pub fn run() -> io::Result<ExitCode> {
     // status-line row are chrome outside the session grid (Spec R02).
     let mut tabs = TabManager::spawn_with(
         content_size(state.screen),
-        config::session_template(&state.config.settings().terminal),
+        config::session_template(state.config.settings()),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
     // The first tab's `terminal_sessions` row (Spec R08): `None` — a
@@ -503,6 +503,7 @@ pub fn run() -> io::Result<ExitCode> {
                     model: &model,
                     profile: profile::status_slot(&state.profile),
                     block: tab.last_block_status(),
+                    remote: tab.remote_target(),
                     exit: tab.exit_status(),
                 },
                 state.toast.as_ref(),
@@ -1108,7 +1109,7 @@ fn drain_config_events(
     while let Ok(event) = receiver.try_recv() {
         match event {
             Ok(settings) => {
-                tabs.set_session_template(config::session_template(&settings.terminal));
+                tabs.set_session_template(config::session_template(&settings));
                 // The OLD declared names decide "deleted" vs
                 // "never declared" — an armed `default` deleted
                 // with the whole table toasts; one that never was

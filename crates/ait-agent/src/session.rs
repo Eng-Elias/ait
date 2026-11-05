@@ -89,7 +89,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_context::{assemble_system_prompt, find_agents_md, AgentContext};
 use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, reported_tokens, slot, Extracted};
-use crate::executor::{CommandExecutor, DetachedExecutor, ShellBridge, UserShellExecutor};
+use crate::executor::{CommandExecutor, ShellBridge};
 use crate::files::{ToolCwd, ToolOutput};
 use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
@@ -563,6 +563,10 @@ fn worker(
     // Drop closes these channels and joins this thread.
     let mut agent_pty = AgentPty::new();
     while let Ok(request) = requests.recv() {
+        // Spec R09-T3: the agent-owned shell's `ssh()` reads the
+        // task's armed `[ssh]` policy — refreshed per request so a
+        // hot-reloaded settings file reaches the next spawn.
+        agent_pty.arm_ssh(&request.settings.ssh);
         serve(
             &runtime,
             request,
@@ -681,18 +685,29 @@ fn serve(
     let allowlist: &[String] = profile
         .map(|profile| profile.directory_allowlist.as_slice())
         .unwrap_or(&[]);
-    let cwd = ToolCwd::new(&request.context.cwd, allowlist);
+    // §5.9 (Spec R09-T5/T6): the bridge's remote state is the task's
+    // one read of where commands land — `Remote` confines the file
+    // tools lexically (their commands run through the executor) and
+    // `select_executor` picks the ControlMaster → in-band → detached
+    // preference order.
+    let remote = request
+        .bridge
+        .as_deref()
+        .and_then(|bridge| bridge.remote_state().ok())
+        .is_some_and(|state| matches!(state, crate::RemoteState::Remote { .. }));
+    let cwd = if remote {
+        ToolCwd::new_remote(&request.context.cwd, allowlist)
+    } else {
+        ToolCwd::new(&request.context.cwd, allowlist)
+    };
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
-    // `run_command`'s §5.9 executor (Spec R06-T4): bound to the task's
-    // `ShellBridge` when the frontend attached one — the
-    // `UserShellExecutor`, tiered on the tab's live integration state —
-    // or to the no-op tier when it didn't.
-    let mut executor: Box<dyn CommandExecutor> = match request.bridge {
-        Some(bridge) => Box::new(UserShellExecutor::new(bridge, token.clone())),
-        None => Box::new(DetachedExecutor),
-    };
+    // `run_command`'s §5.9 executor (Spec R06-T4): `select_executor`
+    // walks §5.9's preference order — a `Remote` + live ControlMaster
+    // socket answers out-of-band, every other bridged session takes
+    // the user-shell tiers, a bridgeless task the detached no-op.
+    let mut executor = crate::select_executor(request.bridge, token.clone());
     // The summarization threshold's denominator (R08-T7, us-19):
     // the profile's `context_window_limit` when it is >0, else the
     // resolved model's `context_window`, else `None` — with no
@@ -716,6 +731,7 @@ fn serve(
         context_limit,
         agent_pty,
         executor.as_mut(),
+        remote,
         token,
         &events,
     ));
@@ -750,6 +766,7 @@ async fn run_loop(
     context_limit: Option<usize>,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
+    remote: bool,
     cancel: CancellationToken,
     events: &EventSink<'_>,
 ) {
@@ -831,6 +848,7 @@ async fn run_loop(
                         cwd,
                         agent_pty,
                         executor,
+                        remote,
                         &cancel,
                         events,
                     ) {
@@ -962,6 +980,7 @@ fn gate_and_execute(
     cwd: &ToolCwd,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
+    remote: bool,
     cancel: &CancellationToken,
     events: &EventSink<'_>,
 ) -> Option<String> {
@@ -988,9 +1007,12 @@ fn gate_and_execute(
     // same plan is what an allow verdict writes — the rendered diff
     // is byte-for-byte the applied change. A planning error still
     // rides the card (the paths plus why) and replays as the tool
-    // result so the model reads what went wrong.
-    let plan = match call.name.as_str() {
-        "edit_files" => Some(tools::plan_edit(call, cwd)),
+    // result so the model reads what went wrong. On a REMOTE task
+    // there is no local plan to render — remote writes are out of
+    // scope (Spec R09-T6) and `execute`'s honest refusal is both the
+    // card summary and the tool result.
+    let plan = match (call.name.as_str(), remote) {
+        ("edit_files", false) => Some(tools::plan_edit(call, cwd)),
         _ => None,
     };
     let summary = match &plan {
@@ -1082,7 +1104,7 @@ fn gate_and_execute(
     let output = match plan {
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
-        None => tools::execute(call, cwd, agent_pty, executor, cancel),
+        None => tools::execute(call, cwd, agent_pty, executor, remote, cancel),
     };
     // A run cut short by Esc reports its own tool error — but the
     // task is over: emit `Cancelled` rather than re-entering the loop
