@@ -109,6 +109,15 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   its `mcp.json` entries shadow same-named user-tier ones and are
   listed but never spawned — a cloned repo cannot run code on the
   user's machine silently (§5.10.1, Spec R10 us-8).
+- **Skill** — a `<dir>/SKILL.md` under `~/.config/ait/skills/` or the
+  project-local `.ait/skills/` whose frontmatter `name`/`description`
+  the agent lists and whose body + bundled files `invoke_skill`
+  returns; a project skill shadows a same-named user skill (§5.10.2).
+- **Skill catalog** — the per-task `SkillsCatalog` snapshot of the
+  skills on disk (effective skills + surfaced skip errors) that rides
+  `AgentRequest.skills`; the frontend's `LiveSkills` watcher refreshes
+  it on changes under either root, keeping last-good copies of
+  entries a write left malformed (§5.10.2, ADR-0006).
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.
