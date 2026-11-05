@@ -42,7 +42,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use ait_config::{load_mcp, McpServerEntry, McpServerOrigin};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ReadResourceResult,
+};
 use rmcp::service::{RoleClient, RunningService, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
@@ -284,33 +286,21 @@ impl McpPool {
         let Some(tool) = tools::arg_str(args, "tool") else {
             return ToolOutput::error(String::from("call_mcp_tool: `tool` must be a string"));
         };
-        let Some(slot) = self.servers.get_mut(server) else {
-            return ToolOutput::error(format!(
-                "call_mcp_tool: no MCP server named {server:?} is configured"
-            ));
-        };
-        slot.connect_if_declared().await;
-        let Some(service) = slot.live_service() else {
-            return ToolOutput::error(slot_error(CALL_MCP_TOOL, server, &slot.state));
-        };
         let mut params = CallToolRequestParams::new(tool.to_string());
         if let Some(arguments) = args.get("arguments").and_then(|v| v.as_object()) {
             params = params.with_arguments(arguments.clone());
         }
-        match timeout(CALL_TIMEOUT, service.call_tool(params)).await {
-            Err(_) => ToolOutput::error(format!(
-                "call_mcp_tool: {server}:{tool} timed out after {}s",
-                CALL_TIMEOUT.as_secs()
-            )),
-            Ok(Err(error)) => {
-                if matches!(error, ServiceError::TransportClosed) {
-                    slot.state =
-                        ServerState::Unavailable(format!("the connection failed: {error}"));
-                }
-                ToolOutput::error(format!("call_mcp_tool: {server}:{tool} failed: {error}"))
-            }
-            Ok(Ok(result)) => render_tool_result(result),
-        }
+        let outcome = match self.service_for(CALL_MCP_TOOL, server).await {
+            Ok(service) => timeout(CALL_TIMEOUT, service.call_tool(params)).await,
+            Err(error) => return error,
+        };
+        self.finish(
+            CALL_MCP_TOOL,
+            server,
+            &format!("{server}:{tool}"),
+            outcome,
+            render_tool_result,
+        )
     }
 
     /// `read_mcp_resource(server, uri)`: text contents join as the
@@ -323,72 +313,103 @@ impl McpPool {
         let Some(uri) = tools::arg_str(args, "uri") else {
             return ToolOutput::error(String::from("read_mcp_resource: `uri` must be a string"));
         };
+        let outcome = match self.service_for(READ_MCP_RESOURCE, server).await {
+            Ok(service) => {
+                timeout(
+                    CALL_TIMEOUT,
+                    service.read_resource(ReadResourceRequestParams::new(uri)),
+                )
+                .await
+            }
+            Err(error) => return error,
+        };
+        self.finish(
+            READ_MCP_RESOURCE,
+            server,
+            &format!("{server} {uri}"),
+            outcome,
+            render_resource_result,
+        )
+    }
+
+    /// The shared front half of both MCP dispatch arms (Spec R10):
+    /// resolve the named server's slot, lazy-connect it when it is
+    /// still only [`ServerState::Declared`] (project-tier — the
+    /// §5.10.1 consent connect), and take the live service — a
+    /// transport that closed since the last reconcile demotes on the
+    /// spot. Anything short of a live service is the [`ToolOutput`]
+    /// error the model reads.
+    async fn service_for(
+        &mut self,
+        tool: &str,
+        server: &str,
+    ) -> Result<&RunningService<RoleClient, ()>, ToolOutput> {
         let Some(slot) = self.servers.get_mut(server) else {
-            return ToolOutput::error(format!(
-                "read_mcp_resource: no MCP server named {server:?} is configured"
-            ));
+            return Err(ToolOutput::error(format!(
+                "{tool}: no MCP server named {server:?} is configured"
+            )));
         };
         slot.connect_if_declared().await;
-        let Some(service) = slot.live_service() else {
-            return ToolOutput::error(slot_error(READ_MCP_RESOURCE, server, &slot.state));
-        };
-        match timeout(
-            CALL_TIMEOUT,
-            service.read_resource(ReadResourceRequestParams::new(uri)),
-        )
-        .await
-        {
+        match slot.live_service() {
+            Ok(service) => Ok(service),
+            Err(reason) => Err(ToolOutput::error(format!(
+                "{tool}: MCP server {server:?} is unavailable: {reason}"
+            ))),
+        }
+    }
+
+    /// The shared back half of both MCP dispatch arms (Spec R10
+    /// us-18): the [`CALL_TIMEOUT`] outcome mapped — a timeout is a
+    /// tool error naming `label`, a transport-closed failure
+    /// additionally demotes the slot so the rest of the task reads
+    /// it unavailable (the next reconcile is the recovery point),
+    /// and `render` turns a success into the call's result.
+    fn finish<T>(
+        &mut self,
+        tool: &str,
+        server: &str,
+        label: &str,
+        outcome: Result<Result<T, ServiceError>, tokio::time::error::Elapsed>,
+        render: impl FnOnce(T) -> ToolOutput,
+    ) -> ToolOutput {
+        match outcome {
             Err(_) => ToolOutput::error(format!(
-                "read_mcp_resource: {server} {uri} timed out after {}s",
+                "{tool}: {label} timed out after {}s",
                 CALL_TIMEOUT.as_secs()
             )),
             Ok(Err(error)) => {
                 if matches!(error, ServiceError::TransportClosed) {
-                    slot.state =
-                        ServerState::Unavailable(format!("the connection failed: {error}"));
-                }
-                ToolOutput::error(format!("read_mcp_resource: {server} {uri} failed: {error}"))
-            }
-            Ok(Ok(result)) => {
-                let mut parts = Vec::new();
-                for content in &result.contents {
-                    match content {
-                        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
-                            parts.push(text.clone())
-                        }
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            uri, blob, ..
-                        } => parts.push(format!(
-                            "[binary resource {uri} — {} base64 characters, contents omitted]",
-                            blob.len()
-                        )),
-                        _ => parts.push(String::from("[unsupported resource content]")),
+                    if let Some(slot) = self.servers.get_mut(server) {
+                        slot.state =
+                            ServerState::Unavailable(format!("the connection failed: {error}"));
                     }
                 }
-                if parts.is_empty() {
-                    ToolOutput::ok(String::from("the resource returned no contents"))
-                } else {
-                    ToolOutput::ok(parts.join("\n"))
-                }
+                ToolOutput::error(format!("{tool}: {label} failed: {error}"))
             }
+            Ok(Ok(result)) => render(result),
         }
     }
 }
 
 impl ServerSlot {
-    /// The slot's live connection, or `None` — the guard both MCP
-    /// tools run after name resolution. A transport that closed
-    /// since the last reconcile demotes the slot to
-    /// [`ServerState::Unavailable`] on the spot.
-    fn live_service(&mut self) -> Option<&RunningService<RoleClient, ()>> {
+    /// The slot's live connection, or the recorded unavailability
+    /// reason — the guard both MCP tools run after name resolution.
+    /// A transport that closed since the last reconcile demotes the
+    /// slot to [`ServerState::Unavailable`] on the spot.
+    fn live_service(&mut self) -> Result<&RunningService<RoleClient, ()>, String> {
         if let ServerState::Connected { service, .. } = &self.state {
             if service.is_transport_closed() {
                 self.state = ServerState::Unavailable(String::from("the server exited"));
             }
         }
         match &self.state {
-            ServerState::Connected { service, .. } => Some(service),
-            _ => None,
+            ServerState::Connected { service, .. } => Ok(service),
+            ServerState::Unavailable(reason) => Err(reason.clone()),
+            // Reached only after `connect_if_declared` ran — a
+            // declared slot is impossible here.
+            ServerState::Declared => {
+                unreachable!("the gated call lazy-connects a declared slot before dispatch")
+            }
         }
     }
 
@@ -442,23 +463,6 @@ impl ServerSlot {
     }
 }
 
-/// The [`ToolOutput`] error text for a slot that could not serve a
-/// request — reached only after `connect_if_declared` ran, so the
-/// slot is always [`ServerState::Unavailable`] here: the recorded
-/// reason (spawn, handshake, enumeration or timeout failure)
-/// replays to the model.
-fn slot_error(tool: &str, server: &str, state: &ServerState) -> String {
-    match state {
-        ServerState::Unavailable(reason) => {
-            format!("{tool}: MCP server {server:?} is unavailable: {reason}")
-        }
-        ServerState::Declared => {
-            unreachable!("the gated call lazy-connects a declared slot before dispatch")
-        }
-        ServerState::Connected { .. } => unreachable!("a live service never errors here"),
-    }
-}
-
 /// Spawn + handshake + enumerate one declared server — the body of
 /// [`ServerSlot::connect`], run under [`CONNECT_TIMEOUT`]. The
 /// `env` additions pass through literally (Spec R10 us-19 — no
@@ -499,6 +503,32 @@ async fn connect_and_enumerate(
         .map(|resource| resource.uri.clone())
         .collect();
     Ok((service, tools, resources))
+}
+
+/// A `resources/read` result → the result text the conversation
+/// carries: text contents joined; a blob reports itself instead of
+/// dumping base64 into the conversation.
+fn render_resource_result(result: ReadResourceResult) -> ToolOutput {
+    let mut parts = Vec::new();
+    for content in &result.contents {
+        match content {
+            rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                parts.push(text.clone())
+            }
+            rmcp::model::ResourceContents::BlobResourceContents { uri, blob, .. } => parts.push(
+                format!(
+                    "[binary resource {uri} — {} base64 characters, contents omitted]",
+                    blob.len()
+                ),
+            ),
+            _ => parts.push(String::from("[unsupported resource content]")),
+        }
+    }
+    if parts.is_empty() {
+        ToolOutput::ok(String::from("the resource returned no contents"))
+    } else {
+        ToolOutput::ok(parts.join("\n"))
+    }
 }
 
 /// A `tools/call` result → the result text the conversation carries:
