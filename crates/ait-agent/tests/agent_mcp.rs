@@ -109,6 +109,27 @@ fn write_mcp_json(xdg: &Path, name: &str, command: &Path, args: &[&str]) {
     .expect("mcp.json");
 }
 
+/// A `{"mcpServers": …}` document with one `name` → `command`+args
+/// entry, written to `<cwd>/.ait/mcp.json` — the project-local
+/// layer (§5.10.1) `project_ait_dir` discovers from the task cwd.
+fn write_project_mcp_json(cwd: &Path, name: &str, command: &Path, args: &[&str]) {
+    let ait_dir = cwd.join(".ait");
+    std::fs::create_dir_all(&ait_dir).expect(".ait dir");
+    let args = args
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("arg"))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(
+        ait_dir.join("mcp.json"),
+        format!(
+            r#"{{"mcpServers":{{"{name}":{{"command":{},"args":[{args}]}}}}}}"#,
+            serde_json::to_string(&command.to_string_lossy()).expect("path")
+        ),
+    )
+    .expect("project mcp.json");
+}
+
 /// A task bound to `cwd`.
 fn task(settings: Settings, cwd: &str) -> AgentRequest {
     AgentRequest {
@@ -593,36 +614,241 @@ fn a_crash_mid_call_surfaces_as_a_tool_error() {
     );
 }
 
-/// Project-tier declarations list in the catalog but never spawn
-/// (Spec R10 us-8 — T4 owns their semantics): the prompt marks the
-/// server as declared-by-`.ait/` and a call against it is a tool
-/// error, so no project code ever runs.
+/// The project-local trust boundary end to end (Spec R10 us-8/9):
+/// a `.ait/mcp.json` server lists in the catalog as
+/// declared-by-the-project and is NOT spawned at task start — the
+/// prompt names no enumerated surface — while the first gated call
+/// connects lazily: the approve card carries the `project .ait/`
+/// origin annotation, and allowing it spawns + initializes +
+/// dispatches under the ordinary timeouts. A second call in the
+/// same task rides the now-live connection, and the NEXT task's
+/// reconcile keeps it — its catalog line upgrades to `available`
+/// and §5.10.3 redaction applies to its results, exactly like a
+/// user-tier server.
 #[test]
-fn project_tier_servers_are_listed_but_never_spawned() {
+fn the_first_allowed_call_connects_a_project_server_lazily() {
     let _lock = xdg_lock();
     let xdg = tempfile::tempdir().expect("xdg");
     std::env::set_var("XDG_CONFIG_HOME", xdg.path());
     // No user-tier mcp.json — only the project layer declares.
     let cwd = tempfile::tempdir().expect("cwd");
-    let ait_dir = cwd.path().join(".ait");
-    std::fs::create_dir_all(&ait_dir).expect(".ait dir");
-    std::fs::write(
-        ait_dir.join("mcp.json"),
-        format!(
-            r#"{{"mcpServers":{{"proj-server":{{"command":{},"args":[]}}}}}}"#,
-            serde_json::to_string(&fixture_bin().to_string_lossy()).expect("path")
-        ),
-    )
-    .expect("project mcp.json");
+    write_project_mcp_json(cwd.path(), "proj", &fixture_bin(), &[]);
+
+    let fixture = Fixture::serve(vec![
+        // Task 1: an allowed call, then a resource read on the
+        // same connection.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "call_mcp_tool",
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "read_mcp_resource",
+            r#"{"server":"proj","uri":"fixture://one"}"#,
+        )])),
+        sse(&chat_text_turn("first task done")),
+        // Task 2: the same server, called again — the connection
+        // reconcile kept — with a credential in the result path.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_3",
+            "call_mcp_tool",
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"AKIAIOSFODNN7EXAMPLE"}}"#,
+        )])),
+        sse(&chat_text_turn("second task done")),
+    ]);
+    let session = session();
+    // `mcp_permissions` unset → the gate asks — the approve card
+    // IS the consent surface for the project-shipped process.
+    session
+        .submit(task(
+            settings(&fixture.base_url, ""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let mut events = Vec::new();
+    let (id, name, summary) = until_approval_collecting(&session, &mut events);
+    assert_eq!(name, "call_mcp_tool");
+    assert_eq!(id, "call_1");
+    // The card names the declaring layer (us-9): this process came
+    // from the repository, not the user's own config.
+    assert_eq!(
+        summary,
+        "proj:echo {\"text\":\"hi\"}\n(declared by the project .ait/mcp.json)"
+    );
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    let (id, name, _) = until_approval_collecting(&session, &mut events);
+    assert_eq!(name, "read_mcp_resource");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    events.extend(collect(&session));
+    assert_eq!(result_of(&events, "call_1"), "echo:hi");
+    assert_eq!(status_of(&events, "call_1"), ToolStatus::Done);
+    assert_eq!(result_of(&events, "call_2"), "FIXTURE-BODY");
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The task-start catalog — captured in request 1 — listed the
+    // server as project-declared with NO enumerated surface: proof
+    // nothing spawned before consent.
+    let first = fixture.captured();
+    assert!(
+        first.body.contains("proj (project .ait/)"),
+        "{}",
+        first.body
+    );
+    assert!(first.body.contains("declared"), "{}", first.body);
+    assert!(
+        !first.body.contains("tools: echo"),
+        "the unconnected server enumerated nothing: {}",
+        first.body
+    );
+
+    // The second task's reconcile keeps the connected slot — the
+    // catalog upgrades it to `available` with the enumerated
+    // surface, and the call's credential-bearing result is redacted
+    // like any user-tier server's (us-9/§5.10.3).
+    session
+        .submit(task(
+            settings(&fixture.base_url, ""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+    let mut events = Vec::new();
+    let (id, _, _) = until_approval_collecting(&session, &mut events);
+    assert_eq!(id, "call_3");
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+    events.extend(collect(&session));
+    assert_eq!(result_of(&events, "call_3"), "echo:[REDACTED]");
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // Requests 2/3 close task 1; request 4 opens task 2 with the
+    // upgraded catalog.
+    fixture.captured();
+    fixture.captured();
+    let fourth = fixture.captured();
+    assert!(
+        fourth.body.contains("proj (project .ait/): available"),
+        "{}",
+        fourth.body.replace("\\n", "\n")
+    );
+    assert!(fourth.body.contains("tools: echo"), "{}", fourth.body);
+    let fifth = fixture.captured();
+    assert!(
+        !fifth.body.contains("echo:AKIAIOSFODNN7EXAMPLE"),
+        "the unredacted project-server result never re-enters: {}",
+        fifth.body
+    );
+    fixture.assert_no_more_requests();
+}
+
+/// A denied call never spawns the project process (Spec R10 us-8 —
+/// the round's one hard guarantee): the `sh -c 'touch MARKER; exec
+/// fixture'` wrapper makes the spawn observable — after a deny the
+/// marker is absent, and the next call's allow still takes the lazy
+/// path and produces it.
+#[test]
+fn a_denied_project_call_never_spawns_the_process() {
+    let _lock = xdg_lock();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+    let cwd = tempfile::tempdir().expect("cwd");
+    let marker = cwd.path().join("spawned");
+    write_project_mcp_json(
+        cwd.path(),
+        "proj",
+        Path::new("sh"),
+        &[
+            "-c",
+            &format!("touch {:?}; exec {:?}", marker, fixture_bin()),
+        ],
+    );
 
     let fixture = Fixture::serve(vec![
         sse(&chat_tool_turn(&[(
             0,
             "call_1",
             "call_mcp_tool",
-            r#"{"server":"proj-server","tool":"echo","arguments":{"text":"hi"}}"#,
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"hi"}}"#,
         )])),
-        sse(&chat_text_turn("understood")),
+        // The model retries after the denial — this call's allow is
+        // where the spawn finally happens.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "call_mcp_tool",
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, ""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let mut events = Vec::new();
+    let (id, _, summary) = until_approval_collecting(&session, &mut events);
+    assert_eq!(id, "call_1");
+    assert!(summary.contains("(declared by the project .ait/mcp.json)"));
+    session
+        .approve(&id, ApprovalVerdict::Deny("I don't trust this repo".into()))
+        .expect("deny");
+
+    // The denial is the tool result, and the process provably never
+    // spawned — the gate refused before `execute` could connect.
+    let (id, _, _) = until_approval_collecting(&session, &mut events);
+    assert_eq!(id, "call_2");
+    assert!(
+        !marker.exists(),
+        "the denied call must never spawn the project process"
+    );
+    session
+        .approve(&id, ApprovalVerdict::AllowOnce)
+        .expect("approve");
+
+    events.extend(collect(&session));
+    assert_eq!(result_of(&events, "call_1"), "I don't trust this repo");
+    assert_eq!(status_of(&events, "call_1"), ToolStatus::Denied);
+    assert_eq!(result_of(&events, "call_2"), "echo:hi");
+    assert!(
+        marker.exists(),
+        "the allowed call lazy-connected and spawned"
+    );
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
+/// `mcp_permissions = "always_allow"` skips the ask but NOT the
+/// lazy connect (Spec R10 us-8): the project server still spawns
+/// only when the first call reaches it — the task-start catalog
+/// lists it declared with no surface — and its ungated card still
+/// carries the `.ait/` origin annotation.
+#[test]
+fn always_allow_connects_project_servers_lazily() {
+    let _lock = xdg_lock();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+    let cwd = tempfile::tempdir().expect("cwd");
+    write_project_mcp_json(cwd.path(), "proj", &fixture_bin(), &[]);
+
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "call_mcp_tool",
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_text_turn("done")),
     ]);
     let session = session();
     session
@@ -633,27 +859,134 @@ fn project_tier_servers_are_listed_but_never_spawned() {
         .expect("submit");
 
     let events = collect(&session);
-    let result = result_of(&events, "call_1");
-    assert!(result.contains("never spawned"), "{result}");
-    assert_eq!(status_of(&events, "call_1"), ToolStatus::Failed);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })),
+        "always_allow never asks: {events:?}"
+    );
+    // The ungated card's summary annotates the declaring layer too.
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolCall { call, summary } if call.id == "call_1" => Some(summary.as_str()),
+            _ => None,
+        })
+        .expect("call_1's ToolCall card");
+    assert!(
+        summary.contains("(declared by the project .ait/mcp.json)"),
+        "{summary}"
+    );
+    assert_eq!(result_of(&events, "call_1"), "echo:hi");
+    assert_eq!(status_of(&events, "call_1"), ToolStatus::Done);
     assert_eq!(events.last(), Some(&AgentEvent::Done));
 
-    // The catalog listed it — origin and availability both visible.
+    // Still lazy: the task-start catalog listed no enumerated
+    // surface — the connect happened inside the call.
     let first = fixture.captured();
-    assert!(first.body.contains("proj-server"), "{}", first.body);
-    assert!(first.body.contains(".ait"), "{}", first.body);
+    assert!(first.body.contains("declared"), "{}", first.body);
     assert!(
-        first.body.contains("declared"),
+        !first.body.contains("tools: echo"),
+        "spawned only on the call, not at task start: {}",
+        first.body
+    );
+}
+
+/// A project server shadows a same-named user server (§5.10.1's
+/// nearest-layer merge): the effective entry is the project's — it
+/// lists as project-declared, stays unconnected at task start, and
+/// the gated call runs the PROJECT command (the user declaration's
+/// spawn would have failed).
+#[test]
+fn a_project_server_shadows_the_same_named_user_server() {
+    let _lock = xdg_lock();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+    // The user layer declares `shared` as an unspawnable command;
+    // the project layer shadows it with the fixture.
+    write_mcp_json(
+        xdg.path(),
+        "shared",
+        Path::new("/nonexistent/ait-mcp-nope"),
+        &[],
+    );
+    let cwd = tempfile::tempdir().expect("cwd");
+    write_project_mcp_json(cwd.path(), "shared", &fixture_bin(), &[]);
+
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "call_mcp_tool",
+            r#"{"server":"shared","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_text_turn("done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "mcp_permissions = \"always_allow\""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let events = collect(&session);
+    // `echo:hi` is the project entry's answer — the user's
+    // /nonexistent command could never produce it.
+    assert_eq!(result_of(&events, "call_1"), "echo:hi");
+    assert_eq!(status_of(&events, "call_1"), ToolStatus::Done);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    let first = fixture.captured();
+    assert!(
+        first.body.contains("shared (project .ait/)"),
         "{}",
-        first.body.replace("\\n", "\n")
+        first.body
     );
-    let second = fixture.captured();
-    assert!(second.body.contains("never spawned"), "{}", second.body);
     assert!(
-        !second.body.contains("echo:hi"),
-        "the project server never ran: {}",
-        second.body
+        !first.body.contains("shared (user config)"),
+        "the project layer shadowed the user entry: {}",
+        first.body
     );
+}
+
+/// A lazily-connected project server degrades exactly like a
+/// user-tier one (Spec R10 us-18): a crash mid-call is a tool
+/// error, never a task wedge.
+#[test]
+fn a_project_server_crash_surfaces_as_a_tool_error() {
+    let _lock = xdg_lock();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+    let cwd = tempfile::tempdir().expect("cwd");
+    write_project_mcp_json(
+        cwd.path(),
+        "proj",
+        &fixture_bin(),
+        &["--exit-on", "tools/call"],
+    );
+
+    let fixture = Fixture::serve(vec![
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "call_mcp_tool",
+            r#"{"server":"proj","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_text_turn("noted")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "mcp_permissions = \"always_allow\""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+
+    let events = collect(&session);
+    assert_eq!(status_of(&events, "call_1"), ToolStatus::Failed);
+    assert!(result_of(&events, "call_1").contains("failed"));
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
 }
 
 /// `agent_decides` works unchanged (Spec R10 us-12): the flag rides
