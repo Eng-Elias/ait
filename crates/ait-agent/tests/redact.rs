@@ -350,6 +350,38 @@ fn each_pii_category_masks_its_specimen() {
     }
 }
 
+/// The `::`-leading IPv6 alternative must not accept zero hex groups:
+/// a bare `::` is Rust path syntax, not an address — `std::io::stdin`
+/// and `ait_config::load_mcp` pass through verbatim while the real
+/// shorthand forms still mask.
+#[test]
+fn pii_ipv6_masks_addresses_but_not_rust_paths() {
+    let redactor = redactor(&[], &["pii_ipv6"], &[]);
+    for input in [
+        "std::io::stdin",
+        "use ait_config::load_mcp",
+        "std::net::Ipv6Addr::LOCALHOST",
+        "let v: Vec::<u8> = Vec::new()",
+    ] {
+        assert_eq!(
+            redactor.redact(input),
+            input,
+            "Rust path syntax must pass through: {input}"
+        );
+    }
+    for (input, expected) in [
+        ("route via ::1", "route via [REDACTED]"),
+        ("route via fe80::1", "route via [REDACTED]"),
+        ("addr 2001:db8::1", "addr [REDACTED]"),
+    ] {
+        assert_eq!(
+            redactor.redact(input),
+            expected,
+            "a real IPv6 shorthand still masks: {input}"
+        );
+    }
+}
+
 /// `extra` user regexes mask what the built-ins miss (§5.10.3,
 /// Spec R10 story 30), alongside the unchanged built-ins.
 #[test]
