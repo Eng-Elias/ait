@@ -69,8 +69,15 @@
 //!   served to `invoke_skill` (gated by `read_files`) as body +
 //!   bundled-file manifest while the skill dirs join `ToolCwd`'s
 //!   read roots.
+//!
+//! Round 11 adds the §5.10.4 input classifier's decision half (Spec
+//! R11-T1): [`classify`] maps the verified input line plus a
+//! [`ProgramIndex`] — the detected shell's builtin table merged with
+//! `$PATH` executable basenames — onto [`InputClass`], conservative
+//! rules keeping every plausible command verbatim.
 
 mod agent_context;
+mod classify;
 mod context;
 mod conversation;
 mod diff;
@@ -91,6 +98,7 @@ mod tools;
 mod transcript;
 
 pub use agent_context::AgentContext;
+pub use classify::{classify, InputClass, ProgramIndex};
 pub use context::{assemble_request, SuggestContext, OUTPUT_LINE_BUDGET};
 pub use executor::{
     select_executor, select_executor_with_program, BridgeError, BridgeEvent, CommandExecutor,

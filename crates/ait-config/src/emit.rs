@@ -38,6 +38,12 @@ pub fn default_template() -> String {
 # osc52            = false            # let child apps write the host clipboard via OSC 52
 # shell_integration = true            # inject OSC 133 + hook events into bash/zsh/fish (default: on)
 
+# Input classifier (§5.10.4): on Enter, a line the heuristic reads as
+# natural language is rewritten to `# <line>` — the request lands in
+# history and the suggestion streams onto the fresh prompt.
+# [input]
+# classifier = "heuristic"   # "heuristic" | "off" (default: heuristic)
+
 # SSH integration (§5.9): sessions started by `ssh` inside an
 # integrated tab get the remote shell bootstrapped with the same
 # snippet, and run_command gains the ControlMaster out-of-band tier.

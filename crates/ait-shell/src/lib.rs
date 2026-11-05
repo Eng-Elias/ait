@@ -20,13 +20,20 @@
 //! the only filesystem access is [`Injection::materialize_in`], which
 //! writes snippet assets into a fresh per-session `0700` temp dir and
 //! never anywhere else (CODING_STANDARDS.md 11).
+//!
+//! Round 11 adds [`builtins_for`] — the per-shell builtin/keyword
+//! tables (shared POSIX set + bash/zsh/fish extras, keyed by shell
+//! name) the §5.10.4 input classifier merges into its program index
+//! (Spec R11-T1).
 
+mod builtins;
 mod codec;
 mod inject;
 mod remote;
 mod run;
 mod snippets;
 
+pub use builtins::builtins_for;
 pub use codec::{
     decode, session_id, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE,
 };
