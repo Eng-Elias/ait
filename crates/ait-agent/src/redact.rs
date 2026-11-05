@@ -112,7 +112,10 @@ const PATTERN_TABLE: &[NamedPattern] = &[
         name: pattern_names::PII_IPV6,
         default_on: false,
         // Full form, compressed (`…::…`), and `::`-leading forms.
-        pattern: r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b|\b(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}:?){0,7}|::(?:[0-9A-Fa-f]{1,4}:?){0,7}\b",
+        // The `::`-leading alternative requires ≥1 hex group — a
+        // bare `::` is Rust path syntax (`std::io::stdin`), not an
+        // address.
+        pattern: r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b|\b(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}:?){0,7}|::(?:[0-9A-Fa-f]{1,4}:?){1,7}\b",
     },
     NamedPattern {
         name: pattern_names::PII_EMAIL,

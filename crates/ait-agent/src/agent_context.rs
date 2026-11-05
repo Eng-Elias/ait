@@ -100,17 +100,12 @@ pub(crate) fn assemble_system_prompt(
             prompt.push('\n');
         }
     }
-    if let Some(mcp_section) = mcp_section {
+    // The optional catalog sections — same append rule each: a
+    // blank line, the section, a terminating newline.
+    for section in [mcp_section, skills_section].into_iter().flatten() {
         prompt.push('\n');
-        prompt.push_str(mcp_section);
-        if !mcp_section.ends_with('\n') {
-            prompt.push('\n');
-        }
-    }
-    if let Some(skills_section) = skills_section {
-        prompt.push('\n');
-        prompt.push_str(skills_section);
-        if !skills_section.ends_with('\n') {
+        prompt.push_str(section);
+        if !section.ends_with('\n') {
             prompt.push('\n');
         }
     }

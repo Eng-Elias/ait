@@ -228,7 +228,8 @@ pub mod pattern_names {
     pub const PII_MAC: &str = "pii_mac";
 
     /// The built-in credential names — the Round 4 minimal set,
-    /// enabled by default.
+    /// enabled by default. The `--init` template's `[redaction]`
+    /// comment is generated from this list.
     pub const BUILTINS: &[&str] = &[
         AWS_ACCESS_KEY,
         GITHUB_TOKEN,
@@ -242,7 +243,8 @@ pub mod pattern_names {
         PRIVATE_KEY_PEM,
     ];
 
-    /// The opt-in PII category names — shipped disabled.
+    /// The opt-in PII category names — shipped disabled. The `--init`
+    /// template's `[redaction]` comment is generated from this list.
     pub const PII: &[&str] = &[PII_IPV4, PII_IPV6, PII_EMAIL, PII_PHONE, PII_MAC];
 
     /// Every name `[redaction]` `enable`/`disable` may resolve to.

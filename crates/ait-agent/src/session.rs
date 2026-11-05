@@ -345,6 +345,65 @@ enum ReplyOutcome<T> {
     Gone,
 }
 
+/// The worker's three reply channels, bundled for the loop (Spec
+/// R06): steering queues user messages between turns, verdicts
+/// answer the approve card's parked wait, answers the ask card's.
+/// The channels live on the worker; the tasks borrow them.
+struct Replies<'a> {
+    /// Steering messages queued while a task runs.
+    steering: &'a Receiver<String>,
+    /// Approve-card verdicts — `(call_id, verdict)` pairs.
+    verdicts: &'a Receiver<(String, ApprovalVerdict)>,
+    /// Ask-card answers — `(call_id, answer)` pairs.
+    answers: &'a Receiver<(String, String)>,
+}
+
+/// The worker's cross-task owned state (Spec R06-T7 / R10-T3): the
+/// lazily-spawned agent PTY and the MCP pool both outlive any one
+/// task — `serve` borrows them whole so their ownership never
+/// leaves the worker thread.
+struct Owned {
+    /// The agent-owned PTY `write_to_pty` drives.
+    agent_pty: AgentPty,
+    /// The session's §5.10.1 MCP connection pool.
+    mcp_pool: McpPool,
+}
+
+/// The per-task environment `serve` builds once and `run_loop`
+/// threads to `gate_and_execute` — bundled so each round's new
+/// collaborator stops adding a parameter apiece: the gate's consult
+/// state (profile, bound cwd, remote flag) plus the task's
+/// executors, catalogs and redactor. Every borrow lives exactly one
+/// task.
+struct TaskEnv<'a> {
+    /// The task's armed profile — the permission engine's consult
+    /// input; `None` arms the missing-profile fail-safe.
+    profile: Option<&'a ExecutionProfile>,
+    /// The armed profile's name — the profile-denial text's
+    /// `<name>` and the model-role resolution key.
+    profile_name: &'a str,
+    /// The file tools' bound cwd ∪ allowlist ∪ skill dirs.
+    cwd: &'a ToolCwd,
+    /// The session's agent-owned PTY (`write_to_pty`).
+    agent_pty: &'a mut AgentPty,
+    /// `run_command`'s §5.9 executor — the remote read tools ride
+    /// it too.
+    executor: &'a mut dyn CommandExecutor,
+    /// The session's MCP pool — `call_mcp_tool`/`read_mcp_resource`'s
+    /// connections.
+    mcp_pool: &'a mut McpPool,
+    /// The request's skills snapshot — `invoke_skill`'s source.
+    skills: &'a SkillsCatalog,
+    /// `true` on a remote (ssh) task — the read tools dispatch
+    /// through the executor and `edit_files` refuses honestly.
+    remote: bool,
+    /// The request's §5.10.3 redactor — every tool result's filter.
+    redactor: &'a Redactor,
+    /// The task's cancellation token — Esc's reach into the parked
+    /// waits and in-flight streams.
+    cancel: &'a CancellationToken,
+}
+
 /// The synchronous handle the frontend holds — one agent conversation
 /// per `Tab` (Spec R06 us: per-tab ownership). One in-flight task at a
 /// time is the frontend's contract; queued tasks run in order on the
@@ -566,62 +625,60 @@ fn worker(
             return;
         }
     };
-    // The agent-owned PTY `write_to_pty` drives (Spec R06-T7): lazy —
-    // nothing spawns until a call reaches it — and shared across this
-    // conversation's tasks so an interactive session outlives the task
-    // that opened it. It drops when the worker exits, which is what
-    // makes a closing tab kill the spawned child: `AgentSession`'s
-    // Drop closes these channels and joins this thread.
-    let mut agent_pty = AgentPty::new();
-    // The §5.10.1 MCP pool (Spec R10-T3): like `agent_pty` it lives
-    // on this worker across the session's tasks — `serve` reconciles
-    // it against the merged mcp.json per task, so an unchanged
-    // user-tier server keeps its connection between tasks while a
-    // failed one retries. Every rmcp value is created and dropped
-    // inside `runtime.block_on` (rmcp's child cleanup spawns a
-    // task), which is why the pool drains inside the final
-    // `block_on` below rather than dropping bare.
-    let mut mcp_pool = McpPool::new();
+    // The agent-owned PTY `write_to_pty` drives (Spec R06-T7) and
+    // the §5.10.1 MCP pool (Spec R10-T3) — both lazy and shared
+    // across this conversation's tasks, so they live on the worker
+    // (`serve` reconciles the pool against the merged mcp.json per
+    // task; an unchanged user-tier server keeps its connection
+    // between tasks while a failed one retries). Every rmcp value
+    // is created and dropped inside `runtime.block_on` (rmcp's
+    // child cleanup spawns a task), which is why the pool drains
+    // inside the final `block_on` below rather than dropping bare.
+    // The PTY's drop is what makes a closing tab kill its spawned
+    // child: `AgentSession`'s Drop closes these channels and joins
+    // this thread.
+    let replies = Replies {
+        steering: &steering,
+        verdicts: &verdicts,
+        answers: &answers,
+    };
+    let mut owned = Owned {
+        agent_pty: AgentPty::new(),
+        mcp_pool: McpPool::new(),
+    };
     while let Ok(request) = requests.recv() {
         // Spec R09-T3: the agent-owned shell's `ssh()` reads the
         // task's armed `[ssh]` policy — refreshed per request so a
         // hot-reloaded settings file reaches the next spawn.
-        agent_pty.arm_ssh(&request.settings.ssh);
+        owned.agent_pty.arm_ssh(&request.settings.ssh);
         serve(
             &runtime,
             request,
-            &steering,
-            &verdicts,
-            &answers,
+            &replies,
             &events,
             &in_flight,
             store.as_ref(),
-            &mut agent_pty,
-            &mut mcp_pool,
+            &mut owned,
         );
     }
     // The request channel closed — shut the pool down inside the
     // runtime so every child process dies cleanly before the
     // worker's thread (and its runtime) exits.
-    runtime.block_on(mcp_pool.drain());
+    runtime.block_on(owned.mcp_pool.drain());
 }
 
 /// One task: resolve `coding_model` → build the endpoint → assemble
 /// the system prompt and per-schema conversation → run the model
 /// loop. Every failure maps to a single terminal event; `Done` is
 /// emitted only when nothing failed.
-#[allow(clippy::too_many_arguments)]
 fn serve(
     runtime: &tokio::runtime::Runtime,
     request: AgentRequest,
-    steering: &Receiver<String>,
-    verdicts: &Receiver<(String, ApprovalVerdict)>,
-    answers: &Receiver<(String, String)>,
+    replies: &Replies<'_>,
     events: &Sender<AgentEvent>,
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
-    agent_pty: &mut AgentPty,
-    mcp_pool: &mut McpPool,
+    owned: &mut Owned,
 ) {
     // The worker's transcript mirror (R08-T7): seeded from `prior`
     // verbatim — those items were folded when first recorded — then
@@ -682,7 +739,7 @@ fn serve(
     // catalog it returns feeds the system prompt's "MCP servers"
     // section; a malformed file or a failed connect degrades to the
     // catalog, never to a task error.
-    let mcp_catalog = runtime.block_on(mcp_pool.reconcile(Path::new(&request.context.cwd)));
+    let mcp_catalog = runtime.block_on(owned.mcp_pool.reconcile(Path::new(&request.context.cwd)));
     // The task's §5.10.3 redactor (Spec R10): built once from the
     // request's `[redaction]` snapshot, applied at context assembly
     // and to every tool result — a settings hot-reload takes effect
@@ -718,7 +775,11 @@ fn serve(
     conversation.push_user(request.task);
     // Steering that queued while the worker was idle joins this task's
     // conversation rather than being dropped.
-    drain_steering(steering, &mut conversation, &mut events.mirror.borrow_mut());
+    drain_steering(
+        replies.steering,
+        &mut conversation,
+        &mut events.mirror.borrow_mut(),
+    );
     // The task's file tools bind to the session's cwd ∪ the active
     // profile's normalized `directory_allowlist` roots (§5.7,
     // R07-T4): a missing profile or an empty list confines to cwd
@@ -767,24 +828,27 @@ fn serve(
             .unwrap_or(0),
         resolved.model.context_window,
     );
+    // The task's environment — bundled so the loop threads one value
+    // through to the gate instead of a parameter per collaborator.
+    let mut env = TaskEnv {
+        profile,
+        profile_name: &request.profile,
+        cwd: &cwd,
+        agent_pty: &mut owned.agent_pty,
+        executor: executor.as_mut(),
+        mcp_pool: &mut owned.mcp_pool,
+        skills: &request.skills,
+        remote,
+        redactor: &redactor,
+        cancel: &token,
+    };
     runtime.block_on(run_loop(
         &endpoint,
         &mut conversation,
         &system,
-        steering,
-        verdicts,
-        answers,
-        &cwd,
-        profile,
-        &request.profile,
+        replies,
+        &mut env,
         context_limit,
-        agent_pty,
-        executor.as_mut(),
-        mcp_pool,
-        &request.skills,
-        remote,
-        &redactor,
-        token,
         &events,
     ));
     slot(in_flight).take();
@@ -804,25 +868,13 @@ fn serve(
 /// the serialized-item chars/4 heuristic — is measured against
 /// [`SUMMARIZE_AT`]; crossing it fires one summarize call and the
 /// oldest half of the transcript becomes a `summary` marker.
-#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     endpoint: &Endpoint,
     conversation: &mut Conversation,
     system: &str,
-    steering: &Receiver<String>,
-    verdicts: &Receiver<(String, ApprovalVerdict)>,
-    answers: &Receiver<(String, String)>,
-    cwd: &ToolCwd,
-    profile: Option<&ExecutionProfile>,
-    profile_name: &str,
+    replies: &Replies<'_>,
+    env: &mut TaskEnv<'_>,
     context_limit: Option<usize>,
-    agent_pty: &mut AgentPty,
-    executor: &mut dyn CommandExecutor,
-    mcp_pool: &mut McpPool,
-    skills: &SkillsCatalog,
-    remote: bool,
-    redactor: &Redactor,
-    cancel: CancellationToken,
     events: &EventSink<'_>,
 ) {
     let mut turns = 0usize;
@@ -853,7 +905,9 @@ async fn run_loop(
                 None => conversation.estimated_tokens(),
             };
             if estimate as f64 >= limit as f64 * SUMMARIZE_AT {
-                match summarize_context(endpoint, conversation, profile, &cancel, events).await {
+                match summarize_context(endpoint, conversation, env.profile, env.cancel, events)
+                    .await
+                {
                     SummarizeOutcome::Summarized => reported = None,
                     SummarizeOutcome::NoSpan => {}
                     SummarizeOutcome::Unavailable => context_limit = None,
@@ -865,7 +919,7 @@ async fn run_loop(
             }
         }
         let request = conversation.request(&endpoint.config().model, system);
-        match stream_turn(endpoint, request, cancel.clone(), events).await {
+        match stream_turn(endpoint, request, env.cancel.clone(), events).await {
             TurnOutcome::EndTurn { text, calls, usage } => {
                 turns += 1;
                 if let Some(tokens) = usage {
@@ -876,7 +930,11 @@ async fn run_loop(
                     // A steering message queued during the stream
                     // becomes a user message on the next request —
                     // the run continues instead of finishing.
-                    if drain_steering(steering, conversation, &mut events.mirror.borrow_mut()) {
+                    if drain_steering(
+                        replies.steering,
+                        conversation,
+                        &mut events.mirror.borrow_mut(),
+                    ) {
                         continue;
                     }
                     events.emit(AgentEvent::Done);
@@ -889,28 +947,11 @@ async fn run_loop(
                 conversation.push_tool_calls(&text, &calls);
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
-                    if cancel.is_cancelled() {
+                    if env.cancel.is_cancelled() {
                         events.emit(AgentEvent::Cancelled);
                         return;
                     }
-                    match gate_and_execute(
-                        call,
-                        profile,
-                        profile_name,
-                        &mut allowed_for_task,
-                        verdicts,
-                        answers,
-                        cwd,
-                        agent_pty,
-                        executor,
-                        mcp_pool,
-                        skills,
-                        remote,
-                        redactor,
-                        &cancel,
-                        events,
-                    )
-                    .await
+                    match gate_and_execute(call, env, replies, &mut allowed_for_task, events).await
                     {
                         Some(result) => results.push(result),
                         None => return,
@@ -919,7 +960,11 @@ async fn run_loop(
                 conversation.push_tool_results(&calls, &results);
                 // Steering queued during the tool turn rides the next
                 // request beside the results.
-                drain_steering(steering, conversation, &mut events.mirror.borrow_mut());
+                drain_steering(
+                    replies.steering,
+                    conversation,
+                    &mut events.mirror.borrow_mut(),
+                );
             }
             TurnOutcome::Cancelled => {
                 events.emit(AgentEvent::Cancelled);
@@ -1029,33 +1074,22 @@ async fn summarize_context(
 /// result carries — the executor's (redacted) output, or a denial
 /// text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
-#[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — the profile engine swaps the policy, not the plumbing
 async fn gate_and_execute(
     call: &ToolCall,
-    profile: Option<&ExecutionProfile>,
-    profile_name: &str,
+    env: &mut TaskEnv<'_>,
+    replies: &Replies<'_>,
     allowed_for_task: &mut HashSet<String>,
-    verdicts: &Receiver<(String, ApprovalVerdict)>,
-    answers: &Receiver<(String, String)>,
-    cwd: &ToolCwd,
-    agent_pty: &mut AgentPty,
-    executor: &mut dyn CommandExecutor,
-    mcp_pool: &mut McpPool,
-    skills: &SkillsCatalog,
-    remote: bool,
-    redactor: &Redactor,
-    cancel: &CancellationToken,
     events: &EventSink<'_>,
 ) -> Option<String> {
     // The consult point Spec R06 built the engine swap for: the
     // verdict, not the plumbing, is what profiles change.
-    let verdict = permissions::evaluate(profile, profile_name, call, allowed_for_task);
+    let verdict = permissions::evaluate(env.profile, env.profile_name, call, allowed_for_task);
     // `ask_user_question` at a non-`never` level never gates and
     // never executes — its own card IS the ask (us-10): it suspends
     // on the answer channel and the reply becomes the call's tool
     // result. `never` falls through to the profile denial below.
     if call.name == tools::ASK_USER_QUESTION && !matches!(verdict, Verdict::Deny(_)) {
-        return ask_and_answer(call, answers, cancel, events);
+        return ask_and_answer(call, replies.answers, env.cancel, events);
     }
     // `update_plan` is exempt the same way (Spec R08 us-16): §5.7
     // maps no profile field to it, so `verdict` is always `Allow`
@@ -1074,8 +1108,8 @@ async fn gate_and_execute(
     // there is no local plan to render — remote writes are out of
     // scope (Spec R09-T6) and `execute`'s honest refusal is both the
     // card summary and the tool result.
-    let plan = match (call.name.as_str(), remote) {
-        ("edit_files", false) => Some(tools::plan_edit(call, cwd)),
+    let plan = match (call.name.as_str(), env.remote) {
+        ("edit_files", false) => Some(tools::plan_edit(call, env.cwd)),
         _ => None,
     };
     let summary = match &plan {
@@ -1088,7 +1122,7 @@ async fn gate_and_execute(
         // server — a project `.ait/` entry asks the user to run code
         // the repository shipped, which reads very differently from
         // a server the user's own config declared.
-        None => match mcp_origin(call, mcp_pool) {
+        None => match mcp_origin(call, env.mcp_pool) {
             Some(McpServerOrigin::Project) => format!(
                 "{}\n(declared by the project .ait/mcp.json)",
                 tools::summarize_args(call)
@@ -1127,7 +1161,7 @@ async fn gate_and_execute(
             return Some(reason);
         }
         Verdict::Ask { first_write } => {
-            match await_reply(verdicts, &call.id, cancel) {
+            match await_reply(replies.verdicts, &call.id, env.cancel) {
                 // `ask_on_first_write` (us-11/12): under it *allow
                 // once* is the interactive session's consent — the
                 // first write's allow covers the tool for the rest
@@ -1182,22 +1216,29 @@ async fn gate_and_execute(
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
         None => match call.name.as_str() {
-            tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE => mcp_pool.execute(call).await,
-            tools::INVOKE_SKILL => skills.invoke_call(call),
-            _ => tools::execute(call, cwd, agent_pty, executor, remote, cancel),
+            tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE => env.mcp_pool.execute(call).await,
+            tools::INVOKE_SKILL => env.skills.invoke_call(call),
+            _ => tools::execute(
+                call,
+                env.cwd,
+                env.agent_pty,
+                env.executor,
+                env.remote,
+                env.cancel,
+            ),
         },
     };
     // A run cut short by Esc reports its own tool error — but the
     // task is over: emit `Cancelled` rather than re-entering the loop
     // for one more doomed request.
-    if cancel.is_cancelled() {
+    if env.cancel.is_cancelled() {
         events.emit(AgentEvent::Cancelled);
         return None;
     }
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
     // preview comes from the same redacted text.
-    let text = redactor.redact(&output.text);
+    let text = env.redactor.redact(&output.text);
     events.emit(AgentEvent::ToolUpdate {
         call_id: call.id.clone(),
         status: if output.is_error {
@@ -1215,14 +1256,7 @@ async fn gate_and_execute(
 /// us-9's card annotation) — `None` for non-MCP calls, undeclared
 /// servers and unparseable arguments alike.
 fn mcp_origin(call: &ToolCall, pool: &McpPool) -> Option<McpServerOrigin> {
-    if !matches!(
-        call.name.as_str(),
-        tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE
-    ) {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
-    pool.origin_of(args.get("server")?.as_str()?)
+    pool.origin_of(&tools::mcp_target(call)?.server)
 }
 
 /// The `ask_user_question` flow (us-10): emit the call's own card —

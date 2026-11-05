@@ -58,7 +58,7 @@ pub use error::ConfigError;
 pub use load::{load, load_from, settings_path};
 pub use mcp::{
     load_mcp, mcp_path, project_ait_dir, McpConfig, McpServer, McpServerEntry, McpServerOrigin,
-    McpServers,
+    McpServers, PROJECT_LAYER_LABEL, USER_LAYER_LABEL,
 };
 pub use resolve::{ModelRole, ResolvedModel};
 #[cfg(feature = "secrets")]

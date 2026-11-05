@@ -1056,6 +1056,90 @@ fn agent_decides_honors_the_safety_flag_on_mcp_calls() {
     assert!(first.body.contains("safety"), "{}", first.body);
 }
 
+/// ADR-0006 keep-last-good (Spec R10 us-4's "the terminal keeps
+/// working"): a malformed `mcp.json` saved mid-session must not
+/// drain healthy connections — the reconcile keeps the last working
+/// pool, the server stays callable on its live transport, and the
+/// `ConfigError` still surfaces: the catalog's `load_error` line
+/// rides the next task's prompt (the frontend toasts the same error
+/// at its submit seam).
+#[test]
+fn a_malformed_mcp_json_keeps_the_healthy_connections() {
+    let _lock = xdg_lock();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+    write_mcp_json(xdg.path(), "fixture", &fixture_bin(), &[]);
+    let cwd = tempfile::tempdir().expect("cwd");
+
+    let fixture = Fixture::serve(vec![
+        // Task 1: one call on the eager connection.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_1",
+            "call_mcp_tool",
+            r#"{"server":"fixture","tool":"echo","arguments":{"text":"hi"}}"#,
+        )])),
+        sse(&chat_text_turn("first task done")),
+        // Task 2 — submitted after the file went bad: the same call
+        // must still run on the kept connection.
+        sse(&chat_tool_turn(&[(
+            0,
+            "call_2",
+            "call_mcp_tool",
+            r#"{"server":"fixture","tool":"echo","arguments":{"text":"still up"}}"#,
+        )])),
+        sse(&chat_text_turn("second task done")),
+    ]);
+    let session = session();
+    session
+        .submit(task(
+            settings(&fixture.base_url, "mcp_permissions = \"always_allow\""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+    let events = collect(&session);
+    assert_eq!(result_of(&events, "call_1"), "echo:hi");
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // Break the file mid-session — the next task's reconcile fails
+    // `load_mcp`.
+    std::fs::write(xdg.path().join("ait").join("mcp.json"), "{not json").expect("corrupt mcp.json");
+
+    session
+        .submit(task(
+            settings(&fixture.base_url, "mcp_permissions = \"always_allow\""),
+            cwd.path().to_str().expect("utf-8 tempdir"),
+        ))
+        .expect("submit");
+    let events = collect(&session);
+    // Keep-last-good: the pool was NOT drained — the call answers
+    // on the live transport rather than degrading to "no MCP server
+    // named fixture".
+    assert_eq!(result_of(&events, "call_2"), "echo:still up");
+    assert_eq!(status_of(&events, "call_2"), ToolStatus::Done);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    // The error still surfaces — task 2's opening request (the
+    // third captured) carries the catalog's load-error line — and
+    // the kept server still lists its live surface.
+    fixture.captured();
+    fixture.captured();
+    let third = fixture.captured();
+    assert!(
+        third.body.contains("mcp.json failed to load"),
+        "the malformed file must surface in the prompt: {}",
+        third.body
+    );
+    assert!(
+        third.body.contains("fixture (user config): available"),
+        "the kept connection stays listed: {}",
+        third.body
+    );
+    // Task 2's closing turn is the fourth and last request.
+    fixture.captured();
+    fixture.assert_no_more_requests();
+}
+
 /// The deny verdict's text reaches the model as the tool result —
 /// the existing approve-card flow, unchanged for MCP calls
 /// (Spec R10 us-8/12).

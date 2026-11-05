@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::settings::pattern_names;
 use crate::ConfigError;
 #[cfg(feature = "schema")]
 use crate::Settings;
@@ -15,6 +16,11 @@ use crate::Settings;
 /// profile as the safe starting point.
 pub fn default_template() -> String {
     let config_key = uuid::Uuid::new_v4();
+    // The [redaction] comment names the toggle vocabulary from the
+    // name table itself — a renamed or added pattern can never drift
+    // from what the template documents (CODING_STANDARDS §17).
+    let builtins = pattern_names::BUILTINS.join(", ");
+    let pii = pattern_names::PII.join(", ");
     format!(
         r#"# AIT settings
 #
@@ -45,12 +51,10 @@ pub fn default_template() -> String {
 #                                       # ControlPath config (default: on)
 
 # Secret redaction (§5.10.3): the named patterns masking credentials
-# and PII before terminal output reaches a provider. The built-ins —
-# aws_access_key, github_token, github_pat, openai_key, anthropic_key,
-# stripe_key, slack_token, slack_app, jwt, private_key_pem — ship
-# enabled; the PII categories — pii_ipv4, pii_ipv6, pii_email,
-# pii_phone, pii_mac — ship disabled. A name in both enable and
-# disable is a load error.
+# and PII before terminal output reaches a provider.
+#   built-ins (ship enabled):           {builtins}
+#   PII categories (opt-in, disabled):  {pii}
+# A name in both enable and disable is a load error.
 # [redaction]
 # extra   = []            # your own regexes, e.g. ['\btoken-[A-Z0-9]{{8}}']
 # enable  = []            # opt in: the pii_* categories

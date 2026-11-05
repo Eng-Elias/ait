@@ -42,6 +42,7 @@ use crate::agent_panel::{context_for, edit_input, AgentPanel};
 use crate::blocks::{
     row_hash, seal_fingerprint, Block, BlockAssembler, BlockStatus, PersistedBlock,
 };
+use crate::config::mcp_error_text;
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
 use crate::remote::RemoteContext;
@@ -917,9 +918,20 @@ impl Tab {
         // project layer. What the model sees is what the request
         // carried; a malformed SKILL.md is skipped and toasted,
         // never silent.
-        let skills = skills.snapshot(Path::new(&context.cwd));
-        if !skills.errors().is_empty() {
-            *toast = Some(Toast::new(skipped_text(skills.errors()), Instant::now()));
+        let catalog = skills.snapshot(Path::new(&context.cwd));
+        if !catalog.errors().is_empty() {
+            *toast = Some(Toast::new(skipped_text(catalog.errors()), Instant::now()));
+        }
+        // §5.10.1 (Spec R10 us-4): the per-task `mcp.json` re-read is
+        // the file's only reload seam — the worker's reconcile sees
+        // the same `ConfigError` and records it in the catalog for
+        // the prompt, but the user-facing toast is the frontend's
+        // job: run the same load here so a malformed file surfaces
+        // naming its path instead of silently reading as "no
+        // servers". The catalog keeps last-good connections either
+        // way (ADR-0006).
+        if let Err(error) = ait_config::load_mcp(Path::new(&context.cwd)) {
+            *toast = Some(Toast::new(mcp_error_text(&error), Instant::now()));
         }
         let request = AgentRequest {
             settings: settings.clone(),
@@ -927,7 +939,7 @@ impl Tab {
             task,
             prior,
             context,
-            skills,
+            skills: catalog,
             bridge: self
                 .bridge
                 .as_ref()
@@ -1676,7 +1688,17 @@ fn title_for(options: &LiveSessionOptions) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    /// `XDG_CONFIG_HOME` is process-global — tests that point it at
+    /// a fixture serialize on this so two writers never race it.
+    static XDG: Mutex<()> = Mutex::new(());
+
+    /// Take the env lock, surviving a poisoned guard.
+    fn xdg_lock() -> std::sync::MutexGuard<'static, ()> {
+        XDG.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Generous bound for every wait below (mirrors ait-term's live
     /// tests): tiny `/bin/sh` runs finish far under it even on a loaded
@@ -3768,6 +3790,7 @@ mod tests {
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
+        let mut skills = LiveSkills::unwatched();
         let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         let staged = |id: &str| ait_agent::AgentEvent::ApprovalRequest {
             call: ait_agent::ToolCall {
@@ -3788,7 +3811,7 @@ mod tests {
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3801,7 +3824,7 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3817,7 +3840,7 @@ mod tests {
                 &key(KeyCode::Char(c)),
                 &settings,
                 "default",
-                &mut LiveSkills::unwatched(),
+                &mut skills,
                 &mut toast,
             );
         }
@@ -3831,7 +3854,7 @@ mod tests {
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3847,14 +3870,14 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3867,21 +3890,21 @@ mod tests {
             &key(KeyCode::Char('x')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3894,7 +3917,7 @@ mod tests {
             &key(KeyCode::Char('a')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(!tab.agent.as_ref().unwrap().awaiting_verdict());
@@ -3905,7 +3928,7 @@ mod tests {
             &key(KeyCode::Char('d')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert_eq!(tab.agent.as_ref().unwrap().input(), "d");
@@ -3922,6 +3945,7 @@ mod tests {
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
+        let mut skills = LiveSkills::unwatched();
         let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         let ask = |id: &str, choices: &[&str]| ait_agent::AgentEvent::AskRequest {
             call: ait_agent::ToolCall {
@@ -3945,21 +3969,21 @@ mod tests {
             &key(KeyCode::Char('x')),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Left),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Backspace),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -3971,14 +3995,14 @@ mod tests {
             &key(KeyCode::Down),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         tab.agent_key(
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -4000,7 +4024,7 @@ mod tests {
                 &key(KeyCode::Char(c)),
                 &settings,
                 "default",
-                &mut LiveSkills::unwatched(),
+                &mut skills,
                 &mut toast,
             );
         }
@@ -4010,7 +4034,7 @@ mod tests {
             &key(KeyCode::Down),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         assert!(tab.agent.as_ref().unwrap().awaiting_answer());
@@ -4018,7 +4042,7 @@ mod tests {
             &key(KeyCode::Enter),
             &settings,
             "default",
-            &mut LiveSkills::unwatched(),
+            &mut skills,
             &mut toast,
         );
         {
@@ -4031,5 +4055,47 @@ mod tests {
             ));
             assert_eq!(panel.input(), "", "the answer consumed the input");
         }
+    }
+
+    /// Spec R10 us-4: a malformed `mcp.json` surfaces as a toast
+    /// naming the offending path at the submit seam — the same
+    /// per-task re-read the worker's reconcile runs (whose
+    /// `load_error` is the model's view of the failure, kept in the
+    /// prompt's catalog section).
+    #[test]
+    fn a_malformed_mcp_json_toasts_at_submit() {
+        let _lock = xdg_lock();
+        let dirs = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", dirs.path().join("xdg"));
+        let cwd = dirs.path().join("work");
+        let ait_dir = cwd.join(".ait");
+        std::fs::create_dir_all(&ait_dir).unwrap();
+        std::fs::write(ait_dir.join("mcp.json"), "{not json").unwrap();
+
+        let mut manager = manager(1, cwd.to_str().unwrap());
+        let mut toast = None;
+        let settings = Settings::default();
+        let mut skills = LiveSkills::unwatched();
+        let tab = manager.active_mut().unwrap();
+        tab.toggle_agent_panel();
+        tab.submit_agent_task(
+            &settings,
+            "default",
+            "do it".to_string(),
+            &mut skills,
+            &mut toast,
+        );
+
+        let toast = toast.expect("the malformed mcp.json toasted");
+        assert!(
+            toast.text().starts_with("mcp.json failed to load:"),
+            "the toast labels the file: {}",
+            toast.text()
+        );
+        assert!(
+            toast.text().contains(".ait"),
+            "the toast names the offending path: {}",
+            toast.text()
+        );
     }
 }
