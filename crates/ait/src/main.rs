@@ -57,6 +57,7 @@ enum Command {
     /// `--version` / `-V`.
     Version,
     /// `--help` / `-h`.
+    Help,
     /// `--init` — `force` spells `--init --force` (the overwrite form).
     Init { force: bool },
     /// `--print-schema`.
