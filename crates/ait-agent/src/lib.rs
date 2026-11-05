@@ -78,7 +78,7 @@ pub use executor::{
     CommandResult, ControlMasterExecutor, DemotingExecutor, DetachedExecutor, ExecutorError,
     RemoteState, ShellBridge, ShellIntegration, UserShellExecutor,
 };
-pub use redact::redact;
+pub use redact::{redact, Redactor};
 pub use sanitize::{sanitize_reply, ReplySanitizer};
 pub use session::{
     result_preview, AgentError, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict,
