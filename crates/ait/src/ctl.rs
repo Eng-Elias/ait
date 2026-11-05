@@ -12,7 +12,7 @@
 //!   `send`, `last_block`);
 //! - [`CtlServer`] — a nonblocking `UnixListener` on
 //!   `${XDG_RUNTIME_DIR}/ait/<pid>.sock` (`$TMPDIR/ait-<uid>` fallback,
-//!   the same rule `ait_shell::ssh_control_dir` uses): parent dir
+//!   the shared `ait_shell::ait_runtime_dir` rule): parent dir
 //!   `0700`, socket `0600`, unlinked on clean exit and re-bound over a
 //!   stale file on start. Accepted connections buffer across app
 //!   ticks, so a request line can never wedge the UI;
@@ -108,8 +108,9 @@ fn send_enter() -> bool {
 }
 
 /// One sealed block's read-back payload — the `last_block` response
-/// body and the client's `--command`/`--exit`/`--output` source.
-/// `exit` is the `OSC 133;D` code: `null` when `D` carried none.
+/// body and the source of the client's `--command`/`--exit` selectors
+/// (no flag prints `output`). `exit` is the `OSC 133;D` code: `null`
+/// when `D` carried none.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockReadout {
@@ -316,11 +317,6 @@ fn which_tab(named: bool, tab: &Tab, what: &str) -> String {
 // Server: the per-instance control socket drained on the app tick.
 // ------------------------------------------------------------------
 
-/// The `ait` dir under `$XDG_RUNTIME_DIR` every ait-owned runtime dir
-/// shares (`ait/ssh` for ControlMaster sockets, `<pid>.sock` here).
-#[cfg(unix)]
-const SOCKET_DIR_NAME: &str = "ait";
-
 /// Bound on one buffered request/response line — a peer that never
 /// finishes its line can't grow memory unboundedly; past this the
 /// connection gets a `{"ok":false}` and closes.
@@ -338,27 +334,13 @@ const PENDING_TTL: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The dir this instance's socket lives under — `$XDG_RUNTIME_DIR/ait`
-/// when the runtime dir is set and non-empty, else
-/// `$TMPDIR/ait-<uid>` — the same per-user fallback
-/// `ait_shell::ssh_control_dir` uses (a shared `/tmp/ait` would lock
-/// every later user out at `0700`).
+/// The dir this instance's socket lives under — the shared runtime-dir
+/// rule [`ait_shell::ait_runtime_dir`] owns (`$XDG_RUNTIME_DIR/ait`,
+/// else the per-user `$TMPDIR/ait-<uid>`): the same `ait` dir
+/// `ait/ssh` ControlMaster sockets live beside.
 #[cfg(unix)]
 fn ctl_dir(runtime_dir: Option<&OsStr>) -> PathBuf {
-    runtime_dir
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .map(|dir| dir.join(SOCKET_DIR_NAME))
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("ait-{}", owner_uid())))
-}
-
-/// The owning uid for the fallback dir name — the real uid on unix;
-/// `$USER`/`$USERNAME` elsewhere (the path only needs a stable
-/// per-user token, never a security check).
-#[cfg(unix)]
-fn owner_uid() -> u32 {
-    // SAFETY: getuid is always safe to call.
-    unsafe { libc::getuid() }
+    ait_shell::ait_runtime_dir(runtime_dir, None)
 }
 
 /// `path` at `mode` — the spec's permissions (dir `0700`, socket
@@ -763,9 +745,12 @@ fn choose(
 }
 
 /// Where `ait ctl` connects: `AIT_CTL_SOCKET` when set (a spawned
-/// session's own instance), else the single `*.sock` under the
+/// session's own instance), else the single LIVE `*.sock` under the
 /// resolved ctl dir — zero is "no running ait instance", several an
-/// error listing each candidate (us-32).
+/// error listing each candidate (us-32). A `kill -9`'d ait leaves
+/// its socket file behind, so each candidate is probed with a
+/// connect (a dead socket refuses instantly); stale files are
+/// unlinked and never counted.
 #[cfg(unix)]
 fn resolve_socket(
     socket_env: Option<&OsStr>,
@@ -785,6 +770,19 @@ fn resolve_socket(
         })
         .unwrap_or_default();
     sockets.sort();
+    // Liveness probe: a bound-but-dead socket fails `connect` with
+    // ECONNREFUSED immediately — the probe costs a local syscall,
+    // the reclaimed file saves every later scan the re-probe, and a
+    // successful probe's connection closes unanswered (the server's
+    // pending-connection TTL reaps it).
+    sockets.retain(|path| {
+        if UnixStream::connect(path).is_ok() {
+            true
+        } else {
+            let _ = std::fs::remove_file(path);
+            false
+        }
+    });
     match sockets.len() {
         0 => Err("no running ait instance".to_owned()),
         1 => Ok(sockets.remove(0)),
@@ -1459,8 +1457,10 @@ mod tests {
     }
 
     /// Socket resolution (us-32): `AIT_CTL_SOCKET` wins; under the
-    /// ctl dir zero sockets is "no running ait instance", one is it,
-    /// several is a candidate listing.
+    /// ctl dir zero LIVE sockets is "no running ait instance", one
+    /// live socket is it, several is a candidate listing — and a
+    /// stale file a killed ait left behind is probed out and
+    /// unlinked, never counted.
     #[cfg(unix)]
     #[test]
     fn resolve_socket_env_then_dir_scan() {
@@ -1475,17 +1475,39 @@ mod tests {
         let none = resolve_socket(None, Some(dir.path().as_os_str())).unwrap_err();
         assert_eq!(none, "no running ait instance");
 
-        // One → it.
         let ait_dir = dir.path().join("ait");
         std::fs::create_dir_all(&ait_dir).unwrap();
-        std::fs::write(ait_dir.join("111.sock"), b"").unwrap();
+
+        // A lone stale file probes dead, gets unlinked and reports
+        // exactly like an empty dir — not "can't reach".
+        std::fs::write(ait_dir.join("999.sock"), b"").unwrap();
+        let stale = resolve_socket(None, Some(dir.path().as_os_str())).unwrap_err();
+        assert_eq!(stale, "no running ait instance");
+        assert!(
+            !ait_dir.join("999.sock").exists(),
+            "the probe reclaims the stale file"
+        );
+
+        // One live listener → it. The binding stays alive in `_one`
+        // for the rest of the test (`let _ =` would drop it now).
+        let _one = UnixListener::bind(ait_dir.join("111.sock")).unwrap();
         assert_eq!(
             resolve_socket(None, Some(dir.path().as_os_str())).unwrap(),
             ait_dir.join("111.sock")
         );
 
-        // Several → the error lists each candidate.
-        std::fs::write(ait_dir.join("222.sock"), b"").unwrap();
+        // A stale file beside the live socket is skipped — live +
+        // stale still connects to the live one, not "several".
+        std::fs::write(ait_dir.join("000.sock"), b"").unwrap();
+        assert_eq!(
+            resolve_socket(None, Some(dir.path().as_os_str())).unwrap(),
+            ait_dir.join("111.sock"),
+            "a dead sibling never reaches the several-error"
+        );
+        assert!(!ait_dir.join("000.sock").exists());
+
+        // Two live sockets → the error lists each candidate.
+        let _two = UnixListener::bind(ait_dir.join("222.sock")).unwrap();
         let several = resolve_socket(None, Some(dir.path().as_os_str())).unwrap_err();
         assert!(several.contains("several ait instances"), "{several}");
         assert!(several.contains("111.sock"), "{several}");

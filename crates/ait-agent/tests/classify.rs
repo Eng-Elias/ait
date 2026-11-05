@@ -143,6 +143,9 @@ fn question_and_auxiliary_openers_are_natural_language() {
 }
 
 /// Rule 4's imperative/request openers and the spec's headline example.
+/// The openers are words no real `$PATH` harvest resolves — an opener
+/// that IS a binary (`find`, `print`, `count`, …) resolves at rule 2
+/// on a live system, so it could never exercise the evidence rule.
 #[test]
 fn request_openers_are_natural_language() {
     assert_class(&[
@@ -150,12 +153,37 @@ fn request_openers_are_natural_language() {
         ("list all the processes", InputClass::NaturalLanguage),
         ("tell me the current directory", InputClass::NaturalLanguage),
         ("explain the last error", InputClass::NaturalLanguage),
-        ("find the biggest directory", InputClass::NaturalLanguage),
+        ("describe the failing test", InputClass::NaturalLanguage),
         (
             "please delete all the temp files",
             InputClass::NaturalLanguage,
         ),
         ("undo my last commit", InputClass::NaturalLanguage),
+        ("summarize the build log", InputClass::NaturalLanguage),
+    ]);
+}
+
+/// A `'` between word characters is an apostrophe, not a quote open:
+/// `what's`/`how's` stay single tokens and normalize onto the
+/// `whats`/`hows` openers (previously the apostrophe opened
+/// single-quote state and the whole line folded into ONE token —
+/// `Command` by rule 1). Quoting elsewhere keeps its POSIX semantics:
+/// a real quote still swallows metachars and the line resolves by
+/// the unquoted words around it.
+#[test]
+fn contractions_are_sentence_text_not_quotes() {
+    assert_class(&[
+        ("what's the time", InputClass::NaturalLanguage),
+        ("how's it going", InputClass::NaturalLanguage),
+        // A contracted non-opener still gets no evidence — `its`,
+        // `dont`, `cant` are in neither table, so the conservative
+        // Command default holds.
+        ("it's done now", InputClass::Command),
+        // Real quoting is untouched: a resolvable first word is a
+        // command at rule 2 whatever the quotes carry, and quoted
+        // metachars never count as syntax.
+        ("echo 'a|b'", InputClass::Command),
+        ("foo 'bar|baz'", InputClass::Command),
     ]);
 }
 

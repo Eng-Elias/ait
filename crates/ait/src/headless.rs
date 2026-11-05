@@ -53,7 +53,7 @@ use std::time::Duration;
 
 use ait_agent::{
     AgentContext, AgentEvent, AgentRequest, AgentSession, ApprovalVerdict, BridgeError,
-    SkillsCatalog, ToolStatus, TranscriptItem,
+    SkillsCatalog, ToolStatus,
 };
 use ait_config::{ModelRole, Settings};
 use ait_term::{LiveSessionOptions, SpawnError};
@@ -64,7 +64,7 @@ use crate::shell_bridge::{self, TabBridge};
 use crate::status::Toast;
 use crate::store::StoreHandle;
 use crate::tabs::{title_for, SessionTemplate, Tab};
-use crate::transcript::{conversation_title, Transcript};
+use crate::transcript::Transcript;
 
 /// How often the drain thread pumps the session — the same order as
 /// the app's ~8 ms input tick that bounds `TabBridge` latency in the
@@ -623,10 +623,10 @@ fn drive(
 }
 
 /// Append the transcript's new items to the store — the headless
-/// `drain_transcripts` (Spec R08 us-28): the first batch creates the
-/// `conversations` row titled from the task, later batches append to
-/// it, `plan` items upsert the `plans` row, and the degrade rule
-/// drops writes on a broken database with one stderr line.
+/// `drain_transcripts` (Spec R08 us-28). The fold itself is the
+/// shared [`StoreHandle::flush_transcript`] the tab drain runs;
+/// here a store-write toast lands on stderr where the TUI would
+/// toast its status row.
 fn flush_conversation(
     store: &mut StoreHandle,
     conversation: &mut Option<i64>,
@@ -635,32 +635,9 @@ fn flush_conversation(
     err: &mut dyn Write,
 ) {
     let items = transcript.take_new();
-    if items.is_empty() {
-        return;
-    }
     let mut toast = None;
-    let id = match *conversation {
-        Some(id) => Some(id),
-        None => {
-            let id = store.conversation_started(
-                &mut toast,
-                &conversation_title(&items, transcript.items()),
-                cwd,
-            );
-            if let Some(id) = id {
-                *conversation = Some(id);
-            }
-            id
-        }
-    };
-    if let Some(id) = id {
-        store.append_transcript(&mut toast, id, &items);
-        for item in &items {
-            if let TranscriptItem::Plan { .. } = item {
-                store.plan_upsert(&mut toast, id, item);
-            }
-        }
-    }
+    *conversation =
+        store.flush_transcript(&mut toast, *conversation, &items, transcript.items(), cwd);
     render_toast(&mut toast, err);
 }
 
@@ -696,7 +673,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::time::Instant;
 
-    use ait_agent::{BridgeEvent, RemoteState, ShellBridge, ShellIntegration};
+    use ait_agent::{BridgeEvent, RemoteState, ShellBridge, ShellIntegration, TranscriptItem};
 
     /// Generous bound for every wait below (mirrors `tabs.rs`'s live
     /// tests): tiny `/bin/bash` runs finish far under it even on a

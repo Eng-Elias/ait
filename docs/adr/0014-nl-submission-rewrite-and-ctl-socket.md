@@ -66,8 +66,11 @@ contracts that are hard to reverse once relied on:
   swallowed line or a wrong request.
 - The `# ` rewrite depends on the shell treating `Ctrl+U` as a line
   kill — true for bash/zsh/fish readlines and for canonical-mode
-  reads; a line discipline that ignores it shows `# <line>` appended
-  after the typed text, still a comment, still inert.
+  reads — so the trigger only arms when the tab's program is a
+  known shell (`ait_shell::is_known_shell`, keyed on the tab title
+  like the `ProgramIndex`): a REPL or other echo-only program
+  degrades to a verbatim submission rather than risking `# <line>`
+  appended onto an un-wiped line.
 - The rewrite preserves request text exactly — `# ` + the verified
   line — so a misfired classification is fully visible in history
   rather than silently discarded.

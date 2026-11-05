@@ -217,6 +217,54 @@ impl StoreHandle {
         self.write(toast, |store| store.upsert_plan(conversation_id, &payload));
     }
 
+    /// The shared transcript→store flush fold (Spec R08-T3, us-28)
+    /// both callers run — `TabManager::drain_transcripts` per tab and
+    /// the headless driver's single run: an empty `items` batch is a
+    /// no-op; the first batch creates the `conversations` row — titled
+    /// from the batch's first task, falling back through `history`
+    /// (the whole transcript — a post-detach batch can start
+    /// mid-conversation, and the detached row's first task still
+    /// names the same conversation, us-11/us-5) — and the caller
+    /// binds the returned id so every later batch appends to the
+    /// SAME row. Each batch appends in the store's own transaction
+    /// and every `Plan` item also upserts the `plans` row (us-17 —
+    /// the transcript keeps every snapshot while the row keeps only
+    /// the newest: the last upsert in the batch wins, matching the
+    /// event order). All of it goes through the degrade rule, so a
+    /// disabled store just drops the batch. Returns the row the
+    /// batch wrote to — `conversation` when one was already bound,
+    /// the new row's id when this batch started it — for the caller
+    /// to bind (`Tab::set_conversation`, the headless loop's slot).
+    pub fn flush_transcript(
+        &mut self,
+        toast: &mut Option<Toast>,
+        conversation: Option<i64>,
+        items: &[TranscriptItem],
+        history: &[TranscriptItem],
+        cwd: &Path,
+    ) -> Option<i64> {
+        if items.is_empty() {
+            return conversation;
+        }
+        let conversation = match conversation {
+            Some(id) => Some(id),
+            None => self.conversation_started(
+                toast,
+                &crate::transcript::conversation_title(items, history),
+                cwd,
+            ),
+        };
+        if let Some(id) = conversation {
+            self.append_transcript(toast, id, items);
+            for item in items {
+                if let TranscriptItem::Plan { .. } = item {
+                    self.plan_upsert(toast, id, item);
+                }
+            }
+        }
+        conversation
+    }
+
     /// The `Alt+R` picker's rows (Spec R08-T6, us-5): every
     /// conversation newest-mutation first with its item count. A
     /// read — `Err` is the caller's to toast WITHOUT disabling the

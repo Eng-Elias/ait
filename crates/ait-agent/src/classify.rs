@@ -138,9 +138,12 @@ struct Token {
 /// machine: `'` quotes everything to the next `'`; `"` quotes
 /// everything (classification doesn't expand); `\` escapes the next
 /// char outside single quotes. An unterminated quote swallows the rest
-/// of the line into the token — matching the shell's own continuation
-/// — which also makes apostrophes (`what's`) safe: their following
-/// text is literal, never syntax.
+/// of the line into the token — matching the shell's own continuation.
+/// One exception to POSIX: a `'` BETWEEN word characters is an
+/// apostrophe, not a quote open — `what's`/`don't` stay single tokens
+/// with the `'` literal instead of swallowing the rest of the line
+/// (a real shell would open a continuation, but classifier-side the
+/// contraction reading is the user's intent).
 fn tokenize(line: &str) -> Vec<Token> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
@@ -154,7 +157,8 @@ fn tokenize(line: &str) -> Vec<Token> {
     let mut text = String::new();
     let mut literal: Vec<bool> = Vec::new();
     let mut has_token = false;
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         if escaped {
             text.push(ch);
             literal.push(true);
@@ -173,6 +177,15 @@ fn tokenize(line: &str) -> Vec<Token> {
             }
             State::Bare => match ch {
                 '\\' => escaped = true,
+                '\'' if text.chars().last().is_some_and(char::is_alphanumeric)
+                    && chars.peek().is_some_and(|next| next.is_alphanumeric()) =>
+                {
+                    // A mid-word apostrophe — literal text, never a
+                    // quote open (marked literal so it can never read
+                    // as shell syntax).
+                    text.push(ch);
+                    literal.push(true);
+                }
                 '\'' => state = State::Single,
                 '"' => state = State::Double,
                 _ => {
@@ -327,7 +340,16 @@ fn has_shell_syntax(token: &Token) -> bool {
 /// trailing unquoted `?`/`.`. A trailing `..` is a path, not a full
 /// stop.
 fn has_sentence_evidence(tokens: &[Token]) -> bool {
-    if SENTENCE_OPENERS.contains(&tokens[0].text.to_lowercase().as_str()) {
+    // Apostrophes normalize out before the opener lookup — `what's`
+    // and `how's` hit `whats`/`hows`, the forms the table already
+    // carries for their uncontracted spellings.
+    let opener: String = tokens[0]
+        .text
+        .to_lowercase()
+        .chars()
+        .filter(|ch| *ch != '\'')
+        .collect();
+    if SENTENCE_OPENERS.contains(&opener.as_str()) {
         return true;
     }
     if tokens
