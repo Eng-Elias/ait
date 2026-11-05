@@ -42,6 +42,12 @@ subagents.
   Sharing is safe only for serial builds of the same content — the
   integration branch's merge gates may share one dir. Round target
   dirs run tens of GB: delete them at cleanup.
+- **Teardown**: a merged ticket branch leaves its worktree checked
+  out and its `target/` on disk — the merge doesn't clean either.
+  At round cleanup: `git worktree remove ait-worktrees/<ticket>`
+  (`--force` when its untracked `target/` blocks removal) drops the
+  worktree *and* its target dir, then `git branch -D <branch>`;
+  GitHub already deleted the remote branch on merge.
 - **Gate output**: run the gate teed to a log —
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis

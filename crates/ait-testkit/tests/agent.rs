@@ -206,7 +206,11 @@ fn changed_output_drifts_the_recording() {
     app.type_text("echo EXTRA-LINE");
     app.press("Enter");
     app.wait_for_screen("the extra line", |app| {
-        app.screen_text().contains("EXTRA-LINE")
+        // `trim() ==` — the output row alone; the `echo EXTRA-LINE`
+        // echo carries `$ echo ` and can't satisfy the wait (std.15).
+        app.screen_text()
+            .lines()
+            .any(|line| line.trim() == "EXTRA-LINE")
     });
 
     app.agent().act("show the agent mark");

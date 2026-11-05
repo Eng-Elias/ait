@@ -478,7 +478,7 @@ fn pr_evidence_ssh_remote_transcript() {
     // the probe keys on what stays visible.
     app.type_text("read remote-marker.txt");
     app.wait_for_screen("the task on the input line", |app| {
-        app.screen_text().contains("remote-marker.txt")
+        app.screen_text().contains("remote-marker.txt") // sentinel-ok: gates the typed task's render in the ~30-col input — the echo IS the wait
     });
     app.press("Enter");
     app.wait_for_screen("the parked read_files approve card", |app| {
@@ -509,7 +509,7 @@ fn pr_evidence_ssh_remote_transcript() {
     let second = fixture.captured();
     assert_post(&second);
     assert!(
-        second.body.contains("R09-REMOTE-FILE-OK"),
+        second.body.contains("R09-REMOTE-FILE-OK"), // sentinel-ok: a fixture-body assert, not a screen probe
         "the remote read's bytes should round-trip in the turn-2 body: {}",
         second.body
     );
