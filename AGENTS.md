@@ -33,7 +33,9 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   `crates/ait-agent` — exists (Rounds 4/6/7/8: NL→command, agent
   mode, execution profiles, transcript/replay/plan/summarize;
   Round 9: §5.9 executor tiers — `RemoteState`, `select_executor`,
-  `ControlMasterExecutor`, remote read tools);
+  `ControlMasterExecutor`, remote read tools;
+  Round 10: §5.10.3 `Redactor` + §5.10.1 `McpPool` — `call_mcp_tool`,
+  `read_mcp_resource`, per-task `mcp.json` reconcile);
   `crates/ait-shell` — exists (Round 5: OSC 7700 hooks + blocks;
   Round 9: §5.9 — `ssh_begin`/`ssh_end` hooks, the `ssh()` wrappers
   in every snippet and the remote bootstrap renderer);

@@ -98,6 +98,17 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   (`ssh -S <sock> <target> -- <cmd>`); a transport failure demotes the task
   permanently — the hit run errors rather than replaying (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **MCP server** — a Model Context Protocol stdio server declared in
+  `mcp.json` (`{"mcpServers": {"name": {"command", "args", "env"}}}`):
+  `ait-agent`'s per-session `McpPool` connects user-tier entries
+  eagerly per task and exposes their tools/resources to the model via
+  `call_mcp_tool`/`read_mcp_resource`, gated by `mcp_permissions` and
+  the `mcp_allowlist`/`mcp_denylist` literals (§5.10.1).
+- **Project-local config layer** — the `.ait/` directory nearest a
+  session's cwd (`project_ait_dir` walks ancestors like `AGENTS.md`):
+  its `mcp.json` entries shadow same-named user-tier ones and are
+  listed but never spawned — a cloned repo cannot run code on the
+  user's machine silently (§5.10.1, Spec R10 us-8).
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.
