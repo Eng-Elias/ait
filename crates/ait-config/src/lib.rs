@@ -14,7 +14,11 @@
 //! behind the injectable [`SecretStore`] seam,
 //! [`Settings::resolve_model`] turns a profile + [`ModelRole`] into
 //! endpoint + model + secret-or-none, and [`default_template`]/
-//! `json_schema` back `ait --init`/`--print-schema`.
+//! `json_schema` back `ait --init`/`--print-schema`. The §5.10.1 MCP
+//! surface mirrors that split: [`McpConfig::from_json`] is the pure
+//! `mcp.json` seam, [`mcp_path`]/[`project_ait_dir`] resolve the user
+//! and project `.ait/` layers, and [`load_mcp`] merges them into one
+//! origin-labeled view.
 //!
 //! ## Cargo features
 //!
@@ -37,6 +41,7 @@
 mod emit;
 mod error;
 mod load;
+mod mcp;
 mod resolve;
 mod secrets;
 mod settings;
@@ -48,6 +53,10 @@ pub use emit::json_schema;
 pub use emit::{default_template, init_settings};
 pub use error::ConfigError;
 pub use load::{load, load_from, settings_path};
+pub use mcp::{
+    load_mcp, mcp_path, project_ait_dir, McpConfig, McpServer, McpServerEntry, McpServerOrigin,
+    McpServers,
+};
 pub use resolve::{ModelRole, ResolvedModel};
 #[cfg(feature = "secrets")]
 pub use secrets::OsKeyring;
