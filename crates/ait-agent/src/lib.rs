@@ -54,6 +54,13 @@
 //!   channel; `MarksOnly`/`Absent` type the command at the prompt
 //!   and detect completion from `133;D` or the `__AIT_END` sentinel
 //!   (R06-T5).
+//! - the §5.10.1 MCP client (Spec R10-T3): a per-session
+//!   [`mcp::McpPool`] of rmcp stdio connections reconciled against
+//!   the merged `mcp.json` at every task start — user-tier servers
+//!   connect eagerly, project-tier entries are listed but never
+//!   spawned — with `call_mcp_tool` and `read_mcp_resource` gated
+//!   by `mcp_permissions` plus the literal `server`/`server:tool`
+//!   deny/allow lists.
 
 mod agent_context;
 mod context;
@@ -62,6 +69,7 @@ mod diff;
 mod endpoint_bridge;
 mod executor;
 mod files;
+mod mcp;
 mod permissions;
 mod pty;
 mod redact;

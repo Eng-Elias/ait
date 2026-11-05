@@ -81,7 +81,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ait_config::{ExecutionProfile, ModelRole, OsKeyring, SecretStore, Settings};
+use ait_config::{ExecutionProfile, McpServerOrigin, ModelRole, OsKeyring, SecretStore, Settings};
 use ait_llm::{Endpoint, EndpointConfig, EndpointRequest, EndpointStream, LlmError};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -91,6 +91,7 @@ use crate::conversation::Conversation;
 use crate::endpoint_bridge::{extract, llm_schema, reported_tokens, slot, Extracted};
 use crate::executor::{CommandExecutor, ShellBridge};
 use crate::files::{ToolCwd, ToolOutput};
+use crate::mcp::McpPool;
 use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
 use crate::redact::Redactor;
@@ -562,6 +563,15 @@ fn worker(
     // makes a closing tab kill the spawned child: `AgentSession`'s
     // Drop closes these channels and joins this thread.
     let mut agent_pty = AgentPty::new();
+    // The §5.10.1 MCP pool (Spec R10-T3): like `agent_pty` it lives
+    // on this worker across the session's tasks — `serve` reconciles
+    // it against the merged mcp.json per task, so an unchanged
+    // user-tier server keeps its connection between tasks while a
+    // failed one retries. Every rmcp value is created and dropped
+    // inside `runtime.block_on` (rmcp's child cleanup spawns a
+    // task), which is why the pool drains inside the final
+    // `block_on` below rather than dropping bare.
+    let mut mcp_pool = McpPool::new();
     while let Ok(request) = requests.recv() {
         // Spec R09-T3: the agent-owned shell's `ssh()` reads the
         // task's armed `[ssh]` policy — refreshed per request so a
@@ -577,8 +587,13 @@ fn worker(
             &in_flight,
             store.as_ref(),
             &mut agent_pty,
+            &mut mcp_pool,
         );
     }
+    // The request channel closed — shut the pool down inside the
+    // runtime so every child process dies cleanly before the
+    // worker's thread (and its runtime) exits.
+    runtime.block_on(mcp_pool.drain());
 }
 
 /// One task: resolve `coding_model` → build the endpoint → assemble
@@ -596,6 +611,7 @@ fn serve(
     in_flight: &Mutex<Option<CancellationToken>>,
     store: &dyn SecretStore,
     agent_pty: &mut AgentPty,
+    mcp_pool: &mut McpPool,
 ) {
     // The worker's transcript mirror (R08-T7): seeded from `prior`
     // verbatim — those items were folded when first recorded — then
@@ -648,6 +664,15 @@ fn serve(
         }
     };
 
+    // §5.10.1 (Spec R10-T3): the per-task MCP reconcile — the merged
+    // mcp.json for the task's cwd is re-read, unchanged user-tier
+    // connections persist, dropped declarations shut down, and new
+    // or previously-failed user servers connect eagerly (spawn +
+    // handshake + enumeration under one connect timeout). The
+    // catalog it returns feeds the system prompt's "MCP servers"
+    // section; a malformed file or a failed connect degrades to the
+    // catalog, never to a task error.
+    let mcp_catalog = runtime.block_on(mcp_pool.reconcile(Path::new(&request.context.cwd)));
     // The task's §5.10.3 redactor (Spec R10): built once from the
     // request's `[redaction]` snapshot, applied at context assembly
     // and to every tool result — a settings hot-reload takes effect
@@ -657,6 +682,7 @@ fn serve(
         &request.context,
         find_agents_md(Path::new(&request.context.cwd)).as_deref(),
         &redactor,
+        mcp_catalog.prompt_section().as_deref(),
     );
     // The §5.7 stance the permission engine consults on every tool
     // call — the task's armed profile missing, renamed or never
@@ -737,6 +763,7 @@ fn serve(
         context_limit,
         agent_pty,
         executor.as_mut(),
+        mcp_pool,
         remote,
         &redactor,
         token,
@@ -773,6 +800,7 @@ async fn run_loop(
     context_limit: Option<usize>,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
+    mcp_pool: &mut McpPool,
     remote: bool,
     redactor: &Redactor,
     cancel: CancellationToken,
@@ -856,11 +884,14 @@ async fn run_loop(
                         cwd,
                         agent_pty,
                         executor,
+                        mcp_pool,
                         remote,
                         redactor,
                         &cancel,
                         events,
-                    ) {
+                    )
+                    .await
+                    {
                         Some(result) => results.push(result),
                         None => return,
                     }
@@ -979,7 +1010,7 @@ async fn summarize_context(
 /// text — and `None` when the run must end (cancelled, or the
 /// frontend's channels are gone).
 #[allow(clippy::too_many_arguments)] // the gate's consult-point state is genuinely this wide — the profile engine swaps the policy, not the plumbing
-fn gate_and_execute(
+async fn gate_and_execute(
     call: &ToolCall,
     profile: Option<&ExecutionProfile>,
     profile_name: &str,
@@ -989,6 +1020,7 @@ fn gate_and_execute(
     cwd: &ToolCwd,
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
+    mcp_pool: &mut McpPool,
     remote: bool,
     redactor: &Redactor,
     cancel: &CancellationToken,
@@ -1031,7 +1063,17 @@ fn gate_and_execute(
             "" => format!("edit_files: {error}"),
             paths => format!("{paths}\nedit_files: {error}"),
         },
-        None => tools::summarize_args(call),
+        // Spec R10 us-9: the card names the layer that declared the
+        // server — a project `.ait/` entry asks the user to run code
+        // the repository shipped, which reads very differently from
+        // a server the user's own config declared.
+        None => match mcp_origin(call, mcp_pool) {
+            Some(McpServerOrigin::Project) => format!(
+                "{}\n(declared by the project .ait/mcp.json)",
+                tools::summarize_args(call)
+            ),
+            _ => tools::summarize_args(call),
+        },
     };
     // `Ask` parks on the three-option approve card; `Allow` and
     // `Deny` open an ungated card — `Deny`'s `Denied` update flips
@@ -1109,12 +1151,18 @@ fn gate_and_execute(
         }
         Verdict::Allow => {}
     }
-    // Apply the plan the card showed (edit_files); every other call
-    // dispatches through the executor.
+    // Apply the plan the card showed (edit_files); MCP calls ride the
+    // session's pool — local to ait's own process even on a remote
+    // task (Spec R10 us-16: MCP is not shell execution, the §5.9
+    // executor tiers never see it); every other call dispatches
+    // through the executor.
     let output = match plan {
         Some(Ok(plan)) => plan.apply(),
         Some(Err(error)) => ToolOutput::error(error),
-        None => tools::execute(call, cwd, agent_pty, executor, remote, cancel),
+        None => match call.name.as_str() {
+            tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE => mcp_pool.execute(call).await,
+            _ => tools::execute(call, cwd, agent_pty, executor, remote, cancel),
+        },
     };
     // A run cut short by Esc reports its own tool error — but the
     // task is over: emit `Cancelled` rather than re-entering the loop
@@ -1138,6 +1186,20 @@ fn gate_and_execute(
         result: Some(text.clone()),
     });
     Some(text)
+}
+
+/// The declaring layer of an MCP call's named server (Spec R10
+/// us-9's card annotation) — `None` for non-MCP calls, undeclared
+/// servers and unparseable arguments alike.
+fn mcp_origin(call: &ToolCall, pool: &McpPool) -> Option<McpServerOrigin> {
+    if !matches!(
+        call.name.as_str(),
+        tools::CALL_MCP_TOOL | tools::READ_MCP_RESOURCE
+    ) {
+        return None;
+    }
+    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok()?;
+    pool.origin_of(args.get("server")?.as_str()?)
 }
 
 /// The `ask_user_question` flow (us-10): emit the call's own card —

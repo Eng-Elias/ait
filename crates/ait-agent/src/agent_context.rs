@@ -64,8 +64,11 @@ pub(crate) fn find_agents_md(cwd: &Path) -> Option<String> {
 
 /// Assemble the system prompt for one task: the fixed head, the
 /// environment block, the nearest `AGENTS.md` contents when
-/// `agents_md` came back, and the redacted output tail. Pure — no I/O,
-/// no clock; `find_agents_md` runs in the caller.
+/// `agents_md` came back, the "MCP servers" section the task's
+/// `mcp.json` reconcile rendered (`mcp_section` is `None` when no
+/// servers are declared — Spec R10 us-6/7, §5.10.1), and the
+/// redacted output tail. Pure — no I/O, no clock; `find_agents_md`
+/// and the reconcile run in the caller.
 ///
 /// Redaction ordering (§5.4, §5.10.3): the output tail passes through
 /// the request's [`Redactor`] here, at assembly time — joined as one
@@ -76,6 +79,7 @@ pub(crate) fn assemble_system_prompt(
     context: &AgentContext,
     agents_md: Option<&str>,
     redactor: &Redactor,
+    mcp_section: Option<&str>,
 ) -> String {
     let mut prompt = String::from(SYSTEM_PROMPT_HEAD);
     prompt.push_str("\n\nEnvironment:\n");
@@ -89,6 +93,13 @@ pub(crate) fn assemble_system_prompt(
         );
         prompt.push_str(agents_md);
         if !agents_md.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    if let Some(mcp_section) = mcp_section {
+        prompt.push('\n');
+        prompt.push_str(mcp_section);
+        if !mcp_section.ends_with('\n') {
             prompt.push('\n');
         }
     }
