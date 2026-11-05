@@ -45,7 +45,7 @@ USAGE:
                                open-tab
                                send [--tab <id>] [--no-enter] <text>
                                last-block [--tab <id>] [--command|--exit]
-    ait --headless "<task>" [--profile <name>]
+    ait --headless \"<task>\" [--profile <name>]
                            Run one agent task non-interactively
                            (text to stdout, activity to stderr)
     ait --init [--force]   Write a commented default settings.toml

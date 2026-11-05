@@ -296,9 +296,7 @@ fn effect_of(event: &AgentEvent) -> Effect {
             reply: Some(Reply::Deny(call.id.clone())),
             ..Effect::default()
         },
-        AgentEvent::AskRequest {
-            call, question, ..
-        } => Effect {
+        AgentEvent::AskRequest { call, question, .. } => Effect {
             stderr: Some(format!("answering non-interactively: {question}")),
             reply: Some(Reply::Answer(call.id.clone())),
             ..Effect::default()
@@ -477,7 +475,11 @@ fn run_inner(task: &str, profile: Option<&str>, out: &mut dyn Write, err: &mut d
         ait_config::project_skills_dir(&cwd).as_deref(),
     );
     if !catalog.errors().is_empty() {
-        let _ = writeln!(err, "ait: {}", crate::skills::skipped_text(catalog.errors()));
+        let _ = writeln!(
+            err,
+            "ait: {}",
+            crate::skills::skipped_text(catalog.errors())
+        );
     }
     if let Err(error) = ait_config::load_mcp(&cwd) {
         let _ = writeln!(err, "ait: {}", crate::config::mcp_error_text(&error));
@@ -522,7 +524,10 @@ fn run_inner(task: &str, profile: Option<&str>, out: &mut dyn Write, err: &mut d
     let mut store = match StoreHandle::open() {
         Ok(store) => store,
         Err(error) => {
-            let _ = writeln!(err, "ait: store unavailable — the run won't persist: {error}");
+            let _ = writeln!(
+                err,
+                "ait: store unavailable — the run won't persist: {error}"
+            );
             StoreHandle::disabled()
         }
     };
@@ -1278,10 +1283,8 @@ config_key = "coding-key"
     /// answer stream only.
     #[test]
     fn done_run_streams_stdout_and_exits_zero() {
-        let (code, out, err, _fixture) = drive_fixture(
-            vec![sse(&chat_text_turn("the answer"))],
-            "",
-        );
+        let (code, out, err, _fixture) =
+            drive_fixture(vec![sse(&chat_text_turn("the answer"))], "");
         assert_eq!(code, 0);
         assert_eq!(out, "the answer");
         assert!(err.is_empty(), "stderr should be silent: {err}");
