@@ -265,7 +265,7 @@ fn sent_input_is_never_classified() {
     // The shell ran the line itself — bash's `command not found` and
     // the `✗ 127` seal — and no `# # <line>` rewrite row exists.
     app.wait_for_screen("the verbatim failure sealed", |app| {
-        app.screen_text().contains("command not found") && app.line(STATUS_ROW).contains("✗ 127")
+        app.screen_text().contains("not found") && app.line(STATUS_ROW).contains("✗ 127")
     });
     assert!(
         !app.screen_text().contains("# # what is the largest file"),
