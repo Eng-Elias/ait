@@ -212,15 +212,16 @@ fn ctl_reports_no_running_instance() {
 }
 
 /// Several `*.sock` candidates refuse to guess — the error lists each
-/// and names `AIT_CTL_SOCKET` as the disambiguator.
+/// and names `AIT_CTL_SOCKET` as the disambiguator. Resolution probes
+/// liveness, so the candidates are real bound listeners, not files.
 #[cfg(unix)]
 #[test]
 fn ctl_lists_candidates_when_several_instances_exist() {
     let dir = tempfile::tempdir().unwrap();
     let ait_dir = dir.path().join("ait");
     std::fs::create_dir_all(&ait_dir).unwrap();
-    std::fs::write(ait_dir.join("111.sock"), b"").unwrap();
-    std::fs::write(ait_dir.join("222.sock"), b"").unwrap();
+    let _one = UnixListener::bind(ait_dir.join("111.sock")).unwrap();
+    let _two = UnixListener::bind(ait_dir.join("222.sock")).unwrap();
 
     let output = ctl(dir.path(), None, &["last-block"]);
 
