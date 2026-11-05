@@ -135,6 +135,8 @@ fn schema_is_valid_json_covering_the_settings_model() {
         "TerminalSettings",
         "SshSettings",
         "RedactionSettings",
+        "InputSettings",
+        "ClassifierMode",
     ] {
         assert!(defs[name].is_object(), "$defs missing {name}");
     }
@@ -142,6 +144,8 @@ fn schema_is_valid_json_covering_the_settings_model() {
     assert!(schema["properties"]["ssh"].is_object());
     // Spec R10-T1: `--print-schema` covers the `[redaction]` model.
     assert!(schema["properties"]["redaction"].is_object());
+    // Spec R11-T1: `--print-schema` covers the `[input]` model.
+    assert!(schema["properties"]["input"].is_object());
 }
 
 /// Spec R09-T1: `ait --init`'s template documents all four `[ssh]`
@@ -184,5 +188,23 @@ fn template_documents_the_redaction_section() {
     assert!(
         template.contains("# [redaction]"),
         "the [redaction] block stays commented"
+    );
+}
+
+/// Spec R11-T1: `ait --init`'s template documents the `[input]`
+/// section — the classifier key and both live modes — in a commented
+/// block (§5.10.4).
+#[test]
+fn template_documents_the_input_section() {
+    let template = default_template();
+    for key in ["classifier", "heuristic", "off"] {
+        assert!(
+            template.contains(key),
+            "template missing [input] vocabulary {key}"
+        );
+    }
+    assert!(
+        template.contains("# [input]"),
+        "the [input] block stays commented"
     );
 }
