@@ -1883,9 +1883,8 @@ mod tests {
         }
 
         let settings = Settings::default();
-        assert_eq!(
-            classified_request(tabs.active().unwrap(), &settings, "default"),
-            None,
+        assert!(
+            classified_request(tabs.active().unwrap(), &settings, "default").is_none(),
             "a non-shell program submits verbatim"
         );
     }
