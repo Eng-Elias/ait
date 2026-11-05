@@ -15,16 +15,21 @@
 //! tools/resources enumeration all inside [`CONNECT_TIMEOUT`] — and
 //! any initialization failure marks the server unavailable in the
 //! [`McpCatalog`] rather than sinking the task. **Project-tier**
-//! entries are listed in the catalog but never spawned — a cloned
-//! repo cannot run code on the user's machine silently; their lazy
-//! consent semantics are a later ticket's (Spec R10 us-8).
+//! entries are listed in the catalog but never spawned at reconcile
+//! — a cloned repo cannot run code on the user's machine silently:
+//! the pool connects them lazily inside the gated call itself
+//! (Spec R10 us-8), so only an approved `call_mcp_tool`/
+//! `read_mcp_resource` ever spawns the process.
 //!
 //! The two MCP tools — `call_mcp_tool` and `read_mcp_resource` —
 //! dispatch through [`McpPool::execute`] after the permission gate,
 //! running locally even on a remote (ssh) task: MCP is not shell
-//! execution, so the §5.9 executor tiers never see it. Every failure
-//! mode — spawn, initialize, call, timeout, crash — is a
-//! [`ToolOutput`] error: model input, never a task wedge.
+//! execution, so the §5.9 executor tiers never see it. `execute` is
+//! reached only once the gate allowed — `mcp_allowlist`/
+//! `always_allow` skip the ask but take the same lazy path — so a
+//! denied call never spawns anything. Every failure mode — spawn,
+//! initialize, call, timeout, crash — is a [`ToolOutput`] error:
+//! model input, never a task wedge.
 //!
 //! All rmcp values are created and dropped inside `block_on`:
 //! `TokioChildProcess`'s `Drop` kills the child through
@@ -89,8 +94,9 @@ struct ServerSlot {
 
 /// Where one pooled server stands.
 enum ServerState {
-    /// A project-tier entry — listed, never spawned (T4 owns the
-    /// lazy consent connect).
+    /// Declared but not connected — what reconcile leaves every
+    /// project-tier entry as; the gated call's lazy connect is the
+    /// only way out (Spec R10 us-8).
     Declared,
     /// Connected and enumerated — `tools`/`resources` hold the names
     /// the catalog renders.
@@ -125,7 +131,9 @@ impl McpPool {
     /// or changed declarations shut down; a server that is
     /// unavailable or dead retries (the recovery point). Project-tier
     /// entries join the catalog as [`ServerState::Declared`] and are
-    /// never spawned.
+    /// never spawned here — their only connect is the gated call's
+    /// lazy path, and a project server that already connected keeps
+    /// its slot like a user-tier one.
     ///
     /// A malformed or unreadable `mcp.json` drains the pool — the
     /// config layer's view is gone — and the [`McpCatalog`]'s
@@ -157,9 +165,11 @@ impl McpPool {
         }
         for (name, entry) in merged.servers {
             match entry.origin {
-                // Spec R10 us-8 / ticket scope: project-tier entries
-                // are listed but never spawned — T4 owns their
-                // semantics.
+                // Spec R10 us-8: project-tier entries are listed
+                // but never spawned at task start — the gated
+                // call's lazy connect is their only spawn path. An
+                // already-connected project server keeps its slot
+                // like a user-tier one.
                 McpServerOrigin::Project => {
                     self.servers.entry(name).or_insert(ServerSlot {
                         entry,
@@ -235,10 +245,12 @@ impl McpPool {
     }
 
     /// The gated dispatch for both MCP tools (Spec R10): parse the
-    /// call's arguments, resolve the named server, run the request
-    /// under [`CALL_TIMEOUT`]. Reached only after the gate allowed —
-    /// every failure is a [`ToolOutput`] error, model input, never a
-    /// task wedge.
+    /// call's arguments, resolve the named server, lazy-connect it
+    /// when it is still only [`ServerState::Declared`] (project-tier
+    /// — this is the spawn a cloned repo can never trigger without
+    /// an allow), then run the request under [`CALL_TIMEOUT`].
+    /// Reached only after the gate allowed — every failure is a
+    /// [`ToolOutput`] error, model input, never a task wedge.
     pub(crate) async fn execute(&mut self, call: &ToolCall) -> ToolOutput {
         let args: serde_json::Value = match serde_json::from_str(&call.arguments) {
             Ok(args) => args,
@@ -273,6 +285,7 @@ impl McpPool {
                 "call_mcp_tool: no MCP server named {server:?} is configured"
             ));
         };
+        slot.connect_if_declared().await;
         let Some(service) = slot.live_service() else {
             return ToolOutput::error(slot_error(CALL_MCP_TOOL, server, &slot.state));
         };
@@ -311,6 +324,7 @@ impl McpPool {
                 "read_mcp_resource: no MCP server named {server:?} is configured"
             ));
         };
+        slot.connect_if_declared().await;
         let Some(service) = slot.live_service() else {
             return ToolOutput::error(slot_error(READ_MCP_RESOURCE, server, &slot.state));
         };
@@ -374,7 +388,21 @@ impl ServerSlot {
         }
     }
 
-    /// One eager-initialization attempt: spawn the declared command,
+    /// §5.10.1's lazy consent connect (Spec R10 us-8): a
+    /// [`ServerState::Declared`] slot — what reconcile leaves every
+    /// project-tier entry as — spawns + initializes inside the
+    /// gated call itself, under `connect`'s ordinary
+    /// [`CONNECT_TIMEOUT`]. [`McpPool::execute`] is reached only
+    /// after the permission gate allowed, so a denied call never
+    /// spawns the process; `mcp_allowlist`/`always_allow` skip the
+    /// ask but take this same lazy path on the first call.
+    async fn connect_if_declared(&mut self) {
+        if matches!(self.state, ServerState::Declared) {
+            self.connect().await;
+        }
+    }
+
+    /// One initialization attempt: spawn the declared command,
     /// run the `initialize` handshake (`serve` performs it), then
     /// enumerate tools and resources — all inside the caller's
     /// [`CONNECT_TIMEOUT`]. A prior connection shuts down first.
@@ -411,17 +439,17 @@ impl ServerSlot {
 }
 
 /// The [`ToolOutput`] error text for a slot that could not serve a
-/// request: project-tier declarations name their never-spawned
-/// status honestly (us-8 — T4 wires the lazy connect), unavailable
-/// servers replay the recorded reason.
+/// request — reached only after `connect_if_declared` ran, so the
+/// slot is always [`ServerState::Unavailable`] here: the recorded
+/// reason (spawn, handshake, enumeration or timeout failure)
+/// replays to the model.
 fn slot_error(tool: &str, server: &str, state: &ServerState) -> String {
     match state {
-        ServerState::Declared => format!(
-            "{tool}: MCP server {server:?} is declared by the project .ait/ layer — \
-             project servers are listed but never spawned"
-        ),
         ServerState::Unavailable(reason) => {
             format!("{tool}: MCP server {server:?} is unavailable: {reason}")
+        }
+        ServerState::Declared => {
+            unreachable!("the gated call lazy-connects a declared slot before dispatch")
         }
         ServerState::Connected { .. } => unreachable!("a live service never errors here"),
     }
@@ -529,7 +557,8 @@ pub(crate) enum McpAvailability {
         /// Resource URIs from `resources/list`.
         resources: Vec<String>,
     },
-    /// Project-tier — listed, never spawned.
+    /// Project-tier — listed, unconnected; the gated call lazy-
+    /// connects it.
     Declared,
     /// Initialization or a call failed — the reason.
     Unavailable(String),
@@ -540,8 +569,9 @@ impl McpCatalog {
     /// names, origins and availability", tool/resource names once
     /// known): one line per entry — `available` lists the surface
     /// the model may name in `call_mcp_tool`/`read_mcp_resource`,
-    /// `declared` marks a project-tier server that is never spawned,
-    /// `unavailable` carries the failure. `None` when nothing is
+    /// `declared` marks a project-tier server that connects lazily
+    /// on the first allowed call, `unavailable` carries the
+    /// failure. `None` when nothing is
     /// declared and nothing failed, so a session with no `mcp.json`
     /// ships the Round 9 prompt verbatim.
     pub(crate) fn prompt_section(&self) -> Option<String> {
@@ -579,8 +609,8 @@ impl McpCatalog {
                     }
                 }
                 McpAvailability::Declared => text.push_str(&format!(
-                    "\n- {} ({origin}): declared — not connected; project servers are \
-                     never spawned",
+                    "\n- {} ({origin}): declared — not connected; the first allowed \
+                     call connects it",
                     entry.name
                 )),
                 McpAvailability::Unavailable(reason) => text.push_str(&format!(
