@@ -1689,7 +1689,7 @@ mod tests {
     /// unverifiable line takes.
     #[test]
     fn classified_line_is_none_for_a_non_shell_program() {
-        let index = ProgramIndex::with_path_entries("python3", []);
+        let index = ProgramIndex::with_path_entries("python3", Vec::<&str>::new());
         let line = "what is the largest file";
         let logical = ">>> what is the largest file";
         // A verified NL line under a REPL prompt is verbatim.
