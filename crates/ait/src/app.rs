@@ -2370,10 +2370,13 @@ mod tests {
         wait_until(&mut harness, |h| {
             rows(h).iter().any(|row| row.contains("R11T2_42"))
         });
+        // `/bin/sh` as root prompts with `# ` — a verbatim line
+        // already renders `# echo …`, so the rewrite's tell is the
+        // doubled hash: prompt `# ` + submitted `# echo …`.
         assert!(
             !rows(&harness)
                 .iter()
-                .any(|row| row.contains("# echo R11T2_")),
+                .any(|row| row.contains("# # echo R11T2_")),
             "no `# ` rewrite row: {:?}",
             rows(&harness)
         );
@@ -2398,10 +2401,13 @@ mod tests {
         wait_until(&mut harness, |h| {
             rows(h).iter().any(|row| row.contains("not found"))
         });
+        // The `# ` prompt makes a verbatim `# what …` row
+        // indistinguishable from the text alone — the rewrite's tell
+        // is the doubled hash.
         assert!(
             !rows(&harness)
                 .iter()
-                .any(|row| row.contains("# what is the largest file")),
+                .any(|row| row.contains("# # what is the largest file")),
             "the stale line was never rewritten"
         );
     }
