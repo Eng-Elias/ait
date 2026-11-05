@@ -90,6 +90,13 @@ it deliberately, one line per release.
   promote `dev` to `main` with a PR; `main` only receives promotion PRs from
   `dev`. `qa` is updated by PR only.
 - PRs into `dev` carry a `Closes #N` line for the spec issue and every ticket.
+- Actions minutes are budgeted (private repo): CI runs on `main` only —
+  the `dev`→`main` promotion PR and the post-merge push. PRs to `dev`
+  get no CI; all development checks are local — run `scripts/check.sh`
+  before pushing. Its one gap vs the CI suite is the docker SSH e2e
+  (`scripts/ssh-e2e.sh run`) — run it when touching §5.9 remote code.
+  A draft promotion PR still skips CI; marking it ready runs the suite
+  once, and a push during an in-flight run cancels it (`concurrency`).
 
 ## Agent skills
 
