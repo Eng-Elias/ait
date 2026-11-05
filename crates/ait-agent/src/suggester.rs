@@ -36,7 +36,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
-use crate::{assemble_request, ReplySanitizer, SuggestContext};
+use crate::{assemble_request, Redactor, ReplySanitizer, SuggestContext};
 
 /// One `# `/`Alt+Enter` request — the value the frontend sends on the
 /// suggester's channel. It carries the terminal-side context the model
@@ -282,7 +282,16 @@ fn serve(
     };
     // `assemble_request` takes the endpoint's own schema + wire model,
     // so the returned IR can never trip `LlmError::SchemaMismatch`.
-    let endpoint_request = assemble_request(&context, endpoint.schema(), &endpoint.config().model);
+    // The request's `[redaction]` settings build its redactor here
+    // (Spec R10) — per request, so a hot-reloaded snapshot applies
+    // to the next submission (us-37).
+    let redactor = Redactor::new(&request.settings.redaction);
+    let endpoint_request = assemble_request(
+        &context,
+        &redactor,
+        endpoint.schema(),
+        &endpoint.config().model,
+    );
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());

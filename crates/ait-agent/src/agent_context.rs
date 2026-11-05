@@ -1,7 +1,7 @@
 //! The agent system-prompt seam (Spec R06, §5.6): cwd, OS, shell, the
 //! nearest `AGENTS.md` found by walking up from cwd, and the last
 //! [`OUTPUT_LINE_BUDGET`] lines of terminal output — redacted through
-//! the existing [`redact`](crate::redact) seam (§5.10.3) — assembled
+//! the request's [`Redactor`] (§5.10.3) — assembled
 //! into the fixed system prompt every agent request carries.
 //!
 //! [`assemble_system_prompt`] is pure (same inputs, same prompt);
@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::{redact, OUTPUT_LINE_BUDGET};
+use crate::{Redactor, OUTPUT_LINE_BUDGET};
 
 /// The terminal-side context one agent task carries — everything §5.6
 /// lets the model see beyond the conversation itself. Fields are owned
@@ -30,7 +30,7 @@ pub struct AgentContext {
     pub os: String,
     /// Recent logical output lines, oldest first. Only the last
     /// [`OUTPUT_LINE_BUDGET`] are sent and they pass through
-    /// [`redact`](crate::redact) as one joined block — send the raw
+    /// the request's [`Redactor`] as one joined block — send the raw
     /// lines, redaction is [`assemble_system_prompt`]'s job.
     pub output_lines: Vec<String>,
 }
@@ -68,11 +68,15 @@ pub(crate) fn find_agents_md(cwd: &Path) -> Option<String> {
 /// no clock; `find_agents_md` runs in the caller.
 ///
 /// Redaction ordering (§5.4, §5.10.3): the output tail passes through
-/// [`redact`](crate::redact) here, at assembly time — joined as one
+/// the request's [`Redactor`] here, at assembly time — joined as one
 /// block so a credential spanning lines (a PEM block) still matches.
 /// The task text itself is never redacted; it travels verbatim in the
 /// user message.
-pub(crate) fn assemble_system_prompt(context: &AgentContext, agents_md: Option<&str>) -> String {
+pub(crate) fn assemble_system_prompt(
+    context: &AgentContext,
+    agents_md: Option<&str>,
+    redactor: &Redactor,
+) -> String {
     let mut prompt = String::from(SYSTEM_PROMPT_HEAD);
     prompt.push_str("\n\nEnvironment:\n");
     prompt.push_str(&format!("- Working directory: {}\n", context.cwd));
@@ -98,7 +102,7 @@ pub(crate) fn assemble_system_prompt(context: &AgentContext, agents_md: Option<&
         // Redact the joined tail, not each line: a credential spanning
         // grid lines only matches the assembled block — the
         // `SuggestContext` seam documents the same rule.
-        prompt.push_str(&redact(&tail.join("\n")));
+        prompt.push_str(&redactor.redact(&tail.join("\n")));
         prompt.push('\n');
     }
     prompt

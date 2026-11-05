@@ -57,7 +57,7 @@
 //! plumbing (Spec R06 us-37).
 //!
 //! Calls in one turn execute sequentially in model order (us-33),
-//! each gated. Every tool result passes [`redact`](crate::redact)
+//! each gated. Every tool result passes the task's [`Redactor`]
 //! before entering the conversation — §5.10.3's rule extends from
 //! terminal output to everything the agent touches. The run ends on
 //! a no-tool-calls end turn with no steering queued, cancellation
@@ -93,7 +93,7 @@ use crate::executor::{CommandExecutor, ShellBridge};
 use crate::files::{ToolCwd, ToolOutput};
 use crate::permissions::{self, Verdict};
 use crate::pty::AgentPty;
-use crate::redact::redact;
+use crate::redact::Redactor;
 use crate::summarize;
 use crate::tool_call::{CallAccumulator, ToolCall, ToolStatus};
 use crate::tools;
@@ -648,9 +648,15 @@ fn serve(
         }
     };
 
+    // The task's §5.10.3 redactor (Spec R10): built once from the
+    // request's `[redaction]` snapshot, applied at context assembly
+    // and to every tool result — a settings hot-reload takes effect
+    // on the next task with no plumbing here.
+    let redactor = Redactor::new(&request.settings.redaction);
     let system = assemble_system_prompt(
         &request.context,
         find_agents_md(Path::new(&request.context.cwd)).as_deref(),
+        &redactor,
     );
     // The §5.7 stance the permission engine consults on every tool
     // call — the task's armed profile missing, renamed or never
@@ -732,6 +738,7 @@ fn serve(
         agent_pty,
         executor.as_mut(),
         remote,
+        &redactor,
         token,
         &events,
     ));
@@ -767,6 +774,7 @@ async fn run_loop(
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     remote: bool,
+    redactor: &Redactor,
     cancel: CancellationToken,
     events: &EventSink<'_>,
 ) {
@@ -849,6 +857,7 @@ async fn run_loop(
                         agent_pty,
                         executor,
                         remote,
+                        redactor,
                         &cancel,
                         events,
                     ) {
@@ -981,6 +990,7 @@ fn gate_and_execute(
     agent_pty: &mut AgentPty,
     executor: &mut dyn CommandExecutor,
     remote: bool,
+    redactor: &Redactor,
     cancel: &CancellationToken,
     events: &EventSink<'_>,
 ) -> Option<String> {
@@ -1116,7 +1126,7 @@ fn gate_and_execute(
     // §5.10.3, extended to everything the agent touches: the result
     // is redacted before it enters the conversation — and the card's
     // preview comes from the same redacted text.
-    let text = redact(&output.text);
+    let text = redactor.redact(&output.text);
     events.emit(AgentEvent::ToolUpdate {
         call_id: call.id.clone(),
         status: if output.is_error {

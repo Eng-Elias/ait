@@ -54,7 +54,7 @@ const GLOB_WALK_CAP: usize = 20_000;
 const GLOB_RESULT_CAP: usize = 500;
 
 /// What a tool call produced — the text that (after
-/// [`redact`](crate::redact)) enters the conversation as the tool
+/// [`Redactor`](crate::Redactor)) enters the conversation as the tool
 /// result, plus whether it is an error the card should paint
 /// `Failed`.
 #[derive(Debug)]

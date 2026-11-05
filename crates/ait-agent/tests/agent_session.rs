@@ -245,6 +245,37 @@ fn system_prompt_carries_context_agents_md_and_redacted_tail() {
     assert!(!body.contains("AKIAIOSFODNN7EXAMPLE"), "{body}");
 }
 
+/// Spec R10-T1: the request's `[redaction]` settings drive the output
+/// tail the same way — a `disable`d built-in's specimen reaches the
+/// wire verbatim while an `enable`d PII category masks its specimen.
+#[test]
+fn redaction_settings_drive_the_output_tail() {
+    let fixture = Fixture::serve(vec![sse(&sse_transcript(&["ok"]))]);
+    let session = session();
+    let mut settings = chat_settings(&fixture.base_url, "coding_model");
+    settings.redaction.disable.push(String::from("aws_access_key"));
+    settings.redaction.enable.push(String::from("pii_email"));
+    let mut task = task(settings, "/home/u/proj");
+    task.context
+        .output_lines
+        .push(String::from("bounce alerts@example.com"));
+    session.submit(task).expect("submit");
+
+    let events = collect(&session);
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+
+    let body = fixture.captured().body;
+    assert!(
+        body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a disabled built-in passes through: {body}"
+    );
+    assert!(
+        !body.contains("alerts@example.com"),
+        "an enabled PII category must mask: {body}"
+    );
+    assert!(body.contains("[REDACTED]"), "{body}");
+}
+
 /// §4.2: `coding_model` unset falls back to `base_model` — the task
 /// still resolves and streams.
 #[test]
