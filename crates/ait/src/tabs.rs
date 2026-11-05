@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use ait_agent::{AgentRequest, ApprovalVerdict};
+use ait_agent::{AgentRequest, ApprovalVerdict, SkillsCatalog};
 use ait_config::Settings;
 use ait_term::{
     Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
@@ -906,12 +906,30 @@ impl Tab {
             .as_ref()
             .map(|panel| panel.transcript_items().to_vec())
             .unwrap_or_default();
+        let context = context_for(self);
+        // §5.10.2 (Spec R10-T5): the skills catalog is scanned at
+        // submit time and rides the request verbatim — what the
+        // model sees is what this snapshot carries (live watching
+        // is R10-T6's). A malformed SKILL.md is skipped and toasted,
+        // never silent.
+        let skills = SkillsCatalog::scan(Path::new(&context.cwd));
+        if let Some(first) = skills.errors().first() {
+            let more = skills.errors().len() - 1;
+            *toast = Some(Toast::new(
+                match more {
+                    0 => format!("skill skipped: {first}"),
+                    n => format!("skill skipped: {first} (+{n} more)"),
+                },
+                Instant::now(),
+            ));
+        }
         let request = AgentRequest {
             settings: settings.clone(),
             profile: profile.to_owned(),
             task,
             prior,
-            context: context_for(self),
+            context,
+            skills,
             bridge: self
                 .bridge
                 .as_ref()
@@ -2063,6 +2081,7 @@ mod tests {
             },
             prior: Vec::new(),
             bridge: None,
+            skills: ait_agent::SkillsCatalog::default(),
         }
     }
 
@@ -3716,6 +3735,7 @@ mod tests {
                     },
                     prior: Vec::new(),
                     bridge: None,
+                    skills: ait_agent::SkillsCatalog::default(),
                 },
                 &mut toast,
             );

@@ -71,6 +71,7 @@ fn task(settings: Settings, cwd: &str) -> AgentRequest {
         },
         prior: Vec::new(),
         bridge: None,
+        skills: ait_agent::SkillsCatalog::default(),
     }
 }
 

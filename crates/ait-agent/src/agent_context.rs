@@ -66,9 +66,12 @@ pub(crate) fn find_agents_md(cwd: &Path) -> Option<String> {
 /// environment block, the nearest `AGENTS.md` contents when
 /// `agents_md` came back, the "MCP servers" section the task's
 /// `mcp.json` reconcile rendered (`mcp_section` is `None` when no
-/// servers are declared — Spec R10 us-6/7, §5.10.1), and the
-/// redacted output tail. Pure — no I/O, no clock; `find_agents_md`
-/// and the reconcile run in the caller.
+/// servers are declared — Spec R10 us-6/7, §5.10.1), the "Available
+/// skills" section the request's skills-catalog snapshot rendered
+/// (`skills_section` is `None` when no skills are loaded — Spec R10
+/// us-23, §5.10.2), and the redacted output tail. Pure — no I/O, no
+/// clock; `find_agents_md`, the reconcile and the catalog scan run
+/// in the caller.
 ///
 /// Redaction ordering (§5.4, §5.10.3): the output tail passes through
 /// the request's [`Redactor`] here, at assembly time — joined as one
@@ -80,6 +83,7 @@ pub(crate) fn assemble_system_prompt(
     agents_md: Option<&str>,
     redactor: &Redactor,
     mcp_section: Option<&str>,
+    skills_section: Option<&str>,
 ) -> String {
     let mut prompt = String::from(SYSTEM_PROMPT_HEAD);
     prompt.push_str("\n\nEnvironment:\n");
@@ -100,6 +104,13 @@ pub(crate) fn assemble_system_prompt(
         prompt.push('\n');
         prompt.push_str(mcp_section);
         if !mcp_section.ends_with('\n') {
+            prompt.push('\n');
+        }
+    }
+    if let Some(skills_section) = skills_section {
+        prompt.push('\n');
+        prompt.push_str(skills_section);
+        if !skills_section.ends_with('\n') {
             prompt.push('\n');
         }
     }

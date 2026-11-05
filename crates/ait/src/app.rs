@@ -3574,6 +3574,7 @@ coding_model = "coding-key"
                 },
                 prior: Vec::new(),
                 bridge: None,
+                skills: ait_agent::SkillsCatalog::default(),
             },
             &mut harness.state.toast,
         );

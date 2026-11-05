@@ -61,6 +61,14 @@
 //!   spawned — with `call_mcp_tool` and `read_mcp_resource` gated
 //!   by `mcp_permissions` plus the literal `server`/`server:tool`
 //!   deny/allow lists.
+//! - the §5.10.2 skills loader (Spec R10-T5): a [`SkillsCatalog`]
+//!   scanned at submit time from `~/.config/ait/skills/` and the
+//!   nearest `.ait/skills/` — malformed `SKILL.md`s skipped with
+//!   surfaced errors, project shadowing user — snapshotted onto
+//!   every `AgentRequest`, rendered into the system prompt, and
+//!   served to `invoke_skill` (gated by `read_files`) as body +
+//!   bundled-file manifest while the skill dirs join `ToolCwd`'s
+//!   read roots.
 
 mod agent_context;
 mod context;
