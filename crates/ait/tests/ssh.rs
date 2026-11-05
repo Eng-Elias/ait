@@ -52,7 +52,7 @@ fn container_target() -> Option<SshTarget> {
     let host = std::env::var("AIT_E2E_SSH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let dest = format!("{user}@{host}");
     let command = format!(
-        "ssh -p {port} -i {key} \
+        "ssh -p {port} -i {key} -o IdentitiesOnly=yes \
          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
          {dest}"
     );

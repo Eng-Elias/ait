@@ -74,7 +74,11 @@ case "${1:-}" in
     run)
         up
         trap down EXIT
-        run_test
+        run_test || {
+            echo "--- sshd container log tail ---" >&2
+            docker logs --tail 40 "$NAME" >&2 || true
+            exit 1
+        }
         ;;
     *)
         echo "usage: $0 {up|down|test|run}" >&2
