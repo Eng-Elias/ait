@@ -143,6 +143,9 @@ fn question_and_auxiliary_openers_are_natural_language() {
 }
 
 /// Rule 4's imperative/request openers and the spec's headline example.
+/// The openers are words no real `$PATH` harvest resolves — an opener
+/// that IS a binary (`find`, `print`, `count`, …) resolves at rule 2
+/// on a live system, so it could never exercise the evidence rule.
 #[test]
 fn request_openers_are_natural_language() {
     assert_class(&[
@@ -150,12 +153,13 @@ fn request_openers_are_natural_language() {
         ("list all the processes", InputClass::NaturalLanguage),
         ("tell me the current directory", InputClass::NaturalLanguage),
         ("explain the last error", InputClass::NaturalLanguage),
-        ("find the biggest directory", InputClass::NaturalLanguage),
+        ("describe the failing test", InputClass::NaturalLanguage),
         (
             "please delete all the temp files",
             InputClass::NaturalLanguage,
         ),
         ("undo my last commit", InputClass::NaturalLanguage),
+        ("summarize the build log", InputClass::NaturalLanguage),
     ]);
 }
 
