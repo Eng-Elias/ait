@@ -44,6 +44,18 @@ pub fn default_template() -> String {
 # reuse_existing_control_master = true  # honor your own ControlMaster/
 #                                       # ControlPath config (default: on)
 
+# Secret redaction (§5.10.3): the named patterns masking credentials
+# and PII before terminal output reaches a provider. The built-ins —
+# aws_access_key, github_token, github_pat, openai_key, anthropic_key,
+# stripe_key, slack_token, slack_app, jwt, private_key_pem — ship
+# enabled; the PII categories — pii_ipv4, pii_ipv6, pii_email,
+# pii_phone, pii_mac — ship disabled. A name in both enable and
+# disable is a load error.
+# [redaction]
+# extra   = []            # your own regexes, e.g. ['\btoken-[A-Z0-9]{{8}}']
+# enable  = []            # opt in: the pii_* categories
+# disable = []            # turn a built-in off, e.g. ["jwt"]
+
 # A declared endpoint — any OpenAI- or Anthropic-compatible server.
 [agents.custom_endpoints.local]
 name     = "Local Ollama"

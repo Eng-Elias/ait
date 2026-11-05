@@ -134,11 +134,14 @@ fn schema_is_valid_json_covering_the_settings_model() {
         "ExecutionProfile",
         "TerminalSettings",
         "SshSettings",
+        "RedactionSettings",
     ] {
         assert!(defs[name].is_object(), "$defs missing {name}");
     }
     // Spec R09-T1: `--print-schema` covers the `[ssh]` model.
     assert!(schema["properties"]["ssh"].is_object());
+    // Spec R10-T1: `--print-schema` covers the `[redaction]` model.
+    assert!(schema["properties"]["redaction"].is_object());
 }
 
 /// Spec R09-T1: `ait --init`'s template documents all four `[ssh]`
@@ -157,5 +160,26 @@ fn template_documents_the_ssh_section() {
     assert!(
         template.contains("# [ssh]"),
         "the [ssh] block stays commented"
+    );
+}
+
+/// Spec R10-T1: `ait --init`'s template documents the `[redaction]`
+/// section — the three lists plus the names they toggle — in a
+/// commented block (§4.3 decided).
+#[test]
+fn template_documents_the_redaction_section() {
+    let template = default_template();
+    for key in ["extra", "enable", "disable"] {
+        assert!(template.contains(key), "template missing [redaction] key {key}");
+    }
+    for name in ["aws_access_key", "pii_email"] {
+        assert!(
+            template.contains(name),
+            "template missing pattern name {name}"
+        );
+    }
+    assert!(
+        template.contains("# [redaction]"),
+        "the [redaction] block stays commented"
     );
 }
