@@ -37,4 +37,9 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
     crate and imported by the frontend, never re-literal'd at a
     second site (R08's interrupted-result / replay-id duplication
     drifted until the review single-sourced them).
+18. A regex that can plausibly over-match ships a negative specimen
+    beside its positive one — near-miss text the pattern must NOT
+    match. Over-match-prone categories especially (§5.10.3's PII
+    set): a lax edge mangles ordinary text, and `pii_ipv6`'s bare
+    `::` match would have redacted every Rust path segment.
 

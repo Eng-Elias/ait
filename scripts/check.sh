@@ -11,3 +11,4 @@ cargo test --workspace
 python3 scripts/check-dep-comments.py
 scripts/check-src-hygiene.sh
 python3 scripts/check-e2e-sentinels.py
+python3 scripts/check-e2e-fixtures.py

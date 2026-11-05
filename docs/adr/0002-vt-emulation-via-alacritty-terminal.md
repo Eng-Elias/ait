@@ -61,7 +61,8 @@ Procedure when adding or upgrading a dependency:
 1. Add a semver requirement (or an `=` pin where the ADR calls for one).
 2. Build; check `Cargo.lock`'s resolved version and that release's date
    on crates.io (`https://crates.io/api/v1/crates/<name>/<version>`,
-   `created_at`).
+   `created_at` — the API 403s scripted calls with no `User-Agent`
+   header; send any, e.g. `curl -H "User-Agent: ait"`).
 3. If the resolved release is younger than 7 days, roll back to the
    newest release that qualifies:
    `cargo update -p <crate> --precise <version>` — the requirement stays

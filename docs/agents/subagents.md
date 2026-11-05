@@ -41,7 +41,10 @@ subagents.
   binary and clippy-checked a lib missing its own branch's changes.
   Sharing is safe only for serial builds of the same content — the
   integration branch's merge gates may share one dir. Round target
-  dirs run tens of GB: delete them at cleanup.
+  dirs run tens of GB — mostly incremental artifacts a ticket gate
+  never needs: set `CARGO_INCREMENTAL=0` in ticket worktrees and
+  delete the dirs at cleanup (an R10 implementer stalled mid-gate
+  at 100% disk and spent a cycle reclaiming caches).
 - **Teardown**: a merged ticket branch leaves its worktree checked
   out and its `target/` on disk — the merge doesn't clean either.
   At round cleanup: `git worktree remove ait-worktrees/<ticket>`
@@ -52,6 +55,13 @@ subagents.
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis
   then has to rebuild.
+- **Known-flaky tests**: timing-sensitive, rerun once before
+  declaring failure — `executor::demotion_never_replays_and_never_recovers`,
+  `pty::the_agent_shell_arms_the_ssh_policy`,
+  `control_master_runs_commands_over_the_socket`,
+  `deterministic_verbs_drive_a_shell_scenario` (ait-testkit). A
+  round that flushes out a new flake appends it here in its retro;
+  prompts carry this file's pointer, not the list.
 
 ## Prompt skeletons
 
@@ -77,5 +87,11 @@ pointers, restated per dispatch, not re-derived:
   later tickets).
 - **Merger/explorer** dispatches stay sparse: the explorer needs only
   the notes-dir path, the spec issue, and the topic list; the merger
-  only the two branches and the gate command.
+  only the two branches and the gate command. The merger skips the
+  re-gate when the merge yields a tree the ticket gate already
+  passed — a branch containing the integration tip produces its own
+  tree on merge (`git diff <tip> <merge-result>` empty); gate only
+  when the merge introduces new content (conflict resolution, a
+  sibling merged in between). A skipped gate is reported as skipped,
+  not as a pass.
 
