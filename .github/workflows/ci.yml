@@ -1,13 +1,29 @@
 name: CI
 
+# Actions-minute budget (private repo): open PRs as drafts — draft PRs
+# skip every job below; mark "ready for review" to run the suite once
+# before merge (AGENTS.md documents the flow). `dev` is intentionally
+# absent from `push:` — it only receives PR merges whose head already
+# passed; `main` keeps a post-merge safety net for promotions.
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
     branches: [main, dev]
+    # `ready_for_review` is not a default type — without it, un-drafting
+    # a PR would never fire CI.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A superseded run keeps billing to completion; cancel it when a newer
+# push lands on the same ref/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
+    # `push` has no pull_request payload — gate drafts, keep pushes.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +37,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.channel }}
+
+      # All three jobs share one cargo/target cache (`shared-key`) —
+      # cold workspace builds are where the billed minutes go.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
 
       - name: Format
         run: cargo fmt --all --check
@@ -61,6 +83,7 @@ jobs:
   # `portable-pty` provides the terminal. Failure dumps under
   # `target/e2e-failures/` are uploaded when the suite fails.
   e2e:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +94,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
 
       # Spec R05 §5.5: the shell-integration e2e matrix gates on
       # installed shells — install them so it covers all three rather
@@ -103,6 +130,7 @@ jobs:
   # docker, so scripts/ssh-e2e.sh provisions its throwaway sshd
   # container and tears it down itself.
   ssh-e2e:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -113,6 +141,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
 
       - name: Build
         run: cargo build -p ait

@@ -90,6 +90,12 @@ it deliberately, one line per release.
   promote `dev` to `main` with a PR; `main` only receives promotion PRs from
   `dev`. `qa` is updated by PR only.
 - PRs into `dev` carry a `Closes #N` line for the spec issue and every ticket.
+- Actions minutes are budgeted (private repo): open PRs as **drafts**
+  and iterate against `scripts/check.sh` locally — CI skips draft PRs
+  entirely. Mark the PR ready for review to run the suite once before
+  merge. The `push:` trigger fires on `main` only, so merging to `dev`
+  doesn't re-run what the PR already passed; pushing to a ready PR
+  cancels the still-running previous attempt (`concurrency`).
 
 ## Agent skills
 
