@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "ait"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ait-agent",
  "ait-config",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "ait-agent"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ait-config",
  "ait-llm",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "ait-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ait-config",
  "keyring",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "ait-llm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ait-config",
  "ait-llm",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "ait-shell"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "ait-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "ait-term"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "ait-testkit"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ait-term",
  "regex",
