@@ -18,7 +18,11 @@ python3 scripts/check-dep-comments.py
 scripts/check-src-hygiene.sh
 python3 scripts/check-e2e-sentinels.py
 python3 scripts/check-e2e-fixtures.py
-# No tag context exists on dev — this enforces the repo-side three-way
-# (workspace version ↔ CHANGELOG top ↔ `ait --version`); a semver tag
-# adds the fourth leg at release time.
+# No tag context exists on dev — this enforces the repo-side four-way
+# (workspace version ↔ CHANGELOG top ↔ version.toml fixture ↔
+# `ait --version`); a semver tag adds the fifth leg at release time.
 python3 scripts/check-release-version.py
+# Hand-editing dist's generated release.yml drifts it from the config;
+# `generate --check` catches that — only where dist is installed (a
+# maintainer tool, not a workspace dep — skip silently elsewhere).
+command -v dist >/dev/null 2>&1 && dist generate --check

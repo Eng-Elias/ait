@@ -10,12 +10,15 @@ Sources compared:
   * workspace — [workspace.package].version in the root Cargo.toml
   * changelog — the top `## [x.y.z]` heading in CHANGELOG.md
                 (`## [Unreleased]` does not match and is skipped)
+  * scenario  — the `expect_text = "ait x.y.z"` literal in
+                crates/ait/tests/scenarios/version.toml (the e2e
+                fixture's second copy of the version)
   * binary    — `ait --version` of target/debug/ait, rebuilt via
                 `cargo build -p ait` when missing or older than sources
 
-Without a tag context the repo-side three-way (workspace ↔ changelog ↔
-binary) is still asserted; a tag adds the fourth. Any disagreement exits
-1 and names every source and its value.
+Without a tag context the repo-side four-way (workspace ↔ changelog ↔
+scenario ↔ binary) is still asserted; a tag adds the fifth. Any
+disagreement exits 1 and names every source and its value.
 
 Usage: scripts/check-release-version.py   (exit 1 + listing on mismatch)
 """
@@ -92,6 +95,20 @@ def tag_version(root: Path) -> str | None:
     return value or None
 
 
+def scenario_version(root: Path) -> str | None:
+    """The `expect_text = "ait x.y.z"` literal in the version e2e
+    scenario — the one place the workspace version is re-literal'd
+    (the scenario file has no interpolation, so it must hand-match)."""
+    scenario = root / "crates" / "ait" / "tests" / "scenarios" / "version.toml"
+    if not scenario.exists():
+        return None
+    for line in scenario.read_text().splitlines():
+        match = re.match(r'^expect_text\s*=\s*"ait\s+(\S+)"', line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
 def binary_stale(binary: Path, root: Path) -> bool:
     """True when the binary is absent or older than any version-affecting
     source: manifests, lockfile, or crates/*/src."""
@@ -136,6 +153,7 @@ def main() -> int:
         sources["RELEASE_TAG/git describe"] = tag
     sources["Cargo.toml [workspace.package]"] = workspace_version(root)
     sources["CHANGELOG.md top entry"] = changelog_version(root)
+    sources["version.toml expect_text"] = scenario_version(root)
     try:
         sources["`ait --version`"] = binary_version(root)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
@@ -161,7 +179,7 @@ def main() -> int:
         return 1
 
     version = next(iter(sources.values()))
-    note = "" if tag is not None else " (no tag context — repo-side three-way)"
+    note = "" if tag is not None else " (no tag context — repo-side four-way)"
     print(f"All version sources agree: {version}{note}")
     return 0
 
