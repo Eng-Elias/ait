@@ -1,6 +1,6 @@
 [package]
 name = "ait-agent"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; Round 6 adds §5.6 agent mode — the AgentSession channel handle and model↔tools loop, the tool registry, the interim ask-everything gate, CommandExecutor/ShellBridge for run_command and the write_to_pty agent-owned PTY; the §5.7 permission engine lands in Round 7."
