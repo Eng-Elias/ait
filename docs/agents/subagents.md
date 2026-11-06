@@ -22,9 +22,11 @@ subagents.
   once at the end — a subagent that dies mid-task leaves its last
   commit, not an uncommitted worktree.
 - **Toolchain**: a subagent shell may lack `cargo` on PATH — the
-  rustup shim lives at `$HOME/.cargo/bin`. When the sandbox denies a
-  subagent's cargo entirely, the parent runs `scripts/check.sh` in
-  that worktree itself; a ticket that never gated doesn't merge.
+  rustup shim lives at `$HOME/.cargo/bin`. The sandbox can deny any
+  exec from a background subagent (R11: even `cargo fmt`) — a
+  dispatch then reports "gate unrun" and the parent runs
+  `cargo fmt --all` and `scripts/check.sh` in that worktree
+  itself; a ticket that never gated doesn't merge.
 - **Dispatches are immutable** — a running background subagent
   can't be resumed or messaged mid-flight; front-load every
   pointer at dispatch. An update that lands mid-task rides the
@@ -47,21 +49,22 @@ subagents.
   at 100% disk and spent a cycle reclaiming caches).
 - **Teardown**: a merged ticket branch leaves its worktree checked
   out and its `target/` on disk — the merge doesn't clean either.
-  At round cleanup: `git worktree remove ait-worktrees/<ticket>`
+  Remove each ticket's worktree *when it merges*, not at round
+  cleanup — sibling target dirs filled the disk mid-gate twice in
+  R11: `git worktree remove ait-worktrees/<ticket>`
   (`--force` when its untracked `target/` blocks removal) drops the
   worktree *and* its target dir, then `git branch -D <branch>`;
-  GitHub already deleted the remote branch on merge.
+  GitHub already deleted the remote branch on merge. Round cleanup
+  verifies `git worktree list` shows none left.
 - **Gate output**: run the gate teed to a log —
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis
   then has to rebuild.
-- **Known-flaky tests**: timing-sensitive, rerun once before
-  declaring failure — `executor::demotion_never_replays_and_never_recovers`,
-  `pty::the_agent_shell_arms_the_ssh_policy`,
-  `control_master_runs_commands_over_the_socket`,
-  `deterministic_verbs_drive_a_shell_scenario` (ait-testkit). A
-  round that flushes out a new flake appends it here in its retro;
-  prompts carry this file's pointer, not the list.
+- **Known-flaky tests**: the canonical list is `docs/using-the-testkit.md`'s
+  "Flaky tests" section — a gate failure on one that goes green on a
+  plain re-run needs no re-diagnosis. A round that flushes out a new
+  flake appends it there in its retro; prompts carry this file's
+  pointer, not the list.
 
 ## Prompt skeletons
 

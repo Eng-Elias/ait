@@ -119,6 +119,13 @@ fn alt_t_opens_a_second_tab() {
   `PS1="$ "`, a fresh temp cwd, `TERM=xterm-256color` — screens
   reproduce across machines and CI. `SpawnConfig.env` is the escape
   hatch (applied after the pins).
+- Two environment facts have burned gate cycles. Tests run as uid 0,
+  where prompts render `# ` (PS1's `\$`) — `# <line>` on screen
+  can't tell "typed verbatim" from "rewritten as a comment", so
+  assert the rewrite as `# # <line>` and verbatim input by the
+  line's own text. And Ubuntu's command-not-found handler prints
+  `Command '<name>' not found` — wait on `not found`, never the
+  `command not found` casing.
 - Every wait is bounded (~15 s); timeouts and failed asserts panic with
   the screen in the message. **No fixed sleeps.**
 - `app.snapshot()` returns cwd-redacted screen text for

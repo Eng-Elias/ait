@@ -160,3 +160,10 @@ surfaces, and file the real fix on the ladder above:
   — first-write timing race (R08 merge gate; green on re-run).
 - `shell_integration.rs::bash_blocks_copy_and_inband_roundtrip`
   — block-seal timing (R08 gate; green on re-run).
+- `executor.rs::control_master_runs_commands_over_the_socket` and
+  `executor.rs::demotion_never_replays_and_never_recovers`
+  (ait-agent) — executor timing; green on re-run.
+- `pty.rs::the_agent_shell_arms_the_ssh_policy` (ait-agent) —
+  PTY timing; green on re-run.
+- `scenario.rs::deterministic_verbs_drive_a_shell_scenario`
+  (ait-testkit self-test) — timing; green on re-run.
