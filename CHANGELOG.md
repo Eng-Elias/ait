@@ -7,7 +7,7 @@ root manifest's `[workspace.package]` (ADR-0015).
 
 ## [Unreleased]
 
-## [1.0.0]
+## [1.0.0] - 2026-11-06
 
 The first release of AIT: a local-first, provider-agnostic AI terminal —
 a full TUI terminal emulator with an agent that reads your shell output,

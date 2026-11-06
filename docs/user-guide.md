@@ -96,11 +96,11 @@ The file's tables:
 
 | Table | Holds |
 |---|---|
-| `[terminal]` | shell, scrollback, `osc52`, `shell_integration` for new sessions |
-| `[agents]` | `custom_endpoints` and `execution_profiles` — the next two sections |
-| `[ssh]` | the SSH-integration policy — see [SSH](#ssh) |
-| `[redaction]` | the named patterns masking secrets before terminal output reaches a provider (`extra` user regexes, `enable`/`disable` per pattern name — `ait --init`'s comments list them) |
-| `[input]` | `classifier` — `heuristic` (default) rewrites a natural-language Enter into the `# ` suggestion flow; `off` submits verbatim |
+| `[terminal]` | shell, scrollback, `osc52`, `shell_integration` |
+| `[agents]` | `custom_endpoints`, `execution_profiles` — next two sections |
+| `[ssh]` | SSH-integration policy — see [SSH](#ssh) |
+| `[redaction]` | named patterns masking secrets before output reaches a provider |
+| `[input]` | `classifier` — `heuristic` (default) or `off` |
 
 ### The `.ait/` project layer
 

@@ -48,9 +48,9 @@ Point `base_model` (under `[agents.execution_profiles.default]`) at
 the `config_key` of a model declared under
 `[[agents.custom_endpoints.*.models]]`, whose endpoint's `base_url`
 and `schema` reach your provider — the generated file ships a working
-local-Ollama example — then run `ait`. Type a natural-language request on the prompt to get a
-suggested command, or press `Alt+A` to open the agent panel and start a
-task.
+local-Ollama example — then run `ait`. Type a natural-language request
+on the prompt to get a suggested command, or press `Alt+A` to open the
+agent panel and start a task.
 
 ## Documentation
 

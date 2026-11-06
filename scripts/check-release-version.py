@@ -31,6 +31,10 @@ from pathlib import Path
 # a version and never matches.
 HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\]")
 VERSION_ENTRY = re.compile(r'^version\s*=\s*"([^"]+)"')
+# Semver-shaped tag (`v` prefix optional). `git describe` answers ANY
+# exact-match tag — a stray local `wip` tag on HEAD is not a release
+# context and must not break `check.sh`; only semver tags count.
+TAG = re.compile(r"^v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$")
 
 
 def workspace_version(root: Path) -> str | None:
@@ -77,6 +81,8 @@ def tag_version(root: Path) -> str | None:
         if result.returncode != 0:
             return None
         tag = result.stdout.strip()
+        if not TAG.match(tag):
+            return None
     value = tag[1:] if tag.startswith("v") else tag
     return value or None
 

@@ -83,9 +83,11 @@ it deliberately, one line per release.
   once, and a push during an in-flight run cancels it (`concurrency`).
 - Release (ADR-0015):
   - Checklist: promotion PR `dev`→`main` → CI green → flip the repo
-    public → `git tag v1.0.0 <main-sha>` → `git push origin v1.0.0` →
-    `release.yml` builds all five targets → `verify-install` gate →
-    announced release.
+    public → `dist plan --tag=vX.Y.Z` and `dist generate --check`
+    locally (the pre-tag sanity — the plan must list all five
+    targets + `ait-installer.sh`) → `git tag vX.Y.Z <main-sha>` →
+    `git push origin vX.Y.Z` → `release.yml` builds all five targets
+    → `verify-install` gate → announced release.
   - Version bump for later releases: bump `[workspace.package].version`
     in the root manifest, add the `## [x.y.z]` CHANGELOG entry, and
     update the literal `expect_text` in
