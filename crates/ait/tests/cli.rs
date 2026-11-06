@@ -2,6 +2,8 @@
 //! 2–5): `ait --init` writes the commented default `settings.toml`
 //! under `$XDG_CONFIG_HOME/ait/` and refuses to overwrite it without
 //! `--force`; `ait --print-schema` emits the settings JSON Schema.
+//! Spec R12 §5.11 adds the `--help`/`--version` surface: man-page
+//! sections covering every arm, and the workspace version string.
 //! The real binary runs as a plain child process — no TTY needed —
 //! with `XDG_CONFIG_HOME` pointed at a fresh tempdir per test.
 
@@ -119,7 +121,9 @@ fn print_schema_emits_the_json_schema() {
 }
 
 /// Unknown arguments — and a `--force` with no `--init` — are usage
-/// errors on stderr, never a silent TUI launch.
+/// errors on stderr, never a silent TUI launch (Spec R12 us-16): the
+/// message names the offender and the full help block follows on
+/// stderr.
 #[test]
 fn bad_arguments_fail_with_usage() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,11 +135,76 @@ fn bad_arguments_fail_with_usage() {
     ] {
         let output = ait(dir.path(), args);
         assert!(!output.status.success(), "{args:?} must fail");
+        let err = stderr(&output);
+        assert!(err.contains("ait:"), "{args:?} stderr: {err}");
+        // The usage error appends the same help `--help` prints.
         assert!(
-            stderr(&output).contains("ait:"),
-            "{args:?} stderr: {}",
+            err.contains("SYNOPSIS"),
+            "{args:?} stderr carries the help block: {err}"
+        );
+    }
+}
+
+/// Spec R12 us-12: `ait --version` prints the built package version —
+/// the `[workspace.package]` single source of truth (us-24), which
+/// this test crate shares through `env!("CARGO_PKG_VERSION")`.
+#[test]
+fn version_prints_the_package_version() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for flag in ["--version", "-V"] {
+        let output = ait(dir.path(), &[flag]);
+        assert!(
+            output.status.success(),
+            "{flag} stderr: {}",
             stderr(&output)
         );
+        assert_eq!(
+            stdout(&output),
+            format!("ait {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag} stdout"
+        );
+    }
+}
+
+/// Spec R12 us-13–15: `ait --help` reads like a man page — NAME,
+/// SYNOPSIS, DESCRIPTION, OPTIONS — with one synopsis line per CLI
+/// arm, and the headless stdout/stderr/exit-code contract spelled
+/// out so scripting ait needs no trial and error.
+#[test]
+fn help_is_man_page_style_and_covers_every_arm() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = ait(dir.path(), &["--help"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let help = stdout(&output);
+    for section in ["NAME", "SYNOPSIS", "DESCRIPTION", "OPTIONS"] {
+        assert!(
+            help.contains(section),
+            "help is missing the {section} section: {help}"
+        );
+    }
+    for synopsis in [
+        "    ait\n",
+        "    ait ctl open-tab\n",
+        "    ait ctl send [--tab <id>] [--no-enter] <text>\n",
+        "    ait ctl last-block [--tab <id>] [--command|--exit]\n",
+        "    ait --headless \"<task>\" [--profile <name>]\n",
+        "    ait --init [--force]\n",
+        "    ait --print-schema\n",
+        "    ait --version\n",
+        "    ait --help\n",
+    ] {
+        assert!(
+            help.contains(synopsis),
+            "help is missing the synopsis line {synopsis:?}: {help}"
+        );
+    }
+    // us-15: the headless contract — answer text to stdout, activity
+    // to stderr, the non-zero exit vocabulary — is on the page.
+    for needle in ["stdout", "stderr", "130"] {
+        assert!(help.contains(needle), "help is missing {needle:?}: {help}");
     }
 }
 
