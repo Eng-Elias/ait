@@ -81,6 +81,21 @@ it deliberately, one line per release.
   (`scripts/ssh-e2e.sh run`) — run it when touching §5.9 remote code.
   A draft promotion PR still skips CI; marking it ready runs the suite
   once, and a push during an in-flight run cancels it (`concurrency`).
+- Release (ADR-0015):
+  - Checklist: promotion PR `dev`→`main` → CI green → flip the repo
+    public → `git tag v1.0.0 <main-sha>` → `git push origin v1.0.0` →
+    `release.yml` builds all five targets → `verify-install` gate →
+    announced release.
+  - Version bump for later releases: bump `[workspace.package].version`
+    in the root manifest, add the `## [x.y.z]` CHANGELOG entry, and
+    update the literal `expect_text` in
+    `crates/ait/tests/scenarios/version.toml` — the fixture hardcodes
+    the version string and `scripts/check-release-version.py` catches
+    drift between all of them.
+  - Tag pushes bypass the `protected-branches` rulesets (branches
+    only), so `guard.yml` is the only on-main enforcement: a version
+    tag on a non-`main` commit or a version mismatch fails the release
+    before any build leg.
 
 ## Agent skills
 
