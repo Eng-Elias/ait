@@ -1,6 +1,6 @@
 [package]
 name = "ait-config"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "AIT's settings.toml model: typed Settings, validation, and errors that name the offending key (REQUIREMENTS.md §4)."

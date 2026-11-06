@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+
+# Single version for the whole workspace (Spec R12 us-24): every crate
+# inherits via `version.workspace = true` so `ait --version`, the release
+# tag and the CHANGELOG top entry can never drift apart by accident.
+[workspace.package]
+version = "1.0.0"
