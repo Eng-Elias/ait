@@ -92,8 +92,8 @@ it deliberately, one line per release.
     in the root manifest, add the `## [x.y.z]` CHANGELOG entry, and
     update the literal `expect_text` in
     `crates/ait/tests/scenarios/version.toml` — the fixture hardcodes
-    the version string; the version scenario test catches its drift
-    while `scripts/check-release-version.py` catches the rest.
+    the version string and `scripts/check-release-version.py` catches
+    drift across all of them.
   - Tag pushes bypass the `protected-branches` rulesets (branches
     only), so `guard.yml` is the only on-main enforcement: a version
     tag on a non-`main` commit or a version mismatch fails the release

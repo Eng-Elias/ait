@@ -18,6 +18,10 @@ subagents.
   its final report and the parent writes them to `ait-notes-<round>/`
   itself. Dispatch note-writing explorers as `subagent_general`, or
   plan to persist the report.
+- **Fresh base**: round work anchors to `origin/dev`'s tip — fetch
+  and confirm the local checkout is current *before* speccing or
+  cutting worktrees, not just at dispatch; a stale `dev` has shipped
+  a spec against pre-merge code (R12 near-miss).
 - **Checkpoints**: implementers commit after each logical step, not
   once at the end — a subagent that dies mid-task leaves its last
   commit, not an uncommitted worktree.
@@ -97,4 +101,12 @@ pointers, restated per dispatch, not re-derived:
   when the merge introduces new content (conflict resolution, a
   sibling merged in between). A skipped gate is reported as skipped,
   not as a pass.
+- **Flake triage**: a gate failure in a test on
+  `docs/agents/flaky-tests.md`'s list is probably load, not your
+  change — rerun the named test alone before re-diagnosing; a pass
+  in isolation means record-and-move-on, never gate-loop.
+- **Docker gates**: `ssh-e2e.sh`/`verify-install.sh` need a live
+  docker daemon — the CLI may sit on a context with the daemon
+  stopped (`desktop-linux` with Docker Desktop off, R12): start it
+  first, don't debug a dead socket.
 
