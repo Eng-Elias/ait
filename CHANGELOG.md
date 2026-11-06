@@ -33,7 +33,7 @@ endpoint including local servers. Ships twelve rounds (REQUIREMENTS.md
 - SSH & executor tiers (R09): `ssh()` snippet wrappers, remote sessions
   over ControlMaster and remote-aware agent tools.
 - Depth features (R10–R11): an MCP client (`mcp.json`), a skills loader
-  (`.devin/skills` + `.ait` roots), complete secret redaction, an input
+  (`~/.config/ait/skills` + project `.ait/skills` roots), complete secret redaction, an input
   classifier, headless mode (`ait --headless "<task>"`) and the `ait
   ctl` control CLI.
 - Packaging & release (R12): one workspace version, this changelog,
