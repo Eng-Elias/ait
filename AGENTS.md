@@ -22,38 +22,14 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
 - `docs/agents/` — issue tracker, triage labels, domain-doc rules.
 - Crate map — one line per crate; each round's landed surface lives
   in ADR-0003's table, not here:
-  `crates/ait-term` — exists (Round 1: pure byte-fed terminal core);
-  `crates/ait` — exists (Round 2 TUI;
-  Round 10: §5.10.2 `LiveSkills` — watcher on both
-  skills roots, per-task catalog snapshots;
-  Round 11: §5.10.4 third submission trigger (NL
-  verdict → `# <line>` rewrite) + §5.10.5 ctl socket
-  server/client and the `--headless` driver);
-  `crates/ait-testkit` — exists (Round E01: e2e toolkit;
-  dev-dependency only — `docs/testing-toolkit.md`);
-  `crates/ait-llm` — exists (Round 3: provider trait + per-schema
-  IRs/adapters);
-  `crates/ait-config` — exists (Round 3: `settings.toml`, secrets,
-  hot reload;
-  Round 10: `[redaction]` + `pattern_names`, the `mcp.json` model
-  and `.ait/` layer, skills roots, `watch_dirs`;
-  Round 11: `[input]` `classifier`);
-  `crates/ait-agent` — exists (Rounds 4/6/7/8: NL→command, agent
-  mode, execution profiles, transcript/replay/plan/summarize;
-  Round 9: §5.9 executor tiers — `RemoteState`, `select_executor`,
-  `ControlMasterExecutor`, remote read tools;
-  Round 10: §5.10.3 `Redactor` + §5.10.1 `McpPool` — `call_mcp_tool`,
-  `read_mcp_resource`, per-task `mcp.json` reconcile;
-  §5.10.2 `SkillsCatalog` snapshot + `invoke_skill`;
-  Round 11: §5.10.4 `classify` + `ProgramIndex` — the
-  input classifier's decision half);
-  `crates/ait-shell` — exists (Round 5: OSC 7700 hooks + blocks;
-  Round 9: §5.9 — `ssh_begin`/`ssh_end` hooks, the `ssh()` wrappers
-  in every snippet and the remote bootstrap renderer;
-  Round 11: §5.10.4 `builtins_for` — per-shell builtin
-  tables for the classifier's `ProgramIndex`);
-  `crates/ait-store` — exists (Round 8: §5.8 persistence —
-  `rusqlite` facade; ADR-0011; Round 9: `blocks.host` migration).
+  `crates/ait-term` — exists (pure byte-fed terminal core);
+  `crates/ait` — exists (the TUI);
+  `crates/ait-testkit` — exists (e2e toolkit; dev-dependency only — `docs/testing-toolkit.md`);
+  `crates/ait-llm` — exists (provider trait + per-schema IRs/adapters);
+  `crates/ait-config` — exists (`settings.toml`, secrets, hot reload);
+  `crates/ait-agent` — exists (NL→command, agent mode, execution profiles, transcripts);
+  `crates/ait-shell` — exists (OSC 7700 hooks + blocks, shell snippets, ssh);
+  `crates/ait-store` — exists (§5.8 persistence — `rusqlite` facade; ADR-0011).
 
 ## Commands
 
