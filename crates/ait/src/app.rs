@@ -2550,13 +2550,14 @@ mod tests {
             harness.state.toast.is_none(),
             "a user-initiated cancel never toasts"
         );
-        assert!(
-            rows(&harness)
+        // The pin's release races the PTY echo of the `# ` comment —
+        // wait for the row like the rewrite test does rather than
+        // snapshotting the instant the suggestion clears.
+        wait_until(&mut harness, |h| {
+            rows(h)
                 .iter()
-                .any(|row| row.ends_with("# what is the largest file")),
-            "the history comment outlives the cancel: {:?}",
-            rows(&harness)
-        );
+                .any(|row| row.ends_with("# what is the largest file"))
+        });
     }
 
     /// Spec R03 stories 10–11 and 14: a good watcher event swaps the

@@ -1,0 +1,63 @@
+name: Release guard
+
+# Reusable workflow invoked as `custom-guard` by release.yml's
+# plan-jobs injection (Spec R12 §5.11). It runs at pipeline start,
+# before any billed build leg, so a bad tag dies cheap. It enforces
+# the two release preconditions dist itself cannot:
+#
+#   1. the tagged commit is an ancestor of origin/main (spec us-26) —
+#      tag pushes are the one write the `protected-branches` ruleset
+#      does not cover (it governs branches only), so without this
+#      check a tag on any commit could mint a release;
+#   2. tag ↔ [workspace.package].version ↔ CHANGELOG top ↔
+#      `ait --version` all agree (spec us-27), via
+#      scripts/check-release-version.py.
+#
+# `workflow_call` deliberately declares no inputs: dist emits
+# plan-phase custom jobs with no `with:` block, so a required input
+# would break the call.
+on:
+  workflow_call:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    # Checkout + a read-only script — least privilege.
+    permissions:
+      contents: read
+    steps:
+      # The ancestry check needs the tagged commit's full history plus
+      # main's; shallow clones can truncate merge-base results.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A tag-push checkout fetches the tag, not branches — pull main
+      # in explicitly so `origin/main` resolves.
+      - name: Resolve origin/main
+        run: git fetch origin '+refs/heads/main:refs/remotes/origin/main'
+
+      - name: Tagged commit must sit on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on origin/main — version tags only ship from main."
+            exit 1
+          fi
+
+      # check-release-version.py also asserts `ait --version`, which
+      # needs target/debug/ait — install the toolchain pinned in
+      # rust-toolchain.toml (the same channel ci.yml reads) and reuse
+      # the shared cargo cache.
+      - name: Read toolchain pin
+        run: echo "channel=$(sed -n 's/^channel = \"\(.*\)\"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Tag, workspace, CHANGELOG and binary agree
+        run: RELEASE_TAG="$GITHUB_REF_NAME" python3 scripts/check-release-version.py

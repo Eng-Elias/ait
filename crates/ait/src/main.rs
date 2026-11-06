@@ -36,23 +36,81 @@ mod transcript;
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "ait — AI Terminal
+/// `--help`'s text and the tail of every usage error (Spec R12
+/// §5.11, us-13–16): man-page layout — NAME/SYNOPSIS/DESCRIPTION/
+/// OPTIONS — covering every arm [`parse_args`] accepts, including
+/// headless's stdout/stderr/exit-code contract. Documentation only;
+/// the accepted forms are the parser's.
+const USAGE: &str = "NAME
+    ait — AI terminal: $SHELL in a full-screen TUI, with an agent
+    that sees and drives it
 
-USAGE:
-    ait                    Open a full-screen terminal running $SHELL
-    ait ctl <verb>         Drive a running ait instance over its
-                           control socket:
-                               open-tab
-                               send [--tab <id>] [--no-enter] <text>
-                               last-block [--tab <id>] [--command|--exit]
+SYNOPSIS
+    ait
+    ait ctl open-tab
+    ait ctl send [--tab <id>] [--no-enter] <text>
+    ait ctl last-block [--tab <id>] [--command|--exit]
     ait --headless \"<task>\" [--profile <name>]
-                           Run one agent task non-interactively
-                           (text to stdout, activity to stderr)
-    ait --init [--force]   Write a commented default settings.toml
-                           (refuses to overwrite unless --force)
-    ait --print-schema     Print the settings JSON Schema and exit
-    ait --version          Print the version and exit
-    ait --help             Print this help
+    ait --init [--force]
+    ait --print-schema
+    ait --version
+    ait --help
+
+DESCRIPTION
+    Bare ait opens a full-screen terminal running $SHELL — tabs,
+    command blocks, an agent sidebar. Every other form performs
+    one action and exits. An unrecognized argument is a usage
+    error: the message and this text land on stderr and the exit
+    code is non-zero.
+
+OPTIONS
+    ctl <verb>
+        Drive a running instance over its control socket (unix
+        only): $AIT_CTL_SOCKET when set, else the one live
+        instance's socket — spawned shells inherit the variable,
+        so `ait ctl` inside a tab drives its own instance. Verb
+        answers go to stdout; failures exit non-zero with the
+        message on stderr.
+
+        open-tab
+            Open a tab and print the response's JSON line — it
+            carries the new tab's session id.
+
+        send [--tab <id>] [--no-enter] <text>
+            Write <text> into the tab's shell input and submit
+            it; --no-enter leaves the text on the input line
+            instead. <id> is the tab's AIT_SESSION_ID — unset
+            targets the active tab.
+
+        last-block [--tab <id>] [--command|--exit]
+            Print the newest sealed block's output; --command or
+            --exit prints that field instead (the two can't
+            combine).
+
+    --headless \"<task>\" [--profile <name>]
+        Run one agent task non-interactively: the answer's text
+        streams to stdout (pipe-safe) while tool and status
+        activity goes to stderr; approval gates are auto-denied
+        and questions get a canned no-interactive answer.
+        --profile names an [agents.execution_profiles.*] entry —
+        unset arms the launch default. Exit codes: 0 done, 1
+        error (startup failures — bad settings, unknown profile,
+        no model — and mid-run errors alike), 2 step budget
+        reached, 130 interrupted by SIGINT (the headless Esc).
+
+    --init [--force]
+        Write a commented default settings.toml under
+        $XDG_CONFIG_HOME/ait/; an existing file is kept unless
+        --force (the `--force --init` order also works).
+
+    --print-schema
+        Print the settings JSON Schema.
+
+    --version
+        Print the version. -V is a synonym.
+
+    --help
+        Print this text. -h is a synonym.
 ";
 
 /// What `argv[1..]` asks the binary to do (Spec R03 `ait` CLI).

@@ -1,3 +1,66 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+
+# Single version for the whole workspace (Spec R12 us-24): every crate
+# inherits via `version.workspace = true` so `ait --version`, the release
+# tag and the CHANGELOG top entry can never drift apart by accident.
+[workspace.package]
+version = "1.0.0"
+
+# cargo-dist release pipeline (Spec R12 §5.11): pushing a version tag
+# builds tarballs for the five §6 targets plus the `ait-installer.sh`
+# curl|sh installer, publishes the GitHub Release, and announces only
+# after the verify-install gate passes. The generated
+# .github/workflows/release.yml is refreshed by `dist generate` —
+# never hand-edit it (dist errors on a stale generated file).
+[workspace.metadata.dist]
+# The exact dist release CI installs — ADR-0002's determinism rule
+# applied to the release toolchain. release.yml's "Install dist" step
+# curls this version's installer.
+cargo-dist-version = "0.34.0"
+ci = ["github"]
+# `ait` is the workspace's sole [[bin]] — the ait-llm `chat` example
+# and ait-testkit are never release artifacts.
+packages = ["ait"]
+# The shell installer is the only installer §5.11 ships — no
+# homebrew/npm/msi this round.
+installers = ["shell"]
+# gzip archives (ait-<target>.tar.gz): decompresses everywhere the
+# installer runs with no extra tooling; dist's default is .tar.xz.
+unix-archive = ".tar.gz"
+# x86_64-musl is the fully static leg (the dep tree is rustls-only, no
+# OpenSSL — Spec R12); aarch64-linux builds natively on the ARM64
+# runner below rather than dist's cargo-zigbuild cross default.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+# "skip" removes the pull_request trigger dist would otherwise emit —
+# a dist dry-run on every PR would bill private-repo minutes on `dev`
+# PRs, and our CI policy is main-only (AGENTS.md).
+pr-run-mode = "skip"
+# Guard the pipeline start (tagged commit on main + version agreement,
+# spec us-26/27) and gate `announce` on a smoke test of the published
+# installer — the two supported injection points. The verify-install
+# reusable workflow is owned by R12-T5.
+plan-jobs = ["./guard"]
+publish-jobs = ["./verify-install"]
+
+# publish-jobs default to escalated id-token/packages permissions; the
+# verifier only reads release assets, so pin it to contents:read.
+[workspace.metadata.dist.github-custom-job-permissions.verify-install]
+contents = "read"
+
+# GitHub's native ARM64 label — free on public repos, and the repo goes
+# public before the first tag (Spec R12).
+[workspace.metadata.dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
