@@ -81,6 +81,7 @@ use crate::agent_panel::{paint_agent_panel, AgentPanel};
 use crate::backend::StyledBackend;
 use crate::config::{self, LiveSettings};
 use crate::conversations::ConversationPicker;
+use crate::ctl;
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
 use crate::profile::{self, ProfilePicker};
@@ -354,13 +355,33 @@ pub fn run() -> io::Result<ExitCode> {
         // R10-T6).
         skills: LiveSkills::new(),
     };
+    // §5.10.5's control socket (Spec R11): a nonblocking listener on
+    // `${XDG_RUNTIME_DIR}/ait/<pid>.sock`, drained on the tick beside
+    // the other channels. A bind failure degrades to running without
+    // ctl — additive surface, never a launch blocker. Its path rides
+    // the spawn template so every session's env exports
+    // `AIT_CTL_SOCKET` (surviving later config reloads —
+    // `set_session_template` carries it).
+    let mut ctl = match ctl::CtlServer::bind() {
+        Ok(server) => Some(server),
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("ctl socket unavailable: {error}"),
+                Instant::now(),
+            ));
+            None
+        }
+    };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
-    let mut tabs = TabManager::spawn_with(
-        content_size(state.screen),
-        config::session_template(state.config.settings()),
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut template = config::session_template(state.config.settings());
+    template.ctl_socket = ctl
+        .as_ref()
+        .map(|server| server.socket_path())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_path_buf());
+    let mut tabs = TabManager::spawn_with(content_size(state.screen), template)
+        .map_err(|e| io::Error::other(e.to_string()))?;
     // The first tab's `terminal_sessions` row (Spec R08): `None` — a
     // disabled store or a failed insert — leaves the tab unpersisted.
     if let Some(tab) = tabs.active_mut() {
@@ -473,6 +494,28 @@ pub fn run() -> io::Result<ExitCode> {
         state
             .suggestion
             .drain(state.suggester.events(), &tabs, &mut state.toast);
+        // The ctl socket drains on the same tick (Spec R11 §5.10.5):
+        // completed requests dispatch over `&mut TabManager` — a
+        // `send`'s bytes land in this tick's session drains, and an
+        // `open_tab`'s spawned tab (now active) gets the
+        // `terminal_sessions` row `Alt+T` registers (Spec R08).
+        if let Some(server) = ctl.as_mut() {
+            for follow in server.drain(&mut tabs) {
+                match follow {
+                    ctl::FollowUp::OpenedTab => {
+                        if let Some(tab) = tabs.active_mut() {
+                            if let Some(id) = state.store.session_started(
+                                &mut state.toast,
+                                tab.title(),
+                                tab.cwd(),
+                            ) {
+                                tab.set_store_session(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Agent sessions on the same tick (Spec R06): `TextDelta`s
         // stream into each tab's conversation and terminal events
         // release its running state — a background tab keeps up.
@@ -959,6 +1002,35 @@ fn handle_event<W: Write>(
                                         request,
                                         &mut state.toast,
                                     );
+                                } else if let Some((line, request)) = suggest::classified_request(
+                                    tab,
+                                    state.config.settings(),
+                                    &state.profile,
+                                ) {
+                                    // The third trigger (§5.10.4, Spec
+                                    // R11-T2): a natural-language verdict
+                                    // swallows the Enter and rewrites the
+                                    // submission — `Ctrl+U` wipes the
+                                    // typed line, `# <line>` + `\r` lands
+                                    // the request in history as a comment
+                                    // and draws the fresh prompt the
+                                    // armed suggestion streams onto
+                                    // (ADR-0007 semantics). The rewrite
+                                    // goes out ONLY once the request is
+                                    // armed: a refused `fire` falls
+                                    // through to the ordinary verbatim
+                                    // submission below — the
+                                    // erase-after-fire ordering
+                                    // `suggest_from_line` established.
+                                    if state.suggestion.fire(
+                                        &state.suggester,
+                                        tab.id,
+                                        request,
+                                        &mut state.toast,
+                                    ) {
+                                        suggest::rewrite_as_comment(tab, &line);
+                                        return Handled::Continue;
+                                    }
                                 }
                             }
                             tab.shadow.update(&key_event);
@@ -2224,6 +2296,267 @@ mod tests {
 
         harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(harness.tabs.active().unwrap().shadow.text(), "");
+    }
+
+    // ---- Spec R11-T2 (§5.10.4): the classifier trigger ----
+    //
+    // The third submission trigger through `handle_event`: a verified
+    // natural-language line + Enter is swallowed and rewritten —
+    // `Ctrl+U`, then `# <line>` + `\r` — while the identical
+    // `SuggestRequest` path arms the stream the fresh prompt receives.
+    // Command lines, stale shadows, echo disagreement and
+    // `classifier = "off"` all forward verbatim.
+
+    /// Every grid row — scrollback then viewport — as trimmed text:
+    /// the shape the classifier tests assert PTY-visible output in.
+    fn rows(harness: &Harness) -> Vec<String> {
+        let tab = harness.tabs.active().unwrap();
+        tab.grid()
+            .scrollback_rows()
+            .chain(tab.grid().visible_rows())
+            .map(|row| row.text().trim_end().to_owned())
+            .collect()
+    }
+
+    /// us-1/2/3: the full rewrite through `handle_event` — the pin
+    /// arms on the whole-line request, the shadow resets, and the PTY
+    /// shows the `# <line>` comment with NO `not found` error: the
+    /// raw sentence never ran.
+    #[test]
+    fn natural_language_enter_rewrites_to_a_hash_request() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&mut harness, |h| !logical(h).is_empty());
+        let prompt = logical(&harness);
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        assert!(!harness.tabs.active().unwrap().shadow.is_stale());
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The request armed the suggester pinned to tab 0 — the same
+        // in-flight contract the `# ` trigger honors (us-14).
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
+            "the classifier's request armed the suggestion path"
+        );
+        // The shadow reset — the streamed suggestion types onto a
+        // fresh one, like the `# ` path and Esc-cancel leave it.
+        let shadow = &harness.tabs.active().unwrap().shadow;
+        assert_eq!(shadow.text(), "");
+        assert!(!shadow.is_stale());
+
+        // The rewrite reached the shell: the `# ` comment echoed and
+        // submitted — a fresh prompt row follows it, identical to the
+        // prompt the line was typed on (the mirror of the Alt+Enter
+        // test's bare-prompt wait).
+        wait_until(&mut harness, |h| {
+            rows(h)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file"))
+        });
+        wait_until(&mut harness, |h| logical(h) == prompt);
+        // …and the typed line never executed: a forwarded Enter would
+        // have run it and `what` resolves nowhere.
+        assert!(
+            !rows(&harness).iter().any(|row| row.contains("not found")),
+            "the raw sentence never reached the shell: {:?}",
+            rows(&harness)
+        );
+    }
+
+    /// us-2: the rewrite's byte contract — `Ctrl+U`, then `# <line>` +
+    /// `\r`, in that order — captured byte-for-byte through the
+    /// `stty raw; head` seam the in-flight tests established.
+    #[test]
+    fn rewrite_as_comment_writes_ctrl_u_then_the_hash_line() {
+        let path = capture_path("rewrite");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &mut harness,
+            &format!("stty raw; head -c 17 > {}", path.display()),
+            &path,
+        );
+
+        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit");
+
+        assert_eq!(
+            wait_file(&mut harness, &path, 17),
+            b"\x15# undo a commit\r",
+            "Ctrl+U, the comment, the submission — in that order"
+        );
+        assert!(
+            harness.tabs.active().unwrap().shadow.text().is_empty(),
+            "the wiped line resets the shadow"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-5: a verified line the heuristic reads as a command reaches
+    /// the shell verbatim — no pin, no rewrite, the command's own
+    /// output on the grid (standard 15: wait on output only execution
+    /// produces).
+    #[test]
+    fn a_command_line_forwards_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "echo R11T2_$((40+2))");
+        wait_until(&mut harness, |h| logical(h).ends_with("R11T2_$((40+2))"));
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            harness.state.suggestion.is_none(),
+            "a command verdict takes no pin"
+        );
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("R11T2_42"))
+        });
+        // `/bin/sh` as root prompts with `# ` — a verbatim line
+        // already renders `# echo …`, so the rewrite's tell is the
+        // doubled hash: prompt `# ` + submitted `# echo …`.
+        assert!(
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# # echo R11T2_")),
+            "no `# ` rewrite row: {:?}",
+            rows(&harness)
+        );
+    }
+
+    /// us-10/16: a stale shadow — staged through the same `mark_stale`
+    /// `ait ctl send` and pastes use — degrades the submission to
+    /// ordinary: Enter forwards verbatim (the shell runs the line and
+    /// `what` resolves nowhere), no pin, no `# ` rewrite.
+    #[test]
+    fn a_stale_shadow_submits_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        harness.tabs.active_mut().unwrap().shadow.mark_stale();
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+        // The `# ` prompt makes a verbatim `# what …` row
+        // indistinguishable from the text alone — the rewrite's tell
+        // is the doubled hash.
+        assert!(
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# # what is the largest file")),
+            "the stale line was never rewritten"
+        );
+    }
+
+    /// us-10: a shadow that desynced from the echoed line — one extra
+    /// char the PTY never saw — fails echo agreement and submits
+    /// verbatim like a stale one: no verdict, no rewrite.
+    #[test]
+    fn an_unverifiable_shadow_submits_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        // A keystroke the PTY never saw leaves the shadow ahead of the
+        // echo — `ends_with` refuses, non-stale or not.
+        harness
+            .tabs
+            .active_mut()
+            .unwrap()
+            .shadow
+            .update(&ait_term::KeyEvent::new(
+                ait_term::Key::Char('z'),
+                ait_term::Modifiers::NONE,
+            ));
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+    }
+
+    /// us-11/13: `classifier = "off"` submits every line verbatim —
+    /// and a settings swap applies to the NEXT submission: the armed
+    /// check reads live settings at Enter, exactly what the config
+    /// watcher's `LiveSettings::adopt` lands.
+    #[test]
+    fn classifier_off_submits_verbatim_until_rearmed() {
+        let mut harness = Harness::new(sh_manager());
+        harness.state.config =
+            LiveSettings::adopt(Settings::from_toml("[input]\nclassifier = \"off\"\n").unwrap());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+
+        // Rearming (what a good hot-reload lands) lets the NEXT
+        // natural-language submission rewrite again.
+        harness.state.config = LiveSettings::adopt(Settings::default());
+        type_keys(&mut harness, "where are the log files");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("where are the log files")
+        });
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
+            "the reloaded setting armed the next submission"
+        );
+    }
+
+    /// us-4: Esc after the rewrite cancels the streaming suggestion —
+    /// and nothing else: the `# <line>` comment stays on the grid
+    /// exactly like a cancelled explicit `# ` request (ADR-0007
+    /// semantics; a misfire costs nothing the user can't undo).
+    #[test]
+    fn esc_after_the_rewrite_only_cancels_the_suggestion() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id)
+        );
+
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        // The pin is marked cancelled — the worker's terminal event
+        // releases it silently — while the comment the rewrite
+        // submitted is untouched.
+        assert!(harness.state.suggestion.is_cancelled());
+        wait_until(&mut harness, |h| h.state.suggestion.is_none());
+        assert!(
+            harness.state.toast.is_none(),
+            "a user-initiated cancel never toasts"
+        );
+        assert!(
+            rows(&harness)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file")),
+            "the history comment outlives the cancel: {:?}",
+            rows(&harness)
+        );
     }
 
     /// Spec R03 stories 10–11 and 14: a good watcher event swaps the

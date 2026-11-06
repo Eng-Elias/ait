@@ -98,6 +98,22 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   (`ssh -S <sock> <target> -- <cmd>`); a transport failure demotes the task
   permanently — the hit run errors rather than replaying (§5.9).
 - **Redaction** — masking secrets in terminal output before it reaches an LLM.
+- **Input classifier** — the §5.10.4 decision on Enter (`classify` in
+  `ait-agent`): the verified input line plus a `ProgramIndex` — the
+  detected shell's builtin table (`ait-shell`'s `builtins_for`, keyed
+  on the program basename) merged with `$PATH` executable basenames —
+  classifies `Command` or `NaturalLanguage`; a natural-language verdict
+  rewrites the submission into the `# ` suggestion flow. Conservative:
+  shell syntax, resolvable first words and anything without positive
+  sentence evidence stay commands; `[input] classifier` arms it.
+- **Headless mode** — `ait --headless "<task>" [--profile <name>]`
+  (§5.10.5): a non-interactive agent run that spawns a hidden,
+  fully-integrated shell, auto-denies approval gates, answers
+  `ask_user_question` with a canned no-interactive reply, streams
+  assistant text to stdout and tool/status activity to stderr, and
+  persists the conversation like a TUI task. `Done` exits 0;
+  `Error`/`BudgetReached`/`Cancelled` exit non-zero; SIGINT is the
+  headless Esc (`session.cancel()`).
 - **MCP server** — a Model Context Protocol stdio server declared in
   `mcp.json` (`{"mcpServers": {"name": {"command", "args", "env"}}}`):
   `ait-agent`'s per-session `McpPool` connects user-tier entries
@@ -118,6 +134,12 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `AgentRequest.skills`; the frontend's `LiveSkills` watcher refreshes
   it on changes under either root, keeping last-good copies of
   entries a write left malformed (§5.10.2, ADR-0006).
+- **Control socket** — the per-instance Unix socket a running `ait`
+  listens on (`${XDG_RUNTIME_DIR}/ait/<pid>.sock`, else
+  `$TMPDIR/ait-<uid>`; dir `0700`, socket `0600`), drained on the app
+  tick and carrying one single-line JSON request/response per
+  connection. `ait ctl <verb>` is its client; `AIT_CTL_SOCKET` —
+  exported into every spawned session — names it (§5.10.5).
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.

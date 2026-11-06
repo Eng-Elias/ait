@@ -32,6 +32,10 @@ pub struct Settings {
     /// the named built-ins and opt-in PII categories.
     #[serde(default)]
     pub redaction: RedactionSettings,
+    /// `[input]` — the §5.10.4 input-classifier configuration (§4.3,
+    /// Spec R11).
+    #[serde(default)]
+    pub input: InputSettings,
 }
 
 impl Settings {
@@ -288,6 +292,38 @@ pub struct RedactionSettings {
     /// over-matches the user's workflow.
     #[serde(default)]
     pub disable: Vec<String>,
+}
+
+/// `[input]` (§4.3, §5.10.4, Spec R11) — how a submitted input line is
+/// classified before it reaches the shell.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct InputSettings {
+    /// The input-classifier mode (§5.10.4): `heuristic` (default)
+    /// rewrites a line the heuristic reads as natural language into
+    /// the `# ` suggestion flow; `off` submits every line verbatim.
+    /// An unrecognized value is a load error naming `input.classifier`
+    /// (ADR-0006 style — a mistake must surface, not silently no-op).
+    /// The `local_model` variant is reserved for the later cargo
+    /// feature and is a load error today.
+    #[serde(default)]
+    pub classifier: ClassifierMode,
+}
+
+/// `classifier` under `[input]` (§5.10.4). `Heuristic` is the default;
+/// the enum reserves a `local_model` slot for the later cargo feature
+/// without a signature break.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifierMode {
+    /// `heuristic` — the default: rule-based classification over the
+    /// program index, shell syntax and sentence evidence.
+    #[default]
+    Heuristic,
+    /// `off` — classification disabled; Enter always submits verbatim.
+    Off,
 }
 
 /// `[terminal]` (§4.3) — settings applied when spawning NEW sessions.

@@ -20,21 +20,29 @@
 //! the only filesystem access is [`Injection::materialize_in`], which
 //! writes snippet assets into a fresh per-session `0700` temp dir and
 //! never anywhere else (CODING_STANDARDS.md 11).
+//!
+//! Round 11 adds [`builtins_for`] — the per-shell builtin/keyword
+//! tables (shared POSIX set + bash/zsh/fish extras, keyed by shell
+//! name) the §5.10.4 input classifier merges into its program index
+//! (Spec R11-T1).
 
+mod builtins;
 mod codec;
 mod inject;
 mod remote;
 mod run;
 mod snippets;
 
+pub use builtins::{builtins_for, is_known_shell};
 pub use codec::{
     decode, session_id, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE,
 };
 pub use inject::{plan, plan_with_zdotdir, Injection, Materialized, ShellKind, ENV_SESSION_ID};
 pub use remote::{
-    bootstrap_script, policy_env, ssh_control_dir, SshPolicy, DEFAULT_CONTROL_PERSIST,
-    ENV_SSH_ALLOW, ENV_SSH_BOOTSTRAP, ENV_SSH_CONTROL_DIR, ENV_SSH_CONTROL_PERSIST, ENV_SSH_DENY,
-    ENV_SSH_ENABLED, ENV_SSH_HOP, ENV_SSH_OFF, ENV_SSH_REUSE_CM, SSH_PROGRAM,
+    ait_runtime_dir, bootstrap_script, policy_env, ssh_control_dir, SshPolicy,
+    DEFAULT_CONTROL_PERSIST, ENV_SSH_ALLOW, ENV_SSH_BOOTSTRAP, ENV_SSH_CONTROL_DIR,
+    ENV_SSH_CONTROL_PERSIST, ENV_SSH_DENY, ENV_SSH_ENABLED, ENV_SSH_HOP, ENV_SSH_OFF,
+    ENV_SSH_REUSE_CM, SSH_PROGRAM,
 };
 pub use run::{
     chunk_run_payload, run_begin_sequence, run_end_sequence, run_request, RunAccumulator, RunResult,

@@ -667,3 +667,127 @@ fn unconfigured_model_toasts_and_the_terminal_keeps_working() {
         app.screen_text().lines().any(|line| line == "ok")
     });
 }
+
+// ---------------------------------------------------------------------------
+// Spec R11 §5.10.4: the input classifier's third submission trigger
+// (ticket R11-T6). A verified natural-language line + Enter is
+// swallowed and rewritten — `Ctrl+U`, then `# <line>` + `\r` — so the
+// request lands in scrollback as a comment and the identical
+// `SuggestRequest` path streams onto the fresh prompt (ADR-0014). A
+// command verdict and `classifier = "off"` forward the line verbatim.
+// Code-first like the R04 tests above: the suggestion stream needs the
+// loopback fixture, whose ephemeral port no scenario `env` can spell.
+// ---------------------------------------------------------------------------
+
+/// Stories 1–3: a typed natural-language line — no `# ` prefix, no
+/// trigger chord — is rewritten into the `# ` flow on Enter alone:
+/// the comment lands in scrollback and the stub's suggestion streams
+/// onto the fresh prompt, exactly as `hash_enter_…` above asserts for
+/// the explicit trigger.
+#[test]
+fn a_natural_language_line_rewrites_to_a_comment_and_streams() {
+    let stub = Fixture::serve(vec![sse(&sse_transcript(&[
+        "find ",
+        ". -type f -size +1G",
+    ]))]);
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(dir.path(), &settings_with_stub(&stub.base_url));
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    wait_for_chrome(&mut app);
+    app.wait_for_screen("the shell prompt", |app| app.line(1) == "$");
+
+    // `what …` carries the classifier's sentence evidence (a leading
+    // question word) and resolves nowhere on `$PATH` — the verdict is
+    // `NaturalLanguage`.
+    app.type_text("what is the largest file");
+    wait_for_typed_echo(&mut app, "what is the largest file");
+    app.press("Enter");
+
+    app.wait_for_screen("the streamed command on the fresh prompt", |app| {
+        input_line(app) == "$ find . -type f -size +1G"
+    });
+    // The rewrite reached the shell as a comment — `$ ` prompt + the
+    // submitted `# <line>` — and the raw sentence never executed, so
+    // no `not found` error row exists.
+    assert_eq!(app.line(1), "$ # what is the largest file");
+    assert!(
+        !app.screen_text().contains("not found"),
+        "the raw sentence never ran: {}",
+        app.screen_text()
+    );
+}
+
+/// Stories 5–8: a line the heuristic reads as a command — `echo` is a
+/// builtin the `ProgramIndex` resolves — reaches the shell verbatim:
+/// its own output renders, no `# ` rewrite row exists, and the stub's
+/// suggestion never types.
+#[test]
+fn a_command_line_submits_verbatim_past_the_classifier() {
+    // Armed anyway: a misfire would stream `SHOULD_NOT_STREAM` onto a
+    // fresh prompt and the assertion below would catch it.
+    let stub = Fixture::serve(vec![sse(&sse_transcript(&["SHOULD_NOT_STREAM"]))]);
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(dir.path(), &settings_with_stub(&stub.base_url));
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    wait_for_chrome(&mut app);
+    app.wait_for_screen("the shell prompt", |app| app.line(1) == "$");
+
+    app.type_text("echo R11T6_VERBATIM");
+    wait_for_typed_echo(&mut app, "echo R11T6_VERBATIM");
+    app.press("Enter");
+
+    // The command ran — `R11T6_VERBATIM` on its own row is output only
+    // execution produces (the echo row carries the command text).
+    app.wait_for_screen("the command's own output", |app| {
+        app.screen_text()
+            .lines()
+            .any(|line| line == "R11T6_VERBATIM")
+    });
+    app.wait_for_screen("a fresh prompt with nothing streamed", |app| {
+        input_line(app) == "$"
+    });
+    assert!(
+        !app.screen_text().contains("# echo R11T6_VERBATIM"),
+        "no `# ` rewrite row: {}",
+        app.screen_text()
+    );
+    assert!(!app.screen_text().contains("SHOULD_NOT_STREAM"));
+}
+
+/// Stories 11/13: `[input] classifier = "off"` submits every line
+/// verbatim — the same natural-language sentence reaches the shell
+/// untouched and fails like any mistyped command: `not found`, and no
+/// `# ` rewrite row.
+#[test]
+fn classifier_off_submits_the_sentence_verbatim() {
+    let stub = Fixture::serve(vec![sse(&sse_transcript(&["SHOULD_NOT_STREAM"]))]);
+    let dir = tempfile::tempdir().expect("fixture tempdir");
+    write_settings(
+        dir.path(),
+        &format!(
+            "{}\n[input]\nclassifier = \"off\"\n",
+            settings_with_stub(&stub.base_url)
+        ),
+    );
+
+    let mut app = spawn_ait_with_xdg(dir.path());
+    wait_for_chrome(&mut app);
+    app.wait_for_screen("the shell prompt", |app| app.line(1) == "$");
+
+    app.type_text("what is the largest file");
+    wait_for_typed_echo(&mut app, "what is the largest file");
+    app.press("Enter");
+
+    // `what` resolves nowhere — the verbatim submission's error is the
+    // tell, and the un-rewritten line sits in scrollback as typed.
+    app.wait_for_screen("the verbatim submission's error", |app| {
+        app.screen_text().contains("not found")
+    });
+    assert!(
+        !app.screen_text().contains("# what is the largest file"),
+        "the disarmed classifier never rewrote: {}",
+        app.screen_text()
+    );
+}

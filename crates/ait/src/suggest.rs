@@ -47,8 +47,11 @@
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use ait_agent::{CommandSuggester, SuggestEvent, SuggestRequest, OUTPUT_LINE_BUDGET};
-use ait_config::Settings;
+use ait_agent::{
+    classify, CommandSuggester, InputClass, ProgramIndex, SuggestEvent, SuggestRequest,
+    OUTPUT_LINE_BUDGET,
+};
+use ait_config::{ClassifierMode, Settings};
 use ait_term::{Cursor, GridView, Key, KeyEvent, Keypad, Modifiers};
 
 use crate::blocks::Block;
@@ -395,6 +398,86 @@ pub fn line_request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option
         .shadow
         .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
     Some(assemble(tab, settings, profile, request))
+}
+
+/// The verdict half of the §5.10.4 classifier trigger (Spec R11-T2):
+/// `mode` armed AND `shell_name` a known shell AND `shadow` verifying
+/// against `logical_line` — the same echo-agreement check both
+/// explicit triggers run — hands the line to [`classify`].
+/// `NaturalLanguage` returns the verified line for the
+/// [`rewrite_as_comment`] path; every other outcome — `off`, an
+/// unknown shell, a `Command` verdict, a stale shadow, echo
+/// disagreement — is `None` and the submission stays ordinary: the
+/// desync-is-inert rule, and the reason input that never passed
+/// through keystrokes (`ait ctl send`, which marks the shadow stale)
+/// is never classified (us-10/11/16). The known-shell gate is the
+/// `\x15` wipe's exposure: a REPL or any other program that echoes
+/// input without readline's kill-to-BOL would get `# <line>` APPENDED
+/// to the un-wiped line — a mangled line executes — so the trigger
+/// only arms where the wipe is honored (us-10). The pure half of the
+/// trigger: byte-fed `Session`s and `with_path_entries` indexes drive
+/// it without a PTY or a `$PATH` walk.
+fn classified_line(
+    shadow: &InputShadow,
+    logical_line: &str,
+    shell_name: &str,
+    index: &ProgramIndex,
+    mode: ClassifierMode,
+) -> Option<String> {
+    if mode == ClassifierMode::Off || !ait_shell::is_known_shell(shell_name) {
+        return None;
+    }
+    let line = shadow.verified_line(logical_line)?;
+    (classify(&line, index) == InputClass::NaturalLanguage).then_some(line)
+}
+
+/// The third submission trigger (§5.10.4, Spec R11-T2) — the check
+/// `app`'s submission arm runs after the `# ` request refuses, while
+/// the shadow still holds the line and the grid still echoes it. On
+/// `Some` the caller swallows the Enter, arms the returned
+/// [`SuggestRequest`] — the `Alt+Enter` whole-line form, so the
+/// request lands on the model exactly as if the user had typed the
+/// `# ` prefix — and submits [`rewrite_as_comment`]'s bytes instead.
+/// `None` changes nothing: `Command` verdicts, `classifier = "off"`,
+/// a non-shell program (`ait_shell::is_known_shell` on the tab
+/// title — the `\x15` wipe's guard), stale shadows and echo
+/// disagreement all forward verbatim (us-10/11/13). The index lives
+/// on the tab — harvested once per session spawn — so the lookup
+/// costs a set probe, never a `$PATH` walk (us-15).
+pub fn classified_request(
+    tab: &Tab,
+    settings: &Settings,
+    profile: &str,
+) -> Option<(String, SuggestRequest)> {
+    let line = classified_line(
+        &tab.shadow,
+        &logical_line(&tab.grid(), tab.cursor()),
+        tab.title(),
+        &tab.program_index,
+        settings.input.classifier,
+    )?;
+    let request = assemble(tab, settings, profile, line.clone());
+    Some((line, request))
+}
+
+/// The natural-language verdict's rewrite (Spec R11-T2, ADR-0014):
+/// `Ctrl+U` (`\x15` — readline's kill-to-start-of-line, the same byte
+/// [`SuggestionPin::cancel`] wipes with) erases the typed line, then
+/// `# <line>` + `\r` submits the request through the shell as a
+/// comment — it lands in history and scrollback exactly like an
+/// explicit `# ` request (ADR-0007 semantics) and the fresh prompt
+/// that follows is where the armed suggestion streams (us-2/3). The
+/// shadow resets rather than going stale: the input line really is
+/// empty, so the next line's shadow starts honest. Called only AFTER
+/// `fire` accepted the request — a refused request leaves the typed
+/// line alone and the Enter forwards verbatim: the erase-after-fire
+/// ordering `suggest_from_line` established.
+pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
+    let _ = tab.session.send_bytes(b"\x15");
+    let _ = tab
+        .session
+        .send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
+    tab.shadow.reset();
 }
 
 /// The in-flight suggestion state machine `app` delegates to (Spec R04
@@ -1542,5 +1625,267 @@ mod tests {
                 "/proc would have answered `/` — the read was skipped"
             );
         }
+    }
+
+    // ---- Spec R11-T2 (§5.10.4): the classifier trigger ----
+    //
+    // Same seam as the `# `/`Alt+Enter` triggers: the shadow updated
+    // key-by-key, byte-fed `Session` grids for the logical line, and a
+    // `with_path_entries` index standing in for the spawn-time
+    // `$PATH` harvest — no PTY, network or real filesystem walk.
+
+    /// The verdict half: an armed `heuristic` mode plus a verified
+    /// line the classifier reads as natural language returns the line
+    /// verbatim — what the rewrite submits as `# <line>` (us-1/2).
+    #[test]
+    fn classified_line_returns_the_verified_nl_line() {
+        let index = ProgramIndex::with_path_entries("sh", ["ls", "echo"]);
+        assert_eq!(
+            classified_line(
+                &typed("what is the largest file"),
+                "$ what is the largest file",
+                "sh",
+                &index,
+                ClassifierMode::Heuristic,
+            ),
+            Some("what is the largest file".to_string())
+        );
+    }
+
+    /// Lines the heuristic reads as commands — a builtin or `$PATH`
+    /// first word, shell syntax, a single token, or unknown words
+    /// without sentence evidence — return `None`: Enter submits them
+    /// verbatim and the trigger stays invisible (us-5/6/7/8).
+    #[test]
+    fn classified_line_stays_none_for_commands() {
+        let index = ProgramIndex::with_path_entries("sh", ["echo", "mybin"]);
+        for line in [
+            "echo hi there",      // a builtin first word
+            "mybin --verbose go", // a $PATH binary plus a flag token
+            "foo | bar baz",      // a pipe is unquoted shell syntax
+            "justoneword",        // single tokens are always commands
+            "foo bar",            // unknown words, no positive evidence
+        ] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    &format!("$ {line}"),
+                    "sh",
+                    &index,
+                    ClassifierMode::Heuristic,
+                ),
+                None,
+                "{line:?} submits verbatim"
+            );
+        }
+    }
+
+    /// The `\x15` wipe's exposure (us-10): the trigger only arms when
+    /// the tab's program is a known shell — `rewrite_as_comment`
+    /// erases the typed line with readline's kill-to-BOL, and a REPL
+    /// or any other program that echoes input without honoring `Ctrl+U`
+    /// would get `# <line>` appended onto the un-wiped text. Non-shell
+    /// prompts degrade to the same verbatim path every other
+    /// unverifiable line takes.
+    #[test]
+    fn classified_line_is_none_for_a_non_shell_program() {
+        let index = ProgramIndex::with_path_entries("python3", Vec::<&str>::new());
+        let line = "what is the largest file";
+        let logical = ">>> what is the largest file";
+        // A verified NL line under a REPL prompt is verbatim.
+        assert_eq!(
+            classified_line(
+                &typed(line),
+                logical,
+                "python3",
+                &index,
+                ClassifierMode::Heuristic
+            ),
+            None
+        );
+        // …as is every non-shell basename — the gate is a known-set,
+        // not a denialist.
+        for shell in ["cat", "irb", "node", "gdb"] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    logical,
+                    shell,
+                    &index,
+                    ClassifierMode::Heuristic
+                ),
+                None,
+                "{shell} is not a shell the rewrite can wipe"
+            );
+        }
+        // The POSIX/readline family still arms.
+        for shell in ["bash", "zsh", "fish", "sh", "dash"] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    &format!("$ {line}"),
+                    shell,
+                    &index,
+                    ClassifierMode::Heuristic
+                ),
+                Some(line.to_string()),
+                "{shell} arms the trigger"
+            );
+        }
+    }
+
+    /// `off`, a stale shadow and grid-echo disagreement all return
+    /// `None` — an ordinary submission, the desync-is-inert rule
+    /// (us-10/11/13). The stale case is what `ait ctl send` leaves
+    /// behind — the same `mark_stale` pastes use — so input that
+    /// never passed through keystrokes is never classified (us-16).
+    #[test]
+    fn classified_line_is_none_when_off_stale_or_desynced() {
+        let index = ProgramIndex::with_path_entries("sh", ["ls"]);
+        let line = "what is the largest file";
+        let logical = "$ what is the largest file";
+        // `classifier = "off"` keeps every submission verbatim.
+        assert_eq!(
+            classified_line(&typed(line), logical, "sh", &index, ClassifierMode::Off),
+            None
+        );
+        // A stale shadow never verifies — `mark_stale` is the same
+        // call pastes and `ait ctl send` make.
+        let mut stale = typed(line);
+        stale.mark_stale();
+        assert_eq!(
+            classified_line(&stale, logical, "sh", &index, ClassifierMode::Heuristic),
+            None
+        );
+        // Echo disagreement (history recall, a REPL, a heredoc): the
+        // line on the grid is not the shadow's line.
+        assert_eq!(
+            classified_line(
+                &typed(line),
+                "$ make install",
+                "sh",
+                &index,
+                ClassifierMode::Heuristic
+            ),
+            None
+        );
+    }
+
+    /// The request half on a real `/bin/sh`: a verified natural-
+    /// language line produces the verified line AND a `SuggestRequest`
+    /// in the `Alt+Enter` whole-line form — the request text IS the
+    /// line, bundled with the same §5.4 context `request_for`
+    /// assembles (us-15–17). Real PTY spawn, no TTY needed.
+    #[test]
+    fn classified_request_bundles_the_verified_line() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if !logical_line(&tab.grid(), tab.cursor()).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"what is the largest file")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if logical_line(&tab.grid(), tab.cursor()).ends_with("what is the largest file") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Stage the shadow as `handle_event` would have.
+        {
+            let tab = tabs.active_mut().unwrap();
+            for c in "what is the largest file".chars() {
+                tab.shadow.update(&char_key(c));
+            }
+        }
+
+        let settings = Settings::default();
+        let (line, request) =
+            classified_request(tabs.active().unwrap(), &settings, "default").expect("NL fires");
+
+        assert_eq!(line, "what is the largest file");
+        assert_eq!(request.request, "what is the largest file");
+        assert_eq!(request.shell, "sh");
+        assert_eq!(request.profile, "default");
+        assert_eq!(request.settings, settings);
+    }
+
+    /// The known-shell gate on the request half (us-10): a tab whose
+    /// program merely echoes its input — `/bin/cat` — verifies the
+    /// shadow exactly like a shell prompt would, but the title fails
+    /// [`ait_shell::is_known_shell`], so the natural-language verdict
+    /// degrades to a verbatim submission instead of a `Ctrl+U` wipe
+    /// the program may not honor. Same seam as the `sh` test above.
+    #[test]
+    fn classified_request_stays_verbatim_on_a_non_shell() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/cat")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // `cat` prints no prompt — the PTY's own echo is what lands
+        // the line on the grid, which is exactly the exposure: echo
+        // agreement without a shell underneath.
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"what is the largest file")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if logical_line(&tab.grid(), tab.cursor()).ends_with("what is the largest file") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let tab = tabs.active_mut().unwrap();
+            for c in "what is the largest file".chars() {
+                tab.shadow.update(&char_key(c));
+            }
+        }
+
+        let settings = Settings::default();
+        assert!(
+            classified_request(tabs.active().unwrap(), &settings, "default").is_none(),
+            "a non-shell program submits verbatim"
+        );
     }
 }
