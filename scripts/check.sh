@@ -19,6 +19,6 @@ scripts/check-src-hygiene.sh
 python3 scripts/check-e2e-sentinels.py
 python3 scripts/check-e2e-fixtures.py
 # No tag context exists on dev — this enforces the repo-side three-way
-# (workspace version ↔ CHANGELOG top ↔ `ait --version`); a v* tag adds
-# the fourth leg at release time.
+# (workspace version ↔ CHANGELOG top ↔ `ait --version`); a semver tag
+# adds the fourth leg at release time.
 python3 scripts/check-release-version.py

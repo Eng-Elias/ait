@@ -40,3 +40,6 @@ endpoint including local servers. Ships twelve rounds (REQUIREMENTS.md
   cargo-dist release builds for Linux (gnu + musl, x86_64 + aarch64) and
   macOS (ARM + Intel), a checksum-verifying `ait-installer.sh`, and a
   man-page-style `ait --help`.
+
+[Unreleased]: https://github.com/Eng-Elias/ait/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/Eng-Elias/ait/releases/tag/v1.0.0

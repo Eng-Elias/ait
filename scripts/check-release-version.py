@@ -81,8 +81,13 @@ def tag_version(root: Path) -> str | None:
         if result.returncode != 0:
             return None
         tag = result.stdout.strip()
+        # A stray non-semver tag on HEAD is not a release context.
         if not TAG.match(tag):
             return None
+    elif not TAG.match(tag):
+        # An explicit RELEASE_TAG is caller intent — a non-semver
+        # value is a caller error, reported loudly, never ignored.
+        sys.exit(f"check-release-version: RELEASE_TAG {tag!r} is not semver-shaped")
     value = tag[1:] if tag.startswith("v") else tag
     return value or None
 

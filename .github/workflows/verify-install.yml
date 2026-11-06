@@ -50,5 +50,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # --native: no docker daemon on macos runners; the installer
-      # lands ait under ~/.cargo/bin and the script adds it to PATH.
+      # lands ait under ~/.cargo/bin, which the script resolves
+      # directly rather than relying on PATH.
       - run: scripts/verify-install.sh --native "${{ github.ref_name }}"
