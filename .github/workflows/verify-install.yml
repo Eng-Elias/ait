@@ -1,0 +1,54 @@
+name: Verify install
+
+# Reusable workflow invoked as `custom-verify-install` by release.yml's
+# publish-jobs injection (Spec R12 §5.11, us-29). publish-jobs is the
+# only custom-job slot dist offers between the GitHub Release going
+# live (the `host` leg creates it) and `announce`, so placing the gate
+# here means a failed verify leaves the release built but unannounced —
+# the workflow stays re-runnable after a fix (us-31).
+#
+# Two legs, one shared implementation (scripts/verify-install.sh):
+#
+#   verify-linux  runs the published installer inside a curl-less
+#                 ubuntu:24.04 docker container (ubuntu-latest runners
+#                 ship docker) — the "clean machine" §5.11 asks for.
+#                 Curl is apt-installed inside the container, the way a
+#                 real fresh user machine would gain it.
+#   verify-macos  macos runners have no docker, so the script's
+#                 --native mode runs the installer on the runner
+#                 itself. This is also the leg that exercises the
+#                 aarch64-apple-darwin tarball the installer selects
+#                 on Apple Silicon.
+on:
+  workflow_call:
+    inputs:
+      # publish-jobs always pass `with.plan: ${{ needs.plan.outputs.val }}`,
+      # so the input must be declared for the call to typecheck — but the
+      # tag under verification is the ref that triggered release.yml, so
+      # the manifest itself goes unused (github.ref_name is the source).
+      plan:
+        required: true
+        type: string
+
+# Read-only: checkout + anonymous release-asset downloads only. The
+# calling job pins the same ceiling via github-custom-job-permissions
+# (publish-jobs otherwise default to escalated id-token/packages).
+permissions:
+  contents: read
+
+jobs:
+  verify-linux:
+    runs-on: ubuntu-latest
+    steps:
+      # Tag-push checkout: resolves the tag, so the script version
+      # under test is the one shipped by this commit.
+      - uses: actions/checkout@v4
+      - run: scripts/verify-install.sh "${{ github.ref_name }}"
+
+  verify-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # --native: no docker daemon on macos runners; the installer
+      # lands ait under ~/.cargo/bin and the script adds it to PATH.
+      - run: scripts/verify-install.sh --native "${{ github.ref_name }}"
