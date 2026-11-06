@@ -1,12 +1,18 @@
 # Spec R03: an unrecognized argument is a usage error on stderr —
 # `ait: unknown argument "--bogus"` plus the usage text — never a
-# silent TUI launch. Exit code 1.
+# silent TUI launch. Exit code 1. R12's man-page --help is ~70 lines,
+# so the screen is sized to hold it all: `expect_text` sees the
+# visible grid only, and at 24 rows the error scrolls off behind the
+# help.
 feature = "Configurations and providers"
-size = [80, 24]
+size = [80, 80]
 args = ["--bogus"]
 
 [[steps]]
 expect_text = "unknown argument \"--bogus\""
+
+[[steps]]
+expect_text = "SYNOPSIS"
 
 [[steps]]
 expect_exit = 1
