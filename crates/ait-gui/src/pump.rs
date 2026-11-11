@@ -5,8 +5,9 @@
 //! is a nonblocking channel read — so [`headless`](ait_app::headless)'s
 //! answer is the model: a thread that drains the app's sources on a
 //! ~5 ms cadence. The GUI's version drains the same set the TUI's tick
-//! drains, in the same order — settings watcher → skills watcher → ctl
-//! → session events → agent events → transcripts → persisted blocks —
+//! drains, in the same order — settings watcher → skills watcher →
+//! suggester events → ctl → session events → agent events → transcripts
+//! → persisted blocks —
 //! and its "paint" step is `ctx.request_repaint()`, fired only when a
 //! pass actually observed something (a folded event, grid damage beyond
 //! the cursor cell, a moved cursor, a serviced ctl request, a bumped
@@ -144,7 +145,7 @@ fn pump_loop(
 }
 
 /// One drain pass — the TUI tick's drain order, verbatim:
-/// settings watcher → skills → ctl → `drain_events` (which folds
+/// settings watcher → skills → suggester → ctl → `drain_events` (which folds
 /// `observe_event` and services each tab's `ShellBridge` internally)
 /// → `drain_agent_events` → `drain_transcripts` →
 /// `take_persisted_blocks` → the per-tab damage/cursor/revision diff.
@@ -177,6 +178,8 @@ fn drain_pass(
         skills,
         profile,
         picker,
+        suggester,
+        suggestion,
         ..
     } = &mut *shared;
 
@@ -215,6 +218,17 @@ fn drain_pass(
     let toast_before = toast.is_some();
     skills.drain(toast);
     activity.config |= toast.is_some() != toast_before;
+
+    // Suggester events on the same cadence (Spec R04): `Delta`s stream
+    // into the pinned tab's session under one paste envelope (the
+    // shell's own echo IS the live preview — the grid paints it), a
+    // terminal `Done`/`Error` releases the pin, and a non-cancelled
+    // `Error` toasts. `apply` per event (rather than the `drain`
+    // batch) is what lets the pass flag the repaint it produced.
+    while let Ok(event) = suggester.events().try_recv() {
+        activity.session = true;
+        suggestion.apply(tabs, event, toast);
+    }
 
     // ctl (Spec R11 §5.10.5): completed requests dispatch over the
     // manager; `OpenedTab` registers the spawned tab's store row like

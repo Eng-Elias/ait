@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ait_agent::CommandSuggester;
 use ait_app::config::{self, LiveSettings};
 use ait_app::ctl::CtlServer;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
@@ -25,6 +26,7 @@ use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
 use ait_app::status::{status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
+use ait_app::suggest::{self, SuggestionPin};
 use ait_app::tabs::TabManager;
 use ait_config::Settings;
 use ait_term::{Key, KeyEvent, Keypad, Size};
@@ -71,6 +73,15 @@ pub struct Shared {
     /// mirroring the TUI (the host clipboard rides `ctx.copy_text`
     /// alongside, since the GUI has a real clipboard API).
     pub copied_text: Option<String>,
+    /// The channel-based command suggester (Spec R04): the `# `+Enter
+    /// trigger, `Alt+Enter` and the §5.10.4 classifier queue a
+    /// [`SuggestRequest`](ait_agent::SuggestRequest) on it; its event
+    /// channel is the pump's streamed-suggestion source.
+    pub suggester: CommandSuggester,
+    /// The in-flight suggestion, pinned to the tab that fired it
+    /// (Spec R04 us-14) — the same one-request state machine the TUI
+    /// delegates to.
+    pub suggestion: SuggestionPin,
 }
 
 /// The GUI frontend's `eframe::App` — T3's agent/suggest wiring,
@@ -177,6 +188,8 @@ impl GuiApp {
             profile: profile::DEFAULT_PROFILE.to_string(),
             picker: None,
             copied_text: None,
+            suggester: CommandSuggester::new(),
+            suggestion: SuggestionPin::new(),
         }));
         let watcher = config::watcher();
         let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher);
@@ -309,15 +322,30 @@ impl GuiApp {
                     }
                 }
             }
-            // Wired in T3/T5 with the suggester and conversation picker
-            // — bound keys must still be consumed (never leaked to the
-            // PTY), so the stub reports the gap instead of no-op'ing.
+            // `Alt+Enter` (Spec R04 us-11/12) — the TUI's arm verbatim:
+            // the input line itself is the request, verified through
+            // the same shadow+grid echo agreement the `# ` path runs;
+            // once the request is accepted the typed line is erased so
+            // request text and the streamed command never interleave.
             Resolution::Action(AppAction::SuggestCommand) => {
-                shared.toast = Some(Toast::new(
-                    "suggest is not wired in the GUI frontend yet",
-                    Instant::now(),
-                ));
+                let Some(tab) = shared.tabs.active_mut() else {
+                    return;
+                };
+                // Input-adjacent: drop the highlight and snap to the
+                // live viewport like typing does.
+                tab.clear_selection();
+                tab.snap_to_bottom();
+                shared.suggestion.suggest_from_line(
+                    &shared.suggester,
+                    shared.config.settings(),
+                    &shared.profile,
+                    tab,
+                    &mut shared.toast,
+                );
             }
+            // Wired in T5 with the conversation picker — bound keys
+            // must still be consumed (never leaked to the PTY), so the
+            // stub reports the gap instead of no-op'ing.
             Resolution::Action(AppAction::Conversations) => {
                 shared.toast = Some(Toast::new(
                     "conversation picker is not wired in the GUI frontend yet",
@@ -391,6 +419,17 @@ impl GuiApp {
                     }
                     return;
                 }
+                // The active tab's index BEFORE the mutable borrow —
+                // in-flight keys are scoped to the pinned tab (Spec
+                // R04 user story 14).
+                let index = shared.tabs.active_index();
+                // In-flight keys (Spec R04 us-8/9/10): intercepted
+                // BEFORE the PTY-input path, and scoped to the pinned
+                // tab — on the tab whose request is streaming, Esc
+                // cancels and Enter is swallowed so a half-written
+                // command can't run; on every other tab both keys
+                // behave normally.
+                let suggestion_here = shared.suggestion.is_live_for(&shared.tabs, index);
                 let Some(tab) = shared.tabs.active_mut() else {
                     return;
                 };
@@ -410,10 +449,79 @@ impl GuiApp {
                     return;
                 }
                 tab.snap_to_bottom();
+                if suggestion_here {
+                    match key.map(|key| key.key) {
+                        // Plain Esc cancels: token + envelope close +
+                        // `Ctrl+U` to wipe the partial line. A modified
+                        // Esc is left for the PTY like any other chord.
+                        Some(Key::Escape) if key.is_some_and(|key| key.modifiers.is_empty()) => {
+                            shared.suggestion.cancel(&shared.suggester, tab);
+                            return;
+                        }
+                        // Any Enter variant is swallowed — including
+                        // `Ctrl+Enter`, which encodes `\r` and would
+                        // execute the partial command (us-9) — and the
+                        // keypad Enter that encodes the same.
+                        Some(Key::Enter) | Some(Key::Keypad(Keypad::Enter)) => {
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if tab.exit_status().is_none() {
                     if let Some(key_event) = key {
-                        // The input shadow tracks what reaches the PTY —
-                        // T3's `# `-trigger verification reads it.
+                        // The `# `+Enter trigger (Spec R04): verify
+                        // while the shadow still holds the line and
+                        // the grid still shows its echo — before the
+                        // submission resets the shadow and the
+                        // forwarded `\r` moves the cursor. Enter is
+                        // sent to the PTY either way: `# …` is a
+                        // comment no-op that lands in history
+                        // (us-2). A live pin gates the next
+                        // trigger — one request in flight at a time.
+                        if shared.suggestion.is_none() && suggest::is_submission(&key_event) {
+                            if let Some(request) =
+                                suggest::request_for(tab, shared.config.settings(), &shared.profile)
+                            {
+                                shared.suggestion.fire(
+                                    &shared.suggester,
+                                    tab.id,
+                                    request,
+                                    &mut shared.toast,
+                                );
+                            } else if let Some((line, request)) = suggest::classified_request(
+                                tab,
+                                shared.config.settings(),
+                                &shared.profile,
+                            ) {
+                                // The third trigger (§5.10.4, Spec
+                                // R11-T2): a natural-language verdict
+                                // swallows the Enter and rewrites the
+                                // submission — `Ctrl+U` wipes the
+                                // typed line, `# <line>` + `\r` lands
+                                // the request in history as a comment
+                                // and draws the fresh prompt the
+                                // armed suggestion streams onto
+                                // (ADR-0007 semantics). The rewrite
+                                // goes out ONLY once the request is
+                                // armed: a refused `fire` falls
+                                // through to the ordinary verbatim
+                                // submission below — the
+                                // erase-after-fire ordering
+                                // `suggest_from_line` established.
+                                if shared.suggestion.fire(
+                                    &shared.suggester,
+                                    tab.id,
+                                    request,
+                                    &mut shared.toast,
+                                ) {
+                                    suggest::rewrite_as_comment(tab, &line);
+                                    return;
+                                }
+                            }
+                        }
+                        // The input shadow tracks what reaches the
+                        // PTY — the `# `-trigger verification reads it.
                         tab.shadow.update(&key_event);
                         let _ = tab.session.send_key(key_event);
                     }
