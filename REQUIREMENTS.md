@@ -29,8 +29,9 @@ cloud dependency, no vendor lock-in.
    including local servers (Ollama, LM Studio, vLLM, llama.cpp).
 3. **SSH-native.** The same features work on remote shells. A TUI is SSH-native
    by construction: run `ait` on the remote host and everything works.
-4. **TUI first.** A GUI is explicitly out of scope for v1 (§11). The agent core
-   never depends on a frontend.
+4. **TUI first.** The TUI ships v1; a GUI frontend follows in Release 2
+   (§5.12), built on the same core. The agent core never depends on a
+   frontend.
 5. **The user stays in control.** Every agent action goes through a permission
    profile (§5.7). No global "yolo" switch.
 6. **Degrade gracefully.** Missing shell integration, a dumb remote shell, or an
@@ -51,7 +52,8 @@ cloud dependency, no vendor lock-in.
 | Layer | Choice | Notes |
 |---|---|---|
 | Language | Rust (stable, edition 2021+) | Cargo workspace |
-| UI | `ratatui` + `crossterm` | TUI only in v1 |
+| UI | `ratatui` + `crossterm` | TUI frontend |
+| GUI | TBD in Round 13 (Proposed: GPU-accelerated Rust stack, e.g. `wgpu`-based; fallbacks: `egui`, webview) | Release 2, §5.12; separate crate + binary |
 | PTY | `portable-pty` | Own the master side; spawn `$SHELL` |
 | VT emulation | `alacritty_terminal` (grid + `vte` parser), exact-pinned | Do not hand-write a full emulator (ADR-0002) |
 | Async | `tokio` | Lives in the library crates that need it (`ait-llm` HTTP/SSE, `ait-agent` worker), each behind a synchronous facade — the `ait` binary stays tokio-free (ADR-0004, amended 2026-10-28). The PTY reader runs on `std::thread` inside `ait-term`; the core stays synchronous |
@@ -94,6 +96,9 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+A second frontend — the `ait-gui` desktop binary (§5.12, Release 2) — joins
+the TUI on the same core; both are thin frontends holding no business logic.
+
 ### 3.1 Crate layout (Decided, ADR-0003)
 
 | Crate | Responsibility |
@@ -105,6 +110,7 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction |
 | `ait` | TUI binary (frontend only — no business logic) |
 | `ait-store` | SQLite store: conversations, transcript items, plans, terminal sessions, block metadata |
+| `ait-gui` | GUI frontend binary (Round 13, §5.12) — planned |
 
 The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-ssh`);
 `ait-store` landed in Round 8 (ADR-0011).
@@ -397,6 +403,62 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 - `ait --version`, `ait --init`, `ait --print-schema`, man-page-style `--help`.
 - README, user guide (config, providers, profiles, SSH), and a CHANGELOG.
 - Verified install from a published release on a clean machine/container.
+- Windows joins the release targets in Release 2 (§5.14).
+
+### 5.12 GUI frontend (Round 13, Release 2)
+
+- An optional desktop frontend over the same core crates, shipped as a
+  separate `ait-gui` binary. The TUI remains the default; nothing in the GUI
+  is required to use `ait`, and `ait` gains no GUI dependencies.
+- Reuses `ait-term`, `ait-shell`, `ait-agent`, `ait-config`, `ait-store` and
+  `ait-llm` unchanged — the core stays frontend-agnostic (§1.1); the GUI
+  crate holds no business logic.
+- Feature-parity target: tabs, scrollback with search/selection, blocks with
+  exit status, the agent conversation panel, permission prompts, the plan
+  view, and the status line — every frontend renders the same session model.
+- Toolkit: **Proposed** — a GPU-accelerated Rust stack rendering the
+  `ait-term` grid directly (e.g. `wgpu`-based); `egui` or a webview shell are
+  the fallbacks. Decided in the round's grilling and recorded as an ADR.
+  Heavyweight deps stay behind cargo features and out of the `ait` tree.
+- Distribution: `ait-gui` joins the §5.11 release artifacts for Linux and
+  macOS; Windows follows once §5.14 lands. GUI workspace panes (file
+  explorer, web browser) ship in the same binary — §5.13.
+
+### 5.13 GUI panels — file explorer & web browser (Round 14, Release 2)
+
+- A file explorer pane in `ait-gui`: browse the session's working directory
+  (tracked via OSC 7), preview files, and open them in the system editor.
+  Read-only by default — any write goes through a confirmation or the
+  agent's `edit_files` diff flow, never a silent mutation.
+- An embedded web browser pane for docs and links. Toolkit: **Proposed** —
+  a system-webview embedding (e.g. `wry`/`tao`), decided in the round's
+  grilling and recorded as an ADR; opening links in the external browser is
+  the fallback if embedding is rejected.
+- Links and file paths detected in terminal output can open in the
+  corresponding pane (opt-in per click; exact gesture decided in the round).
+- Both panes are `ait-gui`-only: the core crates and the `ait` TUI gain no
+  new dependencies or features. Local-first applies to the web pane —
+  terminal content is never sent to the webview host or any remote service,
+  and nothing is fetched except what the user navigates to.
+
+### 5.14 Windows support (Round 15, Release 2)
+
+- `ait` (and `ait-gui` with its §5.13 panes where the toolkit allows) runs
+  natively on Windows:
+  `portable-pty`'s ConPTY backend in `ait-term`; `crossterm` already supports
+  Windows on the TUI side.
+- Shell integration for PowerShell (`pwsh` and Windows PowerShell) emitting
+  the same OSC 133/7 and OSC 7700-series hook events as the Unix snippets.
+  `cmd.exe` and integration-less setups degrade gracefully — no blocks, no
+  errors (the §5.5 rule applies).
+- Platform specifics live behind the existing seams: config under
+  `%APPDATA%`, secrets in Windows Credential Manager (`keyring` already
+  abstracts it), path handling, and the `[terminal]` shell override.
+- SSH integration targets Windows OpenSSH where present; remote sessions are
+  unchanged — the far side is still a Unix shell.
+- `x86_64-pc-windows-msvc` joins the §5.11 release targets (aarch64 Windows
+  optional); CI gains a `windows-latest` leg for the tests that can run
+  headless there.
 
 ---
 
@@ -407,7 +469,8 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 - **Security:** secrets never written to settings or logs; redaction before
   context assembly; permission engine on every tool call; no network calls
   except configured LLM/MCP endpoints.
-- **Portability:** Linux first, macOS supported; bash, zsh, fish.
+- **Portability:** Linux first, macOS supported, Windows from Release 2
+  (§5.14); bash, zsh, fish, PowerShell.
 - **Reliability:** the terminal stays usable when the LLM is slow/down;
   panics restore the host terminal.
 - **Testability:** core crates are testable without a TTY or network; CI runs
@@ -432,9 +495,13 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 | 10 | MCP client, skills loader, full redaction | §5.10.1–3 |
 | 11 | Input classifier, headless mode, control CLI | §5.10.4–5 |
 | 12 | Packaging & release | §5.11 |
+| 13 | GUI frontend | §5.12 |
+| 14 | GUI panels — file explorer & web browser | §5.13 |
+| 15 | Windows support | §5.14 |
 
 **MVP = Rounds 1–4**: a working TUI terminal that turns natural language into a
-command using any configured endpoint.
+command using any configured endpoint. **v1 = Rounds 1–12**; **Release 2 =
+Rounds 13–15**. Post-v1 candidates pending review live in §12.
 
 ---
 
@@ -499,8 +566,24 @@ command using any configured endpoint.
 
 ## 11. Out of scope for v1
 
-- GUI frontend (GPU renderer, egui, webview, embedded browser).
 - Accounts, cloud sync, telemetry, team features.
 - Hosted model credits or subscription sign-in flows.
-- Codebase indexing (`tantivy`) and voice input — candidates after v1.
-- Windows support (ConPTY) — candidate after v1.
+- Codebase indexing (`tantivy`) and voice input — post-v1 candidates (§12).
+
+The GUI frontend and Windows support used to be parked here; they are now
+committed post-v1 features — §5.12–§5.14 (Release 2, §7).
+
+## 12. Planned features (post-v1, pending review)
+
+Candidates held for review before any commitment to implement. Each becomes a
+spec + tickets through a Part A planning round (grill → spec → tickets,
+milestone "Release 3"); nothing is implemented until its Part B step runs.
+Drop a candidate by closing its spec; move it by editing the milestone.
+
+| Plan | Feature | Spec | Milestone |
+|---|---|---|---|
+| P01 | Codebase indexing and search (`tantivy`, `search_codebase` tool) | — | Release 3 |
+| P02 | Remote daemon executor (§5.9 tier 3) | — | Release 3 |
+| P03 | Shell-native completions (§5.5.2) | — | Release 3 |
+| P04 | Local model input classifier (§5.10.4) | — | Release 3 |
+| P05 | Voice input (push-to-talk → configured STT endpoint or local model) | — | Release 3 |
