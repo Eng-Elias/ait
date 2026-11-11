@@ -678,6 +678,15 @@ fn handle_event<W: Write>(
                 Resolution::Action(AppAction::NextTab) => tabs.activate_next(),
                 Resolution::Action(AppAction::PrevTab) => tabs.activate_prev(),
                 Resolution::Action(AppAction::JumpToTab(n)) => tabs.jump_to(n),
+                // `Ctrl+Shift+←/→` reorder — a MOVE keeps the tab's own
+                // selection/viewport (the manager carries it with the
+                // slot), so unlike a switch nothing is cleared.
+                Resolution::Action(AppAction::MoveTabLeft) => {
+                    tabs.move_active_prev();
+                }
+                Resolution::Action(AppAction::MoveTabRight) => {
+                    tabs.move_active_next();
+                }
                 // `Alt+Enter` (Spec R04 us-11/12): the input line itself
                 // is the request — same shadow+grid verification as the
                 // `# ` path, then, once the request was accepted, the
@@ -821,6 +830,8 @@ fn handle_event<W: Write>(
                         | AppAction::NextTab
                         | AppAction::PrevTab
                         | AppAction::JumpToTab(_)
+                        | AppAction::MoveTabLeft
+                        | AppAction::MoveTabRight
                         | AppAction::SuggestCommand
                         | AppAction::AgentPanel
                         | AppAction::SwitchProfile

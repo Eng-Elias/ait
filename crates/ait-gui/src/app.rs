@@ -333,6 +333,15 @@ impl GuiApp {
             Resolution::Action(AppAction::NextTab) => shared.tabs.activate_next(),
             Resolution::Action(AppAction::PrevTab) => shared.tabs.activate_prev(),
             Resolution::Action(AppAction::JumpToTab(n)) => shared.tabs.jump_to(n),
+            // `Ctrl+Shift+←/→` reorder — a MOVE keeps the tab's own
+            // selection/viewport (the manager carries it with the
+            // slot), so unlike a switch nothing is cleared.
+            Resolution::Action(AppAction::MoveTabLeft) => {
+                shared.tabs.move_active_prev();
+            }
+            Resolution::Action(AppAction::MoveTabRight) => {
+                shared.tabs.move_active_next();
+            }
             // `Alt+A` (Spec R06): the shared toggle — open focuses,
             // a second press while focused closes — then `resize_active`
             // re-derives THIS tab's winsize through the GUI's
@@ -440,6 +449,8 @@ impl GuiApp {
                     | AppAction::NextTab
                     | AppAction::PrevTab
                     | AppAction::JumpToTab(_)
+                    | AppAction::MoveTabLeft
+                    | AppAction::MoveTabRight
                     | AppAction::AgentPanel
                     | AppAction::SwitchProfile
                     | AppAction::SuggestCommand
@@ -735,7 +746,15 @@ impl GuiApp {
         let bar = tab_chips(rect, &widths);
         let active = shared.tabs.active_index();
         for (index, chip) in bar.tabs.iter().enumerate() {
-            let chip_hit = ui.interact(chip.rect, egui::Id::unique(("tab", index)), Sense::click());
+            // `click_and_drag`: a release inside the same chip is the
+            // activate click; a drag released over ANOTHER chip is the
+            // reorder — `move_tab` slides the others over, so the chip
+            // lands where the pointer dropped it (Spec R13 §5.12).
+            let chip_hit = ui.interact(
+                chip.rect,
+                egui::Id::unique(("tab", index)),
+                Sense::click_and_drag(),
+            );
             let close_hit = ui.interact(
                 chip.close,
                 egui::Id::unique(("tab-close", index)),
@@ -773,6 +792,18 @@ impl GuiApp {
                 // shared close path runs, quitting on the last tab.
                 shared.tabs.jump_to(index + 1);
                 self.close_active_tab(shared);
+            } else if chip_hit.drag_stopped() {
+                // The drop slot: the chip the pointer is over, clamped
+                // to the set's edges so a drop past either end lands at
+                // that end. `move_tab` no-ops on a same-slot drop.
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    let to = bar
+                        .tabs
+                        .iter()
+                        .position(|slot| pos.x <= slot.rect.right())
+                        .unwrap_or(bar.tabs.len().saturating_sub(1));
+                    shared.tabs.move_tab(index, to);
+                }
             } else if chip_hit.clicked() {
                 shared.tabs.jump_to(index + 1);
             }

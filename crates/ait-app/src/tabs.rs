@@ -1563,6 +1563,48 @@ impl TabManager {
         }
     }
 
+    /// `Ctrl+Shift+←/→` and the GUI's chip drag (Spec R13 §5.12's tab
+    /// reorder): move the tab at `from` to position `to`, sliding the
+    /// others over — a move, NOT a swap, so a drag across several
+    /// chips lands where it was dropped. `active` follows the tab it
+    /// named: the moved tab keeps focus when IT was active, and an
+    /// unmoved active tab shifts a slot iff the move crossed it —
+    /// selection, viewport and scroll state all travel with their
+    /// tab. `titles()`'s `N:` labels renumber positionally, like every
+    /// reorder, so `Alt+N` still jumps to what the bar shows.
+    /// `false` on a no-op: same-slot or out-of-range.
+    pub fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = if self.active == from {
+            to
+        } else if self.active > from && self.active <= to {
+            self.active - 1
+        } else if self.active < from && self.active >= to {
+            self.active + 1
+        } else {
+            self.active
+        };
+        true
+    }
+
+    /// `Ctrl+Shift+←`: the active tab trades one slot left — inert at
+    /// the left edge.
+    pub fn move_active_prev(&mut self) -> bool {
+        self.active
+            .checked_sub(1)
+            .is_some_and(|to| self.move_tab(self.active, to))
+    }
+
+    /// `Ctrl+Shift+→`: the active tab trades one slot right — inert
+    /// at the right edge.
+    pub fn move_active_next(&mut self) -> bool {
+        (self.active + 1 < self.tabs.len()) && self.move_tab(self.active, self.active + 1)
+    }
+
     /// The active tab — `None` only on the empty set.
     pub fn active(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
@@ -1976,6 +2018,60 @@ mod tests {
         assert_eq!(manager.active_index(), 0, "zero is inert");
     }
 
+    /// `move_tab` slides rather than swaps, and `active` follows the
+    /// tab it named: the moved tab keeps focus when IT was active, an
+    /// unmoved active tab shifts a slot iff the move crossed it. The
+    /// `N:` labels renumber positionally, so `Alt+N` still addresses
+    /// what the bar shows after a reorder.
+    #[test]
+    fn move_tab_slides_and_retargets_active() {
+        let mut manager = manager(4, "/tmp");
+        let ids: Vec<u64> = manager.tabs().iter().map(|tab| tab.id).collect();
+        let order =
+            |manager: &TabManager| manager.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>();
+
+        // Move the ACTIVE tab (index 3) to the front: it keeps focus
+        // and the crossed tabs slide right — insert semantics, not a
+        // swap.
+        assert!(manager.move_tab(3, 0));
+        assert_eq!(order(&manager), vec![ids[3], ids[0], ids[1], ids[2]]);
+        assert_eq!(manager.active_index(), 0, "the moved tab keeps focus");
+
+        // Move a BACKGROUND tab across the active one: `active`
+        // shifts a slot to stay on the same tab — remove(0) slides
+        // the active tab left to the front.
+        manager.jump_to(2);
+        assert_eq!(manager.active().unwrap().id, ids[0]);
+        assert!(manager.move_tab(0, 3));
+        assert_eq!(order(&manager), vec![ids[0], ids[1], ids[2], ids[3]]);
+        assert_eq!(
+            manager.active_index(),
+            0,
+            "the unmoved active tab slid left with its slot"
+        );
+
+        // The chord helpers trade one slot and are inert at the edges.
+        assert!(!manager.move_active_prev(), "inert at the left edge");
+        assert!(manager.move_active_next());
+        assert!(manager.move_active_next());
+        assert_eq!(manager.active_index(), 2);
+        assert_eq!(manager.active().unwrap().id, ids[0]);
+        assert!(manager.move_active_next());
+        assert!(!manager.move_active_next(), "inert at the right edge");
+        assert!(!manager.move_tab(2, 2), "same-slot is a no-op");
+        assert!(!manager.move_tab(9, 0));
+        assert!(!manager.move_tab(0, 9));
+
+        // `Alt+N` still addresses what the bar shows — the labels'
+        // positions renumbered with the move: the order is now
+        // [ids1, ids2, ids3, ids0], so `jump_to(4)` lands on the moved
+        // active tab and `jump_to(3)` on ids[3].
+        manager.jump_to(4);
+        assert_eq!(manager.active().unwrap().id, ids[0]);
+        manager.jump_to(3);
+        assert_eq!(manager.active().unwrap().id, ids[3]);
+    }
+
     /// Closing activates whatever shifted into the freed slot — or the
     /// new last tab when the closed one was last. Session identity is
     /// tracked by child pid.
@@ -2021,6 +2117,9 @@ mod tests {
         manager.activate_next();
         manager.activate_prev();
         manager.jump_to(1);
+        assert!(!manager.move_tab(0, 0));
+        assert!(!manager.move_active_prev());
+        assert!(!manager.move_active_next());
         assert!(!manager.close_active());
     }
 

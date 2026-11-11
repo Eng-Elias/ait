@@ -63,6 +63,11 @@ pub enum AppAction {
     NextTab,
     /// Jump to tab N (`Alt+1..=9`, 1-based).
     JumpToTab(usize),
+    /// Reorder the active tab one slot left (`Ctrl+Shift+Left`; the
+    /// GUI's chip drag lands the same `TabManager::move_tab`).
+    MoveTabLeft,
+    /// Reorder the active tab one slot right (`Ctrl+Shift+Right`).
+    MoveTabRight,
     /// Treat the current input line as a command request — the Spec R04
     /// `Alt+Enter` trigger (`ESC CR` vs `CR` is byte-distinct in both
     /// tiers; ADR-0005).
@@ -171,6 +176,23 @@ const BINDINGS: &[Binding] = &[
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::NextTab,
+    },
+    // Tab reorder — both tiers: `CSI 1;6A/D` (Ctrl+Shift+arrow) is
+    // byte-distinct on every xterm-class host, no enhancement needed.
+    // The same chord reorders in gnome-terminal and wezterm.
+    Binding {
+        key: Key::Left,
+        modifiers: CTRL_SHIFT,
+        enhanced_only: false,
+        case_sensitive: false,
+        action: AppAction::MoveTabLeft,
+    },
+    Binding {
+        key: Key::Right,
+        modifiers: CTRL_SHIFT,
+        enhanced_only: false,
+        case_sensitive: false,
+        action: AppAction::MoveTabRight,
     },
     Binding {
         key: Key::Char('t'),
@@ -504,6 +526,20 @@ mod tests {
                     Resolution::Action(AppAction::JumpToTab(digit as usize)),
                 );
             }
+            // Ctrl+Shift+arrow is byte-distinct on every host — the
+            // reorder binds in BOTH tiers, unlike the letter aliases.
+            assert_action(
+                Key::Left,
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                tier,
+                AppAction::MoveTabLeft,
+            );
+            assert_action(
+                Key::Right,
+                Modifiers::CONTROL | Modifiers::SHIFT,
+                tier,
+                AppAction::MoveTabRight,
+            );
         }
     }
 
