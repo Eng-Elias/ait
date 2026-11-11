@@ -55,8 +55,8 @@ pub fn run() -> eframe::Result<()> {
 }
 
 /// The binary's error path: `run`'s failure text to stderr and a
-/// nonzero exit — no `println!`/`eprintln!` (src-hygiene rule); the
-/// error goes through `io::stderr().write_all`.
+/// nonzero exit — not the std print macros (the src-hygiene rule bans
+/// them outside `ait/src/main.rs`), but `io::stderr().write_all`.
 pub fn report_error(error: &eframe::Error) {
     let _ = writeln!(std::io::stderr(), "ait-gui: {error}");
 }
