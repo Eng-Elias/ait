@@ -429,7 +429,10 @@ mod tests {
 
     /// One pass over the test's `Shared` — `drain_pass`'s per-tab
     /// snapshots bundled so each call site reads like the pump loop's.
+    /// `ctx` is a default (windowless) `Context`: the pass only ever
+    /// `copy_text`s into its memory buffer.
     struct Pass {
+        ctx: Context,
         cursors: HashMap<u64, Cursor>,
         revisions: HashMap<u64, u64>,
     }
@@ -437,6 +440,7 @@ mod tests {
     impl Pass {
         fn new() -> Self {
             Self {
+                ctx: Context::default(),
                 cursors: HashMap::new(),
                 revisions: HashMap::new(),
             }
@@ -448,7 +452,14 @@ mod tests {
             ctl: Option<&mut CtlServer>,
             watcher: Option<&SettingsWatcher>,
         ) -> PumpActivity {
-            drain_pass(shared, ctl, watcher, &mut self.cursors, &mut self.revisions)
+            drain_pass(
+                &self.ctx,
+                shared,
+                ctl,
+                watcher,
+                &mut self.cursors,
+                &mut self.revisions,
+            )
         }
 
         /// Passes until `pred` observes the shared state, or the
