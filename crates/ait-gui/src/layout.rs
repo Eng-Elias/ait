@@ -154,6 +154,10 @@ pub const NEW_TAB_W: f32 = 24.0;
 pub const CHIP_INSET: f32 = 3.0;
 pub const BAR_MARGIN: f32 = 6.0;
 
+/// The find bar's height in points — fixed like the other chrome (not
+/// cell-tied) so zoom doesn't reflow it.
+pub const FIND_BAR_H: f32 = 26.0;
+
 /// Lay out the tab bar's chips: `widths` are the rendered label widths
 /// in points — the caller measures through egui's font tables, so this
 /// stays pure `f32` math testable without a GPU context (the same seam
@@ -270,6 +274,67 @@ pub fn grid_point(pos: Pos2, pane: Rect, cell: CellMetrics, scroll_offset: usize
 /// simply aren't drawn).
 pub fn cursor_row(cursor_line: usize, scroll_offset: usize) -> i64 {
     cursor_line as i64 + scroll_offset as i64
+}
+
+/// One command block's chrome input, in LIVE coordinates — what the
+/// app maps each resolved `ait_app::blocks::Block` into before the
+/// paint pass ([`plan_block_chrome`] turns it into screen rows).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockDivider {
+    /// The block's first line (the `B`-mark echo row) in live
+    /// scrollback-then-viewport coordinates — `Block::range().start()`.
+    pub start: usize,
+    /// The exit-status chip's text (`✓ 0 · 1.2s` — `block_text`'s
+    /// format) and whether the exit was success; `None` while the
+    /// command still runs (divider only, no chip).
+    pub label: Option<BlockLabel>,
+}
+
+/// The exit-status chip on a block divider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockLabel {
+    /// The `✓/✗ <code> · <dur>` text.
+    pub text: String,
+    /// Exit zero — the chip's green; `false` is the failure red.
+    pub ok: bool,
+}
+
+/// A divider planned for painting: the screen row its line tops and
+/// the chip to float on it, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockChip {
+    /// The screen row (0 = pane top) whose top edge carries the divider.
+    pub row: usize,
+    /// The exit-status chip, same option as [`BlockDivider::label`].
+    pub label: Option<BlockLabel>,
+}
+
+/// Live-coordinate block starts → visible dividers: live line `l`
+/// maps to grid line `l - scrollback` (the `grid_line` rule) and then
+/// to screen row `l - scrollback + scroll_offset` — the same
+/// conversion selection and the cursor share. Blocks whose start row
+/// isn't on screen produce nothing.
+pub fn plan_block_chrome(
+    dividers: &[BlockDivider],
+    scrollback: usize,
+    scroll_offset: usize,
+    rows: usize,
+) -> Vec<BlockChip> {
+    let scrollback = i64::try_from(scrollback).unwrap_or(i64::MAX);
+    let offset = i64::try_from(scroll_offset).unwrap_or(i64::MAX);
+    dividers
+        .iter()
+        .filter_map(|divider| {
+            let row = divider.start as i64 - scrollback + offset;
+            usize::try_from(row)
+                .ok()
+                .filter(|row| *row < rows)
+                .map(|row| BlockChip {
+                    row,
+                    label: divider.label.clone(),
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -428,5 +493,46 @@ mod tests {
         metrics.zoom_reset();
         assert_eq!(metrics.zoom, 1.0);
         assert_eq!(metrics.font_px(), 15.0);
+    }
+
+    /// Block dividers follow the shared `grid_line` rule: live line
+    /// `l` paints on screen row `l - scrollback + offset`, and
+    /// off-screen starts produce no chip.
+    #[test]
+    fn block_chrome_maps_live_lines_to_screen_rows() {
+        let label = |ok| {
+            Some(BlockLabel {
+                text: "✓ 0 · 1.2s".into(),
+                ok,
+            })
+        };
+        let dividers = vec![
+            BlockDivider {
+                start: 2, // scrollback line -1 at scrollback 3
+                label: label(false),
+            },
+            BlockDivider {
+                start: 5, // viewport line 2
+                label: label(true),
+            },
+            BlockDivider {
+                start: 9, // past a 4-row pane
+                label: None,
+            },
+        ];
+        // scrollback 3, unscrolled: rows 0..4 show live lines 3..=6.
+        let chips = plan_block_chrome(&dividers, 3, 0, 4);
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].row, 2);
+        assert!(chips[0].label.as_ref().unwrap().ok);
+
+        // Scrolled up 1 (view top = live line 2): the line-2 divider
+        // tops the pane (row 0), line 5 lands on row 3.
+        let chips = plan_block_chrome(&dividers, 3, 1, 4);
+        assert_eq!(
+            chips.iter().map(|chip| chip.row).collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+        assert!(!chips[0].label.as_ref().unwrap().ok);
     }
 }

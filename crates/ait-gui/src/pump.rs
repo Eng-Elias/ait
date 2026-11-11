@@ -177,6 +177,7 @@ fn drain_pass(
         skills,
         profile,
         picker,
+        find,
         ..
     } = &mut *shared;
 
@@ -305,6 +306,20 @@ fn drain_pass(
             .is_some_and(|old| old != revision)
         {
             activity.agent = true;
+        }
+    }
+
+    // The find bar's hits are line-indexed snapshots (Spec R13-T4):
+    // drained output shifts the grid under them, so any session
+    // activity rescans against the tab they were taken from. A bar
+    // pointing at a different tab (mid-switch) is left for the UI's
+    // retarget — rescanning it against the wrong session would paint
+    // foreign positions for a frame.
+    if activity.session {
+        if let (Some(find), Some(tab)) = (find.as_mut(), tabs.active()) {
+            if find.tab() == tab.id {
+                find.rescan(&tab.grid());
+            }
         }
     }
 

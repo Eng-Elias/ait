@@ -11,12 +11,13 @@
 //!
 //! [Spec R13 §5.12, REQUIREMENTS.md §5.12]
 
+use ait_app::search::SearchHit;
 use ait_app::selection::SelectionRange;
 use ait_term::{Cursor, CursorShape, GridView, Underline};
 use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::grid::{plan_viewport, CellSpan, GridTheme, RowPlan};
-use crate::layout::{cursor_row, CellMetrics};
+use crate::layout::{cursor_row, BlockChip, CellMetrics};
 
 /// Everything one paint pass needs that isn't per-row state — the
 /// painter (already clipped to `pane`), the pane rect, the cell
@@ -34,6 +35,35 @@ pub struct GridSurface<'a> {
     pub theme: GridTheme,
     /// The monospace `FontId` at the current zoom.
     pub font: &'a FontId,
+}
+
+/// The overlays painted between the planned rows and the cursor —
+/// all optional so a bare `paint_grid` call is just `Overlays::default`.
+/// Every input arrives already mapped to the spaces the fields name —
+/// the planner fns in `crate::layout`/`ait_app::search` own the
+/// conversions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Overlays<'a> {
+    /// The find bar's matches (`ait_app::search::search_grid` output —
+    /// grid-line coordinates) and the current hit's index, painted as
+    /// a translucent wash over the covered cells.
+    pub find: Option<FindOverlay<'a>>,
+    /// The planned command-block chrome — divider rows plus
+    /// exit-status chips — in screen rows already
+    /// (`layout::plan_block_chrome` output). Empty/`None` outside
+    /// `Integrated` sessions, which is what keeps MarksOnly/Absent
+    /// tabs identical to plain output.
+    pub block_chips: Option<&'a [BlockChip]>,
+}
+
+/// The find bar's paint inputs — the full hit list plus which index
+/// is current.
+#[derive(Debug, Clone, Copy)]
+pub struct FindOverlay<'a> {
+    /// All hits in `GridView` line space (sorted by `(line, column)`).
+    pub hits: &'a [SearchHit],
+    /// The bar's current hit's index into `hits`.
+    pub current: Option<usize>,
 }
 
 impl GridSurface<'_> {
@@ -268,15 +298,100 @@ fn paint_selection(
     }
 }
 
-/// Paint the whole grid pane: theme-bg fill, then planned rows,
-/// selection wash, cursor — the order that keeps text over backgrounds
-/// and the cursor over everything.
+/// The find bar's wash: each hit's covered columns get the theme's
+/// translucent match rect — the current one in the stronger color so
+/// it stands out in a row of hits. Hits already carry grid lines, so
+/// the mapping is the same `line + offset` rule the planner used.
+fn paint_find(
+    surface: &GridSurface<'_>,
+    overlay: FindOverlay<'_>,
+    scroll_offset: usize,
+    rows: usize,
+) {
+    let offset = i64::try_from(scroll_offset).unwrap_or(i64::MAX);
+    for (index, hit) in overlay.hits.iter().enumerate() {
+        let row = hit.line as i64 + offset;
+        if row < 0 || row >= rows as i64 {
+            continue;
+        }
+        let color = if Some(index) == overlay.current {
+            surface.theme.find_current
+        } else {
+            surface.theme.find_match
+        };
+        surface.painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(surface.x(hit.column), surface.y(row as usize)),
+                Vec2::new(hit.cells as f32 * surface.cell.width, surface.cell.height),
+            ),
+            0.0,
+            color,
+        );
+    }
+}
+
+/// Command-block chrome (Spec R13-T4): a divider at each block's start
+/// row plus a right-aligned exit-status chip straddling it — the
+/// `✓/✗ <code> · <dur>` label `block_text` formats for the status
+/// line, in the theme's ok/err colors. `chips` arrive as screen rows
+/// from `layout::plan_block_chrome`; the caller feeds it resolved
+/// `Block`s only on `Integrated` tabs, so marks-only and unintegrated
+/// sessions get nothing here (Spec R05's graceful degrade).
+fn paint_block_chrome(surface: &GridSurface<'_>, chips: &[BlockChip]) {
+    let painter = surface.painter;
+    for chip in chips {
+        let y = surface.y(chip.row);
+        painter.line_segment(
+            [
+                Pos2::new(surface.pane.left(), y),
+                Pos2::new(surface.pane.right(), y),
+            ],
+            Stroke::new(1.0, surface.theme.block_edge),
+        );
+        if let Some(label) = &chip.label {
+            let color = if label.ok {
+                surface.theme.block_ok
+            } else {
+                surface.theme.block_err
+            };
+            let galley =
+                painter.layout_no_wrap(label.text.clone(), surface.font.clone(), Color32::WHITE);
+            // The chip floats on the divider's right end — a rounded
+            // rect straddling the boundary line, bg-filled so the rows
+            // above and below stay readable under it.
+            let chip_w = galley.size().x + 10.0;
+            let chip_h = surface.cell.height + 4.0;
+            let rect = Rect::from_center_size(
+                Pos2::new(surface.pane.right() - chip_w / 2.0 - 4.0, y),
+                Vec2::new(chip_w, chip_h),
+            );
+            painter.rect_filled(rect, chip_h / 2.0, surface.theme.bg);
+            painter.rect_stroke(
+                rect,
+                chip_h / 2.0,
+                Stroke::new(1.0, color),
+                eframe::egui::StrokeKind::Inside,
+            );
+            painter.galley(
+                Pos2::new(rect.left() + 5.0, rect.center().y - galley.size().y / 2.0),
+                galley,
+                color,
+            );
+        }
+    }
+}
+
+/// Paint the whole grid pane: theme-bg fill, then planned rows, the
+/// find wash, selection wash, block chrome, cursor — the order that
+/// keeps text over backgrounds, both washes over text, the chrome over
+/// the washes, and the cursor over everything.
 pub fn paint_grid(
     surface: &GridSurface<'_>,
     grid: &GridView<'_>,
     scroll_offset: usize,
     cursor: Cursor,
     selection: Option<SelectionRange>,
+    overlays: Overlays<'_>,
 ) {
     surface
         .painter
@@ -291,8 +406,14 @@ pub fn paint_grid(
         }
         paint_row(surface, surface.y(row as usize), plan);
     }
+    if let Some(find) = overlays.find {
+        paint_find(surface, find, scroll_offset, rows);
+    }
     if let Some(range) = selection {
         paint_selection(surface, range, scroll_offset, width, rows);
+    }
+    if let Some(chips) = overlays.block_chips {
+        paint_block_chrome(surface, chips);
     }
     paint_cursor(surface, cursor, scroll_offset, rows);
 }

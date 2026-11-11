@@ -26,6 +26,17 @@ pub struct GridTheme {
     pub cursor: Color32,
     /// The selection overlay's translucent wash.
     pub selection: Color32,
+    /// The find bar's match wash — every hit except the current one.
+    pub find_match: Color32,
+    /// The current match's wash — brighter so it stands out in a row
+    /// of hits.
+    pub find_current: Color32,
+    /// The command-block divider line (integrated sessions only).
+    pub block_edge: Color32,
+    /// The exit-status chip's success color (`✓`).
+    pub block_ok: Color32,
+    /// The exit-status chip's failure color (`✗`).
+    pub block_err: Color32,
 }
 
 impl Default for GridTheme {
@@ -35,6 +46,11 @@ impl Default for GridTheme {
             bg: Color32::from_rgb(0x14, 0x14, 0x14),
             cursor: Color32::from_rgba_unmultiplied(0xD8, 0xD8, 0xD8, 0x70),
             selection: Color32::from_rgba_unmultiplied(0x33, 0x66, 0xFF, 0x60),
+            find_match: Color32::from_rgba_unmultiplied(0xCC, 0xAA, 0x00, 0x50),
+            find_current: Color32::from_rgba_unmultiplied(0xFF, 0x88, 0x00, 0x90),
+            block_edge: Color32::from_rgba_unmultiplied(0x88, 0x88, 0x88, 0x40),
+            block_ok: Color32::from_rgb(0x4C, 0xAF, 0x50),
+            block_err: Color32::from_rgb(0xE0, 0x50, 0x50),
         }
     }
 }
