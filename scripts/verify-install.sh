@@ -139,14 +139,19 @@ for var in AIT_DOWNLOAD_URL AIT_INSTALL_DIR AIT_GITHUB_TOKEN \
     fi
 done
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 {
     cat <<'EOF'
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 # The image starts WITHOUT curl on purpose — installing it here is the
-# clean-machine simulation (see this script's header).
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends curl ca-certificates
+# clean-machine simulation (see this script's header). Its ubuntu.com
+# apt sources get the same kernel.org repoint the runners need —
+# container DNS rides the host's resolver (see fix-apt-mirror.sh).
+EOF
+    cat "$script_dir/fix-apt-mirror.sh"
+    cat <<'EOF'
+apt-get -o Acquire::Retries=3 -qq install -y --no-install-recommends curl ca-certificates
 EOF
     cat "$work/verify-inner.sh"
 } >"$work/container.sh"

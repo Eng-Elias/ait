@@ -51,12 +51,12 @@ plan-jobs = ["./guard"]
 publish-jobs = ["./verify-install"]
 
 # The musl leg's generated "Install dependencies" step runs
-# `apt-get install musl-tools` through the runner's
-# mirror+file:/etc/apt/apt-mirrors.txt, whose azure.archive.ubuntu.com
-# mirror flaked DNS hard enough to kill the v1.0.0 tag build twice in
-# a row. dist splices this file's steps in right after checkout —
-# before that step — so it can repoint apt at archive.ubuntu.com and
-# pre-install the packages, turning dist's own apt call into a no-op.
+# `apt-get install musl-tools` through apt sources on *.ubuntu.com —
+# every such host flaked DNS at once and killed the v1.0.0 tag build
+# twice in a row. dist splices this file's steps in right after
+# checkout — before that step — so it can repoint apt at kernel.org's
+# mirror (scripts/fix-apt-mirror.sh) and pre-install the packages,
+# turning dist's own apt call into a no-op.
 github-build-setup = "../build-setup.yml"
 
 # publish-jobs default to escalated id-token/packages permissions; the
