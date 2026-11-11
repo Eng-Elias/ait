@@ -99,14 +99,10 @@ pub fn gate(panel: &AgentPanel) -> Option<Gate<'_>> {
         return Some(Gate::Approve { name, denying });
     }
     if panel.awaiting_answer() {
-        return panel
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                Entry::Ask(card) if card.answer.is_none() => Some(Gate::Ask(card)),
-                _ => None,
-            });
+        return panel.entries().iter().rev().find_map(|entry| match entry {
+            Entry::Ask(card) if card.answer.is_none() => Some(Gate::Ask(card)),
+            _ => None,
+        });
     }
     None
 }
@@ -313,15 +309,10 @@ pub fn view_window(panel: &AgentPanel, total: usize, height: usize) -> (usize, u
 /// send travels the same channel the keyboard answer does). A
 /// no-op while no choices ask is parked.
 pub fn answer_choice(panel: &mut AgentPanel, index: usize, toast: &mut Option<Toast>) {
-    let Some(card) = panel
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            Entry::Ask(card) if card.answer.is_none() => Some(card),
-            _ => None,
-        })
-    else {
+    let Some(card) = panel.entries().iter().rev().find_map(|entry| match entry {
+        Entry::Ask(card) if card.answer.is_none() => Some(card),
+        _ => None,
+    }) else {
         return;
     };
     if !panel.awaiting_answer() || card.choices.is_empty() || index >= card.choices.len() {

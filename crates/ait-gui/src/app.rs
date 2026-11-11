@@ -14,9 +14,12 @@
 //! hit-tests use, and the quit flag.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use ait_agent::ApprovalVerdict;
+use ait_app::agent_panel::AgentPanel;
 use ait_app::config::{self, LiveSettings};
+use ait_app::conversations::ConversationPicker;
 use ait_app::ctl::CtlServer;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
 use ait_app::profile::{self, ProfilePicker};
@@ -27,7 +30,7 @@ use ait_app::status::{status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
 use ait_app::tabs::TabManager;
 use ait_config::Settings;
-use ait_term::{Key, KeyEvent, Keypad, Size};
+use ait_term::{Key, KeyEvent, Keypad, Modifiers, Size};
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2, ViewportCommand,
 };
@@ -39,6 +42,7 @@ use crate::layout::{
     Chrome, GuiMetrics, CHIP_PAD,
 };
 use crate::paint::paint_grid;
+use crate::panel::{self, Gate, Tone};
 use crate::pump::Pump;
 
 /// How long before a live toast's expiry the UI asks for one more
@@ -67,6 +71,9 @@ pub struct Shared {
     /// The open `Alt+P` profile switcher, if any — app-global and
     /// ephemeral like the TUI's (dropped on settings reload).
     pub picker: Option<ProfilePicker>,
+    /// The open `Alt+R` conversation picker, if any (Spec R08 §5.8) —
+    /// a snapshot of the store's rows taken at open, like the TUI's.
+    pub conversations: Option<ConversationPicker>,
     /// ait's own copied selection — `Shift+Insert`'s paste source,
     /// mirroring the TUI (the host clipboard rides `ctx.copy_text`
     /// alongside, since the GUI has a real clipboard API).
@@ -94,6 +101,14 @@ pub struct GuiApp {
     /// The last frame's grid pane — the wheel-scroll and drag-selection
     /// hit-test region (events arriving this frame test against it).
     grid_pane: Option<Rect>,
+    /// The last frame's side-panel region — the wheel hit-test routes
+    /// hovers over it to the panel's own conversation scroll (the
+    /// layout contract's "panel wheel events must not scroll the
+    /// terminal grid" rule, from the other side).
+    panel_pane: Option<Rect>,
+    /// The conversation rows the panel's last paint fit — a Page-unit
+    /// wheel's scroll distance over the panel region.
+    panel_rows: usize,
     /// Set when the input dispatch decided the app should close —
     /// applied after `ui` returns so the frame can't see a
     /// half-drained state.
@@ -176,6 +191,7 @@ impl GuiApp {
             skills: LiveSkills::new(),
             profile: profile::DEFAULT_PROFILE.to_string(),
             picker: None,
+            conversations: None,
             copied_text: None,
         }));
         let watcher = config::watcher();
@@ -188,6 +204,8 @@ impl GuiApp {
             chrome,
             last_band: band,
             grid_pane: None,
+            panel_pane: None,
+            panel_rows: 0,
             quit: false,
             find_open: false,
         })
@@ -309,20 +327,44 @@ impl GuiApp {
                     }
                 }
             }
-            // Wired in T3/T5 with the suggester and conversation picker
-            // — bound keys must still be consumed (never leaked to the
-            // PTY), so the stub reports the gap instead of no-op'ing.
+            // Wired in T3/T6 with the suggester — bound keys must
+            // still be consumed (never leaked to the PTY), so the
+            // stub reports the gap instead of no-op'ing.
             Resolution::Action(AppAction::SuggestCommand) => {
                 shared.toast = Some(Toast::new(
                     "suggest is not wired in the GUI frontend yet",
                     Instant::now(),
                 ));
             }
+            // `Alt+R` (Spec R08 §5.8): the conversation picker over
+            // the store's rows — newest-first, Enter resumes into the
+            // active tab's panel, `Ctrl+D` deletes behind a one-key
+            // confirm, Esc closes. A second `Alt+R` toggles it closed,
+            // and opening it drops the profile picker — one overlay at
+            // a time. The list is a snapshot taken here; an empty
+            // store toasts instead of opening nothing.
             Resolution::Action(AppAction::Conversations) => {
-                shared.toast = Some(Toast::new(
-                    "conversation picker is not wired in the GUI frontend yet",
-                    Instant::now(),
-                ));
+                if shared.conversations.take().is_some() {
+                    // Toggled closed — the highlight is dropped.
+                } else {
+                    shared.picker = None;
+                    match shared.store.conversations() {
+                        Ok(listed) if listed.is_empty() => {
+                            shared.toast =
+                                Some(Toast::new("no stored conversations", Instant::now()));
+                        }
+                        Ok(listed) => {
+                            shared.conversations =
+                                Some(ConversationPicker::new(&listed, SystemTime::now()));
+                        }
+                        Err(error) => {
+                            shared.toast = Some(Toast::new(
+                                format!("conversations list failed: {error}"),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
             }
             Resolution::Action(action) => {
                 let Some(tab) = shared.tabs.active_mut() else {
@@ -391,6 +433,16 @@ impl GuiApp {
                     }
                     return;
                 }
+                // The open conversation picker owns unbound keys the
+                // same way (Spec R08-T6): ↑/↓ move, Enter resumes,
+                // `Ctrl+D` deletes behind its confirm, plain Esc
+                // dismisses — nothing leaks to the PTY mid-pick.
+                if shared.conversations.is_some() {
+                    if let Some(key) = key {
+                        conversation_key(&key, shared);
+                    }
+                    return;
+                }
                 let Some(tab) = shared.tabs.active_mut() else {
                     return;
                 };
@@ -439,8 +491,11 @@ impl GuiApp {
     }
 
     /// Wheel over the grid pane scrolls the terminal — wheel over the
-    /// panel region or the chrome does not (the layout contract's
-    /// "panel wheel events must not scroll the terminal grid" rule).
+    /// panel region scrolls the PANEL's conversation (the layout
+    /// contract's "panel wheel events must not scroll the terminal
+    /// grid" rule, from the other side: terminal wheel events must
+    /// not scroll the panel either — the two regions route to their
+    /// own scroll state).
     fn wheel(
         &mut self,
         shared: &mut Shared,
@@ -448,30 +503,29 @@ impl GuiApp {
         unit: egui::MouseWheelUnit,
         delta: Vec2,
     ) {
-        let Some(pane) = self.grid_pane else { return };
-        let hovering = ctx
-            .input(|input| input.pointer.hover_pos())
-            .is_some_and(|pos| pane.contains(pos));
-        if !hovering {
+        let Some(hover) = ctx.input(|input| input.pointer.hover_pos()) else {
+            return;
+        };
+        if self.panel_pane.is_some_and(|pane| pane.contains(hover)) {
+            let Some(tab) = shared.tabs.active_mut() else {
+                return;
+            };
+            let lines = self.wheel_lines(ctx, unit, delta.y);
+            if delta.y > 0.0 {
+                tab.agent_scroll_up(lines);
+            } else {
+                tab.agent_scroll_down(lines);
+            }
+            return;
+        }
+        if !self.grid_pane.is_some_and(|pane| pane.contains(hover)) {
             return;
         }
         let Some(tab) = shared.tabs.active_mut() else {
             return;
         };
+        let lines = self.wheel_lines(ctx, unit, delta.y);
         match unit {
-            egui::MouseWheelUnit::Line => {
-                // One notch reports ±1.0 in LineDelta units — scale by
-                // the shared WHEEL_LINES so a tick scrolls the same
-                // 3 lines the TUI's wheel binding does
-                // (CODING_STANDARDS §17 — one constant, both
-                // frontends).
-                let lines = (delta.y.abs() * WHEEL_LINES as f32).ceil().max(1.0) as usize;
-                if delta.y > 0.0 {
-                    tab.scroll_up(lines);
-                } else {
-                    tab.scroll_down(lines);
-                }
-            }
             egui::MouseWheelUnit::Page => {
                 if delta.y > 0.0 {
                     tab.page_up();
@@ -479,15 +533,34 @@ impl GuiApp {
                     tab.page_down();
                 }
             }
-            egui::MouseWheelUnit::Point => {
-                let cell = self.cell_height(ctx);
-                let lines = (delta.y / cell).trunc() as i64;
-                if lines > 0 {
-                    tab.scroll_up(lines as usize);
-                } else if lines < 0 {
-                    tab.scroll_down((-lines) as usize);
+            _ => {
+                if delta.y > 0.0 {
+                    tab.scroll_up(lines);
+                } else {
+                    tab.scroll_down(lines);
                 }
             }
+        }
+    }
+
+    /// One wheel delta → scroll lines: Line units scale by the shared
+    /// `WHEEL_LINES` so a tick scrolls the same 3 lines the TUI's
+    /// wheel binding does (CODING_STANDARDS §17 — one constant, both
+    /// frontends); Point units divide by the cell height; Page units
+    /// are handled by the grid arm's page_up/page_down (the panel's
+    /// conversation scrolls in lines regardless).
+    fn wheel_lines(&self, ctx: &egui::Context, unit: egui::MouseWheelUnit, delta_y: f32) -> usize {
+        match unit {
+            egui::MouseWheelUnit::Line => {
+                (delta_y.abs() * WHEEL_LINES as f32).ceil().max(1.0) as usize
+            }
+            egui::MouseWheelUnit::Point => {
+                let cell = self.cell_height(ctx);
+                (delta_y / cell).trunc().abs() as usize
+            }
+            // The panel arm uses this as its page distance (the grid
+            // arm handles Page through page_up/page_down itself).
+            egui::MouseWheelUnit::Page => self.panel_rows.max(1),
         }
     }
 
@@ -682,30 +755,388 @@ impl GuiApp {
         );
     }
 
-    /// The side-panel region (Spec R13-T5's hook): the layout contract
-    /// already carves and resizes for it — the skeleton paints the
-    /// region and the panel's headline state, and T5 fills in the
-    /// conversation transcript, the input line and the ask cards.
-    fn paint_panel(&self, ui: &mut egui::Ui, shared: &Shared, rect: Rect) {
+    /// The side-panel region (Spec R13-T5): the agent conversation
+    /// panel's egui paint over [`AgentPanel`]'s shared state — the
+    /// same regions the TUI's `paint_agent_panel` carves: the title
+    /// row (reversed while the panel owns the keyboard — the focus
+    /// affordance), the pinned `update_plan` block under it, the
+    /// wrapped conversation between, the parked gate's interactive
+    /// card above the input row, and the `› ` input line on the
+    /// last row. Line planning is [`crate::panel`]'s pure half; the
+    /// scroll window publishes back through `set_painted_view` so
+    /// the wheel bounds match the real layout.
+    ///
+    /// Clicks resolve to [`PanelAction`]s applied after painting:
+    /// the verdict buttons call the same `decide`/`begin_deny_reason`
+    /// the `a`/`t`/`d` keys reach through `agent_key`, and choice
+    /// rows answer through `answer_choice` — the click and the
+    /// keyboard can never disagree about what a gate does.
+    fn paint_panel(&mut self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect) {
+        let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1B, 0x1B, 0x1B));
+        painter.rect_filled(rect, 0.0, PANEL_BG);
         painter.line_segment(
             [rect.left_top(), rect.left_bottom()],
             Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
         );
-        let text = shared
-            .tabs
-            .active()
-            .and_then(|tab| tab.agent_panel())
-            .map(|panel| format!("agent — {} items", panel.entries().len()))
-            .unwrap_or_else(|| "agent".to_string());
-        painter.text(
-            rect.left_top() + Vec2::new(8.0, 8.0),
-            Align2::LEFT_TOP,
-            text,
-            FontId::proportional(12.0),
-            Color32::from_rgb(0x88, 0x88, 0x88),
+        let font = FontId::monospace(13.0);
+        let (line_h, cell_w) = ctx.fonts_mut(|fonts| {
+            (
+                fonts.row_height(&font).max(1.0),
+                fonts.glyph_width(&font, 'M').max(1.0),
+            )
+        });
+        let mut action: Option<PanelAction> = None;
+        {
+            let Some(panel) = shared.tabs.active().and_then(|tab| tab.agent_panel()) else {
+                return;
+            };
+            let left = rect.left() + PANEL_PAD;
+            let right = rect.right() - PANEL_PAD / 2.0;
+            let width_cols = ((right - left) / cell_w).floor().max(1.0) as usize;
+
+            // Title row — reversed while focused, the TUI's focus
+            // affordance — plus the in-flight hint while a task runs.
+            let title_rect = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), line_h));
+            if panel.is_focused() {
+                painter.rect_filled(title_rect, 0.0, self.theme.fg);
+            }
+            painter.text(
+                title_rect.left_top(),
+                Align2::LEFT_TOP,
+                panel::title(panel),
+                font.clone(),
+                if panel.is_focused() {
+                    PANEL_BG
+                } else {
+                    self.theme.fg
+                },
+            );
+            let content_top = rect.top() + line_h;
+
+            // The input row owns the last line; the parked gate's card
+            // anchors directly above it (never hidden — the
+            // conversation loses those rows for the duration).
+            let input_rect = Rect::from_min_max(
+                Pos2::new(rect.left(), rect.bottom() - line_h),
+                rect.right_bottom(),
+            );
+            let card_height = self.paint_gate_card(
+                ui,
+                &painter,
+                panel,
+                &font,
+                line_h,
+                left,
+                right,
+                input_rect.top(),
+                &mut action,
+            );
+            let card_top = input_rect.top() - card_height;
+
+            // The pinned plan block directly under the title — capped
+            // so a long plan folds rather than crowding the
+            // scrollback out.
+            let available_rows = ((card_top - content_top) / line_h).floor().max(0.0) as usize;
+            let plan = panel::plan_lines(
+                panel.plan(),
+                panel::PLAN_BLOCK_MAX.min(available_rows.saturating_sub(1)),
+            );
+            for (index, row) in plan.iter().enumerate() {
+                let y = content_top + index as f32 * line_h;
+                painter.text(
+                    Pos2::new(left, y),
+                    Align2::LEFT_TOP,
+                    &row.text,
+                    font.clone(),
+                    tone_color(row.tone, self.theme),
+                );
+            }
+            let conv_top = content_top + plan.len() as f32 * line_h;
+
+            // The conversation, pinned to the tail unless the user
+            // scrolled — the paint owns the wrap, so it also owns the
+            // scroll clamp: `top`/`painted` are what the wheel
+            // handlers bound against.
+            let conv_height = (card_top - conv_top).max(0.0);
+            let conv_rows = (conv_height / line_h).floor() as usize;
+            self.panel_rows = conv_rows;
+            let lines = panel::display_lines(panel.entries(), width_cols);
+            let (top, max_top) = panel::view_window(panel, lines.len(), conv_rows);
+            panel.set_painted_view((top, max_top));
+            let conv_rect = Rect::from_min_max(
+                Pos2::new(rect.left(), conv_top),
+                Pos2::new(rect.right(), card_top),
+            );
+            let conv_painter = painter.with_clip_rect(conv_rect);
+            for row in 0..conv_rows {
+                let y = conv_top + row as f32 * line_h;
+                if let Some(row) = lines.get(top + row) {
+                    conv_painter.text(
+                        Pos2::new(left, y),
+                        Align2::LEFT_TOP,
+                        &row.text,
+                        font.clone(),
+                        tone_color(row.tone, self.theme),
+                    );
+                }
+            }
+
+            // The input line: `› ` plus the tail of the buffer — a
+            // long draft clips from the left, the end being edited
+            // stays visible — and a beam caret while the panel owns
+            // the keyboard.
+            let room = width_cols.saturating_sub(panel::PROMPT_WIDTH);
+            let shown = panel::tail(panel.input(), room);
+            painter.text(
+                Pos2::new(left, input_rect.top()),
+                Align2::LEFT_TOP,
+                format!("{}{}", panel::INPUT_PROMPT, shown),
+                font.clone(),
+                self.theme.fg,
+            );
+            if panel.is_focused() {
+                let caret_x = (left
+                    + (panel::PROMPT_WIDTH + shown.chars().count()) as f32 * cell_w)
+                    .min(right - 1.0);
+                painter.line_segment(
+                    [
+                        Pos2::new(caret_x, input_rect.top() + 1.0),
+                        Pos2::new(caret_x, input_rect.bottom() - 1.0),
+                    ],
+                    Stroke::new(1.5, self.theme.fg),
+                );
+            }
+        }
+        // The whole region is the focus affordance: a click anywhere
+        // that isn't a button re-focuses an unfocused panel (the
+        // `Alt+A` refocus arm's mouse counterpart — never a close).
+        let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
+        if body.clicked()
+            && shared
+                .tabs
+                .active()
+                .and_then(|tab| tab.agent_panel())
+                .is_some_and(|panel| panel.is_open() && !panel.is_focused())
+        {
+            action = action.or(Some(PanelAction::Focus));
+        }
+        if let Some(action) = action {
+            self.panel_action(shared, action);
+        }
+    }
+
+    /// The parked gate's card above the input row — the approve
+    /// card's verdict buttons (allow once / allow for task / deny)
+    /// or its deny-reason prompt, or the ask card's clickable
+    /// choices / free-text hint. Paints inside `painter`, queues the
+    /// click's [`PanelAction`] into `action`, and returns the card's
+    /// height in points (`0.0` while no gate is parked).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_gate_card(
+        &self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        panel: &AgentPanel,
+        font: &FontId,
+        line_h: f32,
+        left: f32,
+        right: f32,
+        input_top: f32,
+        action: &mut Option<PanelAction>,
+    ) -> f32 {
+        let gate = panel::gate(panel);
+        // Rows of card content: the prompt row, plus the buttons row
+        // for a waiting approve or one row per choice for a choices
+        // ask (a long list folds like the plan block's `… N more`).
+        let content_rows = match &gate {
+            Some(Gate::Approve { denying, .. }) => {
+                if *denying {
+                    1
+                } else {
+                    2
+                }
+            }
+            Some(Gate::Ask(card)) if !card.choices.is_empty() => {
+                1 + card.choices.len().min(ASK_CHOICES_MAX + 1)
+            }
+            Some(Gate::Ask(_)) => 1,
+            None => 0,
+        };
+        if content_rows == 0 {
+            return 0.0;
+        }
+        let height = content_rows as f32 * line_h + 8.0;
+        let card = Rect::from_min_max(
+            Pos2::new(left - 4.0, input_top - height),
+            Pos2::new(right, input_top - 2.0),
         );
+        painter.rect_filled(card, 4.0, Color32::from_rgb(0x22, 0x22, 0x22));
+        painter.rect_stroke(
+            card,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+            egui::StrokeKind::Inside,
+        );
+        let mut y = card.top() + 4.0;
+        match gate {
+            Some(Gate::Approve { name, denying }) => {
+                painter.text(
+                    Pos2::new(left, y),
+                    Align2::LEFT_TOP,
+                    if denying {
+                        format!(" deny {name} — type a reason · enter: deny ")
+                    } else {
+                        format!(" approve {name} ")
+                    },
+                    font.clone(),
+                    tone_color(Tone::Alert, self.theme),
+                );
+                y += line_h;
+                if !denying {
+                    // The three verdict buttons — the `a`/`t`/`d`
+                    // keys' click counterparts, same semantics.
+                    let buttons = [
+                        (
+                            "a: once",
+                            egui::Id::unique("agent-allow-once"),
+                            PanelAction::Verdict(ApprovalVerdict::AllowOnce),
+                        ),
+                        (
+                            "t: task",
+                            egui::Id::unique("agent-allow-task"),
+                            PanelAction::Verdict(ApprovalVerdict::AllowForTask),
+                        ),
+                        (
+                            "d: deny",
+                            egui::Id::unique("agent-deny"),
+                            PanelAction::BeginDenyReason,
+                        ),
+                    ];
+                    let button_w = (card.width() - 16.0 - 8.0 * 2.0) / 3.0;
+                    for (index, (label, id, verdict)) in buttons.into_iter().enumerate() {
+                        let button = Rect::from_min_size(
+                            Pos2::new(card.left() + 8.0 + index as f32 * (button_w + 8.0), y),
+                            Vec2::new(button_w, line_h),
+                        );
+                        let hit = ui.interact(button, id, Sense::click());
+                        painter.rect_filled(
+                            button,
+                            3.0,
+                            if hit.hovered() {
+                                Color32::from_rgb(0x3A, 0x3A, 0x3A)
+                            } else {
+                                Color32::from_rgb(0x2A, 0x2A, 0x2A)
+                            },
+                        );
+                        painter.text(
+                            button.center(),
+                            Align2::CENTER_CENTER,
+                            label,
+                            font.clone(),
+                            self.theme.fg,
+                        );
+                        if hit.clicked() {
+                            *action = Some(verdict);
+                        }
+                    }
+                }
+            }
+            Some(Gate::Ask(ask)) => {
+                if ask.choices.is_empty() {
+                    painter.text(
+                        Pos2::new(left, y),
+                        Align2::LEFT_TOP,
+                        " ask — type your answer · enter: send ",
+                        font.clone(),
+                        tone_color(Tone::Alert, self.theme),
+                    );
+                } else {
+                    painter.text(
+                        Pos2::new(left, y),
+                        Align2::LEFT_TOP,
+                        format!(" ask — {} ", ask.question),
+                        font.clone(),
+                        tone_color(Tone::Alert, self.theme),
+                    );
+                    y += line_h;
+                    let shown = ask.choices.len().min(ASK_CHOICES_MAX);
+                    for (index, choice) in ask.choices.iter().take(shown).enumerate() {
+                        let row = Rect::from_min_size(
+                            Pos2::new(card.left() + 4.0, y),
+                            Vec2::new(card.width() - 8.0, line_h),
+                        );
+                        let hit = ui.interact(
+                            row,
+                            egui::Id::unique(("agent-ask", index)),
+                            Sense::click(),
+                        );
+                        let selected = index == ask.selected;
+                        if selected || hit.hovered() {
+                            painter.rect_filled(row, 2.0, Color32::from_rgb(0x33, 0x44, 0x66));
+                        }
+                        painter.text(
+                            Pos2::new(left, y),
+                            Align2::LEFT_TOP,
+                            if selected {
+                                format!("    ▸ {choice}")
+                            } else {
+                                format!("      {choice}")
+                            },
+                            font.clone(),
+                            if selected {
+                                tone_color(Tone::Strong, self.theme)
+                            } else {
+                                self.theme.fg
+                            },
+                        );
+                        if hit.clicked() {
+                            *action = Some(PanelAction::AnswerChoice(index));
+                        }
+                        y += line_h;
+                    }
+                    if ask.choices.len() > shown {
+                        painter.text(
+                            Pos2::new(left, y),
+                            Align2::LEFT_TOP,
+                            format!("    … {} more · ↑/↓ to reach", ask.choices.len() - shown),
+                            font.clone(),
+                            tone_color(Tone::Dim, self.theme),
+                        );
+                    }
+                }
+            }
+            None => {}
+        }
+        height
+    }
+
+    /// Apply one queued [`PanelAction`] — the click's shared-state
+    /// mutation, routed to the same methods `agent_key` reaches.
+    fn panel_action(&self, shared: &mut Shared, action: PanelAction) {
+        let Some(tab) = shared.tabs.active_mut() else {
+            return;
+        };
+        match action {
+            PanelAction::Focus => {
+                tab.toggle_agent_panel();
+            }
+            PanelAction::Verdict(verdict) => {
+                if let Some(panel) = tab.agent.as_mut() {
+                    panel.decide(verdict, &mut shared.toast);
+                }
+            }
+            PanelAction::BeginDenyReason => {
+                if let Some(panel) = tab.agent.as_mut() {
+                    panel.begin_deny_reason();
+                }
+            }
+            PanelAction::AnswerChoice(index) => {
+                if let Some(panel) = tab.agent.as_mut() {
+                    panel::answer_choice(panel, index, &mut shared.toast);
+                }
+            }
+        }
     }
 
     /// The status strip: `status_text` over the same `StatusLine` the
@@ -751,15 +1182,16 @@ impl GuiApp {
         );
     }
 
-    /// The modal layer — painted last so overlays always win. Hosts the
-    /// `Alt+P` profile picker now; T4's find bar and T5+'s conversation
-    /// picker anchor here (same slot the TUI's `paint_profile_picker`
-    /// and `paint_conversations` occupy).
+    /// The modal layer — painted last so overlays always win. Hosts
+    /// the `Alt+P` profile picker and the `Alt+R` conversation picker
+    /// (the same slots the TUI's `paint_profile_picker` and
+    /// `paint_conversation_picker` occupy); T4's find bar anchors
+    /// here too.
     fn paint_modals(&self, ui: &mut egui::Ui, shared: &Shared, area: Rect) {
+        let painter = ui.painter();
+        let font = FontId::monospace(13.0);
+        let row_h = 18.0;
         if let Some(picker) = shared.picker.as_ref() {
-            let painter = ui.painter();
-            let font = FontId::monospace(13.0);
-            let row_h = 18.0;
             let h = picker.names().len() as f32 * row_h + 16.0;
             let rect = Rect::from_center_size(
                 Pos2::new(
@@ -800,6 +1232,87 @@ impl GuiApp {
                     Color32::WHITE,
                 );
             }
+        }
+        // `Alt+R`'s conversation picker (Spec R08 §5.8): the stored
+        // rows newest-first — `▸ title  age · N items` on the
+        // highlighted row — over a bottom-anchored card, the hint row
+        // doubling as `Ctrl+D`'s one-key confirm prompt. The list
+        // windows around the highlight when it outgrows the card,
+        // same as the TUI's band.
+        if let Some(picker) = shared.conversations.as_ref() {
+            let shown = picker.rows().len().min(CONVERSATION_ROWS);
+            let start = picker
+                .selected()
+                .saturating_add(1)
+                .saturating_sub(shown)
+                .min(picker.rows().len().saturating_sub(shown));
+            let h = shown as f32 * row_h + row_h + 16.0;
+            let rect = Rect::from_center_size(
+                Pos2::new(
+                    area.center().x,
+                    area.bottom() - h / 2.0 - self.chrome.status - 8.0,
+                ),
+                Vec2::new(440.0, h),
+            );
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(0x22, 0x22, 0x22));
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+                egui::StrokeKind::Inside,
+            );
+            for (offset, row) in picker.rows().iter().skip(start).take(shown).enumerate() {
+                let index = start + offset;
+                let y = rect.top() + 8.0 + offset as f32 * row_h;
+                let selected = index == picker.selected();
+                if selected {
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(rect.left() + 4.0, y - 1.0),
+                            Vec2::new(rect.width() - 8.0, row_h),
+                        ),
+                        2.0,
+                        Color32::from_rgb(0x33, 0x44, 0x66),
+                    );
+                }
+                painter.text(
+                    Pos2::new(rect.left() + 12.0, y),
+                    Align2::LEFT_TOP,
+                    format!(
+                        "{} {}  {} · {} items",
+                        if selected { "▸" } else { " " },
+                        row.title,
+                        row.age,
+                        row.items,
+                    ),
+                    font.clone(),
+                    Color32::WHITE,
+                );
+            }
+            // The bottom row is the keys hint — `Ctrl+D`'s armed
+            // state replaces it with the confirm prompt (us-11).
+            let (hint, color) = if picker.confirming() {
+                let title = picker
+                    .selected_row()
+                    .map(|row| row.title.as_str())
+                    .unwrap_or_default();
+                (
+                    format!(" ctrl+d again deletes \"{title}\""),
+                    tone_color(Tone::Alert, self.theme),
+                )
+            } else {
+                (
+                    " enter: resume · ctrl+d: delete · esc: close".to_string(),
+                    tone_color(Tone::Dim, self.theme),
+                )
+            };
+            painter.text(
+                Pos2::new(rect.left() + 12.0, rect.top() + 8.0 + shown as f32 * row_h),
+                Align2::LEFT_TOP,
+                hint,
+                font.clone(),
+                color,
+            );
         }
         // T4 hook: the find bar anchors above the status strip here.
         let _ = self.find_open;
@@ -860,8 +1373,11 @@ impl eframe::App for GuiApp {
 
         self.paint_tab_bar(ui, &mut shared, regions.tab_bar);
         self.paint_grid_pane(&ctx, ui, &mut shared, grid_pane, cell, &font);
+        // The wheel hit-test mirrors THIS frame's split — a stale
+        // rect would deaden the region the grid just reclaimed.
+        self.panel_pane = panel_rect;
         if let Some(rect) = panel_rect {
-            self.paint_panel(ui, &shared, rect);
+            self.paint_panel(ui, &mut shared, rect);
         }
         self.paint_status(ui, &shared, regions.status);
         self.paint_modals(ui, &shared, area);
@@ -877,6 +1393,184 @@ impl eframe::App for GuiApp {
             pump.stop();
         }
     }
+}
+
+/// The agent panel's palette slots: its own bg and the pad its text
+/// keeps off the separator.
+const PANEL_BG: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1B);
+const PANEL_PAD: f32 = 8.0;
+/// How many choice rows a parked ask card shows before folding —
+/// the plan block's `… N more` idiom applied to the card.
+const ASK_CHOICES_MAX: usize = 6;
+/// How many rows the conversation picker lists before windowing —
+/// the card stays a card, never a screen takeover.
+const CONVERSATION_ROWS: usize = 8;
+
+/// A click on the panel's interactive surfaces, resolved after the
+/// paint pass (the responses borrow `ui`, the mutation borrows
+/// `shared` — queuing keeps the two from overlapping).
+enum PanelAction {
+    /// Re-focus an open-but-unfocused panel (the `Alt+A` refocus
+    /// arm's mouse counterpart — never a close).
+    Focus,
+    /// Answer the parked approve card — `AgentPanel::decide`.
+    Verdict(ApprovalVerdict),
+    /// The `d` key: switch the card into denial-reason mode.
+    BeginDenyReason,
+    /// Answer the parked choices ask as if choice `index` had been
+    /// highlighted and Enter pressed.
+    AnswerChoice(usize),
+}
+
+/// A panel row's [`Tone`] → the paint color — `Strong` lifts the
+/// theme foreground to full white (the same bright-foreground
+/// degrade `bold_color` documents for the grid, since egui's
+/// bundled monospace has no bold face).
+fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
+    match tone {
+        Tone::Plain => theme.fg,
+        Tone::Strong => Color32::WHITE,
+        Tone::Dim => Color32::from_rgb(0x77, 0x77, 0x77),
+        Tone::Alert => Color32::from_rgb(0xE0, 0xC0, 0x40),
+        Tone::Good => Color32::from_rgb(0x50, 0xC8, 0x50),
+        Tone::Bad => Color32::from_rgb(0xE0, 0x50, 0x50),
+        Tone::Info => Color32::from_rgb(0x50, 0xC0, 0xC0),
+    }
+}
+
+/// One key while the conversation picker is open (Spec R08-T6,
+/// us-5/11) — the TUI's `conversation_key`, verbatim: ↑/↓ move the
+/// highlight, Enter resumes the highlighted row into the active
+/// tab's panel, `Ctrl+D` arms then confirms the delete (one
+/// gesture, never an accident — any other key disarms), plain Esc
+/// dismisses. `shared.conversations` is `Some` on entry — the
+/// caller already routed.
+fn conversation_key(key: &KeyEvent, shared: &mut Shared) {
+    enum Outcome {
+        /// Nothing happened — key consumed.
+        None,
+        /// Close the picker.
+        Close,
+        /// Resume `id` into the active tab's panel.
+        Resume(i64),
+        /// The armed confirm fired: delete `id`.
+        Delete(i64),
+    }
+    let outcome = {
+        let Some(picker) = shared.conversations.as_mut() else {
+            return;
+        };
+        // `Ctrl+D` is the one-key confirm's whole vocabulary: the
+        // first press arms, the second deletes. Anything else first
+        // disarms, then does its usual thing — a stray key can never
+        // sneak a delete past the user (us-11).
+        if key.key == Key::Char('d') && key.modifiers == Modifiers::CONTROL {
+            if picker.confirming() {
+                match picker.selected_row() {
+                    Some(row) => Outcome::Delete(row.id),
+                    None => Outcome::Close,
+                }
+            } else {
+                picker.arm_delete();
+                Outcome::None
+            }
+        } else {
+            picker.disarm_delete();
+            match key.key {
+                Key::Up => {
+                    picker.prev();
+                    Outcome::None
+                }
+                Key::Down => {
+                    picker.next();
+                    Outcome::None
+                }
+                Key::Enter => match picker.selected_row() {
+                    Some(row) => Outcome::Resume(row.id),
+                    None => Outcome::Close,
+                },
+                Key::Escape if key.modifiers.is_empty() => Outcome::Close,
+                _ => Outcome::None,
+            }
+        }
+    };
+    match outcome {
+        Outcome::None => {}
+        Outcome::Close => shared.conversations = None,
+        Outcome::Resume(id) => {
+            shared.conversations = None;
+            resume_conversation(id, shared);
+        }
+        Outcome::Delete(id) => {
+            if shared.store.delete_conversation(&mut shared.toast, id) {
+                // The row is gone — every tab bound to it must open
+                // a new row rather than append to a deleted one.
+                shared.tabs.detach_conversation(id);
+                if let Some(picker) = shared.conversations.as_mut() {
+                    picker.remove_selected();
+                    if picker.rows().is_empty() {
+                        shared.conversations = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Enter` on a picker row: load the conversation and swap the
+/// active tab's panel to it (Spec R08-T6, us-6/10) — the TUI's
+/// `resume_conversation`, verbatim. Refused with a toast while the
+/// tab's task runs — a live run is never clobbered. The reads land
+/// BEFORE the swap so a failed load changes nothing; the row binds
+/// so every later flush appends to it.
+fn resume_conversation(id: i64, shared: &mut Shared) {
+    let running = shared
+        .tabs
+        .active()
+        .and_then(|tab| tab.agent_panel())
+        .is_some_and(AgentPanel::is_running);
+    if running {
+        shared.toast = Some(Toast::new(
+            "a task is still running — resume refused",
+            Instant::now(),
+        ));
+        return;
+    }
+    let items = match shared.store.load_transcript(id) {
+        Ok(items) => items,
+        Err(error) => {
+            shared.toast = Some(Toast::new(
+                format!("transcript load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    let plan = match shared.store.load_plan(id) {
+        Ok(Some(ait_agent::TranscriptItem::Plan { todos })) => Some(todos),
+        Ok(_) => None,
+        Err(error) => {
+            shared.toast = Some(Toast::new(
+                format!("plan load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    if let Some(tab) = shared.tabs.active_mut() {
+        let previous = tab.conversation();
+        tab.resume_conversation(id, items, plan);
+        shared.toast = Some(Toast::new("conversation resumed", Instant::now()));
+        // `status` mirrors the binding: the resumed row re-opens,
+        // and the row this tab just swapped away from is unowned now.
+        shared.store.conversation_reopened(&mut shared.toast, id);
+        if let Some(old) = previous.filter(|old| *old != id) {
+            shared.store.conversation_closed(&mut shared.toast, old);
+        }
+    }
+    // The panel may have opened on a tab that never had one —
+    // re-derive its winsize through the same path `Alt+A` takes.
+    shared.tabs.resize_active(session_size);
 }
 
 /// `char`-less cell metrics from egui's font tables — 'M' is the
