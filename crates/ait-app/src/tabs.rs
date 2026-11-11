@@ -356,7 +356,7 @@ impl Tab {
     /// story 14). Capped at [`PROMPT_MARK_CAP`] — the newest win.
     /// Only tests read them today; Round 5's block assembly is the
     /// consumer this accessor exists for.
-    #[allow(dead_code)]
+    #[doc(hidden)] // test-side inspection — not production surface
     pub fn prompt_marks(&self) -> impl Iterator<Item = &PromptMark> {
         self.prompt_marks.iter()
     }

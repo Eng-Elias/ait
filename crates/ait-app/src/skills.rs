@@ -107,6 +107,7 @@ impl LiveSkills {
     /// `ensure_watcher` never builds and snapshots rescan the empty
     /// root into an empty catalog. Frontends' dispatch tests use it
     /// the same way this module's do.
+    #[doc(hidden)] // cross-crate test seam — not production surface
     pub fn unwatched() -> Self {
         Self {
             user_root: PathBuf::new(),

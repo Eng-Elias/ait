@@ -148,7 +148,7 @@ impl HiddenSession {
 
     /// The `AIT_SESSION_ID` this session's spawn allocated — the
     /// identity its hooks echo (standard 14).
-    #[allow(dead_code)] // asserted by the tests; the driver needs no id.
+    #[doc(hidden)] // asserted by the tests; the driver needs no id.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

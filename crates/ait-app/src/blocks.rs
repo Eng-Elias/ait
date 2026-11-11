@@ -109,7 +109,7 @@ pub fn seal_fingerprint(
 }
 
 /// Row text for debug dumps — trimmed trailing blanks.
-#[allow(dead_code)]
+#[doc(hidden)] // test-side inspection — not production surface
 pub fn row_text(row: &Row<'_>) -> String {
     row.text().trim_end().to_string()
 }
@@ -231,7 +231,7 @@ impl BlockAssembler {
     /// open means its `D` never came — the open block closes
     /// best-effort, ending on the row above the new boundary. `C`/`D`
     /// with no open command are orphans and ignored.
-    #[allow(dead_code)] // the drain feeds `observe_mark_row`; tests use this
+    #[doc(hidden)] // the drain feeds `observe_mark_row`; tests use this
     pub fn observe_mark(&mut self, mark: &PromptMark, dropped: usize) {
         self.observe_mark_row(mark, dropped, None);
     }
@@ -662,7 +662,6 @@ pub struct PersistedBlock {
 // The full read-side surface stays: `range`/`end_column` are consumed
 // by the block nav/select/status paths; the rest serve the seams'
 // tests and the suggester's context assembly (Spec R05).
-#[allow(dead_code)]
 impl Block {
     /// The block's clamped live-coordinate line range (`B→D`), inclusive.
     pub fn range(&self) -> RangeInclusive<usize> {
