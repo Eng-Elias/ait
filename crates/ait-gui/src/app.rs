@@ -1043,3 +1043,563 @@ impl std::fmt::Display for BootError {
 }
 
 impl std::error::Error for BootError {}
+
+#[cfg(test)]
+mod tests {
+    //! Dispatch tests at the same seams the TUI's `handle_event` tests
+    //! exercise (Spec R04, R11-T2 — `dispatch_key` IS the GUI's
+    //! `handle_event`): post-translation [`KeyEvent`]s over real
+    //! `/bin/sh` tabs, where the shadow, the pin and the PTY byte
+    //! stream are the observables. `pump: None` keeps the drain
+    //! thread out — `wait_until` drives the same drains by hand, the
+    //! way the pump's `drain_pass` does.
+
+    use super::*;
+    use ait_agent::SuggestEvent;
+    use ait_app::tabs::SessionTemplate;
+    use ait_term::{LiveSessionOptions, Modifiers};
+
+    /// A manager on `/bin/sh` — deterministic tty echo for the
+    /// trigger tests (the TUI's `sh_manager` rationale: an
+    /// interactive `$SHELL`'s prompt timing can bury typed text
+    /// mid-line and `ends_with` could never hold).
+    fn sh_manager() -> TabManager {
+        TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The dispatch harness: a `GuiApp` minus its pump and window,
+    /// sharing one `Arc<Mutex<Shared>>` with the test body — the same
+    /// shape `ui` locks per frame.
+    struct Harness {
+        app: GuiApp,
+        shared: Arc<Mutex<Shared>>,
+        ctx: egui::Context,
+    }
+
+    impl Harness {
+        fn new(tabs: TabManager) -> Self {
+            let shared = Arc::new(Mutex::new(Shared {
+                tabs,
+                config: LiveSettings::adopt(Settings::default()),
+                store: StoreHandle::disabled(),
+                toast: None,
+                // No watcher and no roots — tests never touch the
+                // filesystem for skills.
+                skills: LiveSkills::unwatched(),
+                profile: profile::DEFAULT_PROFILE.to_string(),
+                picker: None,
+                copied_text: None,
+                // `NoSecrets` keeps keyring lookups out of tests —
+                // resolution never blocks on the Secret Service.
+                suggester: CommandSuggester::with_secret_store(config::NoSecrets),
+                suggestion: SuggestionPin::new(),
+            }));
+            Self {
+                app: GuiApp {
+                    shared: Arc::clone(&shared),
+                    pump: None,
+                    theme: GridTheme::default(),
+                    metrics: GuiMetrics {
+                        base_px: 15.0,
+                        zoom: 1.0,
+                    },
+                    chrome: Chrome::default(),
+                    last_band: Size::new(40, 10),
+                    grid_pane: None,
+                    quit: false,
+                    find_open: false,
+                },
+                shared,
+                ctx: egui::Context::default(),
+            }
+        }
+
+        /// One post-translation key through the dispatch — the seam
+        /// `egui::Event::Key` + `translate_key` feed it in `ui`.
+        fn press(&mut self, key: Key, modifiers: Modifiers) {
+            let mut shared = self.shared.lock().unwrap();
+            self.app
+                .dispatch_key(&self.ctx, &mut shared, Some(KeyEvent::new(key, modifiers)));
+        }
+
+        /// The shared state under the same lock the UI holds —
+        /// short-lived guards only, `pred`s lock per probe.
+        fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
+            self.shared.lock().unwrap()
+        }
+    }
+
+    /// Drain sessions and suggester events until `pred` holds, or
+    /// fail after a generous bound — the drains `drain_pass` runs,
+    /// minus the repaint decision.
+    fn wait_until(harness: &Harness, pred: impl Fn(&Harness) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !pred(harness) {
+            {
+                let mut shared = harness.shared();
+                let Shared {
+                    tabs,
+                    suggester,
+                    suggestion,
+                    toast,
+                    ..
+                } = &mut *shared;
+                tabs.drain_events();
+                suggestion.drain(suggester.events(), tabs, toast);
+            }
+            assert!(Instant::now() < deadline, "timed out waiting");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The logical input line at the active tab's cursor.
+    fn logical(harness: &Harness) -> String {
+        let shared = harness.shared();
+        let tab = shared.tabs.active().unwrap();
+        suggest::logical_line(&tab.grid(), tab.cursor())
+    }
+
+    /// Every grid row — scrollback then viewport — as trimmed text.
+    fn rows(harness: &Harness) -> Vec<String> {
+        let shared = harness.shared();
+        let tab = shared.tabs.active().unwrap();
+        tab.grid()
+            .scrollback_rows()
+            .chain(tab.grid().visible_rows())
+            .map(|row| row.text().trim_end().to_owned())
+            .collect()
+    }
+
+    /// Wait for the prompt to exist BEFORE typing (the TUI's race
+    /// note: the kernel echo must land after the prompt), then press
+    /// `text`'s characters.
+    fn type_keys(harness: &mut Harness, text: &str) {
+        wait_until(harness, |h| !logical(h).is_empty());
+        for c in text.chars() {
+            harness.press(Key::Char(c), Modifiers::NONE);
+        }
+    }
+
+    // ---- The `# `+Enter and Alt+Enter triggers (Spec R04) ----
+
+    /// The `# `+Enter trigger end to end through `dispatch_key`:
+    /// the shadow built by typed keys verifies against the PTY's own
+    /// echo, the request fires into the suggester pinned to its tab —
+    /// and Enter is forwarded normally, so the comment lands in the
+    /// shell's line discipline like any input (us-2). The
+    /// unconfigured default settings answer `Error`, which the drain
+    /// surfaces as a toast and releases the pin (us-22).
+    #[test]
+    fn hash_enter_fires_request_and_forwards_enter() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "# ls");
+        // The verification reads the grid — wait for the PTY echo.
+        wait_until(&harness, |h| logical(h).ends_with("# ls"));
+        assert!(!harness.shared().tabs.active().unwrap().shadow.is_stale());
+
+        harness.press(Key::Enter, Modifiers::NONE);
+
+        // The verified request fired, pinned to tab 0's id (us-14).
+        {
+            let shared = harness.shared();
+            assert_eq!(
+                shared.suggestion.pinned_id(),
+                Some(shared.tabs.tabs()[0].id),
+                "the '# ' request fired into the suggester"
+            );
+            // The shadow reset for the next line.
+            assert_eq!(shared.tabs.active().unwrap().shadow.text(), "");
+        }
+
+        // Enter reached the PTY normally: the kernel echoes the
+        // submitted line and the cursor advances past it.
+        wait_until(&harness, |h| {
+            h.shared().tabs.active().unwrap().cursor().line > 0
+        });
+
+        // Default settings hold no model — the worker answers `Error`,
+        // the drain toasts it and releases the pin.
+        wait_until(&harness, |h| {
+            let shared = h.shared();
+            shared.toast.is_some() && shared.suggestion.is_none()
+        });
+        let shared = harness.shared();
+        let toast = shared.toast.as_ref().unwrap();
+        assert!(
+            toast.text().contains("profile"),
+            "the toast names the model-resolution failure: {}",
+            toast.text()
+        );
+    }
+
+    /// us-11/12/14: `Alt+Enter` on a verified bare line fires the
+    /// request pinned to its tab, erases the typed line via DELs (the
+    /// grid returns to the bare prompt), resets the shadow, and the
+    /// suggestion streams into the cleared input line — the shell's
+    /// own echo IS the live preview.
+    #[test]
+    fn alt_enter_fires_erases_and_streams_into_the_cleared_line() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        let prompt = logical(&harness);
+        type_keys(&mut harness, "git undo");
+        wait_until(&harness, |h| logical(h).ends_with("git undo"));
+
+        harness.press(Key::Enter, Modifiers::ALT);
+
+        {
+            let shared = harness.shared();
+            assert_eq!(
+                shared.suggestion.pinned_id(),
+                Some(shared.tabs.tabs()[0].id),
+                "the bare line fired as a request, pinned to its tab"
+            );
+            let shadow = &shared.tabs.active().unwrap().shadow;
+            assert_eq!(shadow.text(), "", "the erased line resets the shadow");
+            assert!(!shadow.is_stale());
+        }
+
+        // us-12: the typed line is gone from the grid — the request
+        // text and the incoming command can never interleave.
+        wait_until(&harness, |h| logical(h) == prompt);
+
+        // The real request answers `Error` (default settings hold no
+        // model) — drain it out of the channel so it can't race the
+        // manual pin the stream seam is driven through below.
+        wait_until(&harness, |h| h.shared().suggestion.is_none());
+
+        // The shared stream path types into the cleared line — the
+        // tty echo makes the preview visible on the grid (us-3).
+        pin_suggestion(&harness, 0);
+        fire(&harness, SuggestEvent::Delta("git reset HEAD~1".into()));
+        wait_until(&harness, |h| logical(h).ends_with("git reset HEAD~1"));
+        fire(&harness, SuggestEvent::Done);
+        assert!(harness.shared().suggestion.is_none());
+    }
+
+    /// us-13: a desynced shadow (history recall via `Up`) cannot fire
+    /// — `Alt+Enter` leaves the line, the shadow and the suggester
+    /// alone, the desync-is-inert rule.
+    #[test]
+    fn alt_enter_on_a_desynced_shadow_does_not_fire() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "git undo");
+        wait_until(&harness, |h| logical(h).ends_with("git undo"));
+        harness.press(Key::Up, Modifiers::NONE);
+        assert!(harness.shared().tabs.active().unwrap().shadow.is_stale());
+
+        harness.press(Key::Enter, Modifiers::ALT);
+
+        assert!(
+            harness.shared().suggestion.is_none(),
+            "stale shadow → no trigger"
+        );
+        assert!(harness.shared().toast.is_none());
+    }
+
+    // ---- The §5.10.4 classifier trigger (Spec R11-T2) ----
+
+    /// A verified natural-language line + Enter is swallowed and
+    /// rewritten — `Ctrl+U`, then `# <line>` + `\r` — while the
+    /// `SuggestRequest` path arms the stream the fresh prompt
+    /// receives. The raw sentence never ran.
+    #[test]
+    fn natural_language_enter_rewrites_to_a_hash_request() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        let prompt = logical(&harness);
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        assert!(!harness.shared().tabs.active().unwrap().shadow.is_stale());
+
+        harness.press(Key::Enter, Modifiers::NONE);
+
+        // The request armed the suggester pinned to tab 0 — the same
+        // in-flight contract the `# ` trigger honors.
+        {
+            let shared = harness.shared();
+            assert_eq!(
+                shared.suggestion.pinned_id(),
+                Some(shared.tabs.tabs()[0].id),
+                "the classifier's request armed the suggestion path"
+            );
+            let shadow = &shared.tabs.active().unwrap().shadow;
+            assert_eq!(shadow.text(), "");
+            assert!(!shadow.is_stale());
+        }
+
+        // The rewrite reached the shell: the `# ` comment echoed and
+        // submitted — a fresh prompt row follows it.
+        wait_until(&harness, |h| {
+            rows(h)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file"))
+        });
+        wait_until(&harness, |h| logical(h) == prompt);
+        // …and the typed line never executed: a forwarded Enter would
+        // have run it and `what` resolves nowhere.
+        assert!(
+            !rows(&harness).iter().any(|row| row.contains("not found")),
+            "the raw sentence never reached the shell: {:?}",
+            rows(&harness)
+        );
+    }
+
+    /// `input.classifier = "off"` submits every line verbatim — no
+    /// pin, no rewrite, the shell's own error for the non-command.
+    #[test]
+    fn classifier_off_submits_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        {
+            let mut shared = harness.shared();
+            shared.config = LiveSettings::adopt(
+                Settings::from_toml("[input]\nclassifier = \"off\"\n").unwrap(),
+            );
+        }
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+
+        harness.press(Key::Enter, Modifiers::NONE);
+
+        assert!(harness.shared().suggestion.is_none());
+        wait_until(&harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+        // The `# ` prompt makes a verbatim `# what …` row
+        // indistinguishable from the text alone — the rewrite's tell
+        // is the doubled hash.
+        assert!(
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# # what is the largest file")),
+            "the line was never rewritten: {:?}",
+            rows(&harness)
+        );
+    }
+
+    // ---- Streaming insertion + in-flight keys (Spec R04 T5) ----
+    //
+    // The insertion seam is byte-exact like the TUI's: the pinned tab
+    // runs `stty raw; head -c N > <file>` so the capture holds the
+    // exact bytes the PTY received — envelope markers, `Ctrl+U` and
+    // all. `SuggestEvent`s are injected through `SuggestionPin::apply`
+    // (the seam the pump's drain uses) instead of a real model.
+
+    /// A unique temp path for one test's capture file.
+    fn capture_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ait-gui-t6-{name}-{}", std::process::id()))
+    }
+
+    /// Run `line` on the active tab's shell once its prompt exists —
+    /// the shell must be up before `stty`/`head` can be started.
+    fn run_line(harness: &Harness, line: &str) {
+        wait_until(harness, |h| !logical(h).is_empty());
+        harness
+            .shared()
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(format!("{line}\n").as_bytes())
+            .unwrap();
+    }
+
+    /// Run `line` and wait until `path` exists — the `> path`
+    /// redirect proves the preceding `stty raw` applied; without that
+    /// sync, bytes sent early hit the still-canonical tty.
+    fn run_capture(harness: &Harness, line: &str, path: &std::path::Path) {
+        run_line(harness, line);
+        wait_until(harness, |_h| path.exists());
+    }
+
+    /// The state a fired `SuggestRequest` leaves behind — a pin on
+    /// `tab`, re-resolved through the tab's stable id.
+    fn pin_suggestion(harness: &Harness, tab: usize) {
+        let mut shared = harness.shared();
+        shared.suggestion = SuggestionPin::staged(shared.tabs.tabs()[tab].id);
+    }
+
+    /// Inject one suggester event through the pump's drain seam.
+    fn fire(harness: &Harness, event: SuggestEvent) {
+        let mut shared = harness.shared();
+        let Shared {
+            tabs,
+            suggestion,
+            toast,
+            ..
+        } = &mut *shared;
+        suggestion.apply(tabs, event, toast);
+    }
+
+    /// Wait for the capture file to hold `len` bytes, then read it.
+    fn wait_file(harness: &Harness, path: &std::path::Path, len: usize) -> Vec<u8> {
+        wait_until(harness, |_h| {
+            std::fs::read(path).is_ok_and(|bytes| bytes.len() >= len)
+        });
+        std::fs::read(path).unwrap()
+    }
+
+    /// us-3/4: a `Delta` sequence lands byte-for-byte as typed text on
+    /// the pinned session — the streamed preview is the shell's own
+    /// echo of those bytes (no newline can ever arrive, so nothing
+    /// executes).
+    #[test]
+    fn deltas_type_byte_for_byte() {
+        let path = capture_path("deltas");
+        let harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 10 > {}", path.display()),
+            &path,
+        );
+        pin_suggestion(&harness, 0);
+
+        for delta in ["git ", "stat", "us"] {
+            fire(&harness, SuggestEvent::Delta(delta.to_string()));
+        }
+        fire(&harness, SuggestEvent::Done);
+
+        assert_eq!(wait_file(&harness, &path, 10), b"git status");
+        assert!(
+            harness.shared().suggestion.is_none(),
+            "Done released the pin"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-8: plain Esc on the pinned tab cancels — the session sees
+    /// the envelope close and `Ctrl+U` (in that order) wiping the
+    /// partial line. The pin survives until the worker's terminal
+    /// event so a post-cancel `Delta` can't retype onto the wiped
+    /// line and the cancellation `Error` arrives silently.
+    #[test]
+    fn esc_cancels_closes_the_envelope_and_wipes_the_line() {
+        let path = capture_path("esc");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!(
+                "stty raw; printf '\\033[?2004h'; head -c 20 > {}",
+                path.display()
+            ),
+            &path,
+        );
+        wait_until(&harness, |h| {
+            h.shared().tabs.active().unwrap().session.bracketed_paste()
+        });
+        pin_suggestion(&harness, 0);
+        fire(&harness, SuggestEvent::Delta("partial".into()));
+        // Shadow text a mid-flight keystroke could have left — the
+        // Ctrl+U wipe makes it untrue, so the cancel resets it.
+        harness
+            .shared()
+            .tabs
+            .active_mut()
+            .unwrap()
+            .shadow
+            .update(&KeyEvent::new(Key::Char('x'), Modifiers::NONE));
+
+        harness.press(Key::Escape, Modifiers::NONE);
+
+        assert_eq!(
+            wait_file(&harness, &path, 20),
+            b"\x1b[200~partial\x1b[201~\x15",
+            "close the envelope, THEN wipe the line — spec order"
+        );
+        assert!(
+            harness.shared().suggestion.is_cancelled(),
+            "the pin survives until the terminal event"
+        );
+        assert!(
+            !harness.shared().suggestion.paste_is_open(),
+            "the envelope is closed"
+        );
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .shadow
+                .text()
+                .is_empty(),
+            "the wiped line resets the input shadow"
+        );
+
+        fire(&harness, SuggestEvent::Delta("z".into()));
+        fire(&harness, SuggestEvent::Error("cancelled".into()));
+        assert!(harness.shared().suggestion.is_none());
+        assert!(
+            harness.shared().toast.is_none(),
+            "a user-initiated cancel is not toasted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-9: Enter on the pinned tab never reaches the PTY mid-stream
+    /// — not even `Ctrl+Enter`, which encodes `\r` and would execute
+    /// the half-written command.
+    #[test]
+    fn enter_is_swallowed_while_a_suggestion_streams() {
+        let path = capture_path("enter");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 3 > {}", path.display()),
+            &path,
+        );
+        pin_suggestion(&harness, 0);
+        fire(&harness, SuggestEvent::Delta("a".into()));
+
+        harness.press(Key::Enter, Modifiers::NONE);
+        harness.press(Key::Enter, Modifiers::CONTROL);
+        assert!(
+            harness.shared().suggestion.is_some(),
+            "Enter does not end the request"
+        );
+
+        fire(&harness, SuggestEvent::Delta("bc".into()));
+        fire(&harness, SuggestEvent::Done);
+
+        assert_eq!(
+            wait_file(&harness, &path, 3),
+            b"abc",
+            "a leaked Enter would put a \\r inside the capture"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-10: with nothing in flight Esc and Enter reach the PTY
+    /// normally — and a stray `Delta` drops silently.
+    #[test]
+    fn esc_and_enter_behave_normally_with_nothing_in_flight() {
+        let path = capture_path("idle");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 2 > {}", path.display()),
+            &path,
+        );
+
+        fire(&harness, SuggestEvent::Delta("nope".into()));
+        harness.press(Key::Enter, Modifiers::NONE);
+        harness.press(Key::Escape, Modifiers::NONE);
+
+        assert_eq!(wait_file(&harness, &path, 2), b"\r\x1b");
+        let _ = std::fs::remove_file(&path);
+    }
+}
