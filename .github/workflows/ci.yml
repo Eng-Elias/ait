@@ -53,9 +53,11 @@ jobs:
       # committed snippets/{bash,zsh,fish} against a stub ssh and skip a
       # shell's leg silently when it isn't installed — install them so
       # `cargo test --workspace` covers all three here too, not just in
-      # the e2e job.
+      # the e2e job. apt's *.ubuntu.com sources are repointed first —
+      # they can all fail DNS at once on GH runners (see
+      # scripts/fix-apt-mirror.sh).
       - name: Install zsh and fish
-        run: sudo apt-get update && sudo apt-get install -y zsh fish
+        run: sh scripts/fix-apt-mirror.sh && sudo apt-get -o Acquire::Retries=3 install -y zsh fish
 
       - name: Test
         run: cargo test --workspace
@@ -100,9 +102,11 @@ jobs:
 
       # Spec R05 §5.5: the shell-integration e2e matrix gates on
       # installed shells — install them so it covers all three rather
-      # than silently running bash-only.
+      # than silently running bash-only. Same apt mirror repoint as
+      # the check job — *.ubuntu.com sources can all fail DNS at once
+      # (see scripts/fix-apt-mirror.sh).
       - name: Install zsh and fish
-        run: sudo apt-get update && sudo apt-get install -y zsh fish
+        run: sh scripts/fix-apt-mirror.sh && sudo apt-get -o Acquire::Retries=3 install -y zsh fish
 
       - name: Build
         run: cargo build -p ait
