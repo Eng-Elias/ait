@@ -239,15 +239,12 @@ fn drain_pass(
         if dispatch::notification_toast(&tab_event, tabs, toast) {
             continue;
         }
-        match tab_event.event {
-            // Child-app OSC 52 (`[terminal] osc52` opt-in, Spec R02):
-            // the GUI IS the host, so the request writes the one
-            // system clipboard egui exposes — `Selection` (X11
-            // primary) has no egui counterpart and collapses onto it.
-            LiveEvent::Osc(SessionEvent::ClipboardWrite { contents, .. }) => {
-                ctx.copy_text(contents);
-            }
-            _ => {}
+        // Child-app OSC 52 (`[terminal] osc52` opt-in, Spec R02):
+        // the GUI IS the host, so the request writes the one
+        // system clipboard egui exposes — `Selection` (X11
+        // primary) has no egui counterpart and collapses onto it.
+        if let LiveEvent::Osc(SessionEvent::ClipboardWrite { contents, .. }) = tab_event.event {
+            ctx.copy_text(contents);
         }
     }
     // Agent events on the same cadence (Spec R06) — a streaming

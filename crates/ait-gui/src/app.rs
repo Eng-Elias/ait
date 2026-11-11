@@ -129,6 +129,11 @@ pub struct GuiApp {
     /// The conversation rows the panel's last paint fit — a Page-unit
     /// wheel's scroll distance over the panel region.
     panel_rows: usize,
+    /// The cross-frame row-galley cache — one `LayoutJob` per row,
+    /// shaped once and reused while the row's plan is unchanged
+    /// (REQUIREMENTS §6; the pump's damage filter decides whether a
+    /// frame runs at all, this keeps the frame cheap).
+    row_galleys: crate::paint::RowGalleys,
     /// Set when the input dispatch decided the app should close —
     /// applied after `ui` returns so the frame can't see a
     /// half-drained state.
@@ -228,6 +233,7 @@ impl GuiApp {
             grid_pane: None,
             panel_pane: None,
             panel_rows: 0,
+            row_galleys: crate::paint::RowGalleys::default(),
             quit: false,
         })
     }
@@ -911,6 +917,7 @@ impl GuiApp {
                 theme: self.theme,
                 font,
             },
+            &mut self.row_galleys,
             &tab.grid(),
             scroll,
             tab.cursor(),
@@ -1646,11 +1653,6 @@ fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
     }
 }
 
-/// `Enter` on a picker row, `Ctrl+D`'s delete, and every other picker
-/// key all route through `conversations::picker_key` now — the
-/// frontend-neutral half the TUI's `conversation_key` shared
-/// (Spec R13 §5.12, ADR-0016).
-
 /// The creation-time cell estimate — fonts don't exist until the
 /// first `Context::run`, so `GuiApp::new` can't read the glyph table.
 /// Typical monospace ratios (advance ~0.6×em, line ~1.2×em) seed the
@@ -1799,6 +1801,7 @@ mod tests {
                     grid_pane: None,
                     panel_pane: None,
                     panel_rows: 0,
+                    row_galleys: crate::paint::RowGalleys::default(),
                     quit: false,
                 },
                 shared,

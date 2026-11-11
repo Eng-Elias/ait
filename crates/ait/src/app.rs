@@ -427,28 +427,26 @@ pub fn run() -> io::Result<ExitCode> {
             if dispatch::notification_toast(&tab_event, &tabs, &mut state.toast) {
                 continue;
             }
-            match tab_event.event {
-                // Child-app OSC 52 — the event only fires when
-                // `[terminal] osc52` opted in (`SessionOptions::osc52`,
-                // Spec R02). Honor the request through the same OSC 52
-                // write our own selection copy uses: a silent no-op
-                // where the host denies it.
-                LiveEvent::Osc(SessionEvent::ClipboardWrite {
-                    selection,
-                    contents,
-                }) => {
-                    let writer = terminal.backend_mut().writer_mut();
-                    let _ = match selection {
-                        ClipboardSelection::Clipboard => {
-                            queue!(writer, CopyToClipboard::to_clipboard_from(&contents))
-                        }
-                        ClipboardSelection::Selection => {
-                            queue!(writer, CopyToClipboard::to_primary_from(&contents))
-                        }
-                    };
-                    let _ = writer.flush();
-                }
-                _ => {}
+            // Child-app OSC 52 — the event only fires when
+            // `[terminal] osc52` opted in (`SessionOptions::osc52`,
+            // Spec R02). Honor the request through the same OSC 52
+            // write our own selection copy uses: a silent no-op
+            // where the host denies it.
+            if let LiveEvent::Osc(SessionEvent::ClipboardWrite {
+                selection,
+                contents,
+            }) = tab_event.event
+            {
+                let writer = terminal.backend_mut().writer_mut();
+                let _ = match selection {
+                    ClipboardSelection::Clipboard => {
+                        queue!(writer, CopyToClipboard::to_clipboard_from(&contents))
+                    }
+                    ClipboardSelection::Selection => {
+                        queue!(writer, CopyToClipboard::to_primary_from(&contents))
+                    }
+                };
+                let _ = writer.flush();
             }
         }
 

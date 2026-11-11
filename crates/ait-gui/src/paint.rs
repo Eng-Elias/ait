@@ -3,18 +3,25 @@
 //! here decides WHAT to paint (that is [`grid::plan_viewport`]'s pure
 //! planning half — the split the spec's testing decisions ask for).
 //!
-//! Per-span `painter.text` is the T2-simple path: every span starts at
-//! its exact column so ASCII/monospace content lands cell-aligned by
-//! the same `CellMetrics` the winsize math used. The seam for T4's
-//! cached-galley runs is [`paint_row`] — swap the per-span `text` call
-//! for a per-row `LayoutJob` without touching the planner.
+//! Text paints one galley per ROW: each span becomes a `TextFormat`
+//! section of one `LayoutJob`, shaped once and cached by
+//! [`RowGalleys`] — `painter.galley` then emits the row in a single
+//! call (REQUIREMENTS §6's no-per-cell-work rule). The pump's damage
+//! filter decides whether a frame repaints at all; the cache decides
+//! how cheap the frame is: an unchanged row is a hash lookup, not a
+//! re-shape.
 //!
 //! [Spec R13 §5.12, REQUIREMENTS.md §5.12]
+
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use ait_app::search::SearchHit;
 use ait_app::selection::SelectionRange;
 use ait_term::{Cursor, CursorShape, GridView, Underline};
-use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::text::{LayoutJob, TextFormat};
+use eframe::egui::{Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::grid::{plan_viewport, CellSpan, GridTheme, RowPlan};
 use crate::layout::{cursor_row, BlockChip, CellMetrics};
@@ -102,36 +109,148 @@ fn bold_color(fg: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(lift(r), lift(g), lift(b), a)
 }
 
-/// Paint one planned row: background rects first (cell-exact, only
-/// where the resolved bg differs from the theme's), then each span's
-/// text and decoration lines.
-fn paint_row(surface: &GridSurface<'_>, row_top: f32, plan: &RowPlan) {
+/// How many laid-out rows the cache holds before it clears — ~25
+/// viewports' worth at 80 rows. Scrollback churn and zoom/theme
+/// changes fill and rebuild rather than growing unbounded.
+const GALLEY_CAP: usize = 2048;
+
+/// The per-row galley cache (REQUIREMENTS §6): `LayoutJob` shaping —
+/// glyph lookup, advance summation, tessellation prep — is the paint
+/// pass's expensive call, so each planned row is laid out once and
+/// the `Arc<Galley>` reused while everything the shape depends on
+/// stays equal (the key hashes every span's text and style plus the
+/// font, so a restyle, a hidden-cell flip or a zoom rebuilds exactly
+/// the rows it changed). The pump's damage filter decides whether a
+/// frame repaints at all; this decides how cheap the frame is.
+#[derive(Debug, Default)]
+pub struct RowGalleys {
+    cache: HashMap<u64, Arc<Galley>>,
+}
+
+impl RowGalleys {
+    /// The row's galley — a cached `Arc` while `plan` and `font` hash
+    /// to a seen key.
+    fn get(&mut self, painter: &Painter, plan: &RowPlan, font: &FontId) -> Arc<Galley> {
+        let key = row_key(plan, font);
+        if let Some(galley) = self.cache.get(&key) {
+            return Arc::clone(galley);
+        }
+        if self.cache.len() >= GALLEY_CAP {
+            self.cache.clear();
+        }
+        let galley = painter.layout_job(row_layout(plan, font));
+        self.cache.insert(key, Arc::clone(&galley));
+        galley
+    }
+}
+
+/// What the galley depends on, hashed — exactly `row_layout`'s
+/// inputs: the font (a zoom's changed pixel size reshapes
+/// everything), and per span its text, resolved foreground, the
+/// `bold`/`italic`/`hidden` flags that transform both, and `cells`
+/// (a hidden span's column count IS its space run). The fields the
+/// galley never reads — `line`, `bg` and the decoration flags the
+/// shape pass paints — stay out, so a bg-only churn doesn't force a
+/// re-shape.
+fn row_key(plan: &RowPlan, font: &FontId) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    font.size.to_bits().hash(&mut hasher);
+    std::mem::discriminant(&font.family).hash(&mut hasher);
+    if let FontFamily::Name(name) = &font.family {
+        name.hash(&mut hasher);
+    }
     for span in &plan.spans {
-        let x = surface.x(span.col);
-        let w = span.cells as f32 * surface.cell.width;
+        span.cells.hash(&mut hasher);
+        span.text.hash(&mut hasher);
+        span.fg.hash(&mut hasher);
+        span.hidden.hash(&mut hasher);
+        span.bold.hash(&mut hasher);
+        span.italic.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// One row's `LayoutJob`: every span's text under its own
+/// `TextFormat` (foreground resolved, bold pre-lifted — the bundled
+/// monospace has no bold face, `italic` honored natively). The
+/// planner tiles the row contiguously from column 0 — a span per
+/// cell, blanks included — so the galley needs no per-span x
+/// anchoring. `hidden` spans still occupy their columns as spaces,
+/// keeping everything after them aligned. Cell-exact columns hold
+/// because every section shares the row's monospace font: each
+/// glyph's advance IS the cell width the winsize math measured.
+fn row_layout(plan: &RowPlan, font: &FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    for span in &plan.spans {
+        // `hidden` cells paint no text — SGR 8's "invisible" is a
+        // blank with its colors — but their columns still exist.
+        let text = if span.hidden {
+            " ".repeat(span.cells)
+        } else {
+            span.text.clone()
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let fg = if span.bold && !span.hidden {
+            bold_color(span.fg)
+        } else {
+            span.fg
+        };
+        job.append(
+            &text,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: fg,
+                italics: span.italic,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// Paint one planned row: background rects first (cell-exact, only
+/// where the resolved bg differs from the theme's), then the row's
+/// one cached galley, then the decoration lines — underlines and
+/// strikeout stay explicit shapes: egui's `TextFormat` covers single-
+/// underline only, and the cell-exact segment widths are already
+/// computed per span.
+fn paint_row(surface: &GridSurface<'_>, galleys: &mut RowGalleys, row_top: f32, plan: &RowPlan) {
+    for span in &plan.spans {
         if let Some(bg) = span.bg {
             surface.painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, row_top), Vec2::new(w, surface.cell.height)),
+                Rect::from_min_size(
+                    Pos2::new(surface.x(span.col), row_top),
+                    Vec2::new(span.cells as f32 * surface.cell.width, surface.cell.height),
+                ),
                 0.0,
                 bg,
             );
         }
-        // `hidden` cells keep their bg but paint no text — SGR 8's
-        // "invisible" is a blank with its colors.
+    }
+    let galley = galleys.get(surface.painter, plan, surface.font);
+    surface.painter.galley(
+        Pos2::new(surface.pane.left(), row_top),
+        galley,
+        surface.theme.fg,
+    );
+    for span in &plan.spans {
         if !span.hidden && !span.text.is_empty() {
             let fg = if span.bold {
                 bold_color(span.fg)
             } else {
                 span.fg
             };
-            surface.painter.text(
-                Pos2::new(x, row_top),
-                Align2::LEFT_TOP,
-                &span.text,
-                surface.font.clone(),
+            paint_decoration(
+                surface,
+                span,
+                surface.x(span.col),
+                row_top,
+                span.cells as f32 * surface.cell.width,
                 fg,
             );
-            paint_decoration(surface, span, x, row_top, w, fg);
         }
     }
 }
@@ -384,9 +503,13 @@ fn paint_block_chrome(surface: &GridSurface<'_>, chips: &[BlockChip]) {
 /// Paint the whole grid pane: theme-bg fill, then planned rows, the
 /// find wash, selection wash, block chrome, cursor — the order that
 /// keeps text over backgrounds, both washes over text, the chrome over
-/// the washes, and the cursor over everything.
+/// the washes, and the cursor over everything. `galleys` is the
+/// caller's cross-frame row cache — the pump's damage filter decides
+/// whether this runs at all; the cache keeps the rows it didn't touch
+/// free.
 pub fn paint_grid(
     surface: &GridSurface<'_>,
+    galleys: &mut RowGalleys,
     grid: &GridView<'_>,
     scroll_offset: usize,
     cursor: Cursor,
@@ -404,7 +527,7 @@ pub fn paint_grid(
         if row < 0 || row >= rows as i64 {
             continue;
         }
-        paint_row(surface, surface.y(row as usize), plan);
+        paint_row(surface, galleys, surface.y(row as usize), plan);
     }
     if let Some(find) = overlays.find {
         paint_find(surface, find, scroll_offset, rows);
@@ -416,4 +539,147 @@ pub fn paint_grid(
         paint_block_chrome(surface, chips);
     }
     paint_cursor(surface, cursor, scroll_offset, rows);
+}
+
+#[cfg(test)]
+mod tests {
+    //! The row-job seam: `row_layout` maps planned spans to one
+    //! `LayoutJob`'s sections and `row_key` covers everything the
+    //! galley depends on — the two halves of "one galley per row,
+    //! cached" (REQUIREMENTS §6).
+
+    use super::*;
+
+    /// A default-styled span at `col`/`cells` carrying `text`.
+    fn span(col: usize, cells: usize, text: &str) -> CellSpan {
+        CellSpan {
+            col,
+            cells,
+            text: text.to_string(),
+            fg: Color32::WHITE,
+            bg: None,
+            hidden: false,
+            bold: false,
+            italic: false,
+            strikeout: false,
+            underline: Underline::None,
+        }
+    }
+
+    fn font() -> FontId {
+        FontId::monospace(15.0)
+    }
+
+    /// One section per span — text concatenates into `job.text`, and
+    /// each section's `TextFormat` carries the span's font, resolved
+    /// color and italics.
+    #[test]
+    fn the_row_job_maps_spans_to_sections() {
+        let mut red = span(0, 2, "ab");
+        red.fg = Color32::RED;
+        let italic = CellSpan {
+            italic: true,
+            ..span(2, 2, "cd")
+        };
+        let plan = RowPlan {
+            line: 0,
+            spans: vec![red, italic],
+        };
+
+        let job = row_layout(&plan, &font());
+        assert_eq!(job.text, "abcd");
+        assert_eq!(job.sections.len(), 2);
+        assert_eq!(job.sections[0].format.color, Color32::RED);
+        assert!(!job.sections[0].format.italics);
+        assert_eq!(job.sections[1].format.color, Color32::WHITE);
+        assert!(job.sections[1].format.italics);
+    }
+
+    /// `hidden` paints no glyphs — SGR 8's blank — but its columns
+    /// still exist, so the job carries spaces and keeps the next
+    /// span's text at its column.
+    #[test]
+    fn hidden_spans_hold_their_columns_as_spaces() {
+        let mut hidden = span(0, 3, "abc");
+        hidden.hidden = true;
+        let plan = RowPlan {
+            line: 0,
+            spans: vec![hidden, span(3, 1, "d")],
+        };
+
+        let job = row_layout(&plan, &font());
+        assert_eq!(job.text, "   d", "the hidden span's cells stay occupied");
+    }
+
+    /// Bold rides the galley as the lifted-foreground degrade — the
+    /// bundled monospace has no bold face.
+    #[test]
+    fn bold_lifts_the_section_foreground() {
+        let gray = Color32::from_rgb(0x80, 0x80, 0x80);
+        let plan = RowPlan {
+            line: 0,
+            spans: vec![CellSpan {
+                bold: true,
+                fg: gray,
+                ..span(0, 1, "x")
+            }],
+        };
+        let job = row_layout(&plan, &font());
+        assert_eq!(job.sections[0].format.color, bold_color(gray));
+        assert_ne!(job.sections[0].format.color, gray);
+    }
+
+    /// The cache key covers everything the galley depends on: a text,
+    /// color, style-flag, hidden or font-size change lands a new key;
+    /// fields the galley never reads (`line`, `bg`, `strikeout` and
+    /// `underline` — both stay explicit shapes outside the galley,
+    /// `bg` stays a rect) can change without invalidating it.
+    #[test]
+    fn the_key_covers_everything_the_galley_depends_on() {
+        let plan = RowPlan {
+            line: 0,
+            spans: vec![span(0, 3, "abc")],
+        };
+        let base = row_key(&plan, &font());
+
+        // The galley's inputs all change the key.
+        for mutate in [
+            (|p: &mut RowPlan| p.spans[0].text = "abd".to_string()) as fn(&mut RowPlan),
+            |p| p.spans[0].fg = Color32::RED,
+            |p| p.spans[0].bold = true,
+            |p| p.spans[0].italic = true,
+            |p| p.spans[0].hidden = true,
+            |p| p.spans[0].cells = 4,
+        ] {
+            let mut changed = plan.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                row_key(&changed, &font()),
+                base,
+                "a galley-visible change must miss the cache"
+            );
+        }
+        assert_ne!(
+            row_key(&plan, &FontId::monospace(16.0)),
+            base,
+            "a zoom's changed font size reshapes every row"
+        );
+
+        // The out-of-galley fields do not: `line`/`bg`/decorations are
+        // painted by the rect/shape passes, not the text run.
+        for mutate in [
+            (|p: &mut RowPlan| p.line = 7) as fn(&mut RowPlan),
+            |p| p.spans[0].bg = Some(Color32::DARK_GRAY),
+            |p| p.spans[0].strikeout = true,
+            |p| p.spans[0].underline = Underline::Curly,
+        ] {
+            let mut changed = plan.clone();
+            mutate(&mut changed);
+            assert_eq!(
+                row_key(&changed, &font()),
+                base,
+                "a shape-pass change must not force a re-shape"
+            );
+        }
+    }
 }
