@@ -10,7 +10,7 @@ follows [GLOSSARY.md](../GLOSSARY.md).
 ### Shell installer (recommended)
 
 ```sh
-curl --proto '=https' --tlsv1.2 -sSf https://github.com/Eng-Elias/ait/releases/latest/download/ait-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Eng-Elias/ait/releases/latest/download/ait-installer.sh | sh
 ```
 
 The installer downloads the archive for your platform, verifies its

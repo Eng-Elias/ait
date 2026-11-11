@@ -15,7 +15,7 @@ round-by-round roadmap.
 Shell installer (Linux and macOS — no Rust toolchain needed):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -sSf https://github.com/Eng-Elias/ait/releases/latest/download/ait-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Eng-Elias/ait/releases/latest/download/ait-installer.sh | sh
 ```
 
 The installer verifies the published `.sha256` checksum before running
