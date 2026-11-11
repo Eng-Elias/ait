@@ -400,6 +400,10 @@ mod tests {
             profile: profile::DEFAULT_PROFILE.to_string(),
             picker: None,
             copied_text: None,
+            // `NoSecrets` keeps keyring lookups out of tests — the
+            // app::tests harness's convention for the same field.
+            suggester: ait_agent::CommandSuggester::with_secret_store(config::NoSecrets),
+            suggestion: ait_app::suggest::SuggestionPin::new(),
         }))
     }
 
