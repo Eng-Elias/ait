@@ -52,12 +52,9 @@ DESCRIPTION
 
 OPTIONS
     gui, --gui
-        Launch the GUI frontend (Spec R13 §5.12) in-process —
-        the same entry point the `ait-gui` binary runs. Only
-        builds compiled with `--features gui` carry it: the
-        feature is off by default and release builds never
-        enable it, so without it this form exits non-zero
-        naming the gap (use the `ait-gui` binary instead).
+        Launch the GUI frontend (Spec R13 §5.12) in-process.
+        Only `--features gui` builds carry it — other builds
+        exit non-zero naming the gap (use `ait-gui` instead).
 
     ctl <verb>
         Drive a running instance over its control socket (unix

@@ -290,10 +290,10 @@ mod tests {
     //! headless seam; these tests drive the pump's `Shared` exactly
     //! the way `new`+`Pump::start` wire it.
     use super::*;
+    use ait_app::ctl::{decode_response, encode_request, Request, Response};
     use ait_app::skills::LiveSkills;
     use ait_app::store::StoreHandle;
     use ait_app::tabs::{SessionTemplate, Tab, TabManager};
-    use ait_app::ctl::{decode_response, encode_request, Request, Response};
     use ait_config::Settings;
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::UnixStream;
@@ -363,10 +363,7 @@ mod tests {
     fn register_session(shared: &Arc<Mutex<Shared>>) {
         let mut shared = shared.lock().unwrap();
         let Shared {
-            tabs,
-            store,
-            toast,
-            ..
+            tabs, store, toast, ..
         } = &mut *shared;
         if let Some(tab) = tabs.active_mut() {
             if let Some(id) = store.session_started(toast, tab.title(), tab.cwd()) {
@@ -419,13 +416,7 @@ mod tests {
             ctl: Option<&mut CtlServer>,
             watcher: Option<&SettingsWatcher>,
         ) -> PumpActivity {
-            drain_pass(
-                shared,
-                ctl,
-                watcher,
-                &mut self.cursors,
-                &mut self.revisions,
-            )
+            drain_pass(shared, ctl, watcher, &mut self.cursors, &mut self.revisions)
         }
 
         /// Passes until `pred` observes the shared state, or the
@@ -497,13 +488,17 @@ mod tests {
     fn ctl_verbs_round_trip_through_the_drain_pass() {
         let mut server = CtlServer::bind().expect("bind the control socket");
         let (_dir, _db, store) = temp_store();
-        let shared = shared(
-            manager(sh(), Some(server.socket_path())),
-            store,
-        );
+        let shared = shared(manager(sh(), Some(server.socket_path())), store);
         register_session(&shared);
         assert!(
-            shared.lock().unwrap().tabs.active().unwrap().store_session().is_some(),
+            shared
+                .lock()
+                .unwrap()
+                .tabs
+                .active()
+                .unwrap()
+                .store_session()
+                .is_some(),
             "the boot tab's store row lands like GuiApp::new's"
         );
         let mut pass = Pass::new();
@@ -560,12 +555,18 @@ mod tests {
         // sh seals no blocks, so the answer is the TUI's same
         // `{"ok":false}` (ait-app's dispatch tests cover the happy
         // path over a marks-staged tab).
-        let block = ctl_round_trip(&shared, &mut server, &mut pass, &Request::LastBlock {
-            tab: None,
-        });
+        let block = ctl_round_trip(
+            &shared,
+            &mut server,
+            &mut pass,
+            &Request::LastBlock { tab: None },
+        );
         assert!(!block.ok);
         assert!(
-            block.error.as_deref().is_some_and(|e| e.contains("no sealed blocks")),
+            block
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no sealed blocks")),
             "{block:?}"
         );
     }
@@ -600,7 +601,13 @@ mod tests {
                 .is_some_and(|toast| toast.text().contains("config error:"))
         });
         assert_eq!(
-            shared.lock().unwrap().config.settings().terminal.scrollback_lines,
+            shared
+                .lock()
+                .unwrap()
+                .config
+                .settings()
+                .terminal
+                .scrollback_lines,
             Some(1234),
             "the broken write never replaced last-good"
         );
