@@ -256,9 +256,11 @@ impl GuiApp {
                     if self.zoom_key(key, modifiers) {
                         continue;
                     }
-                    // The find bar's open chord — Ctrl+F/⌘F (Spec
-                    // R13-T4). The keymap can't own it: the TUI has no
-                    // find bar, so the chord is GUI-local like zoom.
+                    // The find bar's open chord — Ctrl+Shift+F, or
+                    // ⌘F on macOS (Spec R13-T4). The keymap can't own
+                    // it: the TUI has no find bar, so the chord is
+                    // GUI-local like zoom. Bare Ctrl+F is readline's
+                    // forward-char — it falls through to the PTY.
                     if find_open_chord(key, modifiers) {
                         self.open_find(shared);
                         continue;
@@ -612,8 +614,9 @@ impl GuiApp {
     // own the input side. Unbound keys route here while it's open
     // (text arrives through `Event::Text`/`Paste` → `find_text`).
 
-    /// `Ctrl+F`/`⌘F`: open the bar over the active tab. Idempotent — a
-    /// second press keeps the bar and its query (the browser rule).
+    /// `Ctrl+Shift+F`/`⌘F`: open the bar over the active tab.
+    /// Idempotent — a second press keeps the bar and its query (the
+    /// browser rule).
     fn open_find(&mut self, shared: &mut Shared) {
         if shared.find.is_some() {
             return;
@@ -1670,15 +1673,18 @@ fn cell_metrics(ctx: &egui::Context, metrics: &GuiMetrics) -> CellMetrics {
     })
 }
 
-/// The find bar's open chord: `Ctrl+F` (Linux/Windows) or `⌘F`
-/// (macOS) — the `command` modifiers' source bits, with `Alt` excluded
-/// so `Option-F`/`Alt+F` chords keep passing through. Shift is allowed
-/// (`Ctrl+Shift+F` is the other find convention). GUI-local like zoom:
-/// the TUI has no find bar so the keymap can't own the chord — and it
-/// does shadow readline's `C-f` forward-char, the same sanctioned
-/// trade the keymap records for `Alt+B`/`M-b`.
+/// The find bar's open chord: `Ctrl+Shift+F`, or `⌘F` on macOS —
+/// with `Alt` excluded so `Option`/`Alt` chords keep passing through.
+/// Bare `Ctrl+F` is deliberately NOT the chord: it is readline's
+/// `C-f` forward-char, and stealing it would leave shell users no way
+/// to move the cursor a character — it falls through to the PTY like
+/// every unbound key. GUI-local like zoom: the TUI has no find bar
+/// so the keymap can't own the chord.
 fn find_open_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
-    key == egui::Key::F && (modifiers.ctrl || modifiers.mac_cmd) && !modifiers.alt
+    if key != egui::Key::F || modifiers.alt {
+        return false;
+    }
+    modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)
 }
 
 /// Scroll the view the minimum amount that puts `hit`'s row on screen:
@@ -2276,6 +2282,63 @@ mod tests {
         harness.press(Key::Escape, Modifiers::NONE);
 
         assert_eq!(wait_file(&harness, &path, 2), b"\r\x1b");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The find chord is `Ctrl+Shift+F` (or `⌘F` on macOS): bare
+    /// `Ctrl+F` is readline's forward-char and must reach the PTY —
+    /// the predicate and the byte stream both say so (R13 review F5).
+    #[test]
+    fn the_find_chord_leaves_ctrl_f_to_the_pty() {
+        // The predicate: Shift is required with Ctrl, `⌘` stays the
+        // macOS chord (shifted or not), and Alt never opens the bar.
+        let mods = |ctrl, shift, alt, mac_cmd| egui::Modifiers {
+            alt,
+            ctrl,
+            shift,
+            mac_cmd,
+            // `command` mirrors the platform accelerator, like egui's
+            // `Modifiers::default()` composition does on each host.
+            command: ctrl || mac_cmd,
+        };
+        assert!(find_open_chord(
+            egui::Key::F,
+            mods(true, true, false, false)
+        ));
+        assert!(find_open_chord(
+            egui::Key::F,
+            mods(false, false, false, true)
+        ));
+        assert!(find_open_chord(
+            egui::Key::F,
+            mods(false, true, false, true)
+        ));
+        assert!(
+            !find_open_chord(egui::Key::F, mods(true, false, false, false)),
+            "bare Ctrl+F is PTY input"
+        );
+        assert!(!find_open_chord(
+            egui::Key::F,
+            mods(true, true, true, false)
+        ));
+        assert!(!find_open_chord(
+            egui::Key::G,
+            mods(true, true, false, false)
+        ));
+
+        // The PTY path: the unshifted chord dispatches PassThrough and
+        // lands in the session as the \x06 byte forward-char reads —
+        // nothing in the dispatch opens the bar on it.
+        let path = capture_path("ctrlf");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        harness.press(Key::Char('f'), Modifiers::CONTROL);
+        assert_eq!(wait_file(&harness, &path, 1), b"\x06");
+        assert!(harness.shared().find.is_none());
         let _ = std::fs::remove_file(&path);
     }
 }
