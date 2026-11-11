@@ -20,6 +20,7 @@ use ait_app::config::{self, LiveSettings};
 use ait_app::ctl::CtlServer;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
 use ait_app::profile::{self, ProfilePicker};
+use ait_app::scroll::WHEEL_LINES;
 use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
 use ait_app::status::{status_text, StatusLine, Toast};
@@ -34,8 +35,8 @@ use eframe::egui::{
 use crate::grid::GridTheme;
 use crate::keys::{translate_key, translate_text};
 use crate::layout::{
-    chrome_regions, grid_point, grid_size, session_size, split_content, CellMetrics, Chrome,
-    GuiMetrics,
+    chrome_regions, grid_point, grid_size, session_size, split_content, tab_chips, CellMetrics,
+    Chrome, GuiMetrics, CHIP_PAD,
 };
 use crate::paint::paint_grid;
 use crate::pump::Pump;
@@ -269,35 +270,8 @@ impl GuiApp {
         });
         match resolution {
             Resolution::Action(AppAction::Quit) => self.quit = true,
-            Resolution::Action(AppAction::NewTab) => {
-                if let Err(error) = shared.tabs.new_tab() {
-                    shared.toast = Some(Toast::new(
-                        format!("new tab failed: {error}"),
-                        Instant::now(),
-                    ));
-                } else if let Some(tab) = shared.tabs.active_mut() {
-                    if let Some(id) =
-                        shared
-                            .store
-                            .session_started(&mut shared.toast, tab.title(), tab.cwd())
-                    {
-                        tab.set_store_session(id);
-                    }
-                }
-            }
-            Resolution::Action(AppAction::CloseTab) => {
-                // Closing the last tab exits the app — capture store
-                // bookkeeping before the tab goes, like the TUI does.
-                if let Some(id) = shared.tabs.active().and_then(|tab| tab.store_session()) {
-                    shared.store.session_ended(&mut shared.toast, id);
-                }
-                if let Some(id) = shared.tabs.active().and_then(|tab| tab.conversation()) {
-                    shared.store.conversation_closed(&mut shared.toast, id);
-                }
-                if !shared.tabs.close_active() {
-                    self.quit = true;
-                }
-            }
+            Resolution::Action(AppAction::NewTab) => self.open_tab(shared),
+            Resolution::Action(AppAction::CloseTab) => self.close_active_tab(shared),
             Resolution::Action(AppAction::NextTab) => shared.tabs.activate_next(),
             Resolution::Action(AppAction::PrevTab) => shared.tabs.activate_prev(),
             Resolution::Action(AppAction::JumpToTab(n)) => shared.tabs.jump_to(n),
@@ -486,7 +460,12 @@ impl GuiApp {
         };
         match unit {
             egui::MouseWheelUnit::Line => {
-                let lines = delta.y.abs().ceil().max(1.0) as usize;
+                // One notch reports ±1.0 in LineDelta units — scale by
+                // the shared WHEEL_LINES so a tick scrolls the same
+                // 3 lines the TUI's wheel binding does
+                // (CODING_STANDARDS §17 — one constant, both
+                // frontends).
+                let lines = (delta.y.abs() * WHEEL_LINES as f32).ceil().max(1.0) as usize;
                 if delta.y > 0.0 {
                     tab.scroll_up(lines);
                 } else {
@@ -519,47 +498,137 @@ impl GuiApp {
     }
 
     // -----------------------------------------------------------------
+    // Tab lifecycle — shared by the keymap actions above and the tab
+    // bar's click targets below, so binding and button can never drift.
+
+    /// `Alt+T` / the bar's "+": spawn a tab and register its
+    /// `terminal_sessions` row. A spawn failure toasts instead of
+    /// taking the window down — the session model stays up (graceful
+    /// degrade, like the TUI).
+    fn open_tab(&mut self, shared: &mut Shared) {
+        if let Err(error) = shared.tabs.new_tab() {
+            shared.toast = Some(Toast::new(
+                format!("new tab failed: {error}"),
+                Instant::now(),
+            ));
+        } else if let Some(tab) = shared.tabs.active_mut() {
+            if let Some(id) =
+                shared
+                    .store
+                    .session_started(&mut shared.toast, tab.title(), tab.cwd())
+            {
+                tab.set_store_session(id);
+            }
+        }
+    }
+
+    /// `Alt+W` / a chip's "×": store bookkeeping lands BEFORE the tab
+    /// goes (same order the TUI captures it), then the manager drops
+    /// it. Closing the last tab leaves an empty manager — guard before
+    /// indexing and exit (CODING_STANDARDS §6).
+    fn close_active_tab(&mut self, shared: &mut Shared) {
+        if let Some(id) = shared.tabs.active().and_then(|tab| tab.store_session()) {
+            shared.store.session_ended(&mut shared.toast, id);
+        }
+        if let Some(id) = shared.tabs.active().and_then(|tab| tab.conversation()) {
+            shared.store.conversation_closed(&mut shared.toast, id);
+        }
+        if !shared.tabs.close_active() {
+            self.quit = true;
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Paint — the five regions, painted in order; the modal layer is
     // last so its overlay always wins.
 
-    /// The tab-bar strip: one label per tab, active highlighted, click
-    /// to activate. T4's find bar slots into the modal layer, not here.
-    fn paint_tab_bar(&self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect) {
+    /// The tab-bar strip: one chip per tab — the body activates, the
+    /// "×" closes — plus the trailing "+" spawn button (Spec R13 §5.12:
+    /// open/close/switch by binding AND by click). [`tab_chips`] owns
+    /// the geometry (it and the painter share one layout, so a click
+    /// can never land beside the chip it was painted on); this
+    /// measures the titles, paints the chips and dispatches the
+    /// clicks. `jump_to` is 1-based — the `N:title` labels ARE the
+    /// jump indices. T4's find bar slots into the modal layer, not
+    /// here.
+    fn paint_tab_bar(&mut self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect) {
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1E, 0x1E, 0x1E));
-        let mut x = rect.left() + 6.0;
-        let mid = rect.center().y;
-        let active = shared.tabs.active_index();
         let font = FontId::proportional(12.0);
-        for (index, title) in shared.tabs.titles().iter().enumerate() {
-            let text = format!(" {} ", title);
-            let galley = painter.layout_no_wrap(text, font.clone(), Color32::WHITE);
-            let w = galley.size().x + 8.0;
-            let tab_rect = Rect::from_min_size(
-                Pos2::new(x, rect.top() + 3.0),
-                Vec2::new(w, rect.height() - 6.0),
+        let titles = shared.tabs.titles();
+        let widths: Vec<f32> = titles
+            .iter()
+            .map(|title| {
+                painter
+                    .layout_no_wrap(title.clone(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .collect();
+        let bar = tab_chips(rect, &widths);
+        let active = shared.tabs.active_index();
+        for (index, chip) in bar.tabs.iter().enumerate() {
+            let chip_hit = ui.interact(chip.rect, egui::Id::unique(("tab", index)), Sense::click());
+            let close_hit = ui.interact(
+                chip.close,
+                egui::Id::unique(("tab-close", index)),
+                Sense::click(),
             );
-            let response = ui.interact(tab_rect, egui::Id::unique(("tab", index)), Sense::click());
             let bg = if index == active {
                 Color32::from_rgb(0x3A, 0x3A, 0x3A)
-            } else if response.hovered() {
+            } else if chip_hit.hovered() || close_hit.hovered() {
                 Color32::from_rgb(0x2A, 0x2A, 0x2A)
             } else {
                 Color32::TRANSPARENT
             };
-            painter.rect_filled(tab_rect, 4.0, bg);
-            painter.galley(
-                Pos2::new(
-                    tab_rect.center().x - galley.size().x / 2.0,
-                    mid - galley.size().y / 2.0,
-                ),
-                galley,
+            painter.rect_filled(chip.rect, 4.0, bg);
+            painter.text(
+                Pos2::new(chip.rect.left() + CHIP_PAD, chip.rect.center().y),
+                Align2::LEFT_CENTER,
+                &titles[index],
+                font.clone(),
                 Color32::WHITE,
             );
-            if response.clicked() {
-                shared.tabs.jump_to(index);
+            painter.text(
+                chip.close.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                font.clone(),
+                if close_hit.hovered() {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0x88, 0x88, 0x88)
+                },
+            );
+            if close_hit.clicked() {
+                // Closing by click activates first (the user's target
+                // is unambiguous) — `jump_to` is 1-based — then the
+                // shared close path runs, quitting on the last tab.
+                shared.tabs.jump_to(index + 1);
+                self.close_active_tab(shared);
+            } else if chip_hit.clicked() {
+                shared.tabs.jump_to(index + 1);
             }
-            x += w + 2.0;
+        }
+        if let Some(new_rect) = bar.new_tab {
+            let new_hit = ui.interact(new_rect, egui::Id::unique("tab-new"), Sense::click());
+            if new_hit.hovered() {
+                painter.rect_filled(new_rect, 4.0, Color32::from_rgb(0x2A, 0x2A, 0x2A));
+            }
+            painter.text(
+                new_rect.center(),
+                Align2::CENTER_CENTER,
+                "+",
+                font,
+                if new_hit.hovered() {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0xAA, 0xAA, 0xAA)
+                },
+            );
+            if new_hit.clicked() {
+                self.open_tab(shared);
+            }
         }
     }
 

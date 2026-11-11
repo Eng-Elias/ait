@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 use ait_app::config::{self, LiveSettings};
 use ait_app::ctl::{CtlServer, FollowUp};
 use ait_app::profile;
-use ait_app::status::Toast;
+use ait_app::status::{notification_text, Toast};
 use ait_config::SettingsWatcher;
-use ait_term::Cursor;
+use ait_term::{Cursor, LiveEvent, SessionEvent};
 use eframe::egui::Context;
 
 use crate::app::Shared;
@@ -129,6 +129,7 @@ fn pump_loop(
     let mut revisions: HashMap<u64, u64> = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
         let activity = drain_pass(
+            &ctx,
             &shared,
             ctl.as_mut(),
             watcher.as_ref(),
@@ -148,6 +149,7 @@ fn pump_loop(
 /// → `drain_agent_events` → `drain_transcripts` →
 /// `take_persisted_blocks` → the per-tab damage/cursor/revision diff.
 fn drain_pass(
+    ctx: &Context,
     shared: &Arc<Mutex<Shared>>,
     ctl: Option<&mut CtlServer>,
     watcher: Option<&SettingsWatcher>,
@@ -235,9 +237,39 @@ fn drain_pass(
     // Sessions: `drain_events` folds each `LiveEvent` into the tab's
     // bookkeeping AND services its `ShellBridge` — the headless drain's
     // `observe → service_bridge`, folded into the manager's pass so
-    // the ordering can't drift.
-    if !tabs.drain_events().is_empty() {
+    // the ordering can't drift. The returned stream still carries the
+    // events the FRONTEND renders: `Notification`s toast (OSC 9/777)
+    // and `ClipboardWrite`s honor the OSC 52 request the session
+    // opted into.
+    for tab_event in tabs.drain_events() {
         activity.session = true;
+        match tab_event.event {
+            // OSC 9/777: the child asked for a notification. A
+            // background tab's toast is prefixed with its `N:title`
+            // label so it surfaces with attribution (Spec R02 user
+            // story 16) — the TUI's status-line rule, verbatim.
+            LiveEvent::Osc(SessionEvent::Notification { title, message }) => {
+                let source = if tab_event.tab == tabs.active_index() {
+                    None
+                } else {
+                    tabs.tabs()
+                        .get(tab_event.tab)
+                        .map(|tab| tab.label(tab_event.tab))
+                };
+                *toast = Some(Toast::new(
+                    notification_text(source.as_deref(), title.as_deref(), &message),
+                    Instant::now(),
+                ));
+            }
+            // Child-app OSC 52 (`[terminal] osc52` opt-in, Spec R02):
+            // the GUI IS the host, so the request writes the one
+            // system clipboard egui exposes — `Selection` (X11
+            // primary) has no egui counterpart and collapses onto it.
+            LiveEvent::Osc(SessionEvent::ClipboardWrite { contents, .. }) => {
+                ctx.copy_text(contents);
+            }
+            _ => {}
+        }
     }
     // Agent events on the same cadence (Spec R06) — a streaming
     // request repaints the panel region even while the grid is idle.

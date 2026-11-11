@@ -15,7 +15,7 @@
 //! cells, never the whole content band's, while the panel is open.
 
 use ait_term::Size;
-use eframe::egui::{Pos2, Rect};
+use eframe::egui::{Pos2, Rect, Vec2};
 
 /// One terminal cell's pixel metrics — from egui's glyph table at the
 /// current font/zoom ([`GuiMetrics`]).
@@ -118,6 +118,75 @@ pub fn chrome_regions(area: Rect, chrome: Chrome) -> Regions {
             Pos2::new(area.right(), area.bottom()),
         ),
     }
+}
+
+/// The tab bar's interactive geometry: one [`TabChip`] per title plus
+/// the trailing new-tab button — [`tab_chips`]'s return, kept whole so
+/// the painter and the hit-tester can never disagree about where a
+/// chip sits (CODING_STANDARDS §17).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabBar {
+    /// One chip per title that fit, in tab order.
+    pub tabs: Vec<TabChip>,
+    /// The "+" button's rect — `None` when even it doesn't fit.
+    pub new_tab: Option<Rect>,
+}
+
+/// One tab chip: click the body to activate the tab, click `close` to
+/// close it (Spec R13 §5.12 — open/close/switch by binding AND by
+/// click).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabChip {
+    /// The whole chip's rect — the activate target.
+    pub rect: Rect,
+    /// The close-button rect inside `rect`'s right end.
+    pub close: Rect,
+}
+
+/// Tab-chip chrome in points: the label's left padding, the close
+/// slot's width (padding included — the glyph centers inside it), the
+/// gap between chips, the new-tab button's width, and the bar's side
+/// margin / vertical inset.
+pub const CHIP_PAD: f32 = 8.0;
+pub const CHIP_CLOSE_W: f32 = 18.0;
+pub const CHIP_GAP: f32 = 2.0;
+pub const NEW_TAB_W: f32 = 24.0;
+pub const CHIP_INSET: f32 = 3.0;
+pub const BAR_MARGIN: f32 = 6.0;
+
+/// Lay out the tab bar's chips: `widths` are the rendered label widths
+/// in points — the caller measures through egui's font tables, so this
+/// stays pure `f32` math testable without a GPU context (the same seam
+/// as [`grid_size`]). Each chip is `pad label | ×`, the whole chip
+/// width reserved up front so hover never reflows the row. A chip that
+/// wouldn't fit whole before the new-tab button ends the row —
+/// mirroring the TUI bar's right-edge clip — and the "+" trails the
+/// last chip, `None` once even it can't fit.
+pub fn tab_chips(bar: Rect, widths: &[f32]) -> TabBar {
+    let inner = bar.shrink2(Vec2::new(BAR_MARGIN, CHIP_INSET));
+    let mut x = inner.left();
+    let mut tabs = Vec::with_capacity(widths.len());
+    for &width in widths {
+        let chip_w = width + CHIP_PAD + CHIP_CLOSE_W;
+        if x + chip_w + NEW_TAB_W > inner.right() {
+            break;
+        }
+        let rect =
+            Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(chip_w, inner.height()));
+        let close = Rect::from_min_size(
+            Pos2::new(rect.right() - CHIP_CLOSE_W, inner.top()),
+            Vec2::new(CHIP_CLOSE_W, inner.height()),
+        );
+        tabs.push(TabChip { rect, close });
+        x += chip_w + CHIP_GAP;
+    }
+    let new_tab = (x + NEW_TAB_W <= inner.right()).then(|| {
+        Rect::from_min_size(
+            Pos2::new(x, inner.top()),
+            Vec2::new(NEW_TAB_W, inner.height()),
+        )
+    });
+    TabBar { tabs, new_tab }
 }
 
 /// The side panel's column share on a `width`-column band: two fifths,
@@ -278,5 +347,86 @@ mod tests {
         let (line, col) = grid_point(Pos2::new(400.0, 500.0), pane, CELL, 0);
         assert_eq!(col, 9);
         assert!(line > 0);
+    }
+
+    /// Tab chips lay out left-to-right inside the bar's inset, each
+    /// `pad + label + close-slot` wide with the close rect docked at
+    /// the chip's right end; the "+" button trails the last chip.
+    #[test]
+    fn tab_chips_lay_out_in_order() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 28.0));
+        let layout = tab_chips(bar, &[30.0, 50.0]);
+        assert_eq!(layout.tabs.len(), 2);
+
+        let first = layout.tabs[0];
+        let chip_w = 30.0 + CHIP_PAD + CHIP_CLOSE_W;
+        assert_eq!(first.rect.left(), BAR_MARGIN);
+        assert_eq!(first.rect.width(), chip_w);
+        // The close button is the chip's rightmost slot, fully inside.
+        assert_eq!(first.close.right(), first.rect.right());
+        assert!(first.rect.contains_rect(first.close));
+        assert!(first.close.left() > first.rect.left() + CHIP_PAD + 30.0 - 1.0);
+
+        // The second chip starts one gap after the first.
+        let second = layout.tabs[1];
+        assert_eq!(second.rect.left(), first.rect.right() + CHIP_GAP);
+        assert_eq!(second.rect.width(), 50.0 + CHIP_PAD + CHIP_CLOSE_W);
+
+        // "+" trails the second chip, still inside the bar.
+        let new_tab = layout.new_tab.unwrap();
+        assert_eq!(new_tab.left(), second.rect.right() + CHIP_GAP);
+        assert_eq!(new_tab.width(), NEW_TAB_W);
+        assert!(bar.contains_rect(new_tab));
+    }
+
+    /// Chips that don't fit whole before the "+" slot end the row —
+    /// the TUI bar's right-edge clip — and an empty bar yields no
+    /// chips and no button (the empty-tab-set guard, standard 6).
+    #[test]
+    fn tab_chips_clip_at_the_bar_edge() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(120.0, 28.0));
+        // inner.right() = 114; a 40-wide label needs 66 px + the
+        // trailing 24 px "+" (96 fits at x=6), while a second 60-wide
+        // chip would need 86 more (breaks at x=74) — only one fits.
+        let layout = tab_chips(bar, &[40.0, 60.0, 60.0]);
+        assert_eq!(layout.tabs.len(), 1);
+        let new_tab = layout.new_tab.unwrap();
+        assert_eq!(new_tab.left(), 74.0);
+        assert!(bar.contains_rect(new_tab), "+ stays inside the bar");
+
+        // A bar too narrow for even one chip — or for the "+" itself —
+        // still can't produce a hit target outside its own pixels.
+        let sliver = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 28.0));
+        let layout = tab_chips(sliver, &[60.0]);
+        assert!(layout.tabs.is_empty());
+        assert!(layout.new_tab.is_none());
+        let layout = tab_chips(sliver, &[]);
+        assert!(layout.tabs.is_empty());
+        assert!(layout.new_tab.is_none());
+    }
+
+    /// Zoom rescales the font (and so the cell metrics derived from
+    /// it) stepwise, clamps at both bounds, and Ctrl+0 returns to
+    /// exactly 1 — the live-rescale/reset contract.
+    #[test]
+    fn zoom_steps_clamp_and_reset() {
+        let mut metrics = GuiMetrics {
+            base_px: 15.0,
+            zoom: 1.0,
+        };
+        metrics.zoom_in();
+        assert!((metrics.zoom - ZOOM_STEP).abs() < f32::EPSILON);
+        assert!((metrics.font_px() - 15.0 * ZOOM_STEP).abs() < 0.001);
+        for _ in 0..100 {
+            metrics.zoom_in();
+        }
+        assert_eq!(metrics.zoom, ZOOM_MAX);
+        for _ in 0..200 {
+            metrics.zoom_out();
+        }
+        assert_eq!(metrics.zoom, ZOOM_MIN);
+        metrics.zoom_reset();
+        assert_eq!(metrics.zoom, 1.0);
+        assert_eq!(metrics.font_px(), 15.0);
     }
 }
