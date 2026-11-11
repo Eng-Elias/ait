@@ -1,0 +1,108 @@
+# Spec R05 §5.5: `SHELL=/bin/bash` makes the injected `--rcfile` snippet
+# live — OSC 133 marks + 7700 hooks flow, blocks assemble, and the
+# status line's `✓/✗ <code> · <dur>` segment reports each finished
+# block. `Alt+Up` then walks block starts upward through scrollback.
+#
+# The prompt text is host-dependent (the user's real bashrc sets PS1),
+# but an interactive bash prompt always ends in a prompt char — `$`,
+# or `#` under uid 0, where PS1's `\$` renders `#`. A line ENDING in
+# either is exactly a fresh, empty prompt — rows are trim_end'ed, and
+# a prompt carrying typed text ends in the command instead.
+#
+# Every command is fenced by two waits: first its own ECHO (until the
+# typed text renders, the previous bare prompt still satisfies `…[$#]$`
+# and a fresh-prompt wait could pass early), then a fresh bare prompt —
+# which renders only after the command finished. Typing into an
+# unrendered prompt interleaves echo, prompt and output on one row.
+feature = "shell-integration"
+size = [80, 24]
+env = { SHELL = "/bin/bash" }
+
+[[steps]]
+wait_text = "· bash ·"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+[[steps]]
+text = "echo R05MARKER\n"
+
+[[steps]]
+expect_regex = "echo R05MARKER"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+# A failing command closes its block with exit 1 — the status line's
+# block segment renders `✗ 1 · <dur>`; the segment lands with the `D`
+# mark, so matching it also means the command finished.
+[[steps]]
+text = "false\n"
+
+[[steps]]
+expect_regex = "false"
+
+[[steps]]
+expect_regex = "✗ 1 · \\d+\\.\\ds · running"
+
+# A slow command's duration lands in the same segment (~2 s of sleep);
+# the prompt-back wait re-arms typing safety for what follows.
+[[steps]]
+text = "sleep 2\n"
+
+[[steps]]
+expect_regex = "sleep 2"
+
+[[steps]]
+expect_regex = "✓ 0 · 2\\.\\ds · running"
+
+# Fill scrollback so block navigation has somewhere to go: after
+# `seq 1 40` and one more echo the `seq` echo line sits above the
+# viewport, so `Alt+Up` tops the view on it.
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+[[steps]]
+text = "seq 1 40\n"
+
+[[steps]]
+expect_regex = "seq 1 40"
+
+[[steps]]
+expect_regex = "✓ 0 · 0\\.\\ds · running"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+[[steps]]
+text = "echo TAILMARKER\n"
+
+[[steps]]
+expect_regex = "echo TAILMARKER"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+# Screen text joins rows with \n; row 0 is the tab bar, so the viewport
+# top is the second line — it must now hold the `seq 1 40` echo (the
+# prompt prefix varies per host, so only the tail is anchored).
+[[steps]]
+keys = ["Alt+Up"]
+
+[[steps]]
+expect_regex = "\\A[^\\n]*\\n[^\\n]*seq 1 40\\n"
+
+# Each press walks one block start upward: the next lands on the
+# `sleep 2` echo, then `false`'s (a no-output command still owns its
+# echo line).
+[[steps]]
+keys = ["Alt+Up"]
+
+[[steps]]
+expect_regex = "\\A[^\\n]*\\n[^\\n]*sleep 2\\n"
+
+[[steps]]
+keys = ["Alt+Up"]
+
+[[steps]]
+expect_regex = "\\A[^\\n]*\\n[^\\n]*false\\n"

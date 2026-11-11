@@ -5,7 +5,10 @@
 
 use std::path::Path;
 
-use crate::{ConfigError, Settings};
+use crate::settings::pattern_names;
+use crate::ConfigError;
+#[cfg(feature = "schema")]
+use crate::Settings;
 
 /// The commented default `settings.toml` `ait --init` writes (§4): an
 /// example local endpoint whose model gets a fresh v4 UUID `config_key`
@@ -13,6 +16,11 @@ use crate::{ConfigError, Settings};
 /// profile as the safe starting point.
 pub fn default_template() -> String {
     let config_key = uuid::Uuid::new_v4();
+    // The [redaction] comment names the toggle vocabulary from the
+    // name table itself — a renamed or added pattern can never drift
+    // from what the template documents (CODING_STANDARDS §17).
+    let builtins = pattern_names::BUILTINS.join(", ");
+    let pii = pattern_names::PII.join(", ");
     format!(
         r#"# AIT settings
 #
@@ -28,6 +36,35 @@ pub fn default_template() -> String {
 # shell            = "/usr/bin/fish"  # program new sessions spawn (default: $SHELL)
 # scrollback_lines = 20000            # scrollback capacity for new sessions
 # osc52            = false            # let child apps write the host clipboard via OSC 52
+# shell_integration = true            # inject OSC 133 + hook events into bash/zsh/fish (default: on)
+
+# Input classifier (§5.10.4): on Enter, a line the heuristic reads as
+# natural language is rewritten to `# <line>` — the request lands in
+# history and the suggestion streams onto the fresh prompt.
+# [input]
+# classifier = "heuristic"   # "heuristic" | "off" (default: heuristic)
+
+# SSH integration (§5.9): sessions started by `ssh` inside an
+# integrated tab get the remote shell bootstrapped with the same
+# snippet, and run_command gains the ControlMaster out-of-band tier.
+# [ssh]
+# enable_integration = true   # global off switch (default: on)
+# hosts_allowlist   = []      # OpenSSH globs (`*`, `?`, `!`-negation) on the
+#                             # destination token; empty = open
+# hosts_denylist    = []      # deny beats allow — a matching ssh stays a
+#                             # plain passthrough, never blocked
+# reuse_existing_control_master = true  # honor your own ControlMaster/
+#                                       # ControlPath config (default: on)
+
+# Secret redaction (§5.10.3): the named patterns masking credentials
+# and PII before terminal output reaches a provider.
+#   built-ins (ship enabled):           {builtins}
+#   PII categories (opt-in, disabled):  {pii}
+# A name in both enable and disable is a load error.
+# [redaction]
+# extra   = []            # your own regexes, e.g. ['\btoken-[A-Z0-9]{{8}}']
+# enable  = []            # opt in: the pii_* categories
+# disable = []            # turn a built-in off, e.g. ["jwt"]
 
 # A declared endpoint — any OpenAI- or Anthropic-compatible server.
 [agents.custom_endpoints.local]
@@ -98,7 +135,9 @@ pub fn init_settings(path: impl AsRef<Path>, force: bool) -> Result<(), ConfigEr
 /// 2020-12) — what `ait --print-schema` prints for editor validation
 /// and completion (user story 5). `deny_unknown_fields` on the model
 /// surfaces as `additionalProperties: false`, so editors flag typos the
-/// same way the loader does.
+/// same way the loader does. Behind the `schema` cargo feature (issue
+/// #77) — `ait --print-schema` is the only consumer.
+#[cfg(feature = "schema")]
 pub fn json_schema() -> String {
     let schema = schemars::schema_for!(Settings);
     serde_json::to_string_pretty(&schema).expect("serializing a JsonSchema cannot fail")

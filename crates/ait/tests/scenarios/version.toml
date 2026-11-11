@@ -4,7 +4,7 @@ size = [80, 24]
 args = ["--version"]
 
 [[steps]]
-expect_text = "ait 0.1.0"
+expect_text = "ait 1.0.0"
 
 [[steps]]
 expect_exit = 0

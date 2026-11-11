@@ -72,6 +72,7 @@ fn unconfigured_settings() -> Settings {
 fn request(settings: Settings) -> SuggestRequest {
     SuggestRequest {
         settings,
+        profile: String::from("default"),
         cwd: String::from("/home/u/proj"),
         shell: String::from("bash"),
         os: String::from("linux"),
@@ -176,6 +177,47 @@ fn request_streams_ordered_deltas_then_done() {
     assert!(captured.body.contains("list files"));
     assert!(captured.body.contains("[REDACTED]"));
     assert!(!captured.body.contains("AKIAIOSFODNN7EXAMPLE"));
+}
+
+/// Spec R10-T1: the request's `[redaction]` settings reach the
+/// suggester's context assembly — a `disable`d built-in's specimen
+/// goes to the provider verbatim while an `extra` pattern masks what
+/// no built-in catches. Per-request construction is what makes a
+/// settings hot-reload effective on the next submission (us-37).
+#[test]
+fn the_request_redaction_settings_drive_context_redaction() {
+    let fixture = Fixture::serve(vec![sse(&sse_transcript(&["ls"]))]);
+    let suggester = suggester();
+    let mut settings = settings(&fixture.base_url, "command_model");
+    settings
+        .redaction
+        .disable
+        .push(String::from("aws_access_key"));
+    settings
+        .redaction
+        .extra
+        .push(String::from(r"\btoken-[A-Z0-9]{8}"));
+    let mut request = request(settings);
+    request
+        .output_lines
+        .push(String::from("token-A1B2C3D4 logged"));
+    suggester.suggest(request).expect("suggest");
+
+    let events = collect(&suggester);
+    assert_eq!(events.last(), Some(&SuggestEvent::Done));
+
+    let captured = fixture.captured();
+    assert!(
+        captured.body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a disabled built-in passes through: {}",
+        captured.body
+    );
+    assert!(
+        !captured.body.contains("token-A1B2C3D4"),
+        "the extra pattern must mask: {}",
+        captured.body
+    );
+    assert!(captured.body.contains("[REDACTED]"), "{}", captured.body);
 }
 
 /// us-21: `command_model` unset falls back to `base_model` — the
@@ -316,6 +358,55 @@ fn unresolvable_model_errors_without_panic_or_hang() {
     suggester.suggest(request(bare)).expect("suggest");
     match suggester.events().recv_timeout(BOUND) {
         Ok(SuggestEvent::Error(_)) => {}
+        other => panic!("expected an Error event, got {other:?}"),
+    }
+}
+
+/// Spec R07 §4.2/us-25 (issue #101): the request's `profile` field
+/// picks which execution profile's `command_model` resolves — a
+/// request armed with `work` streams where `default` (undeclared
+/// here) can only error.
+#[test]
+fn the_request_profile_resolves_its_own_command_model() {
+    let fixture = Fixture::serve(vec![sse(&sse_transcript(&["git ", "status"]))]);
+    let work_only = Settings::from_toml(&format!(
+        r#"
+[agents.custom_endpoints.local]
+name = "Fixture"
+base_url = "{}"
+schema = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name = "test-model"
+alias = "Test Model"
+config_key = "cmd-key"
+
+[agents.execution_profiles.work]
+command_model = "cmd-key"
+"#,
+        fixture.base_url
+    ))
+    .expect("test settings must parse");
+    let suggester = suggester();
+
+    let mut armed = request(work_only.clone());
+    armed.profile = String::from("work");
+    suggester.suggest(armed).expect("suggest");
+
+    let events = collect(&suggester);
+    assert_eq!(delta_text(&events), "git status");
+    assert_eq!(events.last(), Some(&SuggestEvent::Done));
+
+    // The same settings under `default` fail closed at model
+    // resolution — the armed name is what resolved, not a constant.
+    let mut missing = request(work_only);
+    missing.profile = String::from("default");
+    suggester.suggest(missing).expect("suggest");
+    match suggester.events().recv_timeout(BOUND) {
+        Ok(SuggestEvent::Error(message)) => assert!(
+            message.contains("unknown execution profile"),
+            "unexpected error {message:?}"
+        ),
         other => panic!("expected an Error event, got {other:?}"),
     }
 }

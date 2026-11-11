@@ -1,7 +1,9 @@
-//! The status line's model: `cwd · shell · model · state` for the
-//! active tab, overridden ~3 s at a time by notification toasts (Spec
-//! R02: "a status line shows cwd, shell, model and session state" +
-//! "notifications surface as toasts").
+//! The status line's model: `cwd · shell · model · [profile ·] state`
+//! for the active tab, overridden ~3 s at a time by notification toasts
+//! (Spec R02: "a status line shows cwd, shell, model and session
+//! state" + "notifications surface as toasts"). The `profile` segment
+//! is conditional (Spec R07 us-24): it exists only while the active
+//! execution profile is not `default`.
 //!
 //! `status` holds only presentation state — pure text and a deadline —
 //! so the whole thing is testable without a PTY (standard 11). [`app`]
@@ -17,6 +19,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ait_term::ExitStatus;
+
+use crate::blocks::BlockStatus;
 
 /// How long a toast stays on the status line before the normal
 /// `cwd · shell · model · state` rendering returns (Spec R02: ~3 s).
@@ -52,29 +56,77 @@ impl Toast {
     }
 }
 
+/// The status summary's inputs for one tab — bundled so
+/// [`status_text`] takes three arguments instead of seven.
+pub struct StatusLine<'a> {
+    /// The tab's tracked working directory (OSC 7, else spawn cwd).
+    pub cwd: &'a Path,
+    /// The tab's program basename.
+    pub shell: &'a str,
+    /// The resolved `base_model`'s display name (`—` when unset —
+    /// Spec R03 story 24).
+    pub model: &'a str,
+    /// The active execution profile's name — `Some` only when it is
+    /// not `default`, which is what keeps the segment out of the R03
+    /// layout (Spec R07 us-24).
+    pub profile: Option<&'a str>,
+    /// The newest finished block's status (`✓/✗ <code> · <dur>` —
+    /// Spec R05 us-15; absent when no block has reported an exit code).
+    pub block: Option<BlockStatus>,
+    /// The live remote session's destination token (Spec R09-T4:
+    /// `ssh:<target>` while an `ssh()`-wrapped session is open;
+    /// absent on a local shell — the R03 layout is unchanged).
+    pub remote: Option<&'a str>,
+    /// The session's exit status once `LiveEvent::Exited` surfaced.
+    pub exit: Option<&'a ExitStatus>,
+}
+
 /// The status line's content at `now`: a live toast wins outright;
-/// otherwise `cwd · shell · model · state` for the described tab.
-///
-/// `cwd` is the tab's tracked working directory (OSC 7, else spawn
-/// cwd), `shell` its program basename, `model` the resolved
-/// `base_model`'s display name (`—` when unset — Spec R03 story 24),
-/// `exit` the session's exit status once `LiveEvent::Exited` surfaced.
-pub fn status_text(
-    cwd: &Path,
-    shell: &str,
-    model: &str,
-    exit: Option<&ExitStatus>,
-    toast: Option<&Toast>,
-    now: Instant,
-) -> String {
+/// otherwise `cwd · shell · model · [profile ·] [block ·] [ssh:·]
+/// state` for the tab `line` describes.
+pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -> String {
     if let Some(toast) = toast.filter(|toast| toast.is_live(now)) {
         return toast.text().to_string();
     }
+    let profile = line
+        .profile
+        .map_or_else(String::new, |name| format!("{name} · "));
+    let block = line
+        .block
+        .map_or_else(String::new, |status| format!("{} · ", block_text(status)));
+    let remote = line
+        .remote
+        .map_or_else(String::new, |target| format!("ssh:{target} · "));
     format!(
-        "{} · {shell} · {model} · {}",
-        cwd.display(),
-        state_text(exit),
+        "{} · {} · {} · {profile}{block}{remote}{}",
+        line.cwd.display(),
+        line.shell,
+        line.model,
+        state_text(line.exit),
     )
+}
+
+/// The block segment: `✓ <code>` when the command exited zero, `✗
+/// <code>` otherwise — then `· <dur>` (Spec R05's `✓ 0 · 1.2s`).
+fn block_text(status: BlockStatus) -> String {
+    let mark = if status.exit == 0 { '✓' } else { '✗' };
+    format!(
+        "{mark} {} · {}",
+        status.exit,
+        duration_text(status.duration)
+    )
+}
+
+/// Sub-minute durations render tenths (`1.2s`, the spec's shape);
+/// minute-plus durations collapse to `Mm SSs` so a long build stays
+/// readable without a float tail.
+fn duration_text(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
 }
 
 /// `running` while the session lives; `exited <code>` once `Exited`
@@ -123,24 +175,95 @@ mod tests {
     #[test]
     fn status_line_is_cwd_shell_model_state() {
         let text = status_text(
-            Path::new("/home/u/project"),
-            "bash",
-            "Qwen Coder",
-            None,
+            &StatusLine {
+                cwd: Path::new("/home/u/project"),
+                shell: "bash",
+                model: "Qwen Coder",
+                profile: None,
+                block: None,
+                remote: None,
+                exit: None,
+            },
             None,
             Instant::now(),
         );
         assert_eq!(text, "/home/u/project · bash · Qwen Coder · running");
 
         let text = status_text(
-            Path::new("/home/u/project"),
-            "bash",
-            "—",
-            None,
+            &StatusLine {
+                cwd: Path::new("/home/u/project"),
+                shell: "bash",
+                model: "—",
+                profile: None,
+                block: None,
+                remote: None,
+                exit: None,
+            },
             None,
             Instant::now(),
         );
         assert_eq!(text, "/home/u/project · bash · — · running");
+    }
+
+    /// Spec R05 us-15: a finished block adds its `✓/✗ <code> · <dur>`
+    /// segment ahead of the session state — `✓` on exit 0, `✗` on
+    /// anything else; no block leaves the layout untouched.
+    #[test]
+    fn block_status_renders_between_model_and_state() {
+        let now = Instant::now();
+        let ok = BlockStatus {
+            exit: 0,
+            duration: Duration::from_millis(1200),
+        };
+        assert_eq!(
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    profile: None,
+                    block: Some(ok),
+                    remote: None,
+                    exit: None,
+                },
+                None,
+                now
+            ),
+            "/tmp · sh · — · ✓ 0 · 1.2s · running"
+        );
+
+        let failed = BlockStatus {
+            exit: 1,
+            duration: Duration::from_millis(60),
+        };
+        assert_eq!(
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    profile: None,
+                    block: Some(failed),
+                    remote: None,
+                    exit: None,
+                },
+                None,
+                now
+            ),
+            "/tmp · sh · — · ✗ 1 · 0.1s · running"
+        );
+    }
+
+    /// The duration slot: tenths under a minute (`1.2s`, the spec's
+    /// example shape), `Mm SSs` past it so a long command stays
+    /// readable.
+    #[test]
+    fn block_duration_shapes() {
+        assert_eq!(duration_text(Duration::from_millis(40)), "0.0s");
+        assert_eq!(duration_text(Duration::from_millis(1234)), "1.2s");
+        assert_eq!(duration_text(Duration::from_secs(59)), "59.0s");
+        assert_eq!(duration_text(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(duration_text(Duration::from_secs(600)), "10m 00s");
     }
 
     /// `Exited` flips the state slot to `exited <code>` — the text
@@ -150,13 +273,37 @@ mod tests {
         let now = Instant::now();
         let code3 = exit(3, None);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", Some(&code3), None, now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    profile: None,
+                    block: None,
+                    remote: None,
+                    exit: Some(&code3),
+                },
+                None,
+                now
+            ),
             "/tmp · sh · — · exited 3"
         );
         // A signaled exit keeps its description readable.
         let hung_up = exit(1, Some("Terminated by SIGHUP"));
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", Some(&hung_up), None, now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    profile: None,
+                    block: None,
+                    remote: None,
+                    exit: Some(&hung_up),
+                },
+                None,
+                now
+            ),
             "/tmp · sh · — · exited 1 (Terminated by SIGHUP)"
         );
     }
@@ -168,7 +315,19 @@ mod tests {
         let now = Instant::now();
         let toast = Toast::new("build finished", now);
         assert_eq!(
-            status_text(Path::new("/tmp"), "sh", "—", None, Some(&toast), now),
+            status_text(
+                &StatusLine {
+                    cwd: Path::new("/tmp"),
+                    shell: "sh",
+                    model: "—",
+                    profile: None,
+                    block: None,
+                    remote: None,
+                    exit: None,
+                },
+                Some(&toast),
+                now
+            ),
             "build finished"
         );
     }
@@ -187,14 +346,80 @@ mod tests {
         );
 
         let summary = status_text(
-            Path::new("/tmp"),
-            "sh",
-            "—",
-            None,
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                profile: None,
+                block: None,
+                remote: None,
+                exit: None,
+            },
             Some(&toast),
             now + TOAST_DURATION,
         );
         assert_eq!(summary, "/tmp · sh · — · running");
+    }
+
+    /// Spec R07 us-24: a non-`default` active profile adds its segment
+    /// right after the model slot — `None` (the armed `default`) keeps
+    /// the R03 layout byte-for-byte.
+    #[test]
+    fn a_non_default_profile_adds_its_segment() {
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                profile: Some("work"),
+                block: None,
+                remote: None,
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/tmp · sh · — · work · running");
+
+        // …and the block segment still lands after it.
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/tmp"),
+                shell: "sh",
+                model: "—",
+                profile: Some("work"),
+                block: Some(BlockStatus {
+                    exit: 0,
+                    duration: Duration::from_millis(1200),
+                }),
+                remote: None,
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/tmp · sh · — · work · ✓ 0 · 1.2s · running");
+    }
+
+    /// Spec R09-T4: a live remote session adds its `ssh:<target>`
+    /// segment right before the state slot — `None` (a local shell)
+    /// keeps the R03 layout byte-for-byte.
+    #[test]
+    fn a_remote_session_adds_its_ssh_segment() {
+        let text = status_text(
+            &StatusLine {
+                cwd: Path::new("/home/u"),
+                shell: "bash",
+                model: "—",
+                profile: None,
+                block: None,
+                remote: Some("user@prod"),
+                exit: None,
+            },
+            None,
+            Instant::now(),
+        );
+        assert_eq!(text, "/home/u · bash · — · ssh:user@prod · running");
     }
 
     /// OSC 9 carries only a message; OSC 777's `notify;<title>;<body>`

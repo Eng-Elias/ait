@@ -133,7 +133,78 @@ fn schema_is_valid_json_covering_the_settings_model() {
         "EndpointSchema",
         "ExecutionProfile",
         "TerminalSettings",
+        "SshSettings",
+        "RedactionSettings",
+        "InputSettings",
+        "ClassifierMode",
     ] {
         assert!(defs[name].is_object(), "$defs missing {name}");
     }
+    // Spec R09-T1: `--print-schema` covers the `[ssh]` model.
+    assert!(schema["properties"]["ssh"].is_object());
+    // Spec R10-T1: `--print-schema` covers the `[redaction]` model.
+    assert!(schema["properties"]["redaction"].is_object());
+    // Spec R11-T1: `--print-schema` covers the `[input]` model.
+    assert!(schema["properties"]["input"].is_object());
+}
+
+/// Spec R09-T1: `ait --init`'s template documents all four `[ssh]`
+/// keys in a commented block.
+#[test]
+fn template_documents_the_ssh_section() {
+    let template = default_template();
+    for key in [
+        "enable_integration",
+        "hosts_allowlist",
+        "hosts_denylist",
+        "reuse_existing_control_master",
+    ] {
+        assert!(template.contains(key), "template missing [ssh] key {key}");
+    }
+    assert!(
+        template.contains("# [ssh]"),
+        "the [ssh] block stays commented"
+    );
+}
+
+/// Spec R10-T1: `ait --init`'s template documents the `[redaction]`
+/// section — the three lists plus the names they toggle — in a
+/// commented block (§4.3 decided).
+#[test]
+fn template_documents_the_redaction_section() {
+    let template = default_template();
+    for key in ["extra", "enable", "disable"] {
+        assert!(
+            template.contains(key),
+            "template missing [redaction] key {key}"
+        );
+    }
+    for name in ["aws_access_key", "pii_email"] {
+        assert!(
+            template.contains(name),
+            "template missing pattern name {name}"
+        );
+    }
+    assert!(
+        template.contains("# [redaction]"),
+        "the [redaction] block stays commented"
+    );
+}
+
+/// Spec R11-T1: `ait --init`'s template documents the `[input]`
+/// section — the classifier key and both live modes — in a commented
+/// block (§5.10.4).
+#[test]
+fn template_documents_the_input_section() {
+    let template = default_template();
+    for key in ["classifier", "heuristic", "off"] {
+        assert!(
+            template.contains(key),
+            "template missing [input] vocabulary {key}"
+        );
+    }
+    assert!(
+        template.contains("# [input]"),
+        "the [input] block stays commented"
+    );
 }

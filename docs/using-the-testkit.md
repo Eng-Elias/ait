@@ -39,6 +39,29 @@ Other verbs: `text`, `bytes` (hex), `mouse = {event, col, row}`,
 `.jsonl` under `tests/recordings/` — regenerate with
 `AIT_E2E_RECORD=1 AIT_E2E_DRIVER=<cmd>`; replay needs no model).
 
+## Wait on execution, not echo
+
+`wait_text` and `expect_*` see everything the PTY renders — including
+the shell's echo of the command you just typed. Gate on a marker only
+a *running* command can produce, or the wait fires early and the test
+asserts on a screen from before the command ran:
+
+- `wait_text = "FLOOD-DONE"` after `text = "echo FLOOD-DONE\n"`
+  matches the echo, not the output. Use shell expansion to separate
+  them: send `echo FD$((100+24))`, wait for `FD124`.
+- The same trap lives in Rust-side waits (`drain_until`,
+  `wait_for_screen`) and in prompt detection itself: a wait that
+  matches the cursor's current row fires early when the prompt ends
+  exactly at the right margin — check for any rendered non-empty row
+  instead.
+
+Code-first tests share `ait_testkit`'s probes rather than re-rolling
+these gates: `wait_fresh_prompt` (every prompt char, `#` included for
+uid-0 shells whose PS1 `\$` renders `#`), `terminal_half` /
+`panel_has_line` (the `│` split), `sentinel_result` (the
+`__AIT_END_<id>=<exit>` result row — never the echo's `=%d`) and
+`json_string` (`src/probes.rs`).
+
 ## Watch it run
 
 ```bash
@@ -51,6 +74,33 @@ cargo run -p ait-testkit --example drive   # interactive manual driving
 
 `target/e2e-failures/<test>/` → `screen.txt`, `pty-tail.bin`,
 `actions.log`. A stuck terminal after a headed run: `reset`.
+
+## Driving the agent panel and remote sessions
+
+Three traps from the R09 ssh transcript test — each costs a debug
+cycle when learned from a timeout dump instead:
+
+- **The task input is ~30 columns.** `type_text` into a focused panel
+  scrolls long input — a `contains` wait on your task text never
+  fires (only the tail stays visible). Gate on what the panel does
+  next — the `approve <tool>` card, a `✓ <tool>` result, the `done`
+  status via `panel_has_line` — or probe the input's *tail*
+  (`contains("remote-marker.txt")` for a task ending in that name,
+  marked `sentinel-ok` since it keys on echo by design).
+- **`Esc` unfocus races queued input.** `Esc` hands focus back to the
+  terminal, but bytes typed in the same breath can still land in the
+  panel's input (`exit` became `xit` mid-flight). `Alt+A` toggles the
+  panel itself — on a focused panel it closes it (the documented
+  three-state cycle) — a deterministic return of keystrokes to the
+  PTY, and a full-width terminal for any `terminal_half` probes after
+  it.
+- **Remote confinement roots at the *remote* cwd.** With remote
+  context open, the agent's file tools resolve through the remote
+  shell's cwd — `/root` on a loopback sshd — not the spawn's local
+  tempdir; `fs::write(app.cwd(), …)` seeds a file the remote read
+  can't see. Seed fixtures over the remote channel itself (an
+  `echo MARKER > file` block run inside the wrapped session) so the
+  agent's read exercises the real path.
 
 ## For AI agents
 
@@ -88,3 +138,32 @@ fix the product code. Never weaken an assertion to silence drift. (4) Keep
 running until green and commit.
 ```
 
+
+## Flaky tests
+
+Timing-bound tests (real PTYs, settle windows, parallel load) flake;
+the fix ladder is ordered. (1) Deterministic seam first — gate waits
+on output only execution produces (standard 15) and on protocol marks
+in a real emitter's order (standard 16); a scripted-but-fictional
+order is a test bug, not coverage. (2) Bound, not guess — a settle
+window or deadline is the last resort, sized for the slowest CI box
+and named as a constant the next ticket can tighten. (3) Retry is the
+honest last resort — mark the retry in the test name or comment so
+flakes surface in the dump instead of hiding; never weaken an
+assertion to silence drift.
+
+Known flakes — a gate failure on one of these that goes green on a
+plain re-run needs no re-diagnosis; add a name here when a new one
+surfaces, and file the real fix on the ladder above:
+
+- `agent_profile.rs::write_to_pty_first_write_asks_then_the_session_runs_free`
+  — first-write timing race (R08 merge gate; green on re-run).
+- `shell_integration.rs::bash_blocks_copy_and_inband_roundtrip`
+  — block-seal timing (R08 gate; green on re-run).
+- `executor.rs::control_master_runs_commands_over_the_socket` and
+  `executor.rs::demotion_never_replays_and_never_recovers`
+  (ait-agent) — executor timing; green on re-run.
+- `pty.rs::the_agent_shell_arms_the_ssh_policy` (ait-agent) —
+  PTY timing; green on re-run.
+- `scenario.rs::deterministic_verbs_drive_a_shell_scenario`
+  (ait-testkit self-test) — timing; green on re-run.

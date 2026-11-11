@@ -1,34 +1,65 @@
 [package]
 name = "ait-agent"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; the tool registry, agent loop and permission engine arrive in later tickets."
+description = "AIT's agent core (REQUIREMENTS.md §3.1): Round 4 lands the §5.4 NL→command feature — §5.10.3 credential redaction, context assembly and reply sanitization pure seams, plus the channel-based CommandSuggester owning its tokio runtime on a worker thread; Round 6 adds §5.6 agent mode — the AgentSession channel handle and model↔tools loop, the tool registry, the interim ask-everything gate, CommandExecutor/ShellBridge for run_command and the write_to_pty agent-owned PTY; the §5.7 permission engine lands in Round 7."
 
 [dependencies]
 # Semver requirements; the resolved releases are >=7 days old per the
 # ADR-0002 supply-chain rule: regex 1.13.1 (2026-07-15) backs the
 # compiled-once credential pattern set behind `redact` (§5.10.3);
 # tokio 1.53.3 (2026-10-13; 1.54.x is too fresh) — the current-thread
-# runtime on CommandSuggester's worker thread, `rt` + `time` being the
+# runtime on the agent workers, `rt` + `time` + `process` being the
 # minimal feature set it needs (ADR-0004: tokio lives here, never in
-# `ait`; the adapters' timers want the `time` driver); tokio-util
+# `ait`; the adapters' timers want the `time` driver, and
+# `process` spawns the §5.10.1 MCP stdio servers); tokio-util
 # 0.7.20 (2026-10-09) — `sync::CancellationToken` for `Endpoint::stream`,
 # needs no feature flag and is NOT re-exported by ait-llm;
-# futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`.
+# futures-util 0.3.34 (2026-08-11) — `StreamExt` on `EndpointStream`;
+# serde 1.0.229 (2026-07-18) + serde_json 1.0.154 (2026-10-11) — tool
+# arguments stream as JSON fragments and parse once complete, `ToolSpec`
+# parameter schemas are `serde_json::Value` (Spec R06), and `derive` puts
+# the persisted `TranscriptItem` vocabulary on the wire (Spec R08).
 regex = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "process"] }
 tokio-util = "0.7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Release >=7 days old per ADR-0002: rmcp 3.8.0 (2026-10-26) — the
+# §5.10.1 MCP client inside the agent's `McpPool` (Spec R10-T3).
+# Exact pin on the `alacritty_terminal` precedent: rmcp ships every
+# ~1–2 weeks and the 3.x client surface still moves. Minimal
+# features — `client` + `transport-child-process` (which supplies
+# the `tokio/process` edge `tokio::process::Command` needs) — keep
+# the server/macros/schemars tree out of the build.
+rmcp = { version = "=3.8.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+] }
 # `Settings::resolve_model`, `ModelRole::Command`, `OsKeyring` /
 # `SecretStore` — per-request model resolution with the command_model →
 # base_model fallback (§4.2); the caller hands Settings in, the
-# suggester never reads settings.toml.
-ait-config = { path = "../ait-config" }
+# suggester never reads settings.toml. `secrets` pulls in the
+# `keyring`-backed `OsKeyring` `CommandSuggester::new` resolves through.
+ait-config = { path = "../ait-config", features = ["secrets"] }
 # Context assembly returns ait-llm's `EndpointRequest` — the
 # schema-matched IR `Endpoint::stream` accepts — so T3's
 # `CommandSuggester` passes assembled requests through unchanged.
 ait-llm = { path = "../ait-llm" }
+# `write_to_pty`'s agent-owned PTY: `LiveSession::spawn` +
+# `send_bytes`/`drain_events` on the worker thread (Spec R06-T7; a
+# core→core edge is permitted — cores never depend on the frontend).
+ait-term = { path = "../ait-term" }
+# The injection planner the agent PTY spawns through (Spec R06-T7)
+# plus `run_command`'s user-shell executor (Spec R06-T4): `plan` +
+# `Materialized`'s argv/env rewrite makes the interactive session
+# `Integrated`, and the bridge's in-band await is typed in
+# ait-shell's `RunResult` with bridge subscriptions carrying decoded
+# `ShellEvent`s (7700 hooks / 7701 frames) — the same §5.5.1 codec
+# vocabulary `ait` decodes.
+ait-shell = { path = "../ait-shell" }
 
 [dev-dependencies]
 # The in-process HTTP fixture server for the CommandSuggester
@@ -36,3 +67,6 @@ ait-llm = { path = "../ait-llm" }
 # `test-fixtures` — `ait_llm::testing`, one shared harness for every
 # crate's tests.
 ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }
+# Release >=7 days old per ADR-0002: tempfile 3.27.0 (2026-03-11) —
+# fixture cwd trees with AGENTS.md files for the AgentSession tests.
+tempfile = "3"

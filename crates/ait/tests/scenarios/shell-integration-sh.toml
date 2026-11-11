@@ -1,0 +1,51 @@
+# Spec R05 §5.5 graceful degrade: the pinned `/bin/sh` (dash) gets no
+# injection — the planner returns `None` for unknown basenames — so the
+# terminal works exactly as before: output renders, no block segment
+# ever appears on the status line, no errors.
+#
+# A line ENDING in `$`/`#` is a fresh, empty prompt — `#` covers uid-0
+# shells, whose PS1 `\$` renders `#` (rows are trim_end'ed; a prompt
+# carrying typed text ends in the command). Every command is fenced by
+# two waits: first its own ECHO (until the typed text renders, the
+# previous bare prompt still satisfies `…[$#]$` and a fresh-prompt
+# wait could pass early), then a fresh bare prompt.
+feature = "shell-integration"
+size = [80, 24]
+
+[[steps]]
+wait_text = "· sh · — · running"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+[[steps]]
+text = "echo SHMARKER\n"
+
+[[steps]]
+expect_regex = "echo SHMARKER"
+
+# Back at a bare prompt — the echo ran to completion.
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+# A failing command: the error output proves `ls` ran to completion,
+# and the fresh prompt behind it lands after its block would have
+# closed — so the status check below can't beat a `✗` that isn't
+# coming.
+[[steps]]
+text = "ls /ait-no-such-dir\n"
+
+[[steps]]
+expect_regex = "ls /ait-no-such-dir"
+
+[[steps]]
+expect_regex = "No such file"
+
+[[steps]]
+expect_regex = "(?m)^[^\\n]*[$#]$"
+
+# The summary is still `cwd · sh · — · running` — no `✓/✗ <code> ·
+# <dur>` segment could slot between `—` and `running`, so this match
+# proves no blocks formed even across a failed command.
+[[steps]]
+expect_text = "· sh · — · running"

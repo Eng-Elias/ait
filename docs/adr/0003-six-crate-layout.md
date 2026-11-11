@@ -20,14 +20,15 @@ We adopt the §3.1 six-crate layout unchanged:
 | Crate | Responsibility | Status |
 |---|---|---|
 | `ait-term` | PTY spawn, VT parsing, grid + scrollback, session lifecycle, OSC interception | exists (Round 1) |
-| `ait-config` | `settings.toml` model, JSON Schema emission, secrets lookup | exists (Round 3) |
+| `ait-config` | `settings.toml` model, JSON Schema emission, secrets lookup; §5.7 command-list regex validation (Round 7 — adds the `regex` edge); §5.10.3 `[redaction]` section + `pattern_names` vocabulary + `watch_dirs` directory watching for the skills roots (Round 10); §5.10.4 `[input]` section — `input.classifier` (Round 11) | exists (Round 3) |
 | `ait-llm` | Provider trait, per-schema message IR, streaming adapters | exists (Round 3) |
-| `ait-shell` | Shell-integration scripts (bash/zsh/fish) and the hook/exec protocol | planned (Round 5) |
-| `ait-agent` | Redaction, context assembly, reply sanitization, `CommandSuggester` (Round 4); tool registry, agent loop, permission engine | exists (Round 4; agent-mode pieces land Round 6) |
-| `ait` | TUI binary (frontend only — no business logic) | exists (Round 2 TUI; Round 3 config wiring) |
+| `ait-shell` | Shell-integration scripts (bash/zsh/fish) and the hook/exec protocol; §5.10.4 per-shell builtin tables (`builtins_for` — the shared POSIX set plus bash/zsh/fish), the classifier `ProgramIndex`'s builtin half (Round 11) | exists (Round 5) |
+| `ait-agent` | Redaction, context assembly, reply sanitization, `CommandSuggester` (Round 4); `AgentSession` loop, tool registry + interim gate, `CommandExecutor`/`ShellBridge`, agent-owned PTY (Round 6 — adds `ait-term` and `ait-shell` edges); §5.7 permission engine (Round 7); §5.8 transcript vocabulary, replay and summarization (Round 8); named-pattern `Redactor` built per request from `[redaction]` + §5.10.1 `McpPool`/`call_mcp_tool`/`read_mcp_resource` on the worker runtime — adds the `rmcp` edge; §5.10.2 `SkillsCatalog` snapshot on `AgentRequest` + `invoke_skill` on the `read_files` level (Round 10); §5.10.4 `classify` + `ProgramIndex`/`InputClass` — the input classifier's decision half (Round 11) | exists (Round 4; agent mode Round 6) |
+| `ait` | TUI binary (frontend only — no business logic); §5.10.2 `LiveSkills` watcher on both skills roots feeding each `AgentRequest`'s catalog snapshot (Round 10); §5.10.4 the third submission trigger (NL verdict → `# <line>` rewrite) and §5.10.5 the `ait ctl` control socket server/client + the `--headless` driver (Round 11) | exists (Round 2 TUI; Round 3 config wiring) |
+| `ait-store` | SQLite store: conversations, transcript items, plans, terminal sessions, block metadata (Round 8, ADR-0011) | exists (Round 8) |
 
-The layout may still grow (e.g. `ait-store`, `ait-ssh`) — such growth gets its
-own ADR.
+The layout may still grow (e.g. `ait-ssh`) — such growth gets its own ADR
+(`ait-store`'s was ADR-0011).
 
 ## Consequences
 

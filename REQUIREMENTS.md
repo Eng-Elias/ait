@@ -58,7 +58,7 @@ cloud dependency, no vendor lock-in.
 | HTTP / streaming | `reqwest` + `eventsource-stream` (SSE) | Streaming for every provider schema |
 | Config | `toml` + `serde` + `schemars` | `settings.toml` + emitted JSON Schema |
 | Secrets | env vars + `keyring` crate | Never in `settings.toml` |
-| Storage | **Proposed:** `rusqlite` | Conversations, blocks, plans (Round 8) |
+| Storage | `rusqlite` (`bundled`) | Conversations, blocks, plans (Round 8, ADR-0011) |
 | MCP | `rmcp` | Round 10 |
 | Search (later) | `tantivy` | Optional, post-v1 |
 | Errors / logs | `thiserror` in libs, `anyhow` in binaries, `tracing` | Logs to file, never to the TUI |
@@ -104,9 +104,10 @@ Heavyweight or platform-specific dependencies go behind cargo features.
 | `ait-shell` | Shell-integration scripts (bash/zsh/fish) and the hook/exec protocol |
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction |
 | `ait` | TUI binary (frontend only — no business logic) |
+| `ait-store` | SQLite store: conversations, transcript items, plans, terminal sessions, block metadata |
 
-The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-store`,
-`ait-ssh`).
+The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-ssh`);
+`ait-store` landed in Round 8 (ADR-0011).
 
 ---
 
@@ -141,11 +142,12 @@ Model roles are separate from endpoints and are set per execution profile:
 `base_model`, `coding_model`, `command_model` (NL→command), `context_window_limit`.
 Each role references a model `config_key`. Unset roles fall back to `base_model`.
 
-### 4.3 Other settings (Proposed)
+### 4.3 Other settings
 
 - `[terminal]` shell path override, scrollback lines, `osc52` child-app clipboard opt-in, keybindings.
-- `[ssh]` `enable_integration`, `hosts_denylist`, `reuse_existing_control_master`.
-- `[redaction]` extra user regexes, toggle per built-in pattern.
+- `[ssh]` `enable_integration`, `hosts_allowlist`, `hosts_denylist`, `reuse_existing_control_master` (Round 9, §5.9).
+- `[redaction]` `extra` user regexes, `enable`/`disable` per named pattern — the §5.10.3 built-ins plus opt-in PII categories (Round 10).
+- `[input]` `classifier` — `heuristic` (default) or `off`, the §5.10.4 input classifier's arm switch (Round 11).
 
 ---
 
@@ -208,7 +210,8 @@ parsing output.
 - Ship rc snippets for bash, zsh and fish. `ait` injects them on session start
   without editing the user's dotfiles (e.g. via `--rcfile`/`ZDOTDIR` wrappers).
 - Snippets emit standard `OSC 133;A/B/C/D;<exit>` and `OSC 7`.
-- Snippets also emit AIT hook events on a private channel (Proposed protocol):
+- Snippets also emit AIT hook events on a private channel (Decided,
+  ADR-0008):
 
   ```
   ESC ] 7700 ; <hex(json)> BEL
@@ -223,22 +226,32 @@ parsing output.
 - **Graceful degrade:** if integration is absent (unknown shell, `sudo -i`,
   dumb remote shell), the terminal still works — no blocks, no errors.
 
-#### 5.5.1 In-band command execution (Proposed protocol)
+#### 5.5.1 In-band command execution (Decided, ADR-0008 — amended)
 
 Lets `ait` run a command inside the user's live shell (with their env, aliases,
 functions) and capture the result without a second channel:
 
 ```
-ait → PTY input : __ait_run <id> '<command>'
+ait → PTY input : __ait_run <id> <hex(command)>
 shell → output  : ESC ] 7701 ; A BEL
-                  ESC ] 7701 ; R ; <len> ; <hex("<id>;<stdout+stderr>;<exit_code>")> BEL
+                  ESC ] 7701 ; R ; <len> ; <hex> BEL          (repeated)
                   ESC ] 7701 ; B BEL
 ```
 
-The shell function runs the command in the background, so the user's prompt is
-not disturbed. Responses are not rendered in the grid.
+The `R` frames carry successive slices of one `<id>;<stdout+stderr>;
+<exit_code>` payload — `<len>` is the decoded byte length of *that* frame, and
+every complete OSC stays under ~1024 raw bytes (the `vte` parser cap). The
+shell function runs the command in a capture subshell, so the user's prompt is
+not disturbed. Responses are not rendered in the grid; the typed `__ait_run`
+line stays visible.
 
-#### 5.5.2 Shell-native completions (stretch, Proposed protocol)
+#### 5.5.2 Shell-native completions (stretch — protocol reserved, not implemented)
+
+Codes `7702` and `7703` are reserved by ADR-0008; nothing emits or consumes
+them yet. The sketch below is still proposal-grade:
+
+`__ait_complete <hex(line)>` asks the shell's own completion system (bash
+`complete -p` + dynamic loaders, zsh compsys, fish `complete -C`) for matches:
 
 `__ait_complete <hex(line)>` asks the shell's own completion system (bash
 `complete -p` + dynamic loaders, zsh compsys, fish `complete -C`) for matches:
@@ -322,6 +335,31 @@ context_window_limit = 0               # 0 = model default
      request/response protocol with request ids and a rotating auth token.
   4. **No-op** — fallback when nothing else is available.
 - Per-host allow/deny (`[ssh] hosts_denylist`), and an opt-out per session.
+
+Decided in Round 9 (Spec R09, ADR-0012): each injected shell defines an
+`ssh()` function that rewrites a bare interactive, policy-allowed
+`ssh [options] <destination>` into `ssh -t <args> '<remote bootstrap>'`,
+attaching `-o ControlMaster=auto -o ControlPath=<control-dir>/%C -o
+ControlPersist=<dur>` unless the user's own config already manages a socket
+(`reuse_existing_control_master`). All other shapes pass through to
+`command ssh` — deny means no wrap, never a block. The wrapper emits
+`ssh_begin` before connect and `ssh_end` after return — every wrapper hook
+carrying a minted `hop` id so nested `ssh` levels attribute correctly;
+the remote bootstrap
+(a self-contained POSIX-sh script, never a dotfile) lands the snippet file
+set in a private `mktemp -d`, exports `AIT_IS_SSH=1` + the `AIT_SSH_*`
+policy so nested hops re-wrap, traps EXIT/HUP for `exit_shell` and cleanup,
+then runs the remote `$SHELL` as a child. The frontend folds vetted hooks
+into a per-tab remote-context stack — a close event retires the level its
+`hop` names and everything above — feeding the `ssh:<target>` status
+segment, bridge `remote_state` (whose `bootstrapped` is the remote shell's
+own integration proof — an unbootstrapped remote clamps off the in-band
+tier), and `blocks.host` at seal; ait-owned control sockets retire on
+close. `select_executor` prefers a live ControlMaster socket — demoting
+permanently on transport failure, the hit run erroring rather than
+replaying — and remote
+`read_files`/`grep`/`glob` compose through the task's executor while
+`edit_files` reports "unsupported" honestly.
 
 ### 5.10 Depth features (Rounds 10–11)
 

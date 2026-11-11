@@ -25,3 +25,25 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
 14. In-flight async work pins a stable identity (`Tab::id`, a session
     token) — never a positional index or an OS handle that reorder or
     recycle underneath it (R04's `SuggestionPin`).
+15. Gate PTY/shell test waits on output only execution produces — never
+    the command's own echo: type `echo FD$((100+24))`, wait for `FD124`
+    (`docs/using-the-testkit.md`).
+16. A test that scripts an external protocol's event order mirrors the
+    order a real emitter produces; a convenient fictional order is a
+    test bug, not a shortcut. (R06's MarksOnly `133;B→D` passed tests
+    while failing every real shell, whose precmd order is `D,A,B`.)
+17. Text that crosses a crate boundary — wire strings, synthetic ids,
+    status lines, preview clips — is defined once in the library
+    crate and imported by the frontend, never re-literal'd at a
+    second site (R08's interrupted-result / replay-id duplication
+    drifted until the review single-sourced them).
+18. A regex that can plausibly over-match ships a negative specimen
+    beside its positive one — near-miss text the pattern must NOT
+    match. Over-match-prone categories especially (§5.10.3's PII
+    set): a lax edge mangles ordinary text, and `pii_ipv6`'s bare
+    `::` match would have redacted every Rust path segment.
+19. Markdown prose wraps at ~80 columns; fenced code blocks, tables
+    and URLs are exempt (a URL split across lines breaks copy-paste,
+    a table row can't wrap). Reviewers cite this rule rather than
+    re-adjudicating line-length nits per round (R12).
+

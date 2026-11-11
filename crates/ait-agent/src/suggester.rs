@@ -7,9 +7,11 @@
 //! dependency tree or its synchronous poll loop.
 //!
 //! Per request the worker resolves
-//! `Settings::resolve_model("default", ModelRole::Command, store)` —
-//! the `command_model` → `base_model` fallback lives inside
-//! `resolve_model` (§4.2, us-21) — assembles the single-turn request
+//! `Settings::resolve_model(request.profile, ModelRole::Command, store)`
+//! — the active execution profile the frontend armed for that
+//! submission (§5.7), with the `command_model` → `base_model` fallback
+//! inside `resolve_model` (§4.2, us-21) — assembles the single-turn
+//! request
 //! through [`assemble_request`], and streams via
 //! `Endpoint::stream(request, CancellationToken)`. Every failure mode
 //! (unconfigured model, resolution/transport/stream error, cancelled
@@ -29,19 +31,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ait_config::{ModelRole, OsKeyring, SecretStore, Settings};
-use ait_llm::{
-    anthropic_messages, openai_chat_completions, openai_responses, Endpoint, EndpointConfig,
-    EndpointRequest, EndpointSchema, EndpointStream, EndpointStreamEvent,
-};
+use ait_llm::{Endpoint, EndpointConfig, EndpointRequest, EndpointStream};
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::{assemble_request, ReplySanitizer, SuggestContext};
-
-/// The execution profile whose model roles command requests resolve
-/// against (§4.2 — the only profile Round 4 wires; per-profile roles
-/// are Round 7).
-const PROFILE: &str = "default";
+use crate::endpoint_bridge::{extract, llm_schema, slot, Extracted};
+use crate::{assemble_request, Redactor, ReplySanitizer, SuggestContext};
 
 /// One `# `/`Alt+Enter` request — the value the frontend sends on the
 /// suggester's channel. It carries the terminal-side context the model
@@ -53,6 +48,11 @@ pub struct SuggestRequest {
     /// The caller's live `Settings` — resolved per request, so the
     /// latest hot-reloaded `command_model` applies immediately.
     pub settings: Settings,
+    /// The active execution profile's name (§5.7 / Spec R07 us-26):
+    /// the stance `command_model` resolves against for THIS request,
+    /// snapshotted beside `settings` so a frontend-side switch applies
+    /// to the next submission.
+    pub profile: String,
     /// The tab's working directory (OSC 7 with a `/proc` fallback).
     pub cwd: String,
     /// The shell name — `$SHELL`'s basename, e.g. `bash` (us-17).
@@ -195,17 +195,6 @@ impl Drop for CommandSuggester {
     }
 }
 
-/// Lock the shared cancellation-token slot, recovering a poisoned
-/// guard — a poisoned `Option<CancellationToken>` is still sound to
-/// read (the token may simply be stale).
-fn slot(
-    mutex: &Mutex<Option<CancellationToken>>,
-) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// The worker thread: own the current-thread runtime and serve
 /// requests in order. A runtime that cannot be built degrades every
 /// request to an `Error` event rather than wedging the frontend (§6).
@@ -246,18 +235,21 @@ fn serve(
     store: &dyn SecretStore,
 ) {
     // `resolve_model` takes `&(impl SecretStore + ?Sized)` — the boxed
-    // store's `&dyn` reference flows straight through.
+    // store's `&dyn` reference flows straight through. The request's
+    // own profile resolves the role (§4.2/§5.7) — the selection the
+    // frontend armed when it fired, never a global.
     let resolved = match request
         .settings
-        .resolve_model(PROFILE, ModelRole::Command, store)
+        .resolve_model(&request.profile, ModelRole::Command, store)
     {
         Ok(Some(resolved)) => resolved,
         Ok(None) => {
             emit(
                 events,
                 SuggestEvent::Error(format!(
-                    "profile {PROFILE:?} has no command_model configured \
-                     (and no base_model fallback) — set it in settings.toml"
+                    "profile {:?} has no command_model configured \
+                     (and no base_model fallback) — set it in settings.toml",
+                    request.profile
                 )),
             );
             return;
@@ -290,7 +282,16 @@ fn serve(
     };
     // `assemble_request` takes the endpoint's own schema + wire model,
     // so the returned IR can never trip `LlmError::SchemaMismatch`.
-    let endpoint_request = assemble_request(&context, endpoint.schema(), &endpoint.config().model);
+    // The request's `[redaction]` settings build its redactor here
+    // (Spec R10) — per request, so a hot-reloaded snapshot applies
+    // to the next submission (us-37).
+    let redactor = Redactor::new(&request.settings.redaction);
+    let endpoint_request = assemble_request(
+        &context,
+        &redactor,
+        endpoint.schema(),
+        &endpoint.config().model,
+    );
 
     let token = CancellationToken::new();
     *slot(in_flight) = Some(token.clone());
@@ -354,68 +355,4 @@ async fn stream_and_emit(
 /// into the void.
 fn emit(events: &Sender<SuggestEvent>, event: SuggestEvent) -> bool {
     events.send(event).is_ok()
-}
-
-/// What a schema-tagged [`EndpointStreamEvent`] means to the command
-/// path — text worth streaming, a provider-reported error worth
-/// toasting, or anything else (`Finish`, `ToolCallDelta`) a one-shot
-/// command request ignores.
-enum Extracted {
-    /// Assistant text — pushed through `ReplySanitizer`.
-    Text(String),
-    /// A provider-reported error event, rendered for the toast.
-    ProviderError(String),
-    /// Everything else.
-    Other,
-}
-
-/// Flatten the three per-schema event IRs (they stay distinct, §5.3 —
-/// the flattening happens here at the channel edge, not in the IRs).
-fn extract(event: EndpointStreamEvent) -> Extracted {
-    match event {
-        EndpointStreamEvent::OpenAiChatCompletions(event) => match event {
-            openai_chat_completions::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            openai_chat_completions::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-        EndpointStreamEvent::OpenAiResponses(event) => match event {
-            openai_responses::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            openai_responses::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-        EndpointStreamEvent::AnthropicMessages(event) => match event {
-            anthropic_messages::StreamEvent::TextDelta { text } => Extracted::Text(text),
-            anthropic_messages::StreamEvent::Error { message, code } => {
-                Extracted::ProviderError(provider_error(message, code))
-            }
-            _ => Extracted::Other,
-        },
-    }
-}
-
-/// A provider error event for the toast: the message, with the
-/// machine-readable code appended when the endpoint sent one.
-fn provider_error(message: String, code: Option<String>) -> String {
-    match code {
-        Some(code) => format!("{message} ({code})"),
-        None => message,
-    }
-}
-
-/// `ait-config`'s schema enum and `ait-llm`'s are deliberately separate
-/// types (the llm crate owns its wire vocabulary); bridge them here —
-/// the same seam `ait-llm`'s `chat` example uses. Two copies exist by
-/// design (ait-llm stays config-free); keep them in sync with
-/// `crates/ait-llm/examples/chat.rs`'s `llm_schema` when a fourth
-/// `EndpointSchema` variant lands.
-fn llm_schema(schema: ait_config::EndpointSchema) -> EndpointSchema {
-    match schema {
-        ait_config::EndpointSchema::OpenAiChatCompletions => EndpointSchema::OpenAiChatCompletions,
-        ait_config::EndpointSchema::OpenAiResponses => EndpointSchema::OpenAiResponses,
-        ait_config::EndpointSchema::AnthropicMessages => EndpointSchema::AnthropicMessages,
-    }
 }

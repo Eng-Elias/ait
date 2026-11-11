@@ -77,6 +77,9 @@ crates/ait-testkit/            the harness library
   src/command.rs               Command driver (AIT_E2E_DRIVER subprocess)
   src/scenario.rs              TOML scenario format + runner
   src/evidence.rs              failure dumps, dump_root, panic_text
+  src/probes.rs                shared probes for code-first tests:
+                               fresh-prompt wait, panel/sentinel
+                               predicates, json_string
   tests/                       self-tests on /bin/sh — no ait needed
 
 crates/ait/tests/
@@ -116,6 +119,13 @@ fn alt_t_opens_a_second_tab() {
   `PS1="$ "`, a fresh temp cwd, `TERM=xterm-256color` — screens
   reproduce across machines and CI. `SpawnConfig.env` is the escape
   hatch (applied after the pins).
+- Two environment facts have burned gate cycles. Tests run as uid 0,
+  where prompts render `# ` (PS1's `\$`) — `# <line>` on screen
+  can't tell "typed verbatim" from "rewritten as a comment", so
+  assert the rewrite as `# # <line>` and verbatim input by the
+  line's own text. And Ubuntu's command-not-found handler prints
+  `Command '<name>' not found` — wait on `not found`, never the
+  `command not found` casing.
 - Every wait is bounded (~15 s); timeouts and failed asserts panic with
   the screen in the message. **No fixed sleeps.**
 - `app.snapshot()` returns cwd-redacted screen text for
@@ -223,6 +233,32 @@ failing test lands in the CI artifact verbatim. Per
 `docs/e2e-driver-protocol.md`, scenarios never type or print real
 secrets; keep it that way.
 
+## PR evidence generators
+
+A round's PR asks for transcript evidence — the convention is an
+`#[ignore]`d, env-gated code-first test named `pr_evidence_*` that
+drives a real flow and `--nocapture`-prints the screen at each beat:
+
+```rust
+#[test]
+#[ignore = "manual evidence generator — AIT_E2E_SSH=1"]
+fn pr_evidence_ssh_remote_transcript() {
+    if std::env::var_os("AIT_E2E_SSH").is_none() {
+        return;
+    }
+    // drive the flow; at each beat:
+    // println!("--- beat N: <what just happened> ---\n{}", app.screen_text());
+}
+```
+
+Committed precedents: `pr_evidence_transcript` (`tests/e2e.rs`),
+`pr_evidence_agent_loop_transcript` and
+`pr_evidence_full_task_transcript` (`tests/agent_panel.rs`),
+`pr_evidence_ssh_remote_transcript` (`tests/ssh.rs`). Run one with
+`cargo test -p ait --test <file> pr_evidence -- --ignored --nocapture`
+plus whatever gate env the test documents — beats land on stdout,
+ready to paste into a PR body.
+
 ## Environment variables
 
 | var | effect |
@@ -234,6 +270,8 @@ secrets; keep it that way.
 | `AIT_E2E_DUMP_DIR` | override the failure-dump root (else `<workspace>/target/e2e-failures`) |
 | `AIT_E2E_HEADED` | headed mode: mirror raw PTY output to the controlling terminal while tests run |
 | `AIT_E2E_SLOWMO` | watch pacing in ms: fixed delay after each input verb (overrides `SpawnConfig::slowmo_ms`) |
+| `AIT_E2E_SSH` | opt the `tests/ssh.rs` suite in — every test there returns early without it; `scripts/ssh-e2e.sh` is the entry point |
+| `AIT_E2E_SSH_PORT`, `AIT_E2E_SSH_KEY` | container-target endpoint + identity from `ssh-e2e.sh up` (both required for that path); `AIT_E2E_SSH_USER`/`AIT_E2E_SSH_HOST` override the `testuser`/`127.0.0.1` defaults. Bare `AIT_E2E_SSH=1` makes the test self-provision a local sshd instead |
 
 ## Watching tests run (headed mode)
 
@@ -270,11 +308,16 @@ interactively from your keyboard.
 
 ## CI
 
-`.github/workflows/ci.yml` has two jobs: `check` (the three AGENTS.md
+`.github/workflows/ci.yml` has three jobs: `check` (the three AGENTS.md
 gates verbatim — `cargo test --workspace` already covers the e2e
-suite) and `e2e` (build `ait`, run `-p ait -p ait-testkit`, upload
-`target/e2e-failures/` as an artifact on failure). Everything runs
-without a TTY or network — the PTY is ours (REQUIREMENTS.md §6).
+suite — plus zsh/fish so `ait-shell`'s snippet tests exec all three
+shells rather than skipping legs silently), `e2e` (build `ait`, run
+`-p ait -p ait-testkit`, upload `target/e2e-failures/` as an artifact
+on failure) and `ssh-e2e` (`scripts/ssh-e2e.sh run` — the
+AIT_E2E_SSH-gated remote loop against a throwaway sshd container).
+Everything runs without a TTY or network — the PTY is ours
+(REQUIREMENTS.md §6); the ssh-e2e job's only network use is docker's
+image pull.
 
 ## Not covered (by design)
 

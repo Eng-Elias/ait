@@ -18,6 +18,8 @@ use std::ops::Range;
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
 
+use crate::conversations::ConversationPicker;
+use crate::profile::ProfilePicker;
 use crate::selection::SelectionRange;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -201,6 +203,51 @@ pub fn content_size(area: Rect) -> Size {
     )
 }
 
+/// The panel's column count on a `width`-column content band: two
+/// fifths of the band (Spec R06 §3's side-by-side split), never more
+/// than what leaves the session one column.
+fn panel_columns(width: usize) -> usize {
+    (width * 2 / 5).min(width.saturating_sub(1))
+}
+
+/// The session's column count on a `width`-column content band — the
+/// whole band, or the band minus the open agent panel's share.
+fn session_columns(width: usize, panel_open: bool) -> usize {
+    if panel_open {
+        width - panel_columns(width)
+    } else {
+        width
+    }
+}
+
+/// Split the content band into the session grid's rect and — when the
+/// active tab's agent panel is open — the right-side panel rect (Spec
+/// R06 §3's side-by-side diagram). `None` for the panel when it is
+/// closed or the band is too narrow to spare it a column. The same
+/// [`panel_columns`] math backs this and [`session_size`], so the
+/// painted split and the PTY winsize can never disagree.
+pub fn split_content(content: Rect, panel_open: bool) -> (Rect, Option<Rect>) {
+    let session = session_columns(usize::from(content.width), panel_open) as u16;
+    let terminal = Rect {
+        width: session,
+        ..content
+    };
+    let panel = (usize::from(content.width - session) > 0).then(|| Rect {
+        x: content.x + session,
+        width: content.width - session,
+        ..content
+    });
+    (terminal, panel)
+}
+
+/// One tab's PTY winsize derived from the content-band `size`: the
+/// whole band, or its terminal side when that tab's agent panel is
+/// open (Spec R06 / issue #85 — opening the panel shrinks the session
+/// through the same resize path a window resize takes).
+pub fn session_size(size: Size, panel_open: bool) -> Size {
+    Size::new(session_columns(size.columns, panel_open).max(1), size.lines)
+}
+
 /// Paint the always-visible tab bar: `" 1:bash "` chunks in order, the
 /// active tab reversed. Titles beyond the row's width are clipped —
 /// jumping (`Alt+N`) still reaches them; T5's status line owns any
@@ -252,6 +299,98 @@ pub fn paint_status_line(buf: &mut Buffer, area: Rect, text: &str, highlighted: 
             buf[(x, y)].modifier |= Modifier::REVERSED;
         }
     }
+}
+
+/// Paint the profile switcher (Spec R07 §5.7 / issue #101): the
+/// declared names as a small overlay anchored on `area`'s bottom rows
+/// — `▸` marks the highlighted row (the ask card's selection idiom,
+/// bolded). Each row is reset before its text so the list reads as an
+/// overlay rather than a patch over the session grid; more names than
+/// `area` has rows clip from the top like every painter's overflow.
+pub fn paint_profile_picker(buf: &mut Buffer, area: Rect, picker: &ProfilePicker) {
+    let names = picker.names();
+    let rows = names.len().min(usize::from(area.height));
+    let top = area.bottom().saturating_sub(rows as u16);
+    for (index, name) in names.iter().take(rows).enumerate() {
+        let y = top + index as u16;
+        reset_span(buf, y, area.x..area.right());
+        let (text, style) = if index == picker.selected() {
+            (
+                format!("▸ {name}"),
+                ratatui::style::Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (format!("  {name}"), ratatui::style::Style::default())
+        };
+        let width = usize::from(area.right() - area.x);
+        buf.set_stringn(area.x, y, text, width, style);
+    }
+}
+
+/// Paint the `Alt+R` conversation picker (Spec R08 §5.8, ticket
+/// R08-T6): the stored rows newest-first over `area`'s bottom rows —
+/// `▸ title  age · N items` bolded on the highlight — and a bottom
+/// hint row that doubles as `Ctrl+D`'s one-key confirm prompt. The
+/// highlight scrolls the window when a long list outgrows the band;
+/// each row is reset before its text like every overlay painter.
+pub fn paint_conversation_picker(buf: &mut Buffer, area: Rect, picker: &ConversationPicker) {
+    if area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.right() - area.x);
+    let rows = picker.rows();
+    // The hint owns the bottom row; the list anchors above it and
+    // windows so the highlight always shows.
+    let list_height = usize::from(area.height - 1);
+    let shown = rows.len().min(list_height);
+    let start = picker
+        .selected()
+        .saturating_add(1)
+        .saturating_sub(shown)
+        .min(rows.len().saturating_sub(shown));
+    let top = area.bottom().saturating_sub(1 + shown as u16);
+    for (offset, row) in rows.iter().skip(start).take(shown).enumerate() {
+        let index = start + offset;
+        let y = top + offset as u16;
+        reset_span(buf, y, area.x..area.right());
+        let (mark, style) = if index == picker.selected() {
+            (
+                "▸",
+                ratatui::style::Style::default().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (" ", ratatui::style::Style::default())
+        };
+        buf.set_stringn(
+            area.x,
+            y,
+            format!("{mark} {}  {} · {} items", row.title, row.age, row.items),
+            width,
+            style,
+        );
+    }
+    // The bottom row is the keys hint — and `Ctrl+D`'s armed state
+    // replaces it with the confirm prompt (us-11).
+    let hint_y = area.bottom() - 1;
+    reset_span(buf, hint_y, area.x..area.right());
+    let (text, style) = if picker.confirming() {
+        let title = picker
+            .selected_row()
+            .map(|row| row.title.as_str())
+            .unwrap_or_default();
+        (
+            format!(" ctrl+d again deletes \"{title}\""),
+            ratatui::style::Style::default()
+                .fg(RtColor::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            " enter: resume · ctrl+d: delete · esc: close".to_string(),
+            ratatui::style::Style::default().fg(RtColor::DarkGray),
+        )
+    };
+    buf.set_stringn(area.x, hint_y, text, width, style);
 }
 
 /// `ait_term` color → ratatui color. Beware the naming trap: ratatui's
@@ -673,6 +812,40 @@ mod tests {
     fn content_size_never_has_zero_lines() {
         assert_eq!(content_size(Rect::new(0, 0, 80, 2)), Size::new(80, 1));
         assert_eq!(content_size(Rect::new(0, 0, 80, 0)), Size::new(80, 1));
+    }
+
+    /// Spec R06's right-side split: a closed panel leaves the whole
+    /// content band to the session; an open one takes two fifths off
+    /// the right edge and the winsize (`session_size`) agrees with the
+    /// painted rect (`split_content`) — one formula feeds both.
+    #[test]
+    fn split_content_carves_a_right_side_panel() {
+        let content = Rect::new(0, 1, 100, 22);
+
+        assert_eq!(
+            split_content(content, false),
+            (content, None),
+            "closed panel: the session owns the whole band"
+        );
+
+        let (terminal, panel) = split_content(content, true);
+        assert_eq!(terminal, Rect::new(0, 1, 60, 22));
+        assert_eq!(panel, Some(Rect::new(60, 1, 40, 22)));
+        // The PTY winsize is the same answer — the split and the
+        // resize can never disagree (us: winsize shrinks on open).
+        assert_eq!(session_size(Size::new(100, 22), true), Size::new(60, 22));
+        assert_eq!(session_size(Size::new(100, 22), false), Size::new(100, 22));
+    }
+
+    /// Degenerate bands never yield a zero-width session: a one-column
+    /// band shows no panel rect (nothing to paint) but still reports a
+    /// one-column session size.
+    #[test]
+    fn split_content_clamps_on_narrow_bands() {
+        let (terminal, panel) = split_content(Rect::new(0, 1, 1, 22), true);
+        assert_eq!(terminal.width, 1);
+        assert_eq!(panel, None, "no room for a panel column");
+        assert_eq!(session_size(Size::new(1, 22), true).columns, 1);
     }
 
     /// Every tab renders `" N:title "`, the active one inverted; the

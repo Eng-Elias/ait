@@ -1,0 +1,1969 @@
+//! The file tools (Spec R06, §5.6): `read_files`, `grep`, `glob`
+//! and `edit_files`, implemented in-crate (`regex` is already a
+//! dependency) and all confined to the bound session's current
+//! working directory — a path that escapes returns a tool error the
+//! model can report, never a panic and never an access outside the
+//! tree. §5.7's `directory_allowlist` (R07-T4) widens that tree to
+//! a union: the session cwd plus each normalized root the active
+//! profile declared. An allowlist only ever expands what the tools
+//! may touch — the permission engine's `never` floor and the
+//! approve-card flow are unaffected.
+//!
+//! Confinement ([`ToolCwd::confine`]) normalizes `..`/`.` segments
+//! lexically first, then — when the candidate exists — canonicalizes
+//! it so a symlink pointing out of the union is still rejected. The
+//! roots themselves are canonicalized at construction, so the two
+//! sides compare on the same terms; a root that does not resolve
+//! falls back to its lexical form (tool errors then come from the
+//! filesystem, not the check).
+//!
+//! [`ToolOutput`] splits "the tool produced output" from "the tool
+//! reported an error": errors still become tool results — the model
+//! reads them and adjusts — but the card paints them `Failed`.
+
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use regex::Regex;
+
+use crate::diff::unified_diff;
+use crate::executor::CommandExecutor;
+
+/// The largest single file `read_files` returns (Spec R06's size
+/// guard): bigger files report an error rather than flooding the
+/// conversation.
+const READ_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+/// How much of a file is sniffed for a NUL byte before it is called
+/// binary — the same cheap heuristic `grep` uses to skip binaries.
+const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// The largest file `grep` opens — bigger ones are skipped (noted in
+/// the output) rather than scanned.
+const GREP_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// `grep` reports at most this many matching lines before noting the
+/// truncation.
+const GREP_MATCH_CAP: usize = 200;
+
+/// `glob` walks at most this many files before stopping.
+const GLOB_WALK_CAP: usize = 20_000;
+
+/// `glob` reports at most this many paths before noting the
+/// truncation.
+const GLOB_RESULT_CAP: usize = 500;
+
+/// What a tool call produced — the text that (after
+/// [`Redactor`](crate::Redactor)) enters the conversation as the tool
+/// result, plus whether it is an error the card should paint
+/// `Failed`.
+#[derive(Debug)]
+pub(crate) struct ToolOutput {
+    /// The result text.
+    pub(crate) text: String,
+    /// `true` when the tool reported an error rather than output.
+    pub(crate) is_error: bool,
+}
+
+impl ToolOutput {
+    /// A successful result.
+    pub(crate) fn ok(text: String) -> Self {
+        Self {
+            text,
+            is_error: false,
+        }
+    }
+
+    /// An error result — still model-facing text, never a throw.
+    pub(crate) fn error(text: String) -> Self {
+        Self {
+            text,
+            is_error: true,
+        }
+    }
+}
+
+/// A task's working directory — the tree every file tool is confined
+/// to — plus any extra roots the active profile's
+/// `directory_allowlist` declared (§5.7, R07-T4). Holds the roots in
+/// the form [`confine`](Self::confine) canonicalizes candidates to,
+/// so both sides of the prefix check agree.
+pub(crate) struct ToolCwd {
+    /// The session's cwd: relative tool paths resolve against it,
+    /// `write_to_pty` spawns in it, `display` renders relative to
+    /// it — and its subtree confines like every other root's.
+    root: PathBuf,
+    /// The normalized `directory_allowlist` roots — each resolved
+    /// exactly like `root` was (relative entries join `root`,
+    /// `..`/`.` normalize lexically, an existing entry
+    /// canonicalizes). An empty list is the status quo: cwd-only
+    /// confinement.
+    extra_roots: Vec<PathBuf>,
+}
+
+impl ToolCwd {
+    /// Bind the tools to `cwd` ∪ `allowlist` — `cwd` canonicalized
+    /// when it resolves, so a `cwd` reached through a symlink
+    /// compares equal to canonical candidates. Every `allowlist`
+    /// entry (§5.7's `directory_allowlist`, a `Vec<String>` from the
+    /// active profile) resolves the same way a tool path would:
+    /// relative entries join the session `cwd`, `..`/`.` segments
+    /// normalize lexically, then an entry that exists canonicalizes
+    /// — an entry that itself escapes (`../shared`) lands on its
+    /// true root before it can confine anything.
+    pub(crate) fn new(cwd: &str, allowlist: &[String]) -> Self {
+        let path = Path::new(cwd);
+        let root = fs::canonicalize(path).unwrap_or_else(|_| normalize(path));
+        let extra_roots = allowlist
+            .iter()
+            .map(|entry| {
+                let candidate = Path::new(entry);
+                let joined = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                let normalized = normalize(&joined);
+                fs::canonicalize(&normalized).unwrap_or(normalized)
+            })
+            .collect();
+        Self { root, extra_roots }
+    }
+
+    /// `new` for a REMOTE session (Spec R09-T6): the same cwd ∪
+    /// allowlist union — but lexical only. The paths live on the
+    /// machine the user ssh'd into, so nothing canonicalizes; the
+    /// matching [`confine_remote`](Self::confine_remote) does the
+    /// same `..` collapse and prefix check [`confine`](Self::confine)
+    /// does, minus the symlink resolution only the local filesystem
+    /// could perform.
+    pub(crate) fn new_remote(cwd: &str, allowlist: &[String]) -> Self {
+        let root = normalize(Path::new(cwd));
+        let extra_roots = allowlist
+            .iter()
+            .map(|entry| {
+                let candidate = Path::new(entry);
+                let joined = if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    root.join(candidate)
+                };
+                normalize(&joined)
+            })
+            .collect();
+        Self { root, extra_roots }
+    }
+
+    /// The bound working directory — the union's first root and the
+    /// directory `write_to_pty` spawns the agent's interactive
+    /// session in (R06-T7).
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Remote `read_files` (Spec R09-T6): each confined path runs as
+    /// one remote command through the task's executor — `[ -f ]`, a
+    /// `wc -c` size guard, then `head -c` — so the agent reads the
+    /// machine the user is actually connected to through the same
+    /// channel `run_command` rides. Exit codes carry the refusal
+    /// reason (3 = not a file, 4 = unreadable, 5 = over the size
+    /// cap); the payload is the file bytes, binary-sniffed here
+    /// exactly like a local read.
+    pub(crate) fn remote_read_files(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
+            return ToolOutput::error(String::from(
+                "read_files: `paths` must be an array of file paths",
+            ));
+        };
+        if paths.is_empty() {
+            return ToolOutput::error(String::from("read_files: `paths` is empty"));
+        }
+        let mut out = String::new();
+        let mut failures = 0usize;
+        for (index, path) in paths.iter().enumerate() {
+            if index > 0 {
+                out.push_str("\n\n");
+            }
+            let Some(path) = path.as_str() else {
+                failures += 1;
+                out.push_str("error: every `paths` entry must be a string");
+                continue;
+            };
+            match self.remote_read_one(path, executor) {
+                Ok((display, contents)) => {
+                    out.push_str(&display);
+                    out.push_str(":\n");
+                    out.push_str(&contents);
+                }
+                Err(error) => {
+                    failures += 1;
+                    out.push_str(path);
+                    out.push_str(": error: ");
+                    out.push_str(&error);
+                }
+            }
+        }
+        if failures == paths.len() {
+            ToolOutput::error(out)
+        } else {
+            ToolOutput::ok(out)
+        }
+    }
+
+    /// One remote `read_files` path: confine lexically, run the
+    /// remote stat+cat command, map its exit code to the local
+    /// read's refusal text.
+    fn remote_read_one(
+        &self,
+        path: &str,
+        executor: &mut dyn CommandExecutor,
+    ) -> Result<(String, String), String> {
+        let confined = self.confine_remote(path)?;
+        let display = remote_display(&self.root, &confined);
+        let command = format!(
+            "p={}; if [ ! -f \"$p\" ]; then exit 3; fi; \
+             s=$(wc -c <\"$p\" 2>/dev/null) || exit 4; \
+             [ \"$s\" -gt {cap} ] && exit 5; head -c {cap} \"$p\" || exit 4",
+            sh_quote(&confined),
+            cap = READ_FILE_MAX_BYTES
+        );
+        match executor.run(&command) {
+            Ok(result) => match result.exit_code {
+                Some(0) => {
+                    if looks_binary(&result.output) {
+                        Err(format!("{display} looks binary"))
+                    } else {
+                        Ok((
+                            display,
+                            String::from_utf8_lossy(&result.output).into_owned(),
+                        ))
+                    }
+                }
+                Some(3) => Err(format!("{display} is not a regular file")),
+                Some(5) => Err(format!(
+                    "{display} exceeds the {} KiB read limit",
+                    READ_FILE_MAX_BYTES / 1024
+                )),
+                _ => Err(format!("cannot read {display}")),
+            },
+            Err(error) => Err(format!("cannot read {display}: {error}")),
+        }
+    }
+
+    /// Remote `grep` (Spec R09-T6): `find` walks the confined base —
+    /// dot-paths skipped, oversized files excluded like the local
+    /// walk — remote `grep` applies the pattern line-wise. `-P`
+    /// (PCRE) is preferred when the remote grep has it: every pattern
+    /// that passed the local `Regex::new` check is PCRE-valid too,
+    /// so matching tracks the local tool's `regex` semantics closely;
+    /// `-E` is the documented degradation on hosts without PCRE.
+    /// `-I` drops binary hits like the local `looks_binary` skip,
+    /// `head` caps at [`GREP_MATCH_CAP`] +1 for the truncation note,
+    /// and hits sort by `(path, line)` here — the local tool's
+    /// file-sorted order `find` doesn't guarantee.
+    pub(crate) fn remote_grep(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("grep: `pattern` must be a string"));
+        };
+        if pattern.is_empty() {
+            return ToolOutput::error(String::from("grep: `pattern` must not be empty"));
+        }
+        if Regex::new(pattern).is_err() {
+            return ToolOutput::error(format!("grep: invalid pattern {pattern:?}"));
+        }
+        let base = match self.remote_base(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let command = format!(
+            "if printf 'x\\n' | grep -qP 'x' 2>/dev/null; then set -- -nIP; \
+             else set -- -nIE; fi; \
+             find {} -type f ! -path '*/.*' -size -{}c \
+             -exec grep \"$@\" -- {} {{}} + 2>/dev/null | head -n {}",
+            sh_quote(&base),
+            GREP_FILE_MAX_BYTES + 1,
+            sh_quote(pattern),
+            GREP_MATCH_CAP + 1
+        );
+        match executor.run(&command) {
+            Err(error) => ToolOutput::error(format!("grep: {error}")),
+            Ok(result) => {
+                let text = String::from_utf8_lossy(&result.output);
+                let prefix = format!("{base}/");
+                let mut hits: Vec<(String, usize, String)> = text
+                    .lines()
+                    .filter_map(|line| {
+                        parse_remote_grep_line(&prefix, line)
+                            .map(|(path, num, text)| (path.to_owned(), num, text.to_owned()))
+                    })
+                    .collect();
+                hits.sort();
+                let truncated = hits.len() > GREP_MATCH_CAP;
+                hits.truncate(GREP_MATCH_CAP);
+                if hits.is_empty() {
+                    ToolOutput::ok(format!("grep: no lines match {pattern:?}"))
+                } else {
+                    let mut out = hits
+                        .iter()
+                        .map(|(path, num, text)| {
+                            format!(
+                                "{}:{num}: {text}",
+                                remote_display(&self.root, &format!("{prefix}{path}"))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if truncated {
+                        out.push_str(&format!("\n… stopped after {GREP_MATCH_CAP} matches"));
+                    }
+                    ToolOutput::ok(out)
+                }
+            }
+        }
+    }
+
+    /// Remote `glob` (Spec R09-T6): `find` lists the confined base
+    /// (dot-paths skipped like the local walk), remote `grep -E`
+    /// applies the glob translated to an anchored ERE — `*`/`?` stay
+    /// segment-local (`[^/]*`, `[^/]`), `**` spans zero or more whole
+    /// components exactly like the local matcher — and `head` caps
+    /// at [`GLOB_RESULT_CAP`] +1 for the truncation note. Results
+    /// sort here: the local tool's path order `find` doesn't
+    /// guarantee.
+    pub(crate) fn remote_glob(
+        &self,
+        args: &serde_json::Value,
+        executor: &mut dyn CommandExecutor,
+    ) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("glob: `pattern` must be a string"));
+        };
+        let segments: Vec<&str> = pattern.split('/').collect();
+        if pattern.is_empty()
+            || segments
+                .iter()
+                .any(|s| s.is_empty() || *s == "." || *s == "..")
+            || pattern.starts_with('/')
+        {
+            return ToolOutput::error(format!(
+                "glob: `pattern` {pattern:?} must be a relative path pattern \
+                 (`*`, `?`, `**`; no `.`/`..` segments)"
+            ));
+        }
+        let base = match self.remote_base(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        let regex = format!("^{}/{}$", ere_escape(&base), glob_to_ere(&segments));
+        let command = format!(
+            "find {} -type f ! -path '*/.*' -print | grep -E -- {} | head -n {}",
+            sh_quote(&base),
+            sh_quote(&regex),
+            GLOB_RESULT_CAP + 1
+        );
+        match executor.run(&command) {
+            Err(error) => ToolOutput::error(format!("glob: {error}")),
+            Ok(result) => {
+                let text = String::from_utf8_lossy(&result.output);
+                let mut found: Vec<&str> = text.lines().take(GLOB_RESULT_CAP + 1).collect();
+                found.sort();
+                let truncated = found.len() > GLOB_RESULT_CAP;
+                found.truncate(GLOB_RESULT_CAP);
+                if found.is_empty() {
+                    ToolOutput::ok(format!("glob: no paths match {pattern:?}"))
+                } else {
+                    let mut out = found
+                        .iter()
+                        .map(|line| remote_display(&self.root, line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if truncated {
+                        out.push_str("\n… truncated");
+                    }
+                    ToolOutput::ok(out)
+                }
+            }
+        }
+    }
+
+    /// The remote twin of [`base_dir`](Self::base_dir): the optional
+    /// `path` argument confined lexically.
+    fn remote_base(&self, arg: Option<&serde_json::Value>) -> Result<String, String> {
+        match arg {
+            None | Some(serde_json::Value::Null) => Ok(self.root.to_string_lossy().into_owned()),
+            Some(value) => match value.as_str() {
+                Some(path) => self.confine_remote(path),
+                None => Err(String::from("`path` must be a string")),
+            },
+        }
+    }
+
+    /// The remote twin of [`confine`](Self::confine): join relative
+    /// paths to the session root, collapse `.`/`..` lexically, then
+    /// the prefix check — but nothing canonicalizes, because the
+    /// filesystem lives on the remote host (Spec R09-T6). The gap
+    /// this leaves is honest and documented: a symlink that escapes
+    /// the union reads through the remote commands exactly like the
+    /// user's own `cat` would — confinement governs which paths the
+    /// tools ASK about, never smuggles a write.
+    fn confine_remote(&self, input: &str) -> Result<String, String> {
+        let candidate = Path::new(input);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.root.join(candidate)
+        };
+        let normalized = normalize(&joined);
+        if !self.contains(&normalized) {
+            return Err(format!(
+                "{input:?} is outside the working directory {}",
+                self.root.display()
+            ));
+        }
+        Ok(normalized.to_string_lossy().into_owned())
+    }
+
+    /// `read_files` — read each of the arguments' `paths`, with the
+    /// size and binary guards (Spec R06: contents inside the guards;
+    /// oversized/binary reads and escapes return tool errors). Each
+    /// path reports its own error inline, so one bad path does not
+    /// erase the good reads.
+    pub(crate) fn read_files(&self, args: &serde_json::Value) -> ToolOutput {
+        let Some(paths) = args.get("paths").and_then(|v| v.as_array()) else {
+            return ToolOutput::error(String::from(
+                "read_files: `paths` must be an array of file paths",
+            ));
+        };
+        if paths.is_empty() {
+            return ToolOutput::error(String::from("read_files: `paths` is empty"));
+        }
+        let mut out = String::new();
+        let mut failures = 0usize;
+        for (index, path) in paths.iter().enumerate() {
+            if index > 0 {
+                out.push_str("\n\n");
+            }
+            let Some(path) = path.as_str() else {
+                failures += 1;
+                out.push_str("error: every `paths` entry must be a string");
+                continue;
+            };
+            match self.read_one(path) {
+                Ok((display, contents)) => {
+                    out.push_str(&display);
+                    out.push_str(":\n");
+                    out.push_str(&contents);
+                }
+                Err(error) => {
+                    failures += 1;
+                    out.push_str(path);
+                    out.push_str(": error: ");
+                    out.push_str(&error);
+                }
+            }
+        }
+        if failures == paths.len() {
+            ToolOutput::error(out)
+        } else {
+            ToolOutput::ok(out)
+        }
+    }
+
+    /// One `read_files` path: confine, then read with the size and
+    /// binary guards. Returns the display path (input-relative when
+    /// it stayed inside the root) and the contents as lossy UTF-8.
+    fn read_one(&self, path: &str) -> Result<(String, String), String> {
+        let confined = self.confine(path)?;
+        let metadata = fs::metadata(&confined)
+            .map_err(|e| format!("cannot stat {}: {e}", self.display(&confined)))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a regular file", self.display(&confined)));
+        }
+        if metadata.len() > READ_FILE_MAX_BYTES {
+            return Err(format!(
+                "{} exceeds the {} KiB read limit ({} bytes)",
+                self.display(&confined),
+                READ_FILE_MAX_BYTES / 1024,
+                metadata.len()
+            ));
+        }
+        let bytes = fs::read(&confined)
+            .map_err(|e| format!("cannot read {}: {e}", self.display(&confined)))?;
+        if looks_binary(&bytes) {
+            return Err(format!("{} looks binary", self.display(&confined)));
+        }
+        Ok((
+            self.display(&confined),
+            String::from_utf8_lossy(&bytes).into_owned(),
+        ))
+    }
+
+    /// `grep` — the in-crate regex search (Spec R06): `pattern`
+    /// (required, a `regex` pattern) applied line-wise over the text
+    /// files under `path` (optional, default the root). Binary and
+    /// oversized files are skipped, hidden entries (`.git`, dotfiles)
+    /// are never walked, and matches cap at [`GREP_MATCH_CAP`].
+    pub(crate) fn grep(&self, args: &serde_json::Value) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("grep: `pattern` must be a string"));
+        };
+        let regex = match Regex::new(pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                return ToolOutput::error(format!("grep: invalid pattern {pattern:?}: {error}"))
+            }
+        };
+        let base = match self.base_dir(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        if !base.is_dir() {
+            return ToolOutput::error(format!("grep: {} is not a directory", self.display(&base)));
+        }
+        let mut files = Vec::new();
+        walk(&base, &mut files, GLOB_WALK_CAP);
+        files.sort();
+        let mut out = String::new();
+        let mut matched = 0usize;
+        let mut truncated = false;
+        'files: for file in files {
+            let Ok(metadata) = fs::metadata(&file) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > GREP_FILE_MAX_BYTES {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&file) else { continue };
+            if looks_binary(&bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (number, line) in text.lines().enumerate() {
+                if regex.is_match(line) {
+                    if matched == GREP_MATCH_CAP {
+                        truncated = true;
+                        break 'files;
+                    }
+                    matched += 1;
+                    out.push_str(&format!(
+                        "{}:{}: {}\n",
+                        self.display(&file),
+                        number + 1,
+                        line
+                    ));
+                }
+            }
+        }
+        if truncated {
+            out.push_str(&format!("… stopped after {GREP_MATCH_CAP} matches\n"));
+        }
+        if out.is_empty() {
+            ToolOutput::ok(format!("grep: no lines match {pattern:?}"))
+        } else {
+            ToolOutput::ok(out.trim_end().to_string())
+        }
+    }
+
+    /// `glob` — the in-crate filename match (Spec R06): `pattern`
+    /// (required — `*`/`?` within a path segment, `**` across
+    /// segments) matched against paths under `path` (optional,
+    /// default the root). Hidden entries are never walked; results
+    /// cap at [`GLOB_RESULT_CAP`].
+    pub(crate) fn glob(&self, args: &serde_json::Value) -> ToolOutput {
+        let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolOutput::error(String::from("glob: `pattern` must be a string"));
+        };
+        let segments: Vec<&str> = pattern.split('/').collect();
+        if pattern.is_empty()
+            || segments
+                .iter()
+                .any(|s| s.is_empty() || *s == "." || *s == "..")
+            || pattern.starts_with('/')
+        {
+            return ToolOutput::error(format!(
+                "glob: `pattern` {pattern:?} must be a relative path pattern \
+                 (`*`, `?`, `**`; no `.`/`..` segments)"
+            ));
+        }
+        let base = match self.base_dir(args.get("path")) {
+            Ok(base) => base,
+            Err(error) => return ToolOutput::error(error),
+        };
+        if !base.is_dir() {
+            return ToolOutput::error(format!("glob: {} is not a directory", self.display(&base)));
+        }
+        let mut files = Vec::new();
+        walk(&base, &mut files, GLOB_WALK_CAP);
+        files.sort();
+        let mut out = Vec::new();
+        for file in &files {
+            if out.len() == GLOB_RESULT_CAP {
+                break;
+            }
+            let Ok(relative) = file.strip_prefix(&base) else {
+                continue;
+            };
+            let names: Vec<&str> = relative
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if glob_match(&segments, &names) {
+                out.push(self.display(file));
+            }
+        }
+        if out.is_empty() {
+            ToolOutput::ok(format!("glob: no paths match {pattern:?}"))
+        } else {
+            let mut text = out.join("\n");
+            if files.len() == GLOB_WALK_CAP || out.len() == GLOB_RESULT_CAP {
+                text.push_str("\n… truncated");
+            }
+            ToolOutput::ok(text)
+        }
+    }
+
+    /// `edit_files` — plan the whole call: parse the `files` array,
+    /// confine every `path`, read each existing file for the diff's
+    /// old side and verify a new file's parent exists inside the
+    /// tree (us-23). The result is an [`EditPlan`] — the unified
+    /// diff the approve card renders AND the write an allow verdict
+    /// applies, planned once so card and disk can never diverge
+    /// (us-22). Any bad entry fails the whole plan: an edit call is
+    /// all-or-nothing, never a partial write.
+    pub(crate) fn plan_edits(&self, args: &serde_json::Value) -> Result<EditPlan, String> {
+        let Some(files) = args.get("files").and_then(|v| v.as_array()) else {
+            return Err(String::from(
+                "edit_files: `files` must be an array of {path, content} entries",
+            ));
+        };
+        if files.is_empty() {
+            return Err(String::from("edit_files: `files` is empty"));
+        }
+        let mut edits = Vec::with_capacity(files.len());
+        for entry in files {
+            edits.push(self.plan_one(entry)?);
+        }
+        Ok(EditPlan { edits })
+    }
+
+    /// `edit_files`' direct execution path — plan then apply. The
+    /// gate holds the plan it rendered and calls
+    /// [`EditPlan::apply`] on it instead, so this arm only serves
+    /// callers that arrive unplanned.
+    pub(crate) fn edit_files(&self, args: &serde_json::Value) -> ToolOutput {
+        match self.plan_edits(args) {
+            Ok(plan) => plan.apply(),
+            Err(error) => ToolOutput::error(error),
+        }
+    }
+
+    /// One `files` entry: `path` + `content` strings, the path
+    /// confined, the old side read (or proven a safely-creatable new
+    /// file) and the unified diff rendered. Anything a diff cannot
+    /// show faithfully — a binary or non-UTF-8 existing file, NUL
+    /// bytes in `content` — refuses rather than writing blind.
+    fn plan_one(&self, entry: &serde_json::Value) -> Result<PlannedEdit, String> {
+        let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+            return Err(String::from(
+                "edit_files: every `files` entry needs a string `path`",
+            ));
+        };
+        let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
+            return Err(format!("edit_files: {path:?} needs a string `content`"));
+        };
+        if content.contains('\0') {
+            return Err(format!(
+                "edit_files: {path} — `content` holds NUL bytes; \
+                 binary writes are not supported"
+            ));
+        }
+        let confined = self.confine(path)?;
+        let display = self.display(&confined);
+        let (target, old) = match fs::metadata(&confined) {
+            Ok(meta) if meta.is_file() => {
+                let bytes =
+                    fs::read(&confined).map_err(|e| format!("cannot read {display}: {e}"))?;
+                if looks_binary(&bytes) {
+                    return Err(format!("{display} looks binary — refusing to replace it"));
+                }
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| format!("{display} is not valid UTF-8 — refusing to diff it"))?;
+                (confined, Some(text))
+            }
+            Ok(_) => return Err(format!("{display} is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (self.new_file_target(&confined, &display)?, None)
+            }
+            Err(error) => return Err(format!("cannot stat {display}: {error}")),
+        };
+        Ok(PlannedEdit {
+            diff: unified_diff(&display, old.as_deref(), content),
+            path: target,
+            display,
+            content: content.to_string(),
+        })
+    }
+
+    /// Where a brand-new `confined` path may be written: its parent
+    /// must exist as a directory inside the union — canonicalized,
+    /// so a symlinked directory cannot smuggle the write outside
+    /// (the leaf does not exist yet, so [`confine`](Self::confine)
+    /// saw only its lexical form). A dangling symlink AT the path
+    /// refuses too: `metadata` reported it missing but a write
+    /// would land wherever the link points.
+    fn new_file_target(&self, confined: &Path, display: &str) -> Result<PathBuf, String> {
+        if let Ok(meta) = fs::symlink_metadata(confined) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "{display} is a dangling symlink — refusing to write through it"
+                ));
+            }
+        }
+        let Some(parent) = confined.parent() else {
+            return Err(format!("edit_files: {display} has no parent directory"));
+        };
+        let Ok(canonical) = fs::canonicalize(parent) else {
+            return Err(format!(
+                "edit_files: {display}'s parent directory does not exist"
+            ));
+        };
+        if !canonical.is_dir() {
+            return Err(format!("edit_files: {display}'s parent is not a directory"));
+        }
+        if !self.contains(&canonical) {
+            return Err(format!(
+                "{display} is outside the working directory {}",
+                self.root.display()
+            ));
+        }
+        Ok(canonical.join(
+            confined
+                .file_name()
+                .expect("a path with a parent names a leaf"),
+        ))
+    }
+
+    /// Resolve the optional `path` argument (a directory) — absent
+    /// means the session root, present confines like every other
+    /// path (so a `directory_allowlist` root is a legal base).
+    fn base_dir(&self, arg: Option<&serde_json::Value>) -> Result<PathBuf, String> {
+        match arg {
+            None | Some(serde_json::Value::Null) => Ok(self.root.clone()),
+            Some(value) => match value.as_str() {
+                Some(path) => self.confine(path),
+                None => Err(String::from("`path` must be a string")),
+            },
+        }
+    }
+
+    /// Confine one model-supplied path to the union: join relative
+    /// paths to the session root, normalize `.`/`..` lexically,
+    /// then — when it exists — canonicalize so a symlink cannot
+    /// smuggle the path out of the union. Anything still outside
+    /// returns a tool error.
+    fn confine(&self, input: &str) -> Result<PathBuf, String> {
+        let candidate = Path::new(input);
+        let joined = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            self.root.join(candidate)
+        };
+        let normalized = normalize(&joined);
+        // The canonical check resolves symlink escapes; a path that
+        // does not exist yet keeps its lexical form (reads of it
+        // simply error below).
+        let resolved = fs::canonicalize(&normalized).unwrap_or(normalized);
+        if !self.contains(&resolved) {
+            return Err(format!(
+                "{input:?} is outside the working directory {}",
+                self.root.display()
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// `path` sits inside the confinement union — under the session
+    /// root or under any `directory_allowlist` root (§5.7).
+    fn contains(&self, path: &Path) -> bool {
+        path.starts_with(&self.root) || self.extra_roots.iter().any(|root| path.starts_with(root))
+    }
+
+    /// `path` shown relative to the session root when it sits under
+    /// it — tool results read like the paths the model passed. A
+    /// path under a `directory_allowlist` root renders absolute:
+    /// the listed tree is not the session's to abbreviate.
+    fn display(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.root) {
+            Ok(relative) if relative.as_os_str().is_empty() => String::from("."),
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => path.display().to_string(),
+        }
+    }
+}
+
+/// A whole `edit_files` call resolved against the tree (Spec R06,
+/// us-22/23): every file's confined write target, the exact
+/// `content` bytes and the unified diff the approve card shows.
+/// The gate plans before the card and an allow verdict applies the
+/// same plan, so the rendered diff is byte-for-byte the applied
+/// change — never a recomputation that could drift.
+#[derive(Debug)]
+pub(crate) struct EditPlan {
+    edits: Vec<PlannedEdit>,
+}
+
+/// One file's planned rewrite.
+#[derive(Debug)]
+struct PlannedEdit {
+    /// The confined, canonicalized write target.
+    path: PathBuf,
+    /// The display name the diff's `a/`/`b/` labels show —
+    /// session-root-relative, or absolute under an allowlist root.
+    display: String,
+    /// The exact bytes [`EditPlan::apply`] writes — `fs::write` of
+    /// this string, nothing else.
+    content: String,
+    /// This file's unified diff (`--- a/`/`+++ b/`, or `/dev/null`
+    /// for a new file).
+    diff: String,
+}
+
+impl EditPlan {
+    /// The approve card's renderable surface — every file's diff,
+    /// one after another.
+    pub(crate) fn summary(&self) -> String {
+        self.edits
+            .iter()
+            .map(|edit| edit.diff.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Write each `content` byte-for-byte to its target. A write
+    /// failure reports which files already landed — partial writes
+    /// can happen on I/O error, so the result says so honestly.
+    pub(crate) fn apply(&self) -> ToolOutput {
+        let mut wrote = Vec::with_capacity(self.edits.len());
+        for edit in &self.edits {
+            if let Err(error) = fs::write(&edit.path, edit.content.as_bytes()) {
+                let mut text = format!("edit_files: cannot write {}: {error}", edit.display);
+                if !wrote.is_empty() {
+                    text.push_str(&format!(" — already wrote {}", wrote.join(", ")));
+                }
+                return ToolOutput::error(text);
+            }
+            wrote.push(edit.display.clone());
+        }
+        match wrote.as_slice() {
+            [one] => ToolOutput::ok(format!("wrote {one}")),
+            many => ToolOutput::ok(format!("wrote {} files: {}", many.len(), many.join(", "))),
+        }
+    }
+}
+
+/// The binary sniff every reader shares: a NUL inside the first
+/// [`BINARY_SNIFF_BYTES`] calls the file binary — cheap, and the
+/// same rule `read_one`, `grep` and `plan_one` apply.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
+}
+
+/// `path` with `.`/`..` resolved lexically — no filesystem access, so
+/// it applies to paths that do not exist yet. `..` at the root stays
+/// at the root (lexical pops cannot leave `/`); the root-confinement
+/// check is the escape guard, this is only normalization.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// POSIX single-quote `value` for a remote command line — every
+/// interpolated path and pattern goes through it, so a `'` in a
+/// model-supplied argument can never break out of its quoting (the
+/// commands the remote tools compose ARE shell text the executor
+/// sends).
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `line` (a remote path) shown relative to the session root when it
+/// sits under it — the remote tools' [`ToolCwd::display`] analog.
+fn remote_display(root: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    match path.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => String::from("."),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// One remote `grep -n` hit — `path:num:text` — parsed against the
+/// confined base prefix the `find` walk printed. The LEFTMOST
+/// `:<digits>:` boundary is the split, so a `:` inside a file name
+/// keeps scanning while a `:` inside the matched text is never
+/// consulted. Returns `(path-relative-to-base, line number, match
+/// text)`.
+fn parse_remote_grep_line<'a>(prefix: &str, line: &'a str) -> Option<(&'a str, usize, &'a str)> {
+    let rest = line.strip_prefix(prefix)?;
+    let mut start = 0;
+    while let Some(at) = rest[start..].find(':') {
+        let after = &rest[start + at + 1..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && after.as_bytes().get(digits) == Some(&b':') {
+            return Some((
+                &rest[..start + at],
+                after[..digits].parse().ok()?,
+                &after[digits + 1..],
+            ));
+        }
+        start += at + 1;
+    }
+    None
+}
+
+/// Escape `text` so it matches literally inside a POSIX ERE — used on
+/// the base path half of the remote `glob` regex.
+fn ere_escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if "\\.[]{}()*+?^$|".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// One glob pattern as a POSIX ERE body (unanchored): `*`/`?` stay
+/// segment-local (`[^/]*`, `[^/]`), a whole-segment `**` spans ZERO
+/// or more whole path components — the local `glob_match`'s exact
+/// rule (`a/**/b` matches `a/b`; `a/**` matches `a` itself;
+/// `**/b` matches `b` at the base) — everything else is literal.
+/// The translation the remote `grep -E` filters `find` output by
+/// (Spec R09-T6).
+fn glob_to_ere(segments: &[&str]) -> String {
+    // A lone `**` matches every file under the base.
+    if segments == ["**"] {
+        return String::from(".*");
+    }
+    let mut out = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        match *segment {
+            // Trailing `**`: `a/**` is `a` itself or anything below —
+            // the separator lives inside the optional group.
+            "**" if index + 1 == segments.len() => out.push_str("(/.*)?"),
+            // Leading/middle `**`: zero or more whole components.
+            // The trailing `/` is part of the group, so the NEXT
+            // segment takes no separator.
+            "**" => {
+                if index > 0 {
+                    out.push('/');
+                }
+                out.push_str("([^/]+/)*");
+            }
+            _ => {
+                if index > 0 && segments[index - 1] != "**" {
+                    out.push('/');
+                }
+                out.push_str(&segment_to_ere(segment));
+            }
+        }
+    }
+    out
+}
+
+/// One glob segment (never whole-segment `**`) as an ERE body:
+/// `*`/`?` stay inside the component (`[^/]*`, `[^/]`) — consecutive
+/// `*`s just repeat that, the local `component_match`'s rule — and
+/// everything else is literal.
+fn segment_to_ere(segment: &str) -> String {
+    let mut out = String::new();
+    for c in segment.chars() {
+        match c {
+            '*' => out.push_str("[^/]*"),
+            '?' => out.push_str("[^/]"),
+            _ => out.push_str(&ere_escape(&c.to_string())),
+        }
+    }
+    out
+}
+
+/// Depth-first file listing under `base`: hidden entries (any name
+/// starting `.`) are skipped wholesale — `.git` is never walked —
+/// and symlinks are neither followed nor listed (`file_type` does
+/// not follow, so a link matches neither `is_dir` nor `is_file`),
+/// which keeps the walk inside the tree by construction. Stops
+/// growing `out` at `cap` entries.
+fn walk(base: &Path, out: &mut Vec<PathBuf>, cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= cap {
+            return;
+        }
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            walk(&entry.path(), out, cap);
+        } else if kind.is_file() {
+            out.push(entry.path());
+        }
+    }
+}
+
+/// Match a `glob` pattern's segments against a relative path's
+/// components: `**` spans zero or more components, every other
+/// segment must match its component in place.
+fn glob_match(pattern: &[&str], names: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => names.is_empty(),
+        Some((&"**", rest)) => {
+            glob_match(rest, names) || (!names.is_empty() && glob_match(pattern, &names[1..]))
+        }
+        Some((segment, rest)) => {
+            !names.is_empty() && component_match(segment, names[0]) && glob_match(rest, &names[1..])
+        }
+    }
+}
+
+/// One pattern segment against one path component: `*` matches any
+/// run (including empty), `?` one character, everything else is
+/// literal.
+fn component_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    fn matches(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => matches(&p[1..], n) || (!n.is_empty() && matches(p, &n[1..])),
+            Some('?') => !n.is_empty() && matches(&p[1..], &n[1..]),
+            Some(&literal) => !n.is_empty() && n[0] == literal && matches(&p[1..], &n[1..]),
+        }
+    }
+    matches(&pattern, &name)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The file tools as a pure seam (Spec R06 testing decisions):
+    //! temp-dir trees in, [`ToolOutput`] text out — no PTY, no model.
+
+    use super::*;
+
+    /// A tempdir bound as the tool root.
+    fn tree(files: &[(&str, &str)]) -> (tempfile::TempDir, ToolCwd) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, contents) in files {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&full, contents).expect("write");
+        }
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"), &[]);
+        (dir, cwd)
+    }
+
+    /// JSON args helper.
+    fn args(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("test args parse")
+    }
+
+    /// A read inside the tree returns the file, root-relative.
+    #[test]
+    fn read_files_returns_contents_inside_the_tree() {
+        let (_dir, cwd) = tree(&[("note.txt", "hello"), ("src/a.rs", "fn a() {}")]);
+        let out = cwd.read_files(&args(r#"{"paths": ["note.txt", "src/a.rs"]}"#));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(out.text, "note.txt:\nhello\n\nsrc/a.rs:\nfn a() {}");
+    }
+
+    /// `..` and absolute escapes are tool errors, and a good path in
+    /// the same call still reads — the error is inline, not fatal.
+    #[test]
+    fn read_files_confines_escapes_to_tool_errors() {
+        let (dir, cwd) = tree(&[("inside.txt", "safe")]);
+        std::fs::write(dir.path().join("../outside.txt"), "SECRET-OUTSIDE").expect("outside");
+        let out = cwd.read_files(&args(r#"{"paths": ["../outside.txt", "inside.txt"]}"#));
+        assert!(
+            !out.is_error,
+            "one good read keeps the call ok: {:?}",
+            out.text
+        );
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{:?}",
+            out.text
+        );
+        assert!(!out.text.contains("SECRET-OUTSIDE"));
+        assert!(out.text.contains("inside.txt:\nsafe"));
+
+        // An absolute escape behaves identically.
+        let out = cwd.read_files(&args(&format!(
+            r#"{{"paths": [{}]}}"#,
+            serde_json::to_string(dir.path().join("../outside.txt").to_str().expect("utf-8"))
+                .expect("json")
+        )));
+        assert!(out.is_error, "every path failed: {:?}", out.text);
+        assert!(out.text.contains("outside the working directory"));
+    }
+
+    /// A symlink inside the tree pointing outside it still escapes —
+    /// canonicalization catches what lexical normalization cannot.
+    #[test]
+    fn read_files_rejects_symlink_escapes() {
+        let (dir, cwd) = tree(&[("inside.txt", "safe")]);
+        let outside = dir.path().join("../outside.txt");
+        std::fs::write(&outside, "SECRET-OUTSIDE").expect("outside");
+        std::os::unix::fs::symlink(&outside, dir.path().join("link.txt")).expect("symlink");
+        let out = cwd.read_files(&args(r#"{"paths": ["link.txt"]}"#));
+        assert!(out.is_error);
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{:?}",
+            out.text
+        );
+        assert!(!out.text.contains("SECRET-OUTSIDE"));
+    }
+
+    /// The size guard reports instead of reading.
+    #[test]
+    fn read_files_refuses_oversized_files() {
+        let (_dir, cwd) = tree(&[("big.txt", &"x".repeat(300 * 1024))]);
+        let out = cwd.read_files(&args(r#"{"paths": ["big.txt"]}"#));
+        assert!(out.is_error);
+        assert!(out.text.contains("exceeds"), "{:?}", out.text);
+    }
+
+    /// A NUL byte in the sniff window marks a file binary.
+    #[test]
+    fn read_files_refuses_binary_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bin.dat"), b"\x89PNG\x00\x01").expect("write");
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8 tempdir"), &[]);
+        let out = cwd.read_files(&args(r#"{"paths": ["bin.dat"]}"#));
+        assert!(out.is_error);
+        assert!(out.text.contains("binary"), "{:?}", out.text);
+    }
+
+    /// Malformed arguments are tool errors too — never a panic.
+    #[test]
+    fn read_files_rejects_bad_arguments() {
+        let (_dir, cwd) = tree(&[]);
+        for bad in [r#"{}"#, r#"{"paths": "x"}"#, r#"{"paths": [1]}"#] {
+            let out = cwd.read_files(&args(bad));
+            assert!(out.is_error, "{bad}: {:?}", out.text);
+        }
+    }
+
+    /// `grep` finds matching lines `path:line: text` inside the tree
+    /// and skips hidden entries.
+    #[test]
+    fn grep_reports_matching_lines_with_paths() {
+        let (_dir, cwd) = tree(&[
+            ("src/a.rs", "fn main() {}\n// TODO: x"),
+            ("src/deep/b.rs", "// TODO: deeper"),
+            (".hidden/secret.rs", "TODO hidden"),
+        ]);
+        let out = cwd.grep(&args(r#"{"pattern": "TODO"}"#));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(
+            out.text,
+            "src/a.rs:2: // TODO: x\nsrc/deep/b.rs:1: // TODO: deeper"
+        );
+    }
+
+    /// `grep`'s `path` argument scopes the walk — and confines.
+    #[test]
+    fn grep_scopes_to_a_confined_subdirectory() {
+        let (_dir, cwd) = tree(&[("src/a.rs", "MARK"), ("other/b.rs", "MARK MARK")]);
+        let out = cwd.grep(&args(r#"{"pattern": "MARK", "path": "src"}"#));
+        assert_eq!(out.text, "src/a.rs:1: MARK");
+        let out = cwd.grep(&args(r#"{"pattern": "MARK", "path": ".."}"#));
+        assert!(out.is_error, "{:?}", out.text);
+        let out = cwd.grep(&args(r#"{"pattern": "["}"#));
+        assert!(
+            out.is_error,
+            "invalid regex is a tool error: {:?}",
+            out.text
+        );
+    }
+
+    /// `glob` matches `**` across directories and `*`/`?` inside
+    /// components — root-relative paths, no hidden entries.
+    #[test]
+    fn glob_matches_across_the_tree() {
+        let (_dir, cwd) = tree(&[
+            ("src/a.rs", ""),
+            ("src/deep/b.rs", ""),
+            ("note.txt", ""),
+            ("src/a.test", ""),
+            (".git/config", ""),
+        ]);
+        let out = cwd.glob(&args(r#"{"pattern": "**/*.rs"}"#));
+        assert!(!out.is_error);
+        assert_eq!(out.text, "src/a.rs\nsrc/deep/b.rs");
+
+        let out = cwd.glob(&args(r#"{"pattern": "src/*.?s"}"#));
+        assert_eq!(out.text, "src/a.rs");
+
+        let out = cwd.glob(&args(r#"{"pattern": "*.txt"}"#));
+        assert_eq!(out.text, "note.txt");
+    }
+
+    /// `glob` confines `path` and rejects `..`/absolute patterns.
+    #[test]
+    fn glob_confines_and_rejects_escape_patterns() {
+        let (_dir, cwd) = tree(&[("a.rs", "")]);
+        for bad in ["../x.rs", "/etc/*.conf", "src/../a.rs", ""] {
+            let out = cwd.glob(&args(&format!("{{\"pattern\": {bad:?}}}")));
+            assert!(out.is_error, "{bad:?}: {:?}", out.text);
+        }
+        let out = cwd.glob(&args(r#"{"pattern": "*.rs", "path": ".."}"#));
+        assert!(out.is_error, "{:?}", out.text);
+    }
+
+    /// The lexical normalizer resolves `.`/`..` without filesystem
+    /// access and cannot pop above `/`.
+    #[test]
+    fn normalize_resolves_segments_lexically() {
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(normalize(Path::new("/../../x")), PathBuf::from("/x"));
+    }
+
+    /// A rewrite diffs old against new — `a/`/`b/` labels, a `@@`
+    /// hunk with `-`/`+` lines and context — and `apply` writes
+    /// `content` byte-for-byte (us-22: the diff IS the change).
+    #[test]
+    fn edit_files_diffs_a_rewrite_and_applies_it_exactly() {
+        let (dir, cwd) = tree(&[("note.txt", "one\ntwo\nthree\n")]);
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "note.txt", "content": "one\nTWO\nthree\n"}]}"#,
+            ))
+            .expect("plan");
+        assert_eq!(
+            plan.summary(),
+            "--- a/note.txt\n+++ b/note.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three"
+        );
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(out.text, "wrote note.txt");
+        assert_eq!(
+            std::fs::read(dir.path().join("note.txt")).expect("read"),
+            b"one\nTWO\nthree\n"
+        );
+    }
+
+    /// A scattered rewrite produces separate hunks with three
+    /// context lines each — the diff is line-granular, not one
+    /// whole-file replace.
+    #[test]
+    fn edit_files_splits_scattered_changes_into_hunks() {
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 1..=20 {
+            old.push_str(&format!("line{i}\n"));
+            new.push_str(&if i == 3 || i == 18 {
+                format!("LINE{i}\n")
+            } else {
+                format!("line{i}\n")
+            });
+        }
+        let (dir, cwd) = tree(&[("big.txt", &old)]);
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": "big.txt", "content": new}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(
+            summary.contains("@@ -1,6 +1,6 @@"),
+            "first hunk keeps 3 context lines: {summary}"
+        );
+        assert!(
+            summary.contains("@@ -15,6 +15,6 @@"),
+            "second hunk: {summary}"
+        );
+        assert_eq!(summary.matches("@@").count(), 4, "two hunk headers");
+        plan.apply();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("big.txt")).expect("read"),
+            new
+        );
+    }
+
+    /// A new file previews `--- /dev/null` → `+++ b/<path>` with all
+    /// `+` lines, and only inside an existing parent (us-23).
+    #[test]
+    fn edit_files_previews_new_files_as_dev_null_diffs() {
+        let (dir, cwd) = tree(&[("sub/keep.txt", "k")]);
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "sub/new.txt", "content": "hello\nworld\n"}]}"#,
+            ))
+            .expect("plan");
+        assert_eq!(
+            plan.summary(),
+            "--- /dev/null\n+++ b/sub/new.txt\n@@ -0,0 +1,2 @@\n+hello\n+world"
+        );
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sub/new.txt")).expect("read"),
+            "hello\nworld\n"
+        );
+    }
+
+    /// A new file under a missing parent directory refuses at
+    /// planning — before the card, never as a silent mkdir (us-23).
+    #[test]
+    fn edit_files_refuses_a_missing_parent_directory() {
+        let (_dir, cwd) = tree(&[]);
+        let error = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "nope/new.txt", "content": "x"}]}"#,
+            ))
+            .expect_err("missing parent");
+        assert!(error.contains("parent"), "{error}");
+        assert!(error.contains("nope/new.txt"), "{error}");
+    }
+
+    /// The confinement rule binds writes the same as reads: `..`
+    /// and absolute escapes, plus a symlinked directory pointing
+    /// out of the tree — the leaf's lexical normalize cannot see
+    /// the last one, the parent's canonicalize can.
+    #[test]
+    fn edit_files_confines_writes_to_the_tree() {
+        let (dir, cwd) = tree(&[("note.txt", "x")]);
+        for path in ["../out.txt", "/tmp/ait-edit-escape.txt"] {
+            let error = cwd
+                .plan_edits(&args(&format!(
+                    r#"{{"files": [{{"path": {path:?}, "content": "y"}}]}}"#
+                )))
+                .expect_err(path);
+            assert!(error.contains("outside the working directory"), "{error}");
+        }
+        // A new file under a symlinked directory escapes through
+        // the parent even though the leaf never exists.
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linkdir")).expect("symlink");
+        let error = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "linkdir/evil.txt", "content": "y"}]}"#,
+            ))
+            .expect_err("symlinked parent");
+        assert!(error.contains("outside the working directory"), "{error}");
+        assert!(!outside.path().join("evil.txt").exists());
+    }
+
+    /// A binary or non-UTF-8 existing file, or `content` holding a
+    /// NUL, refuses: the diff could not show the change faithfully,
+    /// so the write must not happen either (us-22).
+    #[test]
+    fn edit_files_refuses_what_a_diff_cannot_show() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bin.dat"), b"\x89PNG\x00\x01").expect("bin");
+        std::fs::write(dir.path().join("bad.txt"), b"\xff\xfe invalid utf8").expect("bad");
+        let cwd = ToolCwd::new(dir.path().to_str().expect("utf-8"), &[]);
+        let error = cwd
+            .plan_edits(&args(r#"{"files": [{"path": "bin.dat", "content": "x"}]}"#))
+            .expect_err("binary");
+        assert!(error.contains("binary"), "{error}");
+        let error = cwd
+            .plan_edits(&args(r#"{"files": [{"path": "bad.txt", "content": "x"}]}"#))
+            .expect_err("non-utf8");
+        assert!(error.contains("UTF-8"), "{error}");
+        let error = cwd
+            .plan_edits(&args(
+                "{\"files\": [{\"path\": \"note.txt\", \"content\": \"a\\u0000b\"}]}",
+            ))
+            .expect_err("nul content");
+        assert!(error.contains("NUL"), "{error}");
+    }
+
+    /// Trailing-newline changes still diff: a line's terminator is
+    /// part of its identity, and the marker prints exactly like a
+    /// real unified diff.
+    #[test]
+    fn edit_files_diffs_trailing_newline_changes() {
+        let (dir, cwd) = tree(&[("f.txt", "a\nb")]); // no trailing newline
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "f.txt", "content": "a\nb\n"}]}"#,
+            ))
+            .expect("plan");
+        assert_eq!(
+            plan.summary(),
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b"
+        );
+        plan.apply();
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).expect("read"),
+            b"a\nb\n"
+        );
+
+        // The reverse — dropping the newline — mirrors the marker.
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "f.txt", "content": "a\nb"}]}"#,
+            ))
+            .expect("plan");
+        assert_eq!(
+            plan.summary(),
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+b\n\\ No newline at end of file"
+        );
+    }
+
+    /// Identical content produces a header-only diff marked as no
+    /// change — an empty summary on the approve card would read as
+    /// a broken card, not a no-op.
+    #[test]
+    fn edit_files_marks_unchanged_content() {
+        let (_dir, cwd) = tree(&[("note.txt", "same\n")]);
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [{"path": "note.txt", "content": "same\n"}]}"#,
+            ))
+            .expect("plan");
+        assert_eq!(
+            plan.summary(),
+            "--- a/note.txt\n+++ b/note.txt\n(no changes)"
+        );
+    }
+
+    /// A rewrite bigger than the LCS table still yields a faithful
+    /// unified diff — one contiguous replace hunk instead of a
+    /// quadratic-memory table (coarser, never wrong).
+    #[test]
+    fn edit_files_falls_back_to_one_hunk_when_the_change_is_huge() {
+        let old: String = (0..1200).map(|i| format!("old{i}\n")).collect();
+        let new: String = (0..1200).map(|i| format!("new{i}\n")).collect();
+        let (dir, cwd) = tree(&[("huge.txt", &old)]);
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": "huge.txt", "content": new}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(
+            summary.contains("@@ -1,1200 +1,1200 @@"),
+            "single replace hunk: {}",
+            &summary[..summary.len().min(300)]
+        );
+        assert!(summary.contains("-old0") && summary.contains("+new1199"));
+        plan.apply();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("huge.txt")).expect("read"),
+            new
+        );
+    }
+
+    /// One call can carry several files — every entry diffs into
+    /// the same summary and all of them apply together.
+    #[test]
+    fn edit_files_plans_and_applies_several_files() {
+        let (dir, cwd) = tree(&[("a.txt", "A\n")]);
+        let plan = cwd
+            .plan_edits(&args(
+                r#"{"files": [
+                    {"path": "a.txt", "content": "A2\n"},
+                    {"path": "b.txt", "content": "B\n"}
+                ]}"#,
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(summary.contains("+++ b/a.txt"), "{summary}");
+        assert!(summary.contains("+++ b/b.txt"), "{summary}");
+        assert!(summary.contains("--- /dev/null"), "{summary}");
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(out.text, "wrote 2 files: a.txt, b.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("a"),
+            "A2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).expect("b"),
+            "B\n"
+        );
+    }
+
+    /// Every bad-arguments shape is a planning error — the model
+    /// reads it and retries; nothing panics and nothing writes.
+    #[test]
+    fn edit_files_rejects_bad_arguments() {
+        let (_dir, cwd) = tree(&[]);
+        for bad in [
+            r#"{}"#,
+            r#"{"files": "x"}"#,
+            r#"{"files": []}"#,
+            r#"{"files": [{"path": 1, "content": "x"}]}"#,
+            r#"{"files": [{"path": "a.txt"}]}"#,
+        ] {
+            assert!(cwd.plan_edits(&args(bad)).is_err(), "{bad} must error");
+        }
+    }
+
+    /// The `edit_files` entry point: plans then applies — the path
+    /// the dispatch arm takes when no plan was precomputed.
+    #[test]
+    fn edit_files_executes_through_plan_and_apply() {
+        let (dir, cwd) = tree(&[("note.txt", "old\n")]);
+        let out = cwd.edit_files(&args(
+            r#"{"files": [{"path": "note.txt", "content": "new\n"}]}"#,
+        ));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).expect("read"),
+            "new\n"
+        );
+        let out = cwd.edit_files(&args(
+            r#"{"files": [{"path": "../x.txt", "content": "y"}]}"#,
+        ));
+        assert!(out.is_error, "{:?}", out.text);
+    }
+
+    /// Bind `dir` as the session root plus `entries` as verbatim
+    /// `directory_allowlist` strings — the shape the active
+    /// profile's `Vec<String>` hands [`ToolCwd::new`] (§5.7).
+    fn bind(dir: &Path, entries: &[String]) -> ToolCwd {
+        ToolCwd::new(dir.to_str().expect("utf-8 dir"), entries)
+    }
+
+    /// One allowlist entry naming `path` verbatim — an absolute
+    /// entry, the common case in `settings.toml`.
+    fn entry(path: &Path) -> String {
+        path.to_str().expect("utf-8 path").to_string()
+    }
+
+    /// §5.7 `directory_allowlist` (R07-T4): a listed root joins the
+    /// confinement union — `read_files`, `grep` and `glob` under it
+    /// behave exactly as under the cwd. Results name the listed
+    /// tree's own absolute paths (only the session root renders
+    /// relative), and a relative input still resolves against the
+    /// session cwd, never the listed root.
+    #[test]
+    fn an_allowlisted_root_reads_and_searches_like_the_cwd() {
+        let (dir, _cwd_only) = tree(&[("note.txt", "cwd note")]);
+        let shared = tempfile::tempdir().expect("shared");
+        std::fs::create_dir_all(shared.path().join("sub")).expect("mkdir");
+        std::fs::write(shared.path().join("a.rs"), "MARK top").expect("a");
+        std::fs::write(shared.path().join("sub/b.rs"), "MARK deep").expect("b");
+        std::fs::write(shared.path().join("note.txt"), "shared note").expect("note");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        // `read_files` on an absolute path inside the union.
+        let a = shared.path().join("a.rs");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [a]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert!(out.text.ends_with("MARK top"), "{:?}", out.text);
+
+        // A relative input still binds to the session cwd — the
+        // listed root's same-named file is not consulted.
+        let out = cwd.read_files(&args(r#"{"paths": ["note.txt"]}"#));
+        assert!(out.text.ends_with("cwd note"), "{:?}", out.text);
+
+        // `grep` and `glob` scope to the listed root through `path`,
+        // reporting the tree's canonical paths.
+        let out = cwd.grep(&args(
+            &serde_json::json!({"pattern": "MARK", "path": shared.path()}).to_string(),
+        ));
+        assert!(!out.is_error, "{:?}", out.text);
+        let a = std::fs::canonicalize(shared.path().join("a.rs")).expect("canonical a");
+        let b = std::fs::canonicalize(shared.path().join("sub/b.rs")).expect("canonical b");
+        assert_eq!(
+            out.text,
+            format!("{}:1: MARK top\n{}:1: MARK deep", a.display(), b.display())
+        );
+        let out = cwd.glob(&args(
+            &serde_json::json!({"pattern": "**/*.rs", "path": shared.path()}).to_string(),
+        ));
+        assert_eq!(out.text, format!("{}\n{}", a.display(), b.display()));
+    }
+
+    /// Allowlist entries get [`confine`](ToolCwd::confine)'s own
+    /// normalization before they can confine anything: a relative
+    /// entry joins the session root (`../shared` deliberately names
+    /// the sibling tree), `..`/`.` segments resolve lexically, and
+    /// a symlinked entry canonicalizes — the root the user declared
+    /// is the root the union grants, under either spelling.
+    #[test]
+    fn allowlist_entries_normalize_like_confined_paths() {
+        // Layout: `parent/proj` is the session cwd, `parent/shared`
+        // the tree a relative `..` entry declares.
+        let parent = tempfile::tempdir().expect("parent");
+        let proj = parent.path().join("proj");
+        let shared = parent.path().join("shared");
+        std::fs::create_dir_all(&proj).expect("proj");
+        std::fs::create_dir_all(shared.join("inner")).expect("shared");
+        std::fs::write(shared.join("top.txt"), "SHARED-TOP").expect("top");
+        std::fs::write(shared.join("inner/deep.txt"), "SHARED-DEEP").expect("deep");
+        let top = shared.join("top.txt");
+
+        // A relative entry escapes the session root on purpose —
+        // normalization, not the confinement check, decides it.
+        let cwd = bind(&proj, &[String::from("../shared")]);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("SHARED-TOP"));
+
+        // `..` and `.` inside entries collapse lexically: both
+        // spellings land on the same real trees.
+        let cwd = bind(
+            &proj,
+            &[
+                String::from("../shared/inner/../"),
+                format!("{}/./inner", shared.display()),
+            ],
+        );
+        let deep = shared.join("inner/deep.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [deep]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+
+        // A narrower entry grants only its own subtree.
+        let cwd = bind(&proj, &[entry(&shared.join("inner"))]);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [deep]}).to_string()));
+        assert!(!out.is_error, "{:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(
+            out.is_error,
+            "the entry's subtree, not its parent, is the root: {:?}",
+            out.text
+        );
+
+        // A symlinked entry resolves to its real root — reads under
+        // either spelling confine to it.
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&shared, &link).expect("symlink");
+        let cwd = bind(&proj, &[entry(&link)]);
+        let via_link = link.join("top.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [via_link]}).to_string()));
+        assert!(!out.is_error, "symlink spelling: {:?}", out.text);
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [top]}).to_string()));
+        assert!(!out.is_error, "real spelling: {:?}", out.text);
+    }
+
+    /// The union's edge: a path under neither the session cwd nor a
+    /// listed root still returns the unchanged escape tool error —
+    /// the allowlist widens only the declared trees.
+    #[test]
+    fn paths_outside_the_union_still_escape() {
+        let (dir, _cwd_only) = tree(&[("inside.txt", "safe")]);
+        let shared = tempfile::tempdir().expect("shared");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").expect("secret");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        let secret = outside.path().join("secret.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [secret]}).to_string()));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(
+            out.text.contains("outside the working directory"),
+            "{:?}",
+            out.text
+        );
+        assert!(!out.text.contains("SECRET"));
+
+        // `..` from the cwd escapes the same way — under neither
+        // root.
+        let out = cwd.read_files(&args(r#"{"paths": ["../x.txt"]}"#));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("outside the working directory"));
+    }
+
+    /// `edit_files` under a listed root plans and applies exactly
+    /// as under the cwd: a rewrite diffs old against new, a new
+    /// file gets the `/dev/null` diff treatment (us-22/23) and
+    /// both write on `apply`. A path under neither root still
+    /// refuses at planning.
+    #[test]
+    fn edit_files_plans_and_applies_under_an_allowlisted_root() {
+        let (dir, _cwd_only) = tree(&[]);
+        let shared = tempfile::tempdir().expect("shared");
+        std::fs::write(shared.path().join("note.txt"), "one\ntwo\n").expect("note");
+        let cwd = bind(dir.path(), &[entry(shared.path())]);
+
+        // Rewriting an existing file under the listed root diffs.
+        let note = shared.path().join("note.txt");
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": note, "content": "one\nTWO\n"}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(summary.contains("-two\n+TWO"), "{summary}");
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(std::fs::read_to_string(&note).expect("read"), "one\nTWO\n");
+
+        // A new file under the listed root gets the `/dev/null`
+        // treatment — the diff labels are its own absolute path.
+        // (Canonical spelling: the leaf does not exist, so confine
+        // compares its lexical form against the canonical root —
+        // the same rule absolute cwd paths already live by.)
+        let fresh = std::fs::canonicalize(shared.path())
+            .expect("canonical shared")
+            .join("fresh.txt");
+        let plan = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": fresh, "content": "hello\n"}]
+                })
+                .to_string(),
+            ))
+            .expect("plan");
+        let summary = plan.summary();
+        assert!(summary.starts_with("--- /dev/null\n+++ b/"), "{summary}");
+        let out = plan.apply();
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(std::fs::read_to_string(&fresh).expect("read"), "hello\n");
+
+        // A write under neither root still refuses at planning —
+        // before the card, as everywhere else.
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("evil.txt");
+        let error = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": target, "content": "x"}]
+                })
+                .to_string(),
+            ))
+            .expect_err("outside union");
+        assert!(error.contains("outside the working directory"), "{error}");
+    }
+
+    /// An empty `directory_allowlist` is the status quo verbatim:
+    /// cwd-only confinement, same escape error.
+    #[test]
+    fn an_empty_allowlist_keeps_the_cwd_only_tree() {
+        let (_dir, cwd) = tree(&[("inside.txt", "safe")]);
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").expect("secret");
+        let secret = outside.path().join("secret.txt");
+        let out = cwd.read_files(&args(&serde_json::json!({"paths": [secret]}).to_string()));
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(out.text.contains("outside the working directory"));
+        let target = outside.path().join("evil.txt");
+        let error = cwd
+            .plan_edits(&args(
+                &serde_json::json!({
+                    "files": [{"path": target, "content": "y"}]
+                })
+                .to_string(),
+            ))
+            .expect_err("outside cwd");
+        assert!(error.contains("outside the working directory"), "{error}");
+    }
+
+    // ── Spec R09-T6: the remote twins against a scripted executor ──
+
+    use crate::{CommandResult, ExecutorError};
+
+    /// A `CommandExecutor` that records the remote command text and
+    /// answers a canned result — no PTY, no ssh; the remote tools'
+    /// command shape and result shaping are what's under test.
+    struct StubExecutor {
+        /// Every command the tool composed, in order.
+        commands: Vec<String>,
+        /// The canned output — ignored when `fails`.
+        output: Vec<u8>,
+        /// `true` answers a transport error instead.
+        fails: bool,
+    }
+
+    impl StubExecutor {
+        fn answering(output: &str) -> Self {
+            Self {
+                commands: Vec::new(),
+                output: output.as_bytes().to_vec(),
+                fails: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                commands: Vec::new(),
+                output: Vec::new(),
+                fails: true,
+            }
+        }
+    }
+
+    impl CommandExecutor for StubExecutor {
+        fn run(&mut self, command: &str) -> Result<CommandResult, ExecutorError> {
+            self.commands.push(command.to_owned());
+            if self.fails {
+                Err(ExecutorError::Transport(String::from("socket dead")))
+            } else {
+                Ok(CommandResult {
+                    output: self.output.clone(),
+                    exit_code: Some(0),
+                })
+            }
+        }
+    }
+
+    /// The glob → ERE translation: whole-segment `**` spans ZERO or
+    /// more components — the local `glob_match`'s exact rule — while
+    /// `*`/`?` stay component-local even when doubled mid-segment.
+    #[test]
+    fn glob_to_ere_spans_zero_or_more_components() {
+        assert_eq!(glob_to_ere(&["a", "**", "b.rs"]), "a/([^/]+/)*b\\.rs");
+        assert_eq!(glob_to_ere(&["**", "b.rs"]), "([^/]+/)*b\\.rs");
+        assert_eq!(glob_to_ere(&["a", "**"]), "a(/.*)?");
+        assert_eq!(glob_to_ere(&["**"]), ".*");
+        assert_eq!(glob_to_ere(&["*.rs"]), "[^/]*\\.rs");
+        // `a**b` inside a segment is two component-local `*`s — never
+        // a separator crosser.
+        assert_eq!(glob_to_ere(&["a**b", "c"]), "a[^/]*[^/]*b/c");
+        // A middle `**` between literals keeps both separators sane.
+        assert_eq!(glob_to_ere(&["a", "**", "b", "c"]), "a/([^/]+/)*b/c");
+    }
+
+    /// The remote `grep -n` line parser: the leftmost `:<digits>:`
+    /// boundary splits path from number — a `:` inside the file name
+    /// keeps scanning, a `:` inside the match text is never consulted.
+    #[test]
+    fn parse_remote_grep_line_splits_on_the_digits_boundary() {
+        assert_eq!(
+            parse_remote_grep_line("/b/", "/b/f.rs:3:hit"),
+            Some(("f.rs", 3, "hit"))
+        );
+        assert_eq!(
+            parse_remote_grep_line("/b/", "/b/a:b.rs:3:hit"),
+            Some(("a:b.rs", 3, "hit"))
+        );
+        assert_eq!(
+            parse_remote_grep_line("/b/", "/b/f.rs:3:hit:5: x"),
+            Some(("f.rs", 3, "hit:5: x"))
+        );
+        assert_eq!(parse_remote_grep_line("/b/", "/other/f.rs:1: x"), None);
+        assert_eq!(parse_remote_grep_line("/b/", "/b/no-marker"), None);
+    }
+
+    /// Remote `grep` composes one command that prefers PCRE (the
+    /// local `regex` dialect's closest remote twin), falls back to
+    /// ERE, skips dot-paths and oversized files like the local walk,
+    /// and sorts hits `path:line` — the local tool's file order.
+    #[test]
+    fn remote_grep_composes_the_parallel_command_and_sorts_hits() {
+        let (dir, cwd) = tree(&[]);
+        let base = dir.path().display().to_string();
+        let mut executor = StubExecutor::answering(&format!(
+            "{base}/deep/b.rs:2:hit\n\
+             {base}/a.rs:1:hit\n\
+             {base}/weird:dir/c.rs:3:hit\n"
+        ));
+        let out = cwd.remote_grep(&args(r#"{"pattern":"hit"}"#), &mut executor);
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(
+            out.text, "a.rs:1: hit\ndeep/b.rs:2: hit\nweird:dir/c.rs:3: hit",
+            "sorted path:line, displayed root-relative"
+        );
+        let command = &executor.commands[0];
+        assert!(command.contains("grep -qP"), "PCRE preferred: {command}");
+        assert!(
+            command.contains("-size -1048577c"),
+            "the size cap rides find: {command}"
+        );
+        assert!(
+            command.contains("! -path '*/.*'"),
+            "dot-paths skipped like the local walk: {command}"
+        );
+        assert!(
+            command.contains(&format!("'{base}'")),
+            "the confined base is quoted in: {command}"
+        );
+    }
+
+    /// Remote `grep`'s `path` arg confines lexically just like the
+    /// local one — `..` escapes are tool errors before a command is
+    /// ever composed.
+    #[test]
+    fn remote_grep_confines_its_base_and_fails_cleanly() {
+        let (_dir, cwd) = tree(&[]);
+        let mut executor = StubExecutor::answering("");
+        let out = cwd.remote_grep(&args(r#"{"pattern":"x","path":".."}"#), &mut executor);
+        assert!(out.is_error, "{:?}", out.text);
+        assert!(executor.commands.is_empty(), "no command on an escape");
+        let out = cwd.remote_grep(&args(r#"{"pattern":"x"}"#), &mut StubExecutor::failing());
+        assert!(out.is_error);
+        assert!(out.text.contains("socket dead"), "{:?}", out.text);
+    }
+
+    /// Remote `glob` emits `find | grep -E` under the confined base —
+    /// and the translated `**` in the emitted regex is the
+    /// zero-or-more-components form the local matcher implements.
+    #[test]
+    fn remote_glob_composes_find_grep_and_sorts_results() {
+        let (dir, cwd) = tree(&[]);
+        let base = dir.path().display().to_string();
+        let mut executor =
+            StubExecutor::answering(&format!("{base}/src/deep/b.rs\n{base}/src/a.rs\n"));
+        let out = cwd.remote_glob(&args(r#"{"pattern":"src/**/*.rs"}"#), &mut executor);
+        assert!(!out.is_error, "{:?}", out.text);
+        assert_eq!(out.text, "src/a.rs\nsrc/deep/b.rs", "sorted, root-relative");
+        let command = &executor.commands[0];
+        assert!(
+            command.contains("src/([^/]+/)*[^/]*\\.rs"),
+            "the `**` ERE: {command}"
+        );
+        assert!(
+            command.contains("! -path '*/.*'"),
+            "dot-paths skipped: {command}"
+        );
+    }
+
+    /// Remote `glob` rejects the same shapes the local one does —
+    /// escapes and empties error before a command is composed.
+    #[test]
+    fn remote_glob_rejects_escape_patterns_and_bad_bases() {
+        let (_dir, cwd) = tree(&[]);
+        for bad in ["../x.rs", "/etc/*.conf", "src/../a.rs", ""] {
+            let mut executor = StubExecutor::answering("");
+            let out = cwd.remote_glob(&args(&format!("{{\"pattern\": {bad:?}}}")), &mut executor);
+            assert!(out.is_error, "{bad:?}: {:?}", out.text);
+            assert!(executor.commands.is_empty());
+        }
+    }
+}

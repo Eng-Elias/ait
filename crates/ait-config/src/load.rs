@@ -52,7 +52,7 @@ pub fn load_from(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
 /// undiscoverable home directory falls back to a relative `.config`,
 /// which resolves against the working directory like any other missing
 /// config (i.e. yields defaults).
-fn config_dir(xdg_config_home: Option<OsString>, home_dir: PathBuf) -> PathBuf {
+pub(crate) fn config_dir(xdg_config_home: Option<OsString>, home_dir: PathBuf) -> PathBuf {
     let xdg = PathBuf::from(xdg_config_home.unwrap_or_default());
     if xdg.is_absolute() {
         xdg

@@ -1,0 +1,24 @@
+[package]
+name = "ait-store"
+version.workspace = true
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Local-first SQLite store: agent conversations, transcripts, plans and terminal-session block metadata under $XDG_DATA_HOME/ait (REQUIREMENTS.md §5.8)."
+
+[dependencies]
+# Semver requirements; resolved releases are >=7 days old per the
+# ADR-0002 supply-chain rule: rusqlite 0.41.0 (2026-10-24),
+# thiserror 2.0.21 (2026-09-23). A semver "0.41" requirement resolves
+# rusqlite 0.41.1 (2026-10-28) — too fresh for ADR-0002 at adoption —
+# so Cargo.lock is pinned back to 0.41.0 via
+# `cargo update -p rusqlite --precise 0.41.0`.
+# `bundled` compiles rusqlite's vendored SQLite so no system SQLite is
+# required (Spec R08, user story 29). The facade stays synchronous —
+# the `ait` binary is tokio-free (ADR-0004) — so no async features.
+rusqlite = { version = "0.41", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Tempdirs for the store tests' on-disk database fixtures.
+# Release >=7 days old per ADR-0002: tempfile 3.27.0 (2026-03-11).
+tempfile = "3"

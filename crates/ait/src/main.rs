@@ -7,35 +7,114 @@
 //! terminal core lives in `ait-term`, the configuration model in
 //! `ait-config`.
 
+mod agent_panel;
 mod app;
 mod backend;
+mod blocks;
 mod config;
+mod conversations;
+mod ctl;
+mod headless;
+mod inband;
+mod integration;
 mod keymap;
 mod keys;
+mod profile;
+mod remote;
 mod render;
 mod scroll;
 mod selection;
+mod shell_bridge;
+mod skills;
 mod status;
+mod store;
 mod suggest;
 mod tabs;
 mod terminal;
+mod transcript;
 
 use std::env;
 use std::process::ExitCode;
 
-const USAGE: &str = "ait — AI Terminal
+/// `--help`'s text and the tail of every usage error (Spec R12
+/// §5.11, us-13–16): man-page layout — NAME/SYNOPSIS/DESCRIPTION/
+/// OPTIONS — covering every arm [`parse_args`] accepts, including
+/// headless's stdout/stderr/exit-code contract. Documentation only;
+/// the accepted forms are the parser's.
+const USAGE: &str = "NAME
+    ait — AI terminal: $SHELL in a full-screen TUI, with an agent
+    that sees and drives it
 
-USAGE:
-    ait                    Open a full-screen terminal running $SHELL
-    ait --init [--force]   Write a commented default settings.toml
-                           (refuses to overwrite unless --force)
-    ait --print-schema     Print the settings JSON Schema and exit
-    ait --version          Print the version and exit
-    ait --help             Print this help
+SYNOPSIS
+    ait
+    ait ctl open-tab
+    ait ctl send [--tab <id>] [--no-enter] <text>
+    ait ctl last-block [--tab <id>] [--command|--exit]
+    ait --headless \"<task>\" [--profile <name>]
+    ait --init [--force]
+    ait --print-schema
+    ait --version
+    ait --help
+
+DESCRIPTION
+    Bare ait opens a full-screen terminal running $SHELL — tabs,
+    command blocks, an agent sidebar. Every other form performs
+    one action and exits. An unrecognized argument is a usage
+    error: the message and this text land on stderr and the exit
+    code is non-zero.
+
+OPTIONS
+    ctl <verb>
+        Drive a running instance over its control socket (unix
+        only): $AIT_CTL_SOCKET when set, else the one live
+        instance's socket — spawned shells inherit the variable,
+        so `ait ctl` inside a tab drives its own instance. Verb
+        answers go to stdout; failures exit non-zero with the
+        message on stderr.
+
+        open-tab
+            Open a tab and print the response's JSON line — it
+            carries the new tab's session id.
+
+        send [--tab <id>] [--no-enter] <text>
+            Write <text> into the tab's shell input and submit
+            it; --no-enter leaves the text on the input line
+            instead. <id> is the tab's AIT_SESSION_ID — unset
+            targets the active tab.
+
+        last-block [--tab <id>] [--command|--exit]
+            Print the newest sealed block's output; --command or
+            --exit prints that field instead (the two can't
+            combine).
+
+    --headless \"<task>\" [--profile <name>]
+        Run one agent task non-interactively: the answer's text
+        streams to stdout (pipe-safe) while tool and status
+        activity goes to stderr; approval gates are auto-denied
+        and questions get a canned no-interactive answer.
+        --profile names an [agents.execution_profiles.*] entry —
+        unset arms the launch default. Exit codes: 0 done, 1
+        error (startup failures — bad settings, unknown profile,
+        no model — and mid-run errors alike), 2 step budget
+        reached, 130 interrupted by SIGINT (the headless Esc).
+
+    --init [--force]
+        Write a commented default settings.toml under
+        $XDG_CONFIG_HOME/ait/; an existing file is kept unless
+        --force (the `--force --init` order also works).
+
+    --print-schema
+        Print the settings JSON Schema.
+
+    --version
+        Print the version. -V is a synonym.
+
+    --help
+        Print this text. -h is a synonym.
 ";
 
 /// What `argv[1..]` asks the binary to do (Spec R03 `ait` CLI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
     /// Bare `ait` — the TUI.
     Run,
@@ -47,12 +126,31 @@ enum Command {
     Init { force: bool },
     /// `--print-schema`.
     PrintSchema,
+    /// `ctl <verb>` — drive a running instance over its control
+    /// socket (Spec R11 §5.10.5); the verb shape is [`ctl`]'s.
+    Ctl(ctl::CtlVerb),
+    /// `--headless "<task>" [--profile <name>]` — the non-interactive
+    /// agent run (Spec R11 §5.10.5).
+    Headless {
+        /// The task text, verbatim.
+        task: String,
+        /// The `--profile <name>` selection — `None` arms the
+        /// launch default.
+        profile: Option<String>,
+    },
 }
 
-/// `argv[1..]` → the [`Command`] to run. `--init`'s `--force` is the
-/// only two-flag form; anything unrecognized is a usage error naming
-/// the offending argument.
+/// `argv[1..]` → the [`Command`] to run. `--init`'s `--force` and
+/// `--headless`'s `--profile` are the only flag forms; anything
+/// unrecognized is a usage error naming the offending argument. A
+/// leading `ctl` hands its whole argv tail to
+/// [`ctl::parse_ctl_args`] — the subcommand surface R11-T3 owns
+/// (later CLI arms add variants additively, never a second
+/// leading-word parser).
 fn parse_args(args: &[String]) -> Result<Command, String> {
+    if args.first().is_some_and(|arg| arg == "ctl") {
+        return ctl::parse_ctl_args(&args[1..]).map(Command::Ctl);
+    }
     match args {
         [] => Ok(Command::Run),
         [arg] => match arg.as_str() {
@@ -60,6 +158,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--help" | "-h" => Ok(Command::Help),
             "--init" => Ok(Command::Init { force: false }),
             "--print-schema" => Ok(Command::PrintSchema),
+            "--headless" => Err("the --headless form needs a task".to_string()),
             _ => Err(format!("unknown argument {arg:?}")),
         },
         [first, second]
@@ -67,6 +166,16 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 || (first == "--force" && second == "--init") =>
         {
             Ok(Command::Init { force: true })
+        }
+        [first, task] if first == "--headless" => Ok(Command::Headless {
+            task: task.clone(),
+            profile: None,
+        }),
+        [first, task, flag, name] if first == "--headless" && flag == "--profile" => {
+            Ok(Command::Headless {
+                task: task.clone(),
+                profile: Some(name.clone()),
+            })
         }
         _ => Err(format!("unrecognized arguments {}", args.join(" "))),
     }
@@ -111,6 +220,14 @@ fn main() -> ExitCode {
             println!("{}", ait_config::json_schema());
             ExitCode::SUCCESS
         }
+        // The ctl client arm (Spec R11): resolve the instance's
+        // socket, exchange one request, print the verb's answer —
+        // `run_client` owns stdout/stderr and the exit code.
+        Ok(Command::Ctl(verb)) => ctl::run_client(&verb),
+        // The non-interactive agent run (Spec R11 §5.10.5) — the
+        // driver owns settings load, the hidden shell and the
+        // stdout/stderr/exit-code contract.
+        Ok(Command::Headless { task, profile }) => headless::run(&task, profile.as_deref()),
         Err(message) => {
             eprintln!("ait: {message}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -152,6 +269,53 @@ mod tests {
         );
     }
 
+    /// Spec R11 §5.10.5: `--headless "<task>"` carries the task
+    /// verbatim; `--profile <name>` selects the profile; the task
+    /// itself may look like a flag (it is a value, not parsed).
+    #[test]
+    fn headless_parses_task_and_optional_profile() {
+        assert_eq!(
+            parse_args(&args(&["--headless", "fix the tests"])),
+            Ok(Command::Headless {
+                task: "fix the tests".to_string(),
+                profile: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&args(&["--headless", "fix the tests", "--profile", "work"])),
+            Ok(Command::Headless {
+                task: "fix the tests".to_string(),
+                profile: Some("work".to_string()),
+            })
+        );
+        // A flag-shaped task stays verbatim.
+        assert_eq!(
+            parse_args(&args(&["--headless", "--verbose"])),
+            Ok(Command::Headless {
+                task: "--verbose".to_string(),
+                profile: None,
+            })
+        );
+    }
+
+    /// The headless forms' failure modes: a bare `--headless` names
+    /// the missing task, a trailing `--profile` with no name or an
+    /// unrecognized flag is a usage error.
+    #[test]
+    fn headless_malformed_forms_are_errors() {
+        assert_eq!(
+            parse_args(&args(&["--headless"])),
+            Err("the --headless form needs a task".to_string())
+        );
+        for list in [
+            &["--headless", "task", "--profile"][..],
+            &["--headless", "task", "--bogus", "name"][..],
+            &["--headless", "task", "--profile", "name", "extra"][..],
+        ] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
+    }
+
     /// `--init --force` in either order is the overwrite form (story 3).
     #[test]
     fn init_force_parses_in_both_orders() {
@@ -182,5 +346,39 @@ mod tests {
             parse_args(&args(&["wat"])),
             Err("unknown argument \"wat\"".to_string())
         );
+    }
+
+    /// `ctl`'s argv tail lands on the client verbs (Spec R11 §5.10.5)
+    /// — and its own malformed shapes stay usage errors, never a
+    /// silent TUI launch.
+    #[test]
+    fn ctl_verbs_parse_to_their_commands() {
+        assert_eq!(
+            parse_args(&args(&["ctl", "open-tab"])),
+            Ok(Command::Ctl(ctl::CtlVerb::OpenTab))
+        );
+        assert_eq!(
+            parse_args(&args(&["ctl", "send", "--no-enter", "echo hi"])),
+            Ok(Command::Ctl(ctl::CtlVerb::Send {
+                tab: None,
+                enter: false,
+                text: "echo hi".to_owned(),
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["ctl", "last-block", "--tab", "2", "--exit"])),
+            Ok(Command::Ctl(ctl::CtlVerb::LastBlock {
+                tab: Some("2".to_owned()),
+                select: ctl::LastBlockSelect::Exit,
+            }))
+        );
+        for list in [
+            &["ctl"][..],
+            &["ctl", "bogus"][..],
+            &["ctl", "send"][..],
+            &["ctl", "last-block", "--command", "--exit"][..],
+        ] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
     }
 }

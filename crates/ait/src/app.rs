@@ -23,7 +23,11 @@
 //!    same tick the settings watcher's channel is drained (Spec R03):
 //!    a good reload swaps the live [`Settings`] — status line and
 //!    NEW-session `[terminal]` options included — while a broken save
-//!    toasts the error and keeps last-good. The suggester's channel
+//!    toasts the error and keeps last-good. The skills watcher drains
+//!    beside it (§5.10.2, Spec R10-T6): a `SKILL.md` change under
+//!    either root refreshes the catalog the next `AgentRequest`
+//!    snapshots, and a malformed write keeps last-good while its
+//!    error toasts. The suggester's channel
 //!    drains on that tick too (Spec R04): the `# `+Enter trigger
 //!    verified in [`suggest`] fires a request from the pass-through
 //!    key path, and `Alt+Enter` fires the same request from the whole
@@ -56,7 +60,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ait_agent::CommandSuggester;
 use ait_config::{ConfigError, Settings};
@@ -66,23 +70,31 @@ use ait_term::{
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::queue;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
+use crate::agent_panel::{paint_agent_panel, AgentPanel};
 use crate::backend::StyledBackend;
-use crate::config::{self, LiveSettings, NoSecrets};
+use crate::config::{self, LiveSettings};
+use crate::conversations::ConversationPicker;
+use crate::ctl;
 use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
+use crate::profile::{self, ProfilePicker};
 use crate::render::{
-    apply_selection, chrome_areas, content_size, grid_line, paint_session, paint_status_line,
-    paint_tab_bar, to_cursor_style, UnderlineOverlay,
+    apply_selection, chrome_areas, content_size, grid_line, paint_conversation_picker,
+    paint_profile_picker, paint_session, paint_status_line, paint_tab_bar, split_content,
+    to_cursor_style, UnderlineOverlay,
 };
 use crate::scroll::WHEEL_LINES;
 use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
-use crate::status::{notification_text, status_text, Toast};
+use crate::skills::LiveSkills;
+use crate::status::{notification_text, status_text, StatusLine, Toast};
+use crate::store::StoreHandle;
 use crate::suggest::{self, SuggestionPin};
 use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
@@ -167,6 +179,39 @@ struct AppState {
     /// the tab's stable [`id`](crate::tabs::Tab) — see
     /// [`suggest::SuggestionPin`] for the whole state machine.
     suggestion: SuggestionPin,
+    /// The active execution profile's name (Spec R07 §5.7 / issue
+    /// #101): the stance the NEXT `AgentRequest`/`SuggestRequest`
+    /// snapshots beside its `Settings` — an in-flight task keeps the
+    /// profile it started with, so consent is never rewritten mid-run.
+    /// `default` at launch, `Alt+P` switches it, and nothing ever
+    /// writes it back to `settings.toml` (us-27: ephemeral by design).
+    /// A name a reload deleted stays armed — the worker's
+    /// missing-profile fail-safe asks for every call until the user
+    /// picks a live one.
+    profile: String,
+    /// The open profile switcher, if any (`Alt+P` with ≥3 declared
+    /// profiles): the names and the highlighted row. App-global like
+    /// the selection itself — a tab switch or panel toggle never
+    /// disturbs it; a settings reload drops the stale list.
+    picker: Option<ProfilePicker>,
+    /// The local store (Spec R08 §5.8): one `terminal_sessions` row
+    /// per spawned tab, one `blocks` row per sealed block. Open/write
+    /// failures degrade to a toast plus an unpersisted run — the
+    /// terminal works either way.
+    store: StoreHandle,
+    /// The open conversation picker, if any (`Alt+R`; Spec R08-T6):
+    /// the store's rows newest-first — Enter resumes into the active
+    /// tab's panel, `Ctrl+D` deletes behind a one-key confirm. Held
+    /// app-global like the profile picker; a second `Alt+R` toggles
+    /// it closed, and opening one picker drops the other.
+    conversations: Option<ConversationPicker>,
+    /// The live skills catalog (REQUIREMENTS.md §5.10.2, Spec
+    /// R10-T6): the frontend-owned watcher on both skills roots keeps
+    /// the last-good [`SkillsCatalog`](ait_agent::SkillsCatalog)
+    /// fresh — create/edit/delete of a `SKILL.md` lands on the NEXT
+    /// task's `AgentRequest.skills` snapshot, a malformed write
+    /// keeps its last-good copy and toasts the surfaced error.
+    skills: LiveSkills,
 }
 
 /// What the last painted frame showed: a change in any field alone
@@ -196,6 +241,32 @@ struct Rendered {
     /// snapshot must carry enough to notice the cell changing under a
     /// stationary cursor (a spinner redrawing in place).
     cursor_cell: Option<Cell>,
+    /// What the active tab's agent panel showed — `None` while the
+    /// tab has none (Spec R06): a streamed `TextDelta` on an idle
+    /// shell produces no grid damage, so the panel's mutation counter
+    /// rides the snapshot to force its repaints.
+    panel: Option<PanelView>,
+    /// The profile picker overlay's painted state (Spec R07): it
+    /// draws over the session grid, which reports no damage of its
+    /// own — opening, moving the highlight and closing must all show
+    /// up in the snapshot to repaint.
+    picker: Option<ProfilePicker>,
+    /// The conversation picker's painted state (Spec R08-T6) —
+    /// same no-damage-of-its-own rule as `picker`.
+    conversations: Option<ConversationPicker>,
+}
+
+/// The painted agent panel's state for the [`Rendered`] snapshot:
+/// every change the paint can see bumps the panel's revision, so
+/// comparing it is comparing the whole panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelView {
+    /// Whether the split was open.
+    open: bool,
+    /// Whether the panel owned the keyboard.
+    focused: bool,
+    /// The panel's mutation counter.
+    revision: u64,
 }
 
 /// Run the TUI: spawn `$SHELL` in a tab and drive the tab set until the
@@ -232,9 +303,9 @@ pub fn run() -> io::Result<ExitCode> {
     // runs on defaults with the `ConfigError` toasted (stories 7–8) —
     // a typo never costs the terminal.
     let (config, load_error) = match ait_config::load() {
-        Ok(settings) => (LiveSettings::adopt(settings, &NoSecrets), None),
+        Ok(settings) => (LiveSettings::adopt(settings), None),
         Err(error) => (
-            LiveSettings::adopt(Settings::default(), &NoSecrets),
+            LiveSettings::adopt(Settings::default()),
             Some(error.message().to_string()),
         ),
     };
@@ -243,24 +314,84 @@ pub fn run() -> io::Result<ExitCode> {
     // absent so a mid-session first write still reloads — a genuine
     // watch failure still degrades to running without reload.
     let watcher = config::watcher();
+    // The store opens before the first session spawns: `terminal_sessions`
+    // rows key every later block insert (Spec R08). An open failure
+    // toasts and the run goes unpersisted — same degrade a later write
+    // failure lands in (user story 25).
+    let (store, store_error) = match StoreHandle::open() {
+        Ok(store) => (store, None),
+        Err(error) => (StoreHandle::disabled(), Some(error.to_string())),
+    };
     let mut state = AppState {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: load_error.map(|text| Toast::new(format!("config error: {text}"), Instant::now())),
+        toast: {
+            // Both failures can land on one launch — the store's
+            // signal must surface even when a config error already
+            // toasted, so they share the line.
+            let failures: Vec<String> = [
+                load_error.map(|text| format!("config error: {text}")),
+                store_error.map(|text| format!("store unavailable: {text}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), Instant::now()))
+        },
         config,
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
         suggester: CommandSuggester::new(),
         suggestion: SuggestionPin::new(),
+        // Every launch starts on `default` (Spec R07 us-27) — the
+        // selection is never read back from disk.
+        profile: profile::DEFAULT_PROFILE.to_string(),
+        picker: None,
+        store,
+        conversations: None,
+        // §5.10.2's watcher starts at launch so a skill written before
+        // the first task still lands in that task's snapshot (Spec
+        // R10-T6).
+        skills: LiveSkills::new(),
+    };
+    // §5.10.5's control socket (Spec R11): a nonblocking listener on
+    // `${XDG_RUNTIME_DIR}/ait/<pid>.sock`, drained on the tick beside
+    // the other channels. A bind failure degrades to running without
+    // ctl — additive surface, never a launch blocker. Its path rides
+    // the spawn template so every session's env exports
+    // `AIT_CTL_SOCKET` (surviving later config reloads —
+    // `set_session_template` carries it).
+    let mut ctl = match ctl::CtlServer::bind() {
+        Ok(server) => Some(server),
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("ctl socket unavailable: {error}"),
+                Instant::now(),
+            ));
+            None
+        }
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).
-    let mut tabs = TabManager::spawn_with(
-        content_size(state.screen),
-        config::session_options(&state.config.settings().terminal),
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut template = config::session_template(state.config.settings());
+    template.ctl_socket = ctl
+        .as_ref()
+        .map(|server| server.socket_path())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_path_buf());
+    let mut tabs = TabManager::spawn_with(content_size(state.screen), template)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // The first tab's `terminal_sessions` row (Spec R08): `None` — a
+    // disabled store or a failed insert — leaves the tab unpersisted.
+    if let Some(tab) = tabs.active_mut() {
+        if let Some(id) = state
+            .store
+            .session_started(&mut state.toast, tab.title(), tab.cwd())
+        {
+            tab.set_store_session(id);
+        }
+    }
 
     let backend = StyledBackend::new(io::stdout());
     let underlines = backend.underline_overlay();
@@ -352,12 +483,52 @@ pub fn run() -> io::Result<ExitCode> {
         if let Some(watcher) = &watcher {
             drain_config_events(watcher.receiver(), &mut state, &mut tabs);
         }
+        // The skills watcher drains beside it (§5.10.2, Spec R10-T6):
+        // each debounced burst refreshes the catalog the next
+        // `AgentRequest` snapshots; a malformed `SKILL.md` keeps its
+        // last-good copy and toasts the surfaced error.
+        state.skills.drain(&mut state.toast);
         // Suggester events on the same tick too (Spec R04): T4 drains
         // errors to the status line and clears the in-flight pin; T5
         // streams `Delta`s into the pinned tab.
         state
             .suggestion
             .drain(state.suggester.events(), &tabs, &mut state.toast);
+        // The ctl socket drains on the same tick (Spec R11 §5.10.5):
+        // completed requests dispatch over `&mut TabManager` — a
+        // `send`'s bytes land in this tick's session drains, and an
+        // `open_tab`'s spawned tab (now active) gets the
+        // `terminal_sessions` row `Alt+T` registers (Spec R08).
+        if let Some(server) = ctl.as_mut() {
+            for follow in server.drain(&mut tabs) {
+                match follow {
+                    ctl::FollowUp::OpenedTab => {
+                        if let Some(tab) = tabs.active_mut() {
+                            if let Some(id) = state.store.session_started(
+                                &mut state.toast,
+                                tab.title(),
+                                tab.cwd(),
+                            ) {
+                                tab.set_store_session(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Agent sessions on the same tick (Spec R06): `TextDelta`s
+        // stream into each tab's conversation and terminal events
+        // release its running state — a background tab keeps up.
+        tabs.drain_agent_events();
+        // The transcript mirror on the same tick (Spec R08-T3):
+        // whatever the drain just folded lands in `transcript_items`
+        // — each tab's batch one transaction — beside the block rows.
+        tabs.drain_transcripts(&mut state.store, &mut state.toast);
+        // Block metadata on the same tick (Spec R08): every block the
+        // PTY drain just sealed lands in ONE transaction, here in the
+        // drain half of the loop — never on the render path.
+        let rows = tabs.take_persisted_blocks();
+        state.store.insert_blocks(&mut state.toast, &rows);
 
         // Standard 6: the last close already exits via `Handled::Quit`;
         // this guard is the belt for any path that could empty the set —
@@ -380,16 +551,25 @@ pub fn run() -> io::Result<ExitCode> {
         // `view.cursor_cell` — both still repaint via the snapshot.
         let damaged = damaged_beyond_cursor(&tab.session.damage(), cursor);
         let now = Instant::now();
+        // The model slot resolves the ACTIVE profile's `base_model`
+        // (Spec R07 §4.2/us-25) — per tick, so a switch or a reload is
+        // the very next frame's text.
+        let model = state.config.model(&state.profile);
         let view = Rendered {
             active,
             count,
             offset: tab.scroll_offset(),
             selection: tab.selection_range(),
             status: status_text(
-                tab.cwd(),
-                tab.title(),
-                state.config.model(),
-                tab.exit_status(),
+                &StatusLine {
+                    cwd: tab.cwd(),
+                    shell: tab.title(),
+                    model: &model,
+                    profile: profile::status_slot(&state.profile),
+                    block: tab.last_block_status(),
+                    remote: tab.remote_target(),
+                    exit: tab.exit_status(),
+                },
                 state.toast.as_ref(),
                 now,
             ),
@@ -399,6 +579,13 @@ pub fn run() -> io::Result<ExitCode> {
                 i32::try_from(cursor.line).unwrap_or(i32::MAX),
                 cursor.column,
             ),
+            panel: tab.agent_panel().map(|panel| PanelView {
+                open: panel.is_open(),
+                focused: panel.is_focused(),
+                revision: panel.revision(),
+            }),
+            picker: state.picker.clone(),
+            conversations: state.conversations.clone(),
         };
         if damaged || rendered.as_ref() != Some(&view) {
             render_frame(
@@ -406,10 +593,26 @@ pub fn run() -> io::Result<ExitCode> {
                 &tabs,
                 &view.status,
                 view.toast,
+                Overlays {
+                    profile: state.picker.as_ref(),
+                    conversations: state.conversations.as_ref(),
+                },
                 &underlines,
                 &mut last_cursor_shape,
             )?;
             rendered = Some(view);
+        }
+    }
+
+    // `ended_at` on app exit (Spec R08): `Alt+W` stamped closed tabs
+    // earlier; every session row still open finishes here — still
+    // through the degrade rule, so a dead store can't wedge shutdown.
+    for tab in tabs.tabs() {
+        if let Some(id) = tab.store_session() {
+            state.store.session_ended(&mut state.toast, id);
+        }
+        if let Some(id) = tab.conversation() {
+            state.store.conversation_closed(&mut state.toast, id);
         }
     }
 
@@ -472,6 +675,17 @@ fn handle_event<W: Write>(
                             format!("new tab failed: {error}"),
                             Instant::now(),
                         ));
+                    } else if let Some(tab) = tabs.active_mut() {
+                        // The spawned tab's `terminal_sessions` row
+                        // (Spec R08) — `None` (unpersisted store or a
+                        // failed insert) leaves the tab unpersisted.
+                        if let Some(id) =
+                            state
+                                .store
+                                .session_started(&mut state.toast, tab.title(), tab.cwd())
+                        {
+                            tab.set_store_session(id);
+                        }
                     }
                 }
                 Resolution::Action(AppAction::CloseTab) => {
@@ -479,6 +693,16 @@ fn handle_event<W: Write>(
                     // the process exit code before it is removed.
                     if tabs.len() == 1 {
                         state.last_exit = tabs.active().and_then(|tab| tab.exit_status().cloned());
+                    }
+                    // `ended_at` on tab close (Spec R08): the row this
+                    // tab's spawn opened finishes with the tab. Its
+                    // conversation closes the same way — `status` is
+                    // "open" only while a live tab owns the row.
+                    if let Some(id) = tabs.active().and_then(|tab| tab.store_session()) {
+                        state.store.session_ended(&mut state.toast, id);
+                    }
+                    if let Some(id) = tabs.active().and_then(|tab| tab.conversation()) {
+                        state.store.conversation_closed(&mut state.toast, id);
                     }
                     // `false` = the set is now empty: quit rather than ever
                     // indexing it (standard 6).
@@ -511,9 +735,92 @@ fn handle_event<W: Write>(
                     state.suggestion.suggest_from_line(
                         &state.suggester,
                         state.config.settings(),
+                        &state.profile,
                         tab,
                         &mut state.toast,
                     );
+                }
+                // `Alt+A` (Spec R06 / issue #85): toggle the active
+                // tab's agent conversation panel — open focuses its
+                // input line, a second press while focused closes the
+                // split. Only THIS tab's winsize changes (panels are
+                // per-tab): `resize_active` re-derives it through the
+                // same session-resize path a window resize takes.
+                Resolution::Action(AppAction::AgentPanel) => {
+                    let Some(tab) = tabs.active_mut() else {
+                        return Handled::Continue;
+                    };
+                    tab.clear_selection();
+                    tab.toggle_agent_panel();
+                    tabs.resize_active();
+                }
+                // `Alt+P` (Spec R07 §5.7 / issue #101): switch the
+                // active execution profile — a picker over three or
+                // more declared names (its keys route through the
+                // pass-through arm while open), a direct cycle
+                // between two, a toast when there is nothing to
+                // switch to. A second press while the picker is open
+                // dismisses it. The selection is app-global and
+                // ephemeral: it rides the NEXT `AgentRequest`/
+                // `SuggestRequest` snapshot, never settings.toml.
+                Resolution::Action(AppAction::SwitchProfile) => {
+                    if state.picker.take().is_some() {
+                        // Toggled closed — the highlight is dropped.
+                    } else {
+                        let names: Vec<String> = state
+                            .config
+                            .settings()
+                            .agents
+                            .execution_profiles
+                            .keys()
+                            .cloned()
+                            .collect();
+                        match profile::switch(&names, &state.profile) {
+                            profile::Switch::Picker => {
+                                state.picker = Some(ProfilePicker::new(names, &state.profile));
+                            }
+                            profile::Switch::Cycle(name) => {
+                                activate_profile(state, name);
+                            }
+                            profile::Switch::Unavailable => {
+                                state.toast = Some(Toast::new(
+                                    "no other execution profiles declared",
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                // `Alt+R` (Spec R08 §5.8, ticket R08-T6): the
+                // conversation picker over the store's rows —
+                // newest-first, Enter resumes into the active tab's
+                // panel, `Ctrl+D` deletes behind a one-key confirm,
+                // Esc closes. A second `Alt+R` toggles it closed, and
+                // opening it drops the profile picker — one overlay
+                // at a time. The list is a snapshot taken here; an
+                // empty store toasts instead of opening nothing.
+                Resolution::Action(AppAction::Conversations) => {
+                    if state.conversations.take().is_some() {
+                        // Toggled closed — the highlight is dropped.
+                    } else {
+                        state.picker = None;
+                        match state.store.conversations() {
+                            Ok(listed) if listed.is_empty() => {
+                                state.toast =
+                                    Some(Toast::new("no stored conversations", Instant::now()));
+                            }
+                            Ok(listed) => {
+                                state.conversations =
+                                    Some(ConversationPicker::new(&listed, SystemTime::now()));
+                            }
+                            Err(error) => {
+                                state.toast = Some(Toast::new(
+                                    format!("conversations list failed: {error}"),
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 // Per-active-tab viewport actions: scrollback + paste.
                 Resolution::Action(action) => {
@@ -526,6 +833,38 @@ fn handle_event<W: Write>(
                         AppAction::ScrollPageDown => tab.page_down(),
                         AppAction::ScrollTop => tab.scroll_to_top(),
                         AppAction::ScrollBottom => tab.snap_to_bottom(),
+                        // Spec R05 §5.5: block navigation scrolls like
+                        // the page bindings; `Alt+B` programs the
+                        // existing selection over the current block's
+                        // clamped range and copies it through the same
+                        // OSC-52 path a mouse release uses. On a tab
+                        // with NO blocks the chords are ordinary input
+                        // again — encoded to the PTY like PassThrough
+                        // (`ESC b`, `ESC [1;3A`, …) rather than eaten
+                        // inertly (§5.5 Out-of-Scope: no integration ⇒
+                        // no behavior change). The spec's readline
+                        // trade-off — `M-b` is backward-word — applies
+                        // only where blocks exist to act on.
+                        AppAction::PrevBlockStart
+                        | AppAction::NextBlockStart
+                        | AppAction::SelectBlock
+                            if !tab.has_blocks() =>
+                        {
+                            tab.snap_to_bottom();
+                            if tab.exit_status().is_none() {
+                                if let Some(key_event) = keys::translate(&key_event) {
+                                    tab.shadow.update(&key_event);
+                                    let _ = tab.session.send_key(key_event);
+                                }
+                            }
+                        }
+                        AppAction::PrevBlockStart => tab.prev_block_start(),
+                        AppAction::NextBlockStart => tab.next_block_start(),
+                        AppAction::SelectBlock => {
+                            if let Some(range) = tab.select_block() {
+                                copy_range(tab, range, state, host);
+                            }
+                        }
                         AppAction::Paste => {
                             // Paste ait's own copied selection (there is no
                             // host-clipboard read), bracketed iff the child
@@ -558,10 +897,35 @@ fn handle_event<W: Write>(
                         | AppAction::NextTab
                         | AppAction::PrevTab
                         | AppAction::JumpToTab(_)
-                        | AppAction::SuggestCommand => {} // dispatched above
+                        | AppAction::SuggestCommand
+                        | AppAction::AgentPanel
+                        | AppAction::SwitchProfile
+                        | AppAction::Conversations => {} // dispatched above
                     }
                 }
                 Resolution::PassThrough => {
+                    // An open profile picker owns unbound keys (Spec
+                    // R07 §5.7): ↑/↓ move the highlight, Enter arms
+                    // the highlighted name, plain Esc dismisses, and
+                    // every other key is swallowed so nothing leaks
+                    // to the PTY mid-pick. Bound chords already ran
+                    // above — `Alt+P` itself dismisses there, like
+                    // `Alt+A` closes the focused panel.
+                    if state.picker.is_some() {
+                        picker_key(&key_event, state);
+                        return Handled::Continue;
+                    }
+                    // The open conversation picker owns unbound keys
+                    // the same way (Spec R08-T6): ↑/↓ move the
+                    // highlight, Enter resumes, `Ctrl+D` deletes
+                    // behind its confirm, plain Esc dismisses, and
+                    // everything else is swallowed — nothing leaks
+                    // to the PTY mid-pick. Bound chords already ran
+                    // above (`Alt+R` itself toggles it closed).
+                    if state.conversations.is_some() {
+                        conversation_key(&key_event, tabs, state);
+                        return Handled::Continue;
+                    }
                     // The active tab's index BEFORE the mutable borrow —
                     // in-flight keys are scoped to the pinned tab
                     // (Spec R04 user story 14).
@@ -580,6 +944,22 @@ fn handle_event<W: Write>(
                     };
                     // Any keypress drops the highlight — never stale state.
                     tab.clear_selection();
+                    // A focused agent panel owns the keystroke (Spec
+                    // R06): it edits the panel's input line, never
+                    // reaches the PTY, never updates the input shadow
+                    // and never snaps the terminal's view. The app
+                    // keymap already resolved above — its bindings
+                    // still win over panel focus (standard 7).
+                    if tab.agent_focused() {
+                        tab.agent_key(
+                            &key_event,
+                            state.config.settings(),
+                            &state.profile,
+                            &mut state.skills,
+                            &mut state.toast,
+                        );
+                        return Handled::Continue;
+                    }
                     // Typing snaps the view back to the live viewport, then
                     // reaches the PTY encoded exactly as before.
                     tab.snap_to_bottom();
@@ -611,15 +991,46 @@ fn handle_event<W: Write>(
                             // (us-2). A live pin gates the next
                             // trigger — one request in flight at a time.
                             if state.suggestion.is_none() && suggest::is_submission(&key_event) {
-                                if let Some(request) =
-                                    suggest::request_for(tab, state.config.settings())
-                                {
+                                if let Some(request) = suggest::request_for(
+                                    tab,
+                                    state.config.settings(),
+                                    &state.profile,
+                                ) {
                                     state.suggestion.fire(
                                         &state.suggester,
                                         tab.id,
                                         request,
                                         &mut state.toast,
                                     );
+                                } else if let Some((line, request)) = suggest::classified_request(
+                                    tab,
+                                    state.config.settings(),
+                                    &state.profile,
+                                ) {
+                                    // The third trigger (§5.10.4, Spec
+                                    // R11-T2): a natural-language verdict
+                                    // swallows the Enter and rewrites the
+                                    // submission — `Ctrl+U` wipes the
+                                    // typed line, `# <line>` + `\r` lands
+                                    // the request in history as a comment
+                                    // and draws the fresh prompt the
+                                    // armed suggestion streams onto
+                                    // (ADR-0007 semantics). The rewrite
+                                    // goes out ONLY once the request is
+                                    // armed: a refused `fire` falls
+                                    // through to the ordinary verbatim
+                                    // submission below — the
+                                    // erase-after-fire ordering
+                                    // `suggest_from_line` established.
+                                    if state.suggestion.fire(
+                                        &state.suggester,
+                                        tab.id,
+                                        request,
+                                        &mut state.toast,
+                                    ) {
+                                        suggest::rewrite_as_comment(tab, &line);
+                                        return Handled::Continue;
+                                    }
                                 }
                             }
                             tab.shadow.update(&key_event);
@@ -631,31 +1042,51 @@ fn handle_event<W: Write>(
         }
         Event::Mouse(mouse_event) => {
             let content = chrome_areas(state.screen).content;
+            // The panel owns its rect: the wheel there scrolls the
+            // conversation, and a click there never starts a terminal
+            // selection (Spec R06 — clicks in the panel are the
+            // panel's, not the grid's).
+            let panel_open = tabs.active().is_some_and(|tab| tab.agent_panel_open());
+            let (terminal, panel) = split_content(content, panel_open);
+            let position = Position::new(mouse_event.column, mouse_event.row);
+            let in_panel = panel.is_some_and(|area| area.contains(position));
             let Some(tab) = tabs.active_mut() else {
                 return Handled::Continue;
             };
             match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    tab.clear_selection();
-                    tab.scroll_up(WHEEL_LINES);
+                    if in_panel {
+                        tab.agent_scroll_up(WHEEL_LINES);
+                    } else {
+                        tab.clear_selection();
+                        tab.scroll_up(WHEEL_LINES);
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    tab.clear_selection();
-                    tab.scroll_down(WHEEL_LINES);
+                    if in_panel {
+                        tab.agent_scroll_down(WHEEL_LINES);
+                    } else {
+                        tab.clear_selection();
+                        tab.scroll_down(WHEEL_LINES);
+                    }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Only a drag starting inside the session area
                     // selects; the chrome rows (tab bar, status line)
-                    // are inert.
-                    if content.contains(Position::new(mouse_event.column, mouse_event.row)) {
-                        tab.begin_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    // and the agent panel are inert.
+                    if terminal.contains(position) {
+                        tab.begin_selection(grid_point(
+                            &mouse_event,
+                            terminal,
+                            tab.scroll_offset(),
+                        ));
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     // An in-flight drag follows the pointer anywhere —
                     // past the top it selects into scrollback, the way
                     // the view would scroll.
-                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    tab.extend_selection(grid_point(&mouse_event, terminal, tab.scroll_offset()));
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
                     // Fold the release point into the range before
@@ -663,16 +1094,9 @@ fn handle_event<W: Write>(
                     // last `Drag` can lag the cell the button released
                     // on — a fast flick would otherwise copy short.
                     // Outside a drag `extend` is a no-op.
-                    tab.extend_selection(grid_point(&mouse_event, content, tab.scroll_offset()));
+                    tab.extend_selection(grid_point(&mouse_event, terminal, tab.scroll_offset()));
                     if let Some(range) = tab.finish_selection() {
-                        let text = extract(&tab.grid(), range);
-                        if !text.is_empty() {
-                            state.copied_text = Some(text.clone());
-                            // OSC 52 silently no-ops where the host
-                            // denies it — never an error (Spec R02).
-                            let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
-                            let _ = host.flush();
-                        }
+                        copy_range(tab, range, state, host);
                     }
                 }
                 // Other buttons and motion aren't captured/used.
@@ -690,6 +1114,27 @@ fn handle_event<W: Write>(
         _ => {}
     }
     Handled::Continue
+}
+
+/// The OSC-52 copy both selection paths share (Spec R02's mouse
+/// release, Spec R05's `Alt+B` block select): extract the range's
+/// text, keep it as ait's own clipboard for `Shift+Insert`, and offer
+/// it to the host — a silent no-op where the host denies OSC 52, never
+/// an error. An empty range copies nothing, same rule the drag path
+/// always applied.
+fn copy_range<W: Write>(
+    tab: &crate::tabs::Tab,
+    range: SelectionRange,
+    state: &mut AppState,
+    host: &mut W,
+) {
+    let text = extract(&tab.grid(), range);
+    if text.is_empty() {
+        return;
+    }
+    state.copied_text = Some(text.clone());
+    let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
+    let _ = host.flush();
 }
 
 /// Service the host input queue once: wait up to [`INPUT_POLL`] for the
@@ -742,6 +1187,14 @@ fn service_input<W: Write>(
 /// keep spawn-time values, story 14); a broken save toasts the
 /// `ConfigError` and keeps last-good. `try_recv` keeps the drain
 /// zero-cost inside the 8 ms poll loop — no async, no extra waking.
+///
+/// Spec R07 §5.7/us-24: a reload that renamed or deleted the ACTIVE
+/// execution profile does NOT rewrite the selection — the name stays
+/// armed so the worker's missing-profile fail-safe keeps asking for
+/// every call until the user picks a live one, and a toast names the
+/// vanished profile instead of a silent fallback. An open picker's
+/// snapshot is dropped with the old settings; the next `Alt+P` lists
+/// the new file's names.
 fn drain_config_events(
     receiver: &Receiver<Result<Settings, ConfigError>>,
     state: &mut AppState,
@@ -750,8 +1203,22 @@ fn drain_config_events(
     while let Ok(event) = receiver.try_recv() {
         match event {
             Ok(settings) => {
-                tabs.set_session_options(config::session_options(&settings.terminal));
-                state.config = LiveSettings::adopt(settings, &NoSecrets);
+                tabs.set_session_template(config::session_template(&settings));
+                // The OLD declared names decide "deleted" vs
+                // "never declared" — an armed `default` deleted
+                // with the whole table toasts; one that never was
+                // stays silent (us-28).
+                let vanished =
+                    profile::active_missing(state.config.settings(), &settings, &state.profile)
+                        .then(|| state.profile.clone());
+                state.config = LiveSettings::adopt(settings);
+                state.picker = None;
+                if let Some(name) = vanished {
+                    state.toast = Some(Toast::new(
+                        format!("execution profile \"{name}\" no longer declared"),
+                        Instant::now(),
+                    ));
+                }
             }
             Err(error) => {
                 state.toast = Some(Toast::new(
@@ -775,14 +1242,28 @@ fn grid_point(mouse: &MouseEvent, content: Rect, scroll_offset: usize) -> GridPo
 
 /// Draw one frame: the tab bar on top, the active tab's grid in the
 /// content band (shifted `scroll_offset` lines into scrollback, selected
-/// cells inverted), the status line at the bottom (`status`, reversed
-/// while it's a live toast), then the application-requested cursor
-/// shape and position.
+/// cells inverted) — or its terminal side when the tab's agent panel is
+/// open, the split's right side going to [`paint_agent_panel`] — the
+/// status line at the bottom (`status`, reversed while it's a live
+/// toast), then the application-requested cursor shape and position:
+/// the panel's input-line cursor while it owns the keyboard, the
+/// session's otherwise.
+/// The overlay pickers one frame can paint (Spec R07 §5.7, R08-T6):
+/// dispatch keeps them mutually exclusive — either may be open,
+/// never both.
+struct Overlays<'a> {
+    /// The `Alt+P` profile switcher.
+    profile: Option<&'a ProfilePicker>,
+    /// The `Alt+R` conversation picker.
+    conversations: Option<&'a ConversationPicker>,
+}
+
 fn render_frame(
     terminal: &mut Terminal<StyledBackend<io::Stdout>>,
     tabs: &TabManager,
     status: &str,
     toast: bool,
+    overlays: Overlays<'_>,
     underlines: &Rc<RefCell<UnderlineOverlay>>,
     last_cursor_shape: &mut Option<SetCursorStyle>,
 ) -> io::Result<()> {
@@ -790,7 +1271,14 @@ fn render_frame(
         return Ok(());
     };
     let cursor = tab.cursor();
-    if let Some(style) = to_cursor_style(cursor.shape) {
+    // A focused panel's input line wants a bar cursor; the session's
+    // own shape governs everywhere else.
+    let shape = if tab.agent_focused() {
+        CursorShape::Beam
+    } else {
+        cursor.shape
+    };
+    if let Some(style) = to_cursor_style(shape) {
         if *last_cursor_shape != Some(style) {
             // Queued on the backend's writer; flushes with this draw.
             queue!(terminal.backend_mut().writer_mut(), style)?;
@@ -802,32 +1290,60 @@ fn render_frame(
     let active = tabs.active_index();
     terminal.draw(|frame| {
         let areas = chrome_areas(frame.area());
+        // Spec R06's right-side split: the session paints in the
+        // terminal half, the agent conversation in the panel half —
+        // same `split_content` formula the winsize derivation uses.
+        let (terminal_area, panel_area) = split_content(areas.content, tab.agent_panel_open());
         let buf = frame.buffer_mut();
         {
             let mut overlay = underlines.borrow_mut();
             overlay.clear();
             paint_session(
                 buf,
-                areas.content,
+                terminal_area,
                 &tab.grid(),
                 &mut overlay,
                 tab.scroll_offset(),
             );
             if let Some(range) = tab.selection_range() {
-                apply_selection(buf, areas.content, &tab.grid(), range, tab.scroll_offset());
+                apply_selection(buf, terminal_area, &tab.grid(), range, tab.scroll_offset());
             }
+        }
+        if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
+            paint_agent_panel(buf, area, panel);
         }
         paint_tab_bar(buf, areas.tab_bar, &titles, active);
         paint_status_line(buf, areas.status, status, toast);
-        // The cursor's live line renders at `content.y + line + offset`;
-        // scrolled far enough up it leaves the band and stays hidden.
-        let y = usize::from(areas.content.y) + cursor.line + tab.scroll_offset();
-        if cursor.shape != CursorShape::Hidden && y < usize::from(areas.content.bottom()) {
-            let x = (areas.content.x + cursor.column as u16)
-                .min(areas.content.right().saturating_sub(1));
-            frame.set_cursor_position((x, y as u16));
+        // The profile switcher and the conversation picker are
+        // overlays (Spec R07 §5.7, R08-T6): they paint last over the
+        // content band's bottom rows so nothing underneath decides
+        // their hit-testing. Dispatch keeps them mutually exclusive
+        // — opening one drops the other.
+        if let Some(picker) = overlays.profile {
+            paint_profile_picker(buf, areas.content, picker);
         }
-        // No position set → ratatui hides the cursor this frame.
+        if let Some(picker) = overlays.conversations {
+            paint_conversation_picker(buf, areas.content, picker);
+        }
+        if let (Some(area), Some(panel)) = (panel_area, tab.agent_panel()) {
+            if panel.is_focused() {
+                // The input line owns the host cursor while the panel
+                // owns the keyboard.
+                let (x, y) = panel.cursor_position(area);
+                frame.set_cursor_position((x, y));
+            }
+        }
+        if !tab.agent_focused() {
+            // The cursor's live line renders at `area.y + line + offset`;
+            // scrolled far enough up it leaves the band and stays hidden.
+            let y = usize::from(terminal_area.y) + cursor.line + tab.scroll_offset();
+            if cursor.shape != CursorShape::Hidden && y < usize::from(terminal_area.bottom()) {
+                let x = (terminal_area.x + cursor.column as u16)
+                    .min(terminal_area.right().saturating_sub(1));
+                frame.set_cursor_position((x, y as u16));
+            }
+            // No position set → ratatui hides the cursor this frame.
+        }
     })?;
     terminal.backend_mut().writer_mut().flush()?;
     Ok(())
@@ -850,6 +1366,184 @@ fn damaged_beyond_cursor(damage: &Damage, cursor: Cursor) -> bool {
     }
 }
 
+/// One key while the profile picker is open (Spec R07 §5.7): the ask
+/// card's vocabulary — ↑/↓ move the highlight, Enter arms the
+/// highlighted name and closes, plain Esc closes without switching.
+/// Anything else is swallowed: a picker that let `q` through would
+/// have typed it into the shell. `state.picker` is `Some` on entry —
+/// the caller already routed.
+fn picker_key(key: &KeyEvent, state: &mut AppState) {
+    let Some(picker) = state.picker.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up => picker.prev(),
+        KeyCode::Down => picker.next(),
+        KeyCode::Enter => {
+            let name = picker.selected_name().to_string();
+            state.picker = None;
+            activate_profile(state, name);
+        }
+        // Plain Esc dismisses; a modified Esc is swallowed like any
+        // other key — a chord with modifiers never types into the PTY
+        // mid-pick.
+        KeyCode::Esc if key.modifiers.is_empty() => {
+            state.picker = None;
+        }
+        _ => {}
+    }
+}
+
+/// Arm a newly chosen execution profile (Spec R07 §5.7): the name is
+/// the active stance from the NEXT `AgentRequest`/`SuggestRequest`
+/// onward — nothing persists it, nothing rewrites an in-flight
+/// request — and a real change confirms itself with the spec's
+/// *profile switched* toast (us-23). Re-arming the already-active
+/// name — the picker's Enter on the highlighted row — switches
+/// nothing, so it stays silent.
+fn activate_profile(state: &mut AppState, name: String) {
+    if name == state.profile {
+        return;
+    }
+    state.toast = Some(Toast::new(
+        format!("execution profile switched to \"{name}\""),
+        Instant::now(),
+    ));
+    state.profile = name;
+}
+
+/// One key while the conversation picker is open (Spec R08-T6,
+/// us-5/11): ↑/↓ move the highlight, Enter resumes the highlighted
+/// row into the active tab's panel, `Ctrl+D` arms then confirms the
+/// delete (one gesture, never an accident — any other key disarms),
+/// plain Esc dismisses. `state.conversations` is `Some` on entry —
+/// the caller already routed.
+fn conversation_key(key: &KeyEvent, tabs: &mut TabManager, state: &mut AppState) {
+    enum Outcome {
+        /// Nothing happened — key consumed.
+        None,
+        /// Close the picker.
+        Close,
+        /// Resume `id` into the active tab's panel.
+        Resume(i64),
+        /// The armed confirm fired: delete `id`.
+        Delete(i64),
+    }
+    let outcome = {
+        let Some(picker) = state.conversations.as_mut() else {
+            return;
+        };
+        // `Ctrl+D` is the one-key confirm's whole vocabulary: the
+        // first press arms, the second deletes. Anything else first
+        // disarms, then does its usual thing — a stray key can never
+        // sneak a delete past the user (us-11).
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            if picker.confirming() {
+                match picker.selected_row() {
+                    Some(row) => Outcome::Delete(row.id),
+                    None => Outcome::Close,
+                }
+            } else {
+                picker.arm_delete();
+                Outcome::None
+            }
+        } else {
+            picker.disarm_delete();
+            match key.code {
+                KeyCode::Up => {
+                    picker.prev();
+                    Outcome::None
+                }
+                KeyCode::Down => {
+                    picker.next();
+                    Outcome::None
+                }
+                KeyCode::Enter => match picker.selected_row() {
+                    Some(row) => Outcome::Resume(row.id),
+                    None => Outcome::Close,
+                },
+                KeyCode::Esc if key.modifiers.is_empty() => Outcome::Close,
+                _ => Outcome::None,
+            }
+        }
+    };
+    match outcome {
+        Outcome::None => {}
+        Outcome::Close => state.conversations = None,
+        Outcome::Resume(id) => {
+            state.conversations = None;
+            resume_conversation(id, tabs, state);
+        }
+        Outcome::Delete(id) => {
+            if state.store.delete_conversation(&mut state.toast, id) {
+                // The row is gone — every tab bound to it must open
+                // a new row rather than append to a deleted one.
+                tabs.detach_conversation(id);
+                if let Some(picker) = state.conversations.as_mut() {
+                    picker.remove_selected();
+                    if picker.rows().is_empty() {
+                        state.conversations = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Enter` on a picker row: load the conversation and swap the
+/// active tab's panel to it (Spec R08-T6, us-6/10). Refused with a
+/// toast while the tab's task runs — a live run is never clobbered.
+/// The reads land BEFORE the swap so a failed load changes nothing;
+/// the row binds so every later flush appends to it.
+fn resume_conversation(id: i64, tabs: &mut TabManager, state: &mut AppState) {
+    let running = tabs
+        .active()
+        .and_then(|tab| tab.agent_panel())
+        .is_some_and(AgentPanel::is_running);
+    if running {
+        state.toast = Some(Toast::new(
+            "a task is still running — resume refused",
+            Instant::now(),
+        ));
+        return;
+    }
+    let items = match state.store.load_transcript(id) {
+        Ok(items) => items,
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("transcript load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    let plan = match state.store.load_plan(id) {
+        Ok(Some(ait_agent::TranscriptItem::Plan { todos })) => Some(todos),
+        Ok(_) => None,
+        Err(error) => {
+            state.toast = Some(Toast::new(
+                format!("plan load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    if let Some(tab) = tabs.active_mut() {
+        let previous = tab.conversation();
+        tab.resume_conversation(id, items, plan);
+        state.toast = Some(Toast::new("conversation resumed", Instant::now()));
+        // `status` mirrors the binding: the resumed row re-opens, and
+        // the row this tab just swapped away from is unowned now.
+        state.store.conversation_reopened(&mut state.toast, id);
+        if let Some(old) = previous.filter(|old| *old != id) {
+            state.store.conversation_closed(&mut state.toast, old);
+        }
+    }
+    // The panel may have opened on a tab that never had one —
+    // re-derive its winsize through the same path `Alt+A` takes.
+    tabs.resize_active();
+}
+
 /// The last closed tab's exit status as the process exit code.
 fn exit_code(status: Option<&ExitStatus>) -> ExitCode {
     match status {
@@ -865,6 +1559,7 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
+    use crate::tabs::SessionTemplate;
     use ait_agent::SuggestEvent;
     use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
@@ -873,7 +1568,7 @@ mod tests {
     use std::collections::VecDeque;
 
     fn manager() -> TabManager {
-        TabManager::spawn_with(Size::new(40, 10), LiveSessionOptions::default()).unwrap()
+        TabManager::spawn_with(Size::new(40, 10), SessionTemplate::default()).unwrap()
     }
 
     /// A manager on `/bin/sh` — deterministic tty echo for the trigger
@@ -883,8 +1578,11 @@ mod tests {
     fn sh_manager() -> TabManager {
         TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(std::ffi::OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -942,11 +1640,18 @@ mod tests {
                     copied_text: None,
                     last_exit: None,
                     toast: None,
-                    config: LiveSettings::adopt(Settings::default(), &NoSecrets),
+                    config: LiveSettings::adopt(Settings::default()),
                     // `NoSecrets` keeps keyring lookups out of tests —
                     // resolution never blocks on the Secret Service.
-                    suggester: CommandSuggester::with_secret_store(NoSecrets),
+                    suggester: CommandSuggester::with_secret_store(config::NoSecrets),
                     suggestion: SuggestionPin::new(),
+                    profile: profile::DEFAULT_PROFILE.to_string(),
+                    picker: None,
+                    store: StoreHandle::disabled(),
+                    conversations: None,
+                    // No watcher and no roots — the harness never
+                    // touches the filesystem for skills.
+                    skills: LiveSkills::unwatched(),
                 },
                 sink: Vec::new(),
             }
@@ -1105,8 +1810,19 @@ mod tests {
         // its own line. Wait for it, then find its grid line.
         // Same gate `run_line` uses: the first `send_bytes` must wait
         // for the prompt or the kernel echo races it onto the marker's
-        // row (deterministic failure on fast machines).
-        wait_until(&mut harness, |h| !logical(h).is_empty());
+        // row (deterministic failure on fast machines). `logical` is
+        // NOT the gate: a prompt that ends exactly at the right margin
+        // leaves the cursor on a fresh blank row below it, so the
+        // cursor's logical line stays empty even though the prompt
+        // already rendered — any non-empty row means the prompt landed.
+        wait_until(&mut harness, |h| {
+            h.tabs
+                .active()
+                .unwrap()
+                .grid()
+                .visible_rows()
+                .any(|row| !row.text().trim_end().is_empty())
+        });
         harness
             .tabs
             .active()
@@ -1189,6 +1905,149 @@ mod tests {
             tab.selection_range().is_some(),
             "a release never drops the highlight"
         );
+    }
+
+    /// A manager whose single `/bin/sh -c` tab emits two complete
+    /// `A B C D` quadruples with scrollback padding between them —
+    /// the block-UX dispatch tests' fixture (the same scripted-marks
+    /// seam `tabs::tests` drives).
+    fn block_manager() -> TabManager {
+        TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(std::ffi::OsString::from("/bin/sh")),
+                    args: vec![
+                        std::ffi::OsString::from("-c"),
+                        std::ffi::OsString::from(
+                            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                             printf 'first'; sleep 0.2; \
+                             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                             printf 'out1\\n'; sleep 0.2; \
+                             printf '\\033]133;D;0\\007\\n'; sleep 0.2; \
+                             i=0; while [ $i -lt 14 ]; do echo pad$i; i=$((i+1)); done; \
+                             sleep 0.2; \
+                             printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                             printf 'second'; sleep 0.2; \
+                             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                             printf 'out2\\n'; sleep 0.2; \
+                             printf '\\033]133;D;7\\007'; sleep 0.5",
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// Wait until the fixture's two blocks completed and scrollback
+    /// exists to navigate.
+    fn wait_for_blocks(harness: &mut Harness) {
+        wait_until(harness, |h| {
+            let Some(tab) = h.tabs.active() else {
+                return false;
+            };
+            tab.blocks().iter().filter(|b| b.completed()).count() == 2 && tab.scrollback() > 0
+        });
+    }
+
+    /// Spec R05 / issue #74: `Alt+↑`/`Alt+↓` dispatch as per-tab
+    /// actions and scroll the viewport between block starts — up
+    /// lands on the newest start above the view's top row, down walks
+    /// back toward the live viewport.
+    #[test]
+    fn block_navigation_chords_scroll_to_block_starts() {
+        let mut harness = Harness::new(block_manager());
+        wait_for_blocks(&mut harness);
+
+        let tab = harness.tabs.active().unwrap();
+        let scrollback = tab.scrollback();
+        let starts: Vec<usize> = tab
+            .blocks()
+            .iter()
+            .map(|block| *block.range().start())
+            .collect();
+        let target = starts
+            .iter()
+            .copied()
+            .filter(|start| *start < scrollback)
+            .max()
+            .expect("the first block sits in scrollback");
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Up, KeyModifiers::ALT)),
+            Handled::Continue
+        );
+        assert_eq!(
+            harness.tabs.active().unwrap().scroll_offset(),
+            scrollback - target,
+            "Alt+Up tops the view on the previous block's start"
+        );
+
+        let next = starts
+            .iter()
+            .copied()
+            .filter(|start| *start > target)
+            .min()
+            .expect("the second block is below");
+        harness.handle(key(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(
+            harness.tabs.active().unwrap().scroll_offset(),
+            scrollback.saturating_sub(next),
+            "Alt+Down walks to the next block start"
+        );
+    }
+
+    /// `Alt+B` (Spec R05 us-17/18): the current block — the one the
+    /// view's bottom row sits in — becomes a real [`Selection`], and
+    /// its text copies through the same OSC-52 path a drag release
+    /// uses: `copied_text` set for `Shift+Insert`, the OSC 52 write on
+    /// the host stream. Scrolled up on the first block, that's the
+    /// block that gets selected.
+    #[test]
+    fn alt_b_selects_and_copies_the_current_block() {
+        let mut harness = Harness::new(block_manager());
+        wait_for_blocks(&mut harness);
+
+        // Park the view on the first block — "current" is then the
+        // block the view's bottom row sits in.
+        harness.handle(key(KeyCode::Up, KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('b'), KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        let range = tab
+            .selection_range()
+            .expect("Alt+B programs a real selection");
+        let first = &tab.blocks()[0];
+        let scrollback = i32::try_from(tab.scrollback()).unwrap();
+        assert_eq!(range.start.line, *first.range().start() as i32 - scrollback);
+        assert_eq!(range.end.line, *first.range().end() as i32 - scrollback);
+
+        let copied = harness.state.copied_text.as_deref().unwrap_or_default();
+        assert!(copied.contains("first"), "the echo row: {copied:?}");
+        assert!(copied.contains("out1"), "the output row: {copied:?}");
+        assert!(
+            harness.sink.windows(5).any(|w| w == b"\x1b]52;"),
+            "the copy went out via OSC 52"
+        );
+    }
+
+    /// No blocks → the chords are inert: nothing selected, nothing
+    /// copied, no panic (§5.5 graceful degrade).
+    #[test]
+    fn block_chords_are_inert_without_blocks() {
+        let mut harness = Harness::new(sh_manager());
+
+        harness.handle(key(KeyCode::Char('b'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Up, KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Down, KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.selection_range().is_none());
+        assert_eq!(tab.scroll_offset(), 0);
+        assert!(harness.state.copied_text.is_none());
     }
 
     /// The input seam: a `poll`/`read` pair that always fails reports
@@ -1287,12 +2146,14 @@ mod tests {
         );
     }
 
-    /// Drain sessions and suggester events until `pred` holds, or fail
-    /// after a generous bound — mirrors `tabs::tests`' `drain_until`.
+    /// Drain sessions, suggester and agent events until `pred` holds,
+    /// or fail after a generous bound — mirrors `tabs::tests`'
+    /// `drain_until`.
     fn wait_until(harness: &mut Harness, pred: impl Fn(&Harness) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !pred(harness) {
             harness.tabs.drain_events();
+            harness.tabs.drain_agent_events();
             harness.state.suggestion.drain(
                 harness.state.suggester.events(),
                 &harness.tabs,
@@ -1437,6 +2298,268 @@ mod tests {
         assert_eq!(harness.tabs.active().unwrap().shadow.text(), "");
     }
 
+    // ---- Spec R11-T2 (§5.10.4): the classifier trigger ----
+    //
+    // The third submission trigger through `handle_event`: a verified
+    // natural-language line + Enter is swallowed and rewritten —
+    // `Ctrl+U`, then `# <line>` + `\r` — while the identical
+    // `SuggestRequest` path arms the stream the fresh prompt receives.
+    // Command lines, stale shadows, echo disagreement and
+    // `classifier = "off"` all forward verbatim.
+
+    /// Every grid row — scrollback then viewport — as trimmed text:
+    /// the shape the classifier tests assert PTY-visible output in.
+    fn rows(harness: &Harness) -> Vec<String> {
+        let tab = harness.tabs.active().unwrap();
+        tab.grid()
+            .scrollback_rows()
+            .chain(tab.grid().visible_rows())
+            .map(|row| row.text().trim_end().to_owned())
+            .collect()
+    }
+
+    /// us-1/2/3: the full rewrite through `handle_event` — the pin
+    /// arms on the whole-line request, the shadow resets, and the PTY
+    /// shows the `# <line>` comment with NO `not found` error: the
+    /// raw sentence never ran.
+    #[test]
+    fn natural_language_enter_rewrites_to_a_hash_request() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&mut harness, |h| !logical(h).is_empty());
+        let prompt = logical(&harness);
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        assert!(!harness.tabs.active().unwrap().shadow.is_stale());
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The request armed the suggester pinned to tab 0 — the same
+        // in-flight contract the `# ` trigger honors (us-14).
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
+            "the classifier's request armed the suggestion path"
+        );
+        // The shadow reset — the streamed suggestion types onto a
+        // fresh one, like the `# ` path and Esc-cancel leave it.
+        let shadow = &harness.tabs.active().unwrap().shadow;
+        assert_eq!(shadow.text(), "");
+        assert!(!shadow.is_stale());
+
+        // The rewrite reached the shell: the `# ` comment echoed and
+        // submitted — a fresh prompt row follows it, identical to the
+        // prompt the line was typed on (the mirror of the Alt+Enter
+        // test's bare-prompt wait).
+        wait_until(&mut harness, |h| {
+            rows(h)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file"))
+        });
+        wait_until(&mut harness, |h| logical(h) == prompt);
+        // …and the typed line never executed: a forwarded Enter would
+        // have run it and `what` resolves nowhere.
+        assert!(
+            !rows(&harness).iter().any(|row| row.contains("not found")),
+            "the raw sentence never reached the shell: {:?}",
+            rows(&harness)
+        );
+    }
+
+    /// us-2: the rewrite's byte contract — `Ctrl+U`, then `# <line>` +
+    /// `\r`, in that order — captured byte-for-byte through the
+    /// `stty raw; head` seam the in-flight tests established.
+    #[test]
+    fn rewrite_as_comment_writes_ctrl_u_then_the_hash_line() {
+        let path = capture_path("rewrite");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &mut harness,
+            &format!("stty raw; head -c 17 > {}", path.display()),
+            &path,
+        );
+
+        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit");
+
+        assert_eq!(
+            wait_file(&mut harness, &path, 17),
+            b"\x15# undo a commit\r",
+            "Ctrl+U, the comment, the submission — in that order"
+        );
+        assert!(
+            harness.tabs.active().unwrap().shadow.text().is_empty(),
+            "the wiped line resets the shadow"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-5: a verified line the heuristic reads as a command reaches
+    /// the shell verbatim — no pin, no rewrite, the command's own
+    /// output on the grid (standard 15: wait on output only execution
+    /// produces).
+    #[test]
+    fn a_command_line_forwards_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "echo R11T2_$((40+2))");
+        wait_until(&mut harness, |h| logical(h).ends_with("R11T2_$((40+2))"));
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            harness.state.suggestion.is_none(),
+            "a command verdict takes no pin"
+        );
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("R11T2_42"))
+        });
+        // `/bin/sh` as root prompts with `# ` — a verbatim line
+        // already renders `# echo …`, so the rewrite's tell is the
+        // doubled hash: prompt `# ` + submitted `# echo …`.
+        assert!(
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# # echo R11T2_")),
+            "no `# ` rewrite row: {:?}",
+            rows(&harness)
+        );
+    }
+
+    /// us-10/16: a stale shadow — staged through the same `mark_stale`
+    /// `ait ctl send` and pastes use — degrades the submission to
+    /// ordinary: Enter forwards verbatim (the shell runs the line and
+    /// `what` resolves nowhere), no pin, no `# ` rewrite.
+    #[test]
+    fn a_stale_shadow_submits_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        harness.tabs.active_mut().unwrap().shadow.mark_stale();
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+        // The `# ` prompt makes a verbatim `# what …` row
+        // indistinguishable from the text alone — the rewrite's tell
+        // is the doubled hash.
+        assert!(
+            !rows(&harness)
+                .iter()
+                .any(|row| row.contains("# # what is the largest file")),
+            "the stale line was never rewritten"
+        );
+    }
+
+    /// us-10: a shadow that desynced from the echoed line — one extra
+    /// char the PTY never saw — fails echo agreement and submits
+    /// verbatim like a stale one: no verdict, no rewrite.
+    #[test]
+    fn an_unverifiable_shadow_submits_verbatim() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+        // A keystroke the PTY never saw leaves the shadow ahead of the
+        // echo — `ends_with` refuses, non-stale or not.
+        harness
+            .tabs
+            .active_mut()
+            .unwrap()
+            .shadow
+            .update(&ait_term::KeyEvent::new(
+                ait_term::Key::Char('z'),
+                ait_term::Modifiers::NONE,
+            ));
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+    }
+
+    /// us-11/13: `classifier = "off"` submits every line verbatim —
+    /// and a settings swap applies to the NEXT submission: the armed
+    /// check reads live settings at Enter, exactly what the config
+    /// watcher's `LiveSettings::adopt` lands.
+    #[test]
+    fn classifier_off_submits_verbatim_until_rearmed() {
+        let mut harness = Harness::new(sh_manager());
+        harness.state.config =
+            LiveSettings::adopt(Settings::from_toml("[input]\nclassifier = \"off\"\n").unwrap());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(harness.state.suggestion.is_none());
+        wait_until(&mut harness, |h| {
+            rows(h).iter().any(|row| row.contains("not found"))
+        });
+
+        // Rearming (what a good hot-reload lands) lets the NEXT
+        // natural-language submission rewrite again.
+        harness.state.config = LiveSettings::adopt(Settings::default());
+        type_keys(&mut harness, "where are the log files");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("where are the log files")
+        });
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id),
+            "the reloaded setting armed the next submission"
+        );
+    }
+
+    /// us-4: Esc after the rewrite cancels the streaming suggestion —
+    /// and nothing else: the `# <line>` comment stays on the grid
+    /// exactly like a cancelled explicit `# ` request (ADR-0007
+    /// semantics; a misfire costs nothing the user can't undo).
+    #[test]
+    fn esc_after_the_rewrite_only_cancels_the_suggestion() {
+        let mut harness = Harness::new(sh_manager());
+        type_keys(&mut harness, "what is the largest file");
+        wait_until(&mut harness, |h| {
+            logical(h).ends_with("what is the largest file")
+        });
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.suggestion.pinned_id(),
+            Some(harness.tabs.tabs()[0].id)
+        );
+
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        // The pin is marked cancelled — the worker's terminal event
+        // releases it silently — while the comment the rewrite
+        // submitted is untouched.
+        assert!(harness.state.suggestion.is_cancelled());
+        wait_until(&mut harness, |h| h.state.suggestion.is_none());
+        assert!(
+            harness.state.toast.is_none(),
+            "a user-initiated cancel never toasts"
+        );
+        // The pin's release races the PTY echo of the `# ` comment —
+        // wait for the row like the rewrite test does rather than
+        // snapshotting the instant the suggestion clears.
+        wait_until(&mut harness, |h| {
+            rows(h)
+                .iter()
+                .any(|row| row.ends_with("# what is the largest file"))
+        });
+    }
+
     /// Spec R03 stories 10–11 and 14: a good watcher event swaps the
     /// live settings — the model slot and the NEW-session `[terminal]`
     /// template both follow it — while a broken save toasts the
@@ -1471,7 +2594,7 @@ base_model = "key-1"
         drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
 
         assert_eq!(
-            harness.state.config.model(),
+            harness.state.config.model("default"),
             "Alias Name",
             "the status slot follows the swap (story 10)"
         );
@@ -1495,9 +2618,255 @@ base_model = "key-1"
             toast.text()
         );
         assert_eq!(
-            harness.state.config.model(),
+            harness.state.config.model("default"),
             "Alias Name",
             "last-good settings are kept (story 11)"
+        );
+    }
+
+    // ---- Spec R07 §5.7 / issue #101: the active execution profile ----
+
+    /// `Alt+P` with fewer than two declared profiles leaves the armed
+    /// `default` alone and says so — the toast is the whole action,
+    /// no picker opens (us-23).
+    #[test]
+    fn alt_p_toasts_when_there_is_nothing_to_switch_to() {
+        // `Settings::default()` declares no `execution_profiles`.
+        let mut harness = Harness::new(manager());
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+
+        assert_eq!(harness.state.profile, "default");
+        assert!(harness.state.picker.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the small count toasts");
+        assert!(
+            toast.text().contains("no other execution profiles"),
+            "the toast says why: {}",
+            toast.text()
+        );
+    }
+
+    /// Exactly two declared profiles: `Alt+P` arms the other one
+    /// directly — no picker ever appears — and pressing again cycles
+    /// straight back (us-23). Each real switch confirms itself with
+    /// the spec's *profile switched* toast.
+    #[test]
+    fn alt_p_cycles_between_two_profiles() {
+        let mut harness = Harness::new(manager());
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(harness.state.profile, "work");
+        assert!(harness.state.picker.is_none(), "two profiles never pick");
+        let toast = harness.state.toast.as_ref().expect("a real switch toasts");
+        assert!(
+            toast.text().contains("\"work\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(harness.state.profile, "default");
+        assert!(harness.state.picker.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("cycling back toasts too");
+        assert!(
+            toast.text().contains("\"default\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
+    }
+
+    /// Three or more open the picker (us-23): the armed name starts
+    /// highlighted, ↑/↓ move over the declared list, Enter arms the
+    /// highlighted name and closes, plain Esc dismisses without
+    /// switching, a stray character is swallowed rather than typed,
+    /// and `Alt+P` itself toggles the picker away.
+    #[test]
+    fn alt_p_picks_from_three_or_more() {
+        let mut harness = Harness::new(manager());
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.scratch]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        let picker = harness
+            .state
+            .picker
+            .as_ref()
+            .expect("three or more open the picker");
+        assert_eq!(picker.names(), &["default", "scratch", "work"]);
+        assert_eq!(
+            picker.selected_name(),
+            "default",
+            "the armed name starts highlighted"
+        );
+
+        // ↓ moves the highlight; a stray character reaches neither
+        // the armed name nor the PTY — the pass-through arm routed
+        // it to the picker.
+        harness.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            harness.state.picker.as_ref().unwrap().selected_name(),
+            "scratch"
+        );
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(harness.state.picker.is_some());
+        assert_eq!(harness.state.profile, "default");
+
+        // Plain Esc dismisses without switching.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(harness.state.profile, "default");
+
+        // Enter arms the highlighted name and closes — the switch
+        // toasts the armed name.
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Down, KeyModifiers::NONE));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(harness.state.profile, "scratch");
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the picker's switch toasts");
+        assert!(
+            toast.text().contains("\"scratch\""),
+            "the toast names the armed profile: {}",
+            toast.text()
+        );
+
+        // `Alt+P` while open toggles the picker away — like `Alt+A`
+        // closes the focused panel.
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_some());
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_none());
+        assert_eq!(
+            harness.state.profile, "scratch",
+            "the toggle changes nothing"
+        );
+
+        // Enter on the already-armed row switches nothing, so no
+        // fresh toast fires.
+        harness.state.toast = None;
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(harness.state.profile, "scratch");
+        assert!(
+            harness.state.toast.is_none(),
+            "re-arming the armed name stays silent"
+        );
+    }
+
+    /// A reload that drops or renames the armed profile toasts its
+    /// name and keeps the selection armed (us-24/us-28): the worker's
+    /// missing-profile fail-safe — ask everything — is what the name
+    /// resolves to, so the toast is the frontend's whole part of the
+    /// story. An open picker's stale list drops with the old file.
+    #[test]
+    fn a_reload_that_drops_the_active_profile_toasts_its_name() {
+        let mut harness = Harness::new(manager());
+        let (tx, rx) = std::sync::mpsc::channel();
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(
+                "[agents.execution_profiles.default]\n\
+                 [agents.execution_profiles.scratch]\n\
+                 [agents.execution_profiles.work]\n",
+            )
+            .unwrap(),
+        );
+        harness.state.profile = "work".to_string();
+        harness.handle(key(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(harness.state.picker.is_some());
+
+        let renamed = Settings::from_toml(
+            "[agents.execution_profiles.default]\n\
+             [agents.execution_profiles.scratch]\n",
+        )
+        .unwrap();
+        tx.send(Ok(renamed)).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        assert_eq!(
+            harness.state.profile, "work",
+            "the selection is never rewritten — the name stays armed"
+        );
+        assert!(
+            harness.state.picker.is_none(),
+            "the stale list dropped with the old settings"
+        );
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the vanished profile toasts");
+        assert!(
+            toast.text().contains("\"work\""),
+            "the toast names the missing profile: {}",
+            toast.text()
+        );
+    }
+
+    /// The whole-table deletion under an armed `default` (us-28): a
+    /// `default` the OLD file declared is gone from the new one — a
+    /// deletion the new file alone cannot distinguish from
+    /// never-declared, so the drain reads the old settings before
+    /// adopting. A `default` that was never declared stays silent:
+    /// armed-but-never-existed is not a deletion.
+    #[test]
+    fn a_reload_deleting_a_declared_default_toasts() {
+        let mut harness = Harness::new(manager());
+        let (tx, rx) = std::sync::mpsc::channel();
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml("[agents.execution_profiles.default]\n").unwrap(),
+        );
+
+        tx.send(Ok(Settings::default())).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+
+        assert_eq!(
+            harness.state.profile, "default",
+            "the selection is never rewritten"
+        );
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("a declared default deleted with the table toasts");
+        assert!(
+            toast.text().contains("\"default\""),
+            "the toast names the missing profile: {}",
+            toast.text()
+        );
+
+        // The same empty-table reload against a file that never
+        // declared `default`: no profile was ever lost, so no toast.
+        let mut harness = Harness::new(manager());
+        tx.send(Ok(Settings::default())).unwrap();
+        drain_config_events(&rx, &mut harness.state, &mut harness.tabs);
+        assert!(
+            harness.state.toast.is_none(),
+            "a never-declared default is the profile-less steady state"
         );
     }
 
@@ -1976,6 +3345,680 @@ base_model = "key-1"
                 .text()
                 .ends_with("git undo"),
             "the shadow kept its line"
+        );
+    }
+
+    // ---- Spec R06 T2: the agent conversation panel (issue #85) ----
+    //
+    // The dispatch seam under test is `handle_event`: `Alt+A` toggles
+    // the split (and the tab's winsize through the resize path), a
+    // focused panel owns keystrokes before the PTY does, Enter submits
+    // or steers, and Esc cancels or unfocuses. A real `AgentSession`
+    // backs the panel — default `Settings` resolve no model, so the
+    // worker's terminal `Error` lands as a conversation status line.
+
+    /// The active tab's panel, staged or toggled live.
+    fn panel(harness: &Harness) -> &crate::agent_panel::AgentPanel {
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .agent_panel()
+            .expect("a panel exists")
+    }
+
+    /// `Alt+A` opens the split focused and shrinks the session through
+    /// the band→session derivation — the same math the resize path
+    /// uses (`Size::new(40, 10)` band → `24` session columns at the
+    /// two-fifths share).
+    #[test]
+    fn alt_a_opens_focused_and_shrinks_the_session() {
+        let mut harness = Harness::new(manager());
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(40, 10)
+        );
+
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.agent_panel_open() && tab.agent_focused());
+        assert_eq!(tab.session.size(), Size::new(24, 10));
+
+        // The focus cycle: Esc unfocuses while keeping the split,
+        // `Alt+A` refocuses, and a press while focused closes —
+        // restoring the whole band.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            harness.tabs.active().unwrap().agent_panel_open()
+                && !harness.tabs.active().unwrap().agent_focused(),
+            "idle Esc returns focus, split stays open"
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(
+            harness.tabs.active().unwrap().agent_focused(),
+            "Alt+A refocuses an unfocused panel"
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        let tab = harness.tabs.active().unwrap();
+        assert!(!tab.agent_panel_open() && !tab.agent_focused());
+        assert_eq!(
+            tab.session.size(),
+            Size::new(40, 10),
+            "closing restores the band"
+        );
+    }
+
+    /// A host resize while the panel is open re-derives the split —
+    /// the session keeps its terminal side, it never restores the
+    /// band under the panel.
+    #[test]
+    fn resize_re_derives_the_open_split() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        harness.handle(Event::Resize(100, 30));
+
+        // Content band 100×28 → session 60 (the panel's two fifths).
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(60, 28)
+        );
+    }
+
+    /// Focused keystrokes reach the input line and never the PTY:
+    /// type into the panel while the shell sits inside a byte-exact
+    /// `head -c` capture — the capture must hold ONLY the character
+    /// typed after focus returned. The input shadow stays empty too:
+    /// panel text is not shell input.
+    #[test]
+    fn focused_typing_reaches_the_panel_and_never_the_pty() {
+        let path = capture_path("panel-keys");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &mut harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+
+        for c in "ab".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(panel(&harness).input(), "ab");
+        assert_eq!(
+            harness.tabs.active().unwrap().shadow.text(),
+            "",
+            "panel text is not shell input — the shadow never saw it"
+        );
+
+        // Idle Esc returns focus; the next char reaches the PTY —
+        // and the capture proves "ab" never did.
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            wait_file(&mut harness, &path, 1),
+            b"c",
+            "only the post-Esc key reached the session"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Enter submits the input as a task: the conversation gains the
+    /// `Task` entry, the panel runs until the worker's terminal event
+    /// (the unconfigured model's `Error`) lands it as a status line.
+    #[test]
+    fn enter_submits_and_the_terminal_event_lands() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(panel(&harness).is_running());
+        assert_eq!(panel(&harness).input(), "", "submitted input clears");
+        assert_eq!(
+            panel(&harness).entries(),
+            &[crate::agent_panel::Entry::Task("fix it".into())]
+        );
+
+        wait_until(&mut harness, |h| !panel(h).is_running());
+        assert!(
+            matches!(
+                panel(&harness).entries().last(),
+                Some(crate::agent_panel::Entry::Status(s)) if s.contains("coding_model")
+            ),
+            "the worker's error became a conversation status line: {:?}",
+            panel(&harness).entries().last()
+        );
+    }
+
+    /// Text typed while a task runs queues as a steering message —
+    /// on the channel AND in the conversation.
+    #[test]
+    fn enter_during_a_run_steers_instead_of_submitting() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        for c in "use sudo".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            panel(&harness).entries().last(),
+            Some(&crate::agent_panel::Entry::Steering("use sudo".into())),
+            "mid-run input recorded as steering"
+        );
+        // Let the task die of its unconfigured model — the steering
+        // entry stays part of the conversation.
+        wait_until(&mut harness, |h| !panel(h).is_running());
+    }
+
+    /// Esc while a task runs cancels it — the in-flight request
+    /// stops — and focus stays for the next task; the terminal event
+    /// releases `running` and leaves the status line.
+    #[test]
+    fn esc_cancels_the_running_task() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            harness.tabs.active().unwrap().agent_focused(),
+            "cancelling keeps panel focus"
+        );
+        wait_until(&mut harness, |h| !panel(h).is_running());
+        assert!(
+            matches!(
+                panel(&harness).entries().last(),
+                Some(crate::agent_panel::Entry::Status(_))
+            ),
+            "a terminal status line closed the task: {:?}",
+            panel(&harness).entries().last()
+        );
+    }
+
+    /// Focused keys never reach the keymap's blind spot the other way
+    /// either: app bindings resolve BEFORE panel focus, so `Alt+T`
+    /// still spawns a tab while the panel owns typing.
+    #[test]
+    fn app_keymap_wins_over_panel_focus() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(harness.tabs.active().unwrap().agent_focused());
+
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(harness.tabs.len(), 2, "Alt+T spawned past panel focus");
+        assert!(
+            harness.tabs.active().unwrap().agent_panel().is_none(),
+            "a fresh tab owns no panel"
+        );
+        // And its session took the whole band, not a phantom split.
+        assert_eq!(
+            harness.tabs.active().unwrap().session.size(),
+            Size::new(40, 10)
+        );
+
+        // The first tab kept its conversation and its split.
+        harness.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        let tab = harness.tabs.active().unwrap();
+        assert!(tab.agent_panel_open());
+        assert_eq!(tab.session.size(), Size::new(24, 10));
+    }
+
+    /// Closing the owning tab drops its agent — the `AgentSession`'s
+    /// Drop cancels and joins the worker even mid-task: no panic, no
+    /// orphan.
+    #[test]
+    fn closing_a_tab_drops_its_agent() {
+        let mut harness = Harness::new(sh_manager());
+        harness.handle(key(KeyCode::Char('t'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        for c in "fix it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel(&harness).is_running());
+
+        assert_eq!(
+            harness.handle(key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Handled::Continue
+        );
+        assert_eq!(harness.tabs.len(), 1);
+        assert!(
+            harness.tabs.active().unwrap().agent_panel().is_none(),
+            "the surviving tab owns no panel"
+        );
+    }
+
+    /// The wheel inside the panel's rect scrolls the conversation —
+    /// the terminal's scroll offset is untouched — while a click there
+    /// never starts a selection.
+    #[test]
+    fn the_wheel_and_clicks_stay_inside_the_split() {
+        let mut harness = Harness::new(manager());
+        harness.handle(Event::Resize(100, 30));
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::ALT));
+        // Stage a conversation tall enough to scroll.
+        let tab = harness.tabs.active_mut().unwrap();
+        for n in 0..10 {
+            tab.agent
+                .as_mut()
+                .unwrap()
+                .apply(ait_agent::AgentEvent::TextDelta(format!("line{n}\n")));
+        }
+
+        // Band is 100×28 → terminal 60 cols, panel x ≥ 60.
+        let wheel_in_panel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 80,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        harness.handle(wheel_in_panel(MouseEventKind::ScrollUp));
+
+        let tab = harness.tabs.active().unwrap();
+        assert_eq!(tab.scroll_offset(), 0, "the terminal never scrolled");
+        assert!(
+            !panel(&harness).is_pinned(),
+            "the conversation took the scroll"
+        );
+
+        harness.handle(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 80,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(
+            harness.tabs.active().unwrap().selection_range().is_none(),
+            "a click in the panel selects nothing"
+        );
+    }
+
+    // ---- Spec R06 T4: `run_command` through the ShellBridge (issue #87) ----
+
+    /// A `chat.completion.chunk` line carrying a tool-call fragment —
+    /// `id`/`name` on announce, bare `arguments` after (ait's tests
+    /// have no `serde_json` edge; the literals are hand-escaped).
+    fn tool_fragment(index: u32, announce: Option<(&str, &str)>, args: &str) -> String {
+        let call = match announce {
+            Some((id, name)) => format!(
+                "{{\"index\":{index},\"id\":\"{id}\",\"type\":\"function\",\"function\":{{\"name\":\"{name}\",\"arguments\":\"{args}\"}}}}"
+            ),
+            None => format!("{{\"index\":{index},\"function\":{{\"arguments\":\"{args}\"}}}}"),
+        };
+        format!("data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}},\"finish_reason\":null}}]}}\n\n")
+    }
+
+    /// All text in a session's grid — the `tabs::tests` helper's
+    /// shape, for the trace assertions below.
+    fn grid_text(session: &ait_term::LiveSession) -> String {
+        let grid = session.grid();
+        grid.scrollback_rows()
+            .chain(grid.visible_rows())
+            .map(|row| row.text().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The whole e2e path (issue #87): a staged panel + bridge on a
+    /// REAL injected-bash tab, a fixture model calling `run_command`,
+    /// the approve card gating the request — no `__ait_run` bytes
+    /// before `a` — then the in-band run types its visible trace and
+    /// the merged result re-enters the conversation.
+    #[test]
+    fn run_command_e2e_gates_types_visibly_and_finishes() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return; // bash isn't installed everywhere tests run
+        }
+        let fixture = ait_llm::testing::Fixture::serve(vec![
+            ait_llm::testing::sse(&format!(
+                "{}{}{}",
+                tool_fragment(0, Some(("call_1", "run_command")), ""),
+                tool_fragment(
+                    0,
+                    None,
+                    "{\\\"command\\\":\\\"printf 'agent-marker'\\\"}"
+                ),
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            )),
+            ait_llm::testing::sse(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let mut harness = Harness::new(
+            TabManager::spawn_with(
+                Size::new(40, 10),
+                SessionTemplate {
+                    options: LiveSessionOptions {
+                        program: Some(std::ffi::OsString::from("/bin/bash")),
+                        cwd: Some(std::path::PathBuf::from("/tmp")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        wait_until(&mut harness, |h| {
+            h.tabs.active().unwrap().integration_state()
+                == crate::integration::IntegrationState::Integrated
+        });
+        // Point `coding_model` at the fixture.
+        harness.state.config = LiveSettings::adopt(
+            Settings::from_toml(&format!(
+                r#"
+[agents.custom_endpoints.local]
+name = "Fixture"
+base_url = "{}"
+schema = "openai_chat_completions"
+
+[[agents.custom_endpoints.local.models]]
+name = "test-model"
+alias = "Test Model"
+config_key = "coding-key"
+
+[agents.execution_profiles.default]
+coding_model = "coding-key"
+"#,
+                fixture.base_url
+            ))
+            .expect("settings"),
+        );
+        // Stage the panel + bridge service — `with_session` opens
+        // focused; the service is what `toggle_agent_panel` creates.
+        {
+            let tab = harness.tabs.active_mut().unwrap();
+            let (_handle, service) = crate::shell_bridge::pair();
+            tab.bridge = Some(service);
+            tab.agent = Some(crate::agent_panel::AgentPanel::with_session(
+                ait_agent::AgentSession::with_secret_store(config::NoSecrets),
+            ));
+        }
+
+        // Type the task and submit.
+        for c in "do it".chars() {
+            harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        wait_until(&mut harness, |h| panel(h).awaiting_verdict());
+        // The gate is parked: no request line has been typed.
+        let grid_before = grid_text(&harness.tabs.active().unwrap().session);
+        assert!(
+            !grid_before.contains("__ait_run"),
+            "no request bytes before approval: {grid_before}"
+        );
+
+        // `a` — allow once — releases the in-band run.
+        harness.handle(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        wait_until(&mut harness, |h| !panel(h).is_running());
+
+        // The task finished; the typed `__ait_run` trace is in the
+        // grid (us-23) while the 7701 output never rendered (us-12).
+        let text = grid_text(&harness.tabs.active().unwrap().session);
+        assert!(text.contains("__ait_run"), "the request's trace: {text}");
+        assert!(
+            !text.contains("agent-marker"),
+            "7701 output is invisible: {text}"
+        );
+        let tool_card_done = panel(&harness).entries().iter().any(|entry| matches!(
+            entry,
+            crate::agent_panel::Entry::Tool(card)
+                if card.name == "run_command" && card.status == crate::agent_panel::CardStatus::Done
+        ));
+        assert!(tool_card_done, "{:?}", panel(&harness).entries());
+
+        // The result re-entered the conversation: the second request
+        // carries the merged output and the exit code.
+        fixture.captured();
+        let second = fixture.captured();
+        assert!(second.body.contains("agent-marker"), "{}", second.body);
+        assert!(second.body.contains("exit code"), "{}", second.body);
+    }
+
+    // ---- Spec R08-T6: the Alt+R conversation picker ----
+
+    /// Seed a tempdir store with `title` + `items`, wrapped in the
+    /// handle the app's picker reads through.
+    fn store_with(
+        items: &[(&str, &[ait_agent::TranscriptItem])],
+    ) -> (tempfile::TempDir, StoreHandle) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ait_store::Store::open(dir.path().join("store.db")).unwrap();
+        for (title, items) in items {
+            let conversation = store
+                .create_conversation(ait_store::NewConversation {
+                    title,
+                    cwd: "/w",
+                    status: "open",
+                })
+                .unwrap();
+            let payloads: Vec<String> = items
+                .iter()
+                .map(|item| serde_json::to_string(item).unwrap())
+                .collect();
+            let rows: Vec<ait_store::NewTranscriptItem> = items
+                .iter()
+                .zip(&payloads)
+                .map(|(item, payload)| ait_store::NewTranscriptItem {
+                    kind: item.kind(),
+                    payload_json: payload,
+                })
+                .collect();
+            store
+                .append_transcript_items(conversation.id, &rows)
+                .unwrap();
+        }
+        (dir, StoreHandle::from_store(store))
+    }
+
+    /// `Alt+R` on a store with no conversations toasts instead of
+    /// opening an empty list — and `Alt+R` on a disabled store reads
+    /// the same (us-25's unpersisted run).
+    #[test]
+    fn alt_r_toasts_when_there_is_nothing_to_list() {
+        let mut harness = Harness::new(manager());
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(harness.state.conversations.is_none());
+        let toast = harness
+            .state
+            .toast
+            .as_ref()
+            .expect("the empty store toasts");
+        assert!(
+            toast.text().contains("no stored conversations"),
+            "the toast says why: {}",
+            toast.text()
+        );
+    }
+
+    /// `Alt+R` opens the picker over the store's rows newest-first;
+    /// Enter resumes the highlighted row — the tab binds the
+    /// conversation id and the panel rebuilds from its items, open
+    /// and focused. `Alt+R` again toggles the picker closed.
+    #[test]
+    fn alt_r_opens_and_enter_resumes_into_the_panel() {
+        let mut harness = Harness::new(manager());
+        let items = vec![
+            ait_agent::TranscriptItem::Task {
+                text: "fix the tests".into(),
+            },
+            ait_agent::TranscriptItem::AssistantText {
+                text: "on it".into(),
+            },
+            ait_agent::TranscriptItem::Status {
+                text: "done".into(),
+            },
+        ];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        let id = handle.conversations().unwrap()[0].conversation.id;
+        harness.state.store = handle;
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        let picker = harness
+            .state
+            .conversations
+            .as_ref()
+            .expect("Alt+R opened the picker");
+        assert_eq!(picker.rows().len(), 1);
+        assert_eq!(picker.rows()[0].title, "fix the tests");
+        assert_eq!(picker.rows()[0].items, 3);
+
+        // A stray key is swallowed mid-pick (never reaches the PTY).
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_some());
+
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_none(), "Enter closed");
+        let tab = harness.tabs.active().unwrap();
+        assert_eq!(tab.conversation(), Some(id), "the row bound");
+        let panel = tab.agent_panel().expect("the resume built a panel");
+        assert!(panel.is_open() && tab.agent_focused());
+        use crate::agent_panel::Entry;
+        assert_eq!(
+            panel.entries(),
+            &[
+                Entry::Task("fix the tests".into()),
+                Entry::Text("on it".into()),
+                Entry::Status("done".into()),
+            ],
+            "the scrollback rebuilt from the transcript"
+        );
+        assert!(harness.state.toast.is_some(), "the resume confirms itself");
+    }
+
+    /// us-10: Enter while the tab's task runs toasts and changes
+    /// nothing — the live run is never clobbered.
+    #[test]
+    fn enter_while_a_task_runs_refuses_the_resume() {
+        let mut harness = Harness::new(manager());
+        let items = vec![ait_agent::TranscriptItem::Task {
+            text: "fix the tests".into(),
+        }];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        harness.state.store = handle;
+        // A submitted task holds `running` until its terminal event —
+        // nothing drains it here (the unconfigured worker's Error
+        // sits queued, unread).
+        harness.tabs.active_mut().unwrap().toggle_agent_panel();
+        let panel = harness.tabs.active_mut().unwrap().agent.as_mut().unwrap();
+        panel.submit(
+            ait_agent::AgentRequest {
+                settings: Settings::default(),
+                profile: "default".to_string(),
+                task: "busy".to_string(),
+                context: ait_agent::AgentContext {
+                    cwd: "/tmp".into(),
+                    shell: "sh".into(),
+                    os: "test".into(),
+                    output_lines: Vec::new(),
+                },
+                prior: Vec::new(),
+                bridge: None,
+                skills: ait_agent::SkillsCatalog::default(),
+            },
+            &mut harness.state.toast,
+        );
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let toast = harness.state.toast.as_ref().expect("the refusal toasts");
+        assert!(
+            toast.text().contains("still running"),
+            "the toast says why: {}",
+            toast.text()
+        );
+        assert!(
+            harness.tabs.active().unwrap().conversation().is_none(),
+            "nothing bound — the live run stands"
+        );
+        assert!(
+            harness
+                .tabs
+                .active()
+                .unwrap()
+                .agent_panel()
+                .unwrap()
+                .is_running(),
+            "the task still runs"
+        );
+    }
+
+    /// us-11: `Ctrl+D` once arms the confirm — nothing deletes — a
+    /// second `Ctrl+D` drops the row from the picker AND the store,
+    /// and a tab bound to it detaches so its next task opens a new
+    /// row. Esc dismisses the picker; `Alt+R` toggles it closed.
+    #[test]
+    fn ctrl_d_deletes_after_the_one_key_confirm() {
+        let mut harness = Harness::new(manager());
+        let items = vec![ait_agent::TranscriptItem::Task {
+            text: "fix the tests".into(),
+        }];
+        let (_dir, handle) = store_with(&[("fix the tests", &items)]);
+        let id = handle.conversations().unwrap()[0].conversation.id;
+        harness.state.store = handle;
+        // The tab is bound to the doomed row — the delete must
+        // detach it rather than leave a dangling append target.
+        harness.tabs.active_mut().unwrap().set_conversation(id);
+
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            harness.state.conversations.as_ref().unwrap().confirming(),
+            "the first Ctrl+D only arms"
+        );
+        assert!(
+            !harness.state.store.conversations().unwrap().is_empty(),
+            "nothing deleted yet"
+        );
+
+        // A stray key disarms instead of deleting.
+        harness.handle(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!harness.state.conversations.as_ref().unwrap().confirming());
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        harness.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            harness.state.conversations.is_none(),
+            "the emptied picker closed"
+        );
+        assert!(
+            harness.state.store.conversations().unwrap().is_empty(),
+            "the row deleted"
+        );
+        assert_eq!(
+            harness.tabs.active().unwrap().conversation(),
+            None,
+            "the bound tab detached"
+        );
+
+        // Esc dismisses; Alt+R toggles closed — both leave the list.
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(harness.state.conversations.is_none());
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        harness.handle(key(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(
+            harness.state.conversations.is_none(),
+            "Alt+R toggled the picker away"
         );
     }
 }

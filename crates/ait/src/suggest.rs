@@ -34,21 +34,29 @@
 //!
 //! [`request_for`] bundles the verified request with the §5.4 context
 //! the model may see: cwd (OSC 7 when the shell reports it, else
-//! `/proc/<pid>/cwd` via [`LiveSession::child_pid`], else the spawn
-//! cwd — us-15), shell name and OS (us-17), and the last
-//! [`OUTPUT_LINE_BUDGET`] logical grid lines (us-16 — credential
-//! redaction runs inside `ait-agent` at assembly time, us-18). The
+//! `/proc/<pid>/cwd` via [`LiveSession::child_pid`] on NON-INTEGRATED
+//! tabs only — Spec R05, issue #76 — else the spawn cwd — us-15),
+//! shell name and OS (us-17), and the output tail (us-16): block text
+//! when the tab has blocks (Spec R05 us-31 — a "retry that with sudo"
+//! request sees the failed command's real output), else the last
+//! [`OUTPUT_LINE_BUDGET`] logical grid lines; credential redaction
+//! runs inside `ait-agent` at assembly time either way (us-18). The
 //! whole trigger is the testable seam (us-29): every case below is
 //! exercised without a PTY via byte-fed [`ait_term::Session`]s.
 
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
-use ait_agent::{CommandSuggester, SuggestEvent, SuggestRequest, OUTPUT_LINE_BUDGET};
-use ait_config::Settings;
+use ait_agent::{
+    classify, CommandSuggester, InputClass, ProgramIndex, SuggestEvent, SuggestRequest,
+    OUTPUT_LINE_BUDGET,
+};
+use ait_config::{ClassifierMode, Settings};
 use ait_term::{Cursor, GridView, Key, KeyEvent, Keypad, Modifiers};
 
-use crate::selection::{PASTE_BEGIN, PASTE_END};
+use crate::blocks::Block;
+use crate::integration::IntegrationState;
+use crate::selection::{extract, GridPoint, SelectionRange, PASTE_BEGIN, PASTE_END};
 use crate::status::Toast;
 use crate::tabs::{Tab, TabManager};
 
@@ -258,14 +266,77 @@ pub fn recent_output_lines(grid: &GridView) -> Vec<String> {
     lines
 }
 
+/// The §5.4 output tail for `tab` (Spec R05 user story 31 — the seam
+/// Spec R04 declared): block text when the tab has blocks, so a
+/// "retry that with sudo" request sees the failed command's real
+/// output; the raw grid tail [`recent_output_lines`] when it has none
+/// — a shell emitting nothing degrades exactly as before (§5.5's
+/// graceful-degrade clause). Both sources stay
+/// [`OUTPUT_LINE_BUDGET`]-bounded: "recent terminal output" is always
+/// a last-N answer. `pub(crate)`: the agent panel's `AgentContext`
+/// assembly asks the same question (Spec R06 §5.6).
+pub(crate) fn output_lines_for(tab: &Tab) -> Vec<String> {
+    let blocks = tab.blocks();
+    if blocks.is_empty() {
+        recent_output_lines(&tab.grid())
+    } else {
+        block_output_lines(&tab.grid(), &blocks)
+    }
+}
+
+/// Block text as context lines, oldest first, capped at the newest
+/// [`OUTPUT_LINE_BUDGET`]. Each block contributes its whole clamped
+/// live range — the command echo row (prompt included, so the model
+/// sees the command as typed) through its last output row — read
+/// through [`extract`], the same machinery a block copy uses. Blocks
+/// walk newest→oldest and stop once the bound is covered, so ancient
+/// history costs nothing.
+fn block_output_lines(grid: &GridView<'_>, blocks: &[Block]) -> Vec<String> {
+    let scrollback = i64::try_from(grid.scrollback()).unwrap_or(i64::MAX);
+    // Live scrollback-then-viewport index → `GridView::line` space.
+    let to_grid_line = |line: usize| -> i32 {
+        let line = i64::try_from(line).unwrap_or(i64::MAX) - scrollback;
+        line.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for block in blocks.iter().rev() {
+        let range = block.range();
+        let text = extract(
+            grid,
+            SelectionRange {
+                start: GridPoint::new(to_grid_line(*range.start()), 0),
+                // `usize::MAX` caps at the row's content end — the same
+                // full-line bound a block copy ends on.
+                end: GridPoint::new(to_grid_line(*range.end()), usize::MAX),
+            },
+        );
+        // Newest→oldest walk: prepend this block's lines.
+        let mut older: Vec<String> = text.lines().map(str::to_owned).collect();
+        older.append(&mut lines);
+        lines = older;
+        if lines.len() >= OUTPUT_LINE_BUDGET {
+            break;
+        }
+    }
+    let skip = lines.len().saturating_sub(OUTPUT_LINE_BUDGET);
+    lines.drain(..skip);
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
 /// The cwd a request reports (us-15): the OSC-7-reported directory
 /// when the shell reports one — the only honest answer when the shell
 /// could be a remote or container session. When OSC 7 never fired,
-/// `/proc/<pid>/cwd` covers vanilla shells (a `cd` without shell
-/// integration still shows up there); the spawn cwd is the last
-/// resort on hosts without `/proc` (non-Linux) or a child already gone.
-fn cwd_for(tab: &Tab) -> String {
-    if !tab.cwd_reported() {
+/// `/proc/<pid>/cwd` covers NON-INTEGRATED tabs (Spec R05 / issue #76
+/// — an `Integrated` shell always reports OSC 7, so a still-unreported
+/// cwd there means the report was lost, not missing, and `/proc` can
+/// only describe the local child); the spawn cwd is the last resort on
+/// hosts without `/proc` (non-Linux) or a child already gone.
+/// `pub(crate)`: the agent panel reports the same cwd (Spec R06 §5.6).
+pub(crate) fn cwd_for(tab: &Tab) -> String {
+    if reads_proc_cwd(tab.cwd_reported(), tab.integration_state()) {
         if let Some(pid) = tab.session.child_pid() {
             if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
                 return path.display().to_string();
@@ -275,17 +346,31 @@ fn cwd_for(tab: &Tab) -> String {
     tab.cwd().display().to_string()
 }
 
+/// Whether `cwd_for`'s `/proc/<pid>/cwd` fallback applies — the pure
+/// gate Spec R05 revisits (issue #76): only when the shell never
+/// reported a cwd AND the tab is not `Integrated`. Integrated shells
+/// always emit OSC 7, so `/proc` can never be their missing report —
+/// it would only ever leak the local child's directory into a remote
+/// or container session's context.
+fn reads_proc_cwd(cwd_reported: bool, integration: IntegrationState) -> bool {
+    !cwd_reported && integration != IntegrationState::Integrated
+}
+
 /// The §5.4 context bundle around a verified `request` — the tail
 /// [`request_for`] and [`line_request_for`] share (us-15–17, 23).
-fn assemble(tab: &Tab, settings: &Settings, request: String) -> SuggestRequest {
+/// `profile` is the app's active execution profile (Spec R07 §5.7):
+/// it rides the request beside the settings snapshot, so a switch
+/// applies to the NEXT submission.
+fn assemble(tab: &Tab, settings: &Settings, profile: &str, request: String) -> SuggestRequest {
     SuggestRequest {
         settings: settings.clone(),
+        profile: profile.to_owned(),
         cwd: cwd_for(tab),
         // The spawned program's basename — the same source of truth
         // the tab title uses (us-17).
         shell: tab.title().to_owned(),
         os: std::env::consts::OS.to_owned(),
-        output_lines: recent_output_lines(&tab.grid()),
+        output_lines: output_lines_for(tab),
         request,
     }
 }
@@ -295,11 +380,11 @@ fn assemble(tab: &Tab, settings: &Settings, request: String) -> SuggestRequest {
 /// caller forwards Enter to the PTY normally (us-2) and sends the
 /// returned [`SuggestRequest`] into the `CommandSuggester`; on `None`
 /// nothing about the keypress changes.
-pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+pub fn request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option<SuggestRequest> {
     let request = tab
         .shadow
         .request_text(&logical_line(&tab.grid(), tab.cursor()))?;
-    Some(assemble(tab, settings, request))
+    Some(assemble(tab, settings, profile, request))
 }
 
 /// The verified `Alt+Enter` request for `tab` — the WHOLE input line
@@ -308,11 +393,91 @@ pub fn request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
 /// typed line (us-12) and runs the shared request → stream → insert
 /// path; `None` (bare, empty, stale or unverifiable) changes nothing —
 /// the desync-is-inert rule (us-13).
-pub fn line_request_for(tab: &Tab, settings: &Settings) -> Option<SuggestRequest> {
+pub fn line_request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option<SuggestRequest> {
     let request = tab
         .shadow
         .verified_line(&logical_line(&tab.grid(), tab.cursor()))?;
-    Some(assemble(tab, settings, request))
+    Some(assemble(tab, settings, profile, request))
+}
+
+/// The verdict half of the §5.10.4 classifier trigger (Spec R11-T2):
+/// `mode` armed AND `shell_name` a known shell AND `shadow` verifying
+/// against `logical_line` — the same echo-agreement check both
+/// explicit triggers run — hands the line to [`classify`].
+/// `NaturalLanguage` returns the verified line for the
+/// [`rewrite_as_comment`] path; every other outcome — `off`, an
+/// unknown shell, a `Command` verdict, a stale shadow, echo
+/// disagreement — is `None` and the submission stays ordinary: the
+/// desync-is-inert rule, and the reason input that never passed
+/// through keystrokes (`ait ctl send`, which marks the shadow stale)
+/// is never classified (us-10/11/16). The known-shell gate is the
+/// `\x15` wipe's exposure: a REPL or any other program that echoes
+/// input without readline's kill-to-BOL would get `# <line>` APPENDED
+/// to the un-wiped line — a mangled line executes — so the trigger
+/// only arms where the wipe is honored (us-10). The pure half of the
+/// trigger: byte-fed `Session`s and `with_path_entries` indexes drive
+/// it without a PTY or a `$PATH` walk.
+fn classified_line(
+    shadow: &InputShadow,
+    logical_line: &str,
+    shell_name: &str,
+    index: &ProgramIndex,
+    mode: ClassifierMode,
+) -> Option<String> {
+    if mode == ClassifierMode::Off || !ait_shell::is_known_shell(shell_name) {
+        return None;
+    }
+    let line = shadow.verified_line(logical_line)?;
+    (classify(&line, index) == InputClass::NaturalLanguage).then_some(line)
+}
+
+/// The third submission trigger (§5.10.4, Spec R11-T2) — the check
+/// `app`'s submission arm runs after the `# ` request refuses, while
+/// the shadow still holds the line and the grid still echoes it. On
+/// `Some` the caller swallows the Enter, arms the returned
+/// [`SuggestRequest`] — the `Alt+Enter` whole-line form, so the
+/// request lands on the model exactly as if the user had typed the
+/// `# ` prefix — and submits [`rewrite_as_comment`]'s bytes instead.
+/// `None` changes nothing: `Command` verdicts, `classifier = "off"`,
+/// a non-shell program (`ait_shell::is_known_shell` on the tab
+/// title — the `\x15` wipe's guard), stale shadows and echo
+/// disagreement all forward verbatim (us-10/11/13). The index lives
+/// on the tab — harvested once per session spawn — so the lookup
+/// costs a set probe, never a `$PATH` walk (us-15).
+pub fn classified_request(
+    tab: &Tab,
+    settings: &Settings,
+    profile: &str,
+) -> Option<(String, SuggestRequest)> {
+    let line = classified_line(
+        &tab.shadow,
+        &logical_line(&tab.grid(), tab.cursor()),
+        tab.title(),
+        &tab.program_index,
+        settings.input.classifier,
+    )?;
+    let request = assemble(tab, settings, profile, line.clone());
+    Some((line, request))
+}
+
+/// The natural-language verdict's rewrite (Spec R11-T2, ADR-0014):
+/// `Ctrl+U` (`\x15` — readline's kill-to-start-of-line, the same byte
+/// [`SuggestionPin::cancel`] wipes with) erases the typed line, then
+/// `# <line>` + `\r` submits the request through the shell as a
+/// comment — it lands in history and scrollback exactly like an
+/// explicit `# ` request (ADR-0007 semantics) and the fresh prompt
+/// that follows is where the armed suggestion streams (us-2/3). The
+/// shadow resets rather than going stale: the input line really is
+/// empty, so the next line's shadow starts honest. Called only AFTER
+/// `fire` accepted the request — a refused request leaves the typed
+/// line alone and the Enter forwards verbatim: the erase-after-fire
+/// ordering `suggest_from_line` established.
+pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
+    let _ = tab.session.send_bytes(b"\x15");
+    let _ = tab
+        .session
+        .send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
+    tab.shadow.reset();
 }
 
 /// The in-flight suggestion state machine `app` delegates to (Spec R04
@@ -435,13 +600,14 @@ impl SuggestionPin {
         &mut self,
         suggester: &CommandSuggester,
         settings: &Settings,
+        profile: &str,
         tab: &mut Tab,
         toast: &mut Option<Toast>,
     ) {
         if self.is_some() || tab.exit_status().is_some() {
             return;
         }
-        let Some(request) = line_request_for(tab, settings) else {
+        let Some(request) = line_request_for(tab, settings, profile) else {
             return;
         };
         if !self.fire(suggester, tab.id, request, toast) {
@@ -644,9 +810,14 @@ mod tests {
     //! logical-line walk — no PTY, shell or network anywhere.
 
     use super::*;
-    use ait_term::{Session, SessionOptions, Size};
+    use crate::blocks::BlockAssembler;
+    use crate::tabs::PromptMark;
+    use ait_term::{PromptMarkKind, Session, SessionOptions, Size};
     use std::ffi::OsString;
+    use std::path::Path;
     use std::time::{Duration, Instant};
+
+    const MS: Duration = Duration::from_millis(1);
 
     fn char_key(c: char) -> KeyEvent {
         KeyEvent::new(Key::Char(c), Modifiers::NONE)
@@ -912,13 +1083,16 @@ mod tests {
     /// spawn — needs no host TTY (same allowance as the tabs tests).
     #[test]
     fn cwd_falls_back_to_proc_then_prefers_osc7() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -964,13 +1138,16 @@ mod tests {
     /// tail — plus the caller's `Settings` snapshot (us-23).
     #[test]
     fn request_for_collects_context() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1011,9 +1188,19 @@ mod tests {
         }
 
         let settings = Settings::default();
-        let request = request_for(tabs.active().unwrap(), &settings).expect("must fire");
+        let request = request_for(tabs.active().unwrap(), &settings, "default").expect("must fire");
 
         assert_eq!(request.request, "list files");
+        assert_eq!(request.profile, "default");
+        // The armed name rides the request itself (Spec R07 us-26):
+        // whatever profile was active at submission is pinned on the
+        // snapshot — a later switch can never rewrite it.
+        assert_eq!(
+            request_for(tabs.active().unwrap(), &settings, "work")
+                .expect("must fire")
+                .profile,
+            "work"
+        );
         assert_eq!(request.shell, "sh");
         assert_eq!(request.os, std::env::consts::OS);
         assert!(!request.cwd.is_empty());
@@ -1033,13 +1220,16 @@ mod tests {
     /// assembles.
     #[test]
     fn line_request_for_collects_the_whole_line() {
-        use crate::tabs::TabManager;
+        use crate::tabs::{SessionTemplate, TabManager};
         use ait_term::LiveSessionOptions;
 
         let mut tabs = TabManager::spawn_with(
             Size::new(40, 10),
-            LiveSessionOptions {
-                program: Some(OsString::from("/bin/sh")),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -1077,12 +1267,625 @@ mod tests {
         }
 
         let settings = Settings::default();
-        let request = line_request_for(tabs.active().unwrap(), &settings).expect("must fire");
+        let request =
+            line_request_for(tabs.active().unwrap(), &settings, "default").expect("must fire");
 
         assert_eq!(request.request, "undo the last commit");
         assert_eq!(request.shell, "sh");
         assert_eq!(request.os, std::env::consts::OS);
         assert!(!request.cwd.is_empty());
         assert_eq!(request.settings, settings);
+    }
+
+    /// A synthetic mark in record-time coordinates — the shape
+    /// `TabManager::drain_events` hands the assembler (the same trick
+    /// `blocks.rs`'s tests use).
+    fn mark(kind: PromptMarkKind, line: usize, column: usize, at: Instant) -> PromptMark {
+        PromptMark {
+            kind,
+            payload: None,
+            line,
+            column,
+            at,
+            wall: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// A `D` mark carrying an exit-code payload.
+    fn end_mark(line: usize, at: Instant, payload: Option<&str>) -> PromptMark {
+        PromptMark {
+            kind: PromptMarkKind::CommandEnd,
+            payload: payload.map(str::to_owned),
+            line,
+            column: 0,
+            at,
+            wall: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// `OSC 7700 ; <hex(json)>` as a line an interactive shell prints —
+    /// how tests hand-emit hook events through a real `/bin/sh` (the
+    /// trick `tabs.rs::hook_line` established for the drain seam).
+    fn hook_line(json: &str) -> Vec<u8> {
+        let hex: String = json.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("printf '\\033]7700;{hex}\\007'\n").into_bytes()
+    }
+
+    /// Spec R05 user story 31 / issue #76: block text as context — the
+    /// command echo row AND the command's output come through, while a
+    /// row that landed past the block's `D` line stays out. A byte-fed
+    /// session plus synthetic marks — no PTY anywhere.
+    #[test]
+    fn block_output_lines_extract_the_block_range() {
+        let session = session(
+            40,
+            b"$ sudo make install\r\npermission denied\r\n$ \r\ntail marker\r\n",
+        );
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::PromptStart, 0, 0, t0), 0);
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 2, t0 + MS), 0);
+        asm.observe_mark(&mark(PromptMarkKind::OutputStart, 1, 0, t0 + 2 * MS), 0);
+        asm.observe_mark(&end_mark(2, t0 + 3 * MS, Some("1")), 0);
+
+        let grid = session.grid();
+        let extent = grid.scrollback() + grid.lines();
+        let blocks: Vec<_> = asm
+            .blocks()
+            .filter_map(|entry| entry.resolve(&grid, 0, extent))
+            .collect();
+        assert_eq!(blocks.len(), 1);
+
+        let lines = block_output_lines(&grid, &blocks);
+        assert!(
+            lines.iter().any(|line| line.contains("sudo make install")),
+            "the command echo row is context: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("permission denied")),
+            "the failed command's output is context: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("tail marker")),
+            "past-D output is outside the block: {lines:?}"
+        );
+    }
+
+    /// The last-N bound is the grid source's rule kept (us-16): block
+    /// text is still capped at [`OUTPUT_LINE_BUDGET`], the newest
+    /// lines winning.
+    #[test]
+    fn block_output_lines_keeps_the_budget_tail() {
+        let mut output = Vec::new();
+        for i in 0..150 {
+            output.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        let mut session = Session::new(SessionOptions {
+            size: Size::new(40, 200),
+            ..Default::default()
+        });
+        session.feed_bytes(&output);
+        let t0 = Instant::now();
+        let mut asm = BlockAssembler::new();
+        asm.observe_mark(&mark(PromptMarkKind::CommandStart, 0, 0, t0), 0);
+        asm.observe_mark(&mark(PromptMarkKind::OutputStart, 1, 0, t0 + MS), 0);
+        asm.observe_mark(&end_mark(149, t0 + 2 * MS, Some("0")), 0);
+
+        let grid = session.grid();
+        let extent = grid.scrollback() + grid.lines();
+        let blocks: Vec<_> = asm
+            .blocks()
+            .filter_map(|entry| entry.resolve(&grid, 0, extent))
+            .collect();
+        let lines = block_output_lines(&grid, &blocks);
+        assert_eq!(lines.len(), OUTPUT_LINE_BUDGET);
+        // `D` at column 0 ends the block on line 148 — the newest
+        // budget slice runs line 49..=148.
+        assert_eq!(lines.first().unwrap(), "line 49");
+        assert_eq!(lines.last().unwrap(), "line 148");
+    }
+
+    /// Spec R05 us-31, the dispatch half: a tab WITH blocks draws its
+    /// context tail from block text — a scripted `sh -c` emits one
+    /// `A B C D` quadruple around a failing command, then a marker row
+    /// past the block's `D` which the grid-lines source would carry
+    /// and block text must not.
+    #[test]
+    fn output_lines_for_draws_on_blocks_when_present() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    args: vec![
+                        OsString::from("-c"),
+                        OsString::from(
+                            "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
+                             printf 'sudo make install'; sleep 0.2; \
+                             printf '\\n\\033]133;C\\007'; sleep 0.2; \
+                             printf 'permission denied\\n'; sleep 0.2; \
+                             printf '\\033]133;D;1\\007'; sleep 0.2; \
+                             printf '\\n'; sleep 0.2; \
+                             printf 'outside any block\\n'; sleep 0.5",
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            let assembled = !tab.blocks().is_empty();
+            let tail_landed = recent_output_lines(&tab.grid())
+                .iter()
+                .any(|line| line.contains("outside any block"));
+            if assembled && tail_landed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "block or tail never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let tab = tabs.active().unwrap();
+        let lines = output_lines_for(tab);
+        assert!(
+            lines.iter().any(|line| line.contains("sudo make install")),
+            "the failed command's echo is context: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("permission denied")),
+            "the failed command's output is context: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("outside any block")),
+            "the post-block row stays out of block context: {lines:?}"
+        );
+        assert!(
+            recent_output_lines(&tab.grid())
+                .iter()
+                .any(|line| line.contains("outside any block")),
+            "…which the raw grid source does carry"
+        );
+    }
+
+    /// The fallback half of us-31: a tab with NO blocks keeps the
+    /// Spec-R04 grid-lines source — same answer, same bound.
+    #[test]
+    fn output_lines_for_falls_back_to_grid_lines_without_blocks() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if !logical_line(&tab.grid(), tab.cursor()).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"echo grid-fallback-marker\n")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if recent_output_lines(&tab.grid())
+                .iter()
+                .any(|line| line.contains("grid-fallback-marker"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let tab = tabs.active().unwrap();
+        assert!(tab.blocks().is_empty(), "no marks → no blocks");
+        let lines = output_lines_for(tab);
+        assert_eq!(lines, recent_output_lines(&tab.grid()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("grid-fallback-marker")),
+            "the grid tail still answers: {lines:?}"
+        );
+    }
+
+    /// Spec R05 / issue #76: `/proc/<pid>/cwd` may answer only when
+    /// OSC 7 never reported AND the tab isn't `Integrated` — the pure
+    /// gate `cwd_for` applies before touching the filesystem.
+    #[test]
+    fn proc_cwd_only_when_unreported_and_not_integrated() {
+        for integration in [
+            IntegrationState::Absent,
+            IntegrationState::MarksOnly,
+            IntegrationState::Integrated,
+        ] {
+            assert!(!reads_proc_cwd(true, integration), "{integration:?}");
+        }
+        assert!(reads_proc_cwd(false, IntegrationState::Absent));
+        assert!(reads_proc_cwd(false, IntegrationState::MarksOnly));
+        assert!(!reads_proc_cwd(false, IntegrationState::Integrated));
+    }
+
+    /// Spec R05 / issue #76: an `Integrated` tab whose OSC 7 report
+    /// never arrived still answers its TRACKED cwd — `/proc` is not
+    /// consulted, and a real `cd /` is what proves the read would have
+    /// answered differently. Real `/bin/sh`, no TTY needed.
+    #[test]
+    fn integrated_tabs_skip_the_proc_cwd_read() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if !logical_line(&tab.grid(), tab.cursor()).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // init_shell integrates the tab — the hook's echoed
+        // `session_id` must equal the allocated id (review fix: only a
+        // vetted stream promotes); no OSC 7 ever arrives.
+        tabs.active_mut().unwrap().session_id = Some("0".to_owned());
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(&hook_line(
+                r#"{"hook":"init_shell","value":{"session_id":0,"shell":"sh"}}"#,
+            ))
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            if tabs.active().unwrap().integration_state() == IntegrationState::Integrated {
+                break;
+            }
+            assert!(Instant::now() < deadline, "integration never landed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Move the child's real cwd — where `/proc` exists it then
+        // disagrees with the tracked cwd, which is what makes skipping
+        // the read observable.
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"cd /\n")
+            .unwrap();
+        let proc_deadline = Instant::now() + Duration::from_secs(5);
+        let mut proc_reports_root = false;
+        while Instant::now() < proc_deadline {
+            tabs.drain_events();
+            if let Some(pid) = tabs.active().unwrap().session.child_pid() {
+                if std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .is_ok_and(|path| path == Path::new("/"))
+                {
+                    proc_reports_root = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let tab = tabs.active().unwrap();
+        let tracked = tab.cwd().display().to_string();
+        assert_ne!(
+            tracked, "/",
+            "the test discriminates only if the tracked cwd isn't /"
+        );
+        assert_eq!(tab.integration_state(), IntegrationState::Integrated);
+        assert!(!tab.cwd_reported(), "plain sh never reports OSC 7");
+        assert_eq!(
+            cwd_for(tab),
+            tracked,
+            "the tracked cwd answers, not /proc's"
+        );
+        if proc_reports_root {
+            assert_ne!(
+                cwd_for(tab),
+                "/",
+                "/proc would have answered `/` — the read was skipped"
+            );
+        }
+    }
+
+    // ---- Spec R11-T2 (§5.10.4): the classifier trigger ----
+    //
+    // Same seam as the `# `/`Alt+Enter` triggers: the shadow updated
+    // key-by-key, byte-fed `Session` grids for the logical line, and a
+    // `with_path_entries` index standing in for the spawn-time
+    // `$PATH` harvest — no PTY, network or real filesystem walk.
+
+    /// The verdict half: an armed `heuristic` mode plus a verified
+    /// line the classifier reads as natural language returns the line
+    /// verbatim — what the rewrite submits as `# <line>` (us-1/2).
+    #[test]
+    fn classified_line_returns_the_verified_nl_line() {
+        let index = ProgramIndex::with_path_entries("sh", ["ls", "echo"]);
+        assert_eq!(
+            classified_line(
+                &typed("what is the largest file"),
+                "$ what is the largest file",
+                "sh",
+                &index,
+                ClassifierMode::Heuristic,
+            ),
+            Some("what is the largest file".to_string())
+        );
+    }
+
+    /// Lines the heuristic reads as commands — a builtin or `$PATH`
+    /// first word, shell syntax, a single token, or unknown words
+    /// without sentence evidence — return `None`: Enter submits them
+    /// verbatim and the trigger stays invisible (us-5/6/7/8).
+    #[test]
+    fn classified_line_stays_none_for_commands() {
+        let index = ProgramIndex::with_path_entries("sh", ["echo", "mybin"]);
+        for line in [
+            "echo hi there",      // a builtin first word
+            "mybin --verbose go", // a $PATH binary plus a flag token
+            "foo | bar baz",      // a pipe is unquoted shell syntax
+            "justoneword",        // single tokens are always commands
+            "foo bar",            // unknown words, no positive evidence
+        ] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    &format!("$ {line}"),
+                    "sh",
+                    &index,
+                    ClassifierMode::Heuristic,
+                ),
+                None,
+                "{line:?} submits verbatim"
+            );
+        }
+    }
+
+    /// The `\x15` wipe's exposure (us-10): the trigger only arms when
+    /// the tab's program is a known shell — `rewrite_as_comment`
+    /// erases the typed line with readline's kill-to-BOL, and a REPL
+    /// or any other program that echoes input without honoring `Ctrl+U`
+    /// would get `# <line>` appended onto the un-wiped text. Non-shell
+    /// prompts degrade to the same verbatim path every other
+    /// unverifiable line takes.
+    #[test]
+    fn classified_line_is_none_for_a_non_shell_program() {
+        let index = ProgramIndex::with_path_entries("python3", Vec::<&str>::new());
+        let line = "what is the largest file";
+        let logical = ">>> what is the largest file";
+        // A verified NL line under a REPL prompt is verbatim.
+        assert_eq!(
+            classified_line(
+                &typed(line),
+                logical,
+                "python3",
+                &index,
+                ClassifierMode::Heuristic
+            ),
+            None
+        );
+        // …as is every non-shell basename — the gate is a known-set,
+        // not a denialist.
+        for shell in ["cat", "irb", "node", "gdb"] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    logical,
+                    shell,
+                    &index,
+                    ClassifierMode::Heuristic
+                ),
+                None,
+                "{shell} is not a shell the rewrite can wipe"
+            );
+        }
+        // The POSIX/readline family still arms.
+        for shell in ["bash", "zsh", "fish", "sh", "dash"] {
+            assert_eq!(
+                classified_line(
+                    &typed(line),
+                    &format!("$ {line}"),
+                    shell,
+                    &index,
+                    ClassifierMode::Heuristic
+                ),
+                Some(line.to_string()),
+                "{shell} arms the trigger"
+            );
+        }
+    }
+
+    /// `off`, a stale shadow and grid-echo disagreement all return
+    /// `None` — an ordinary submission, the desync-is-inert rule
+    /// (us-10/11/13). The stale case is what `ait ctl send` leaves
+    /// behind — the same `mark_stale` pastes use — so input that
+    /// never passed through keystrokes is never classified (us-16).
+    #[test]
+    fn classified_line_is_none_when_off_stale_or_desynced() {
+        let index = ProgramIndex::with_path_entries("sh", ["ls"]);
+        let line = "what is the largest file";
+        let logical = "$ what is the largest file";
+        // `classifier = "off"` keeps every submission verbatim.
+        assert_eq!(
+            classified_line(&typed(line), logical, "sh", &index, ClassifierMode::Off),
+            None
+        );
+        // A stale shadow never verifies — `mark_stale` is the same
+        // call pastes and `ait ctl send` make.
+        let mut stale = typed(line);
+        stale.mark_stale();
+        assert_eq!(
+            classified_line(&stale, logical, "sh", &index, ClassifierMode::Heuristic),
+            None
+        );
+        // Echo disagreement (history recall, a REPL, a heredoc): the
+        // line on the grid is not the shadow's line.
+        assert_eq!(
+            classified_line(
+                &typed(line),
+                "$ make install",
+                "sh",
+                &index,
+                ClassifierMode::Heuristic
+            ),
+            None
+        );
+    }
+
+    /// The request half on a real `/bin/sh`: a verified natural-
+    /// language line produces the verified line AND a `SuggestRequest`
+    /// in the `Alt+Enter` whole-line form — the request text IS the
+    /// line, bundled with the same §5.4 context `request_for`
+    /// assembles (us-15–17). Real PTY spawn, no TTY needed.
+    #[test]
+    fn classified_request_bundles_the_verified_line() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if !logical_line(&tab.grid(), tab.cursor()).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "prompt never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"what is the largest file")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if logical_line(&tab.grid(), tab.cursor()).ends_with("what is the largest file") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Stage the shadow as `handle_event` would have.
+        {
+            let tab = tabs.active_mut().unwrap();
+            for c in "what is the largest file".chars() {
+                tab.shadow.update(&char_key(c));
+            }
+        }
+
+        let settings = Settings::default();
+        let (line, request) =
+            classified_request(tabs.active().unwrap(), &settings, "default").expect("NL fires");
+
+        assert_eq!(line, "what is the largest file");
+        assert_eq!(request.request, "what is the largest file");
+        assert_eq!(request.shell, "sh");
+        assert_eq!(request.profile, "default");
+        assert_eq!(request.settings, settings);
+    }
+
+    /// The known-shell gate on the request half (us-10): a tab whose
+    /// program merely echoes its input — `/bin/cat` — verifies the
+    /// shadow exactly like a shell prompt would, but the title fails
+    /// [`ait_shell::is_known_shell`], so the natural-language verdict
+    /// degrades to a verbatim submission instead of a `Ctrl+U` wipe
+    /// the program may not honor. Same seam as the `sh` test above.
+    #[test]
+    fn classified_request_stays_verbatim_on_a_non_shell() {
+        use crate::tabs::{SessionTemplate, TabManager};
+        use ait_term::LiveSessionOptions;
+
+        let mut tabs = TabManager::spawn_with(
+            Size::new(40, 10),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/cat")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // `cat` prints no prompt — the PTY's own echo is what lands
+        // the line on the grid, which is exactly the exposure: echo
+        // agreement without a shell underneath.
+        tabs.active()
+            .unwrap()
+            .session
+            .send_bytes(b"what is the largest file")
+            .unwrap();
+        loop {
+            tabs.drain_events();
+            let tab = tabs.active().unwrap();
+            if logical_line(&tab.grid(), tab.cursor()).ends_with("what is the largest file") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let tab = tabs.active_mut().unwrap();
+            for c in "what is the largest file".chars() {
+                tab.shadow.update(&char_key(c));
+            }
+        }
+
+        let settings = Settings::default();
+        assert!(
+            classified_request(tabs.active().unwrap(), &settings, "default").is_none(),
+            "a non-shell program submits verbatim"
+        );
     }
 }
