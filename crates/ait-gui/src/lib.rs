@@ -13,6 +13,8 @@
 //! - [`grid`] — the pure cell→styled-run planner (wide-char cover,
 //!   combining-char ride-along, the cursor-only damage filter).
 //! - [`paint`] — the `Painter` pass over the planner's output.
+//! - [`panel`] — the agent panel's pure line planning (entries →
+//!   styled rows, the pinned plan block, the parked gate card).
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -28,6 +30,7 @@ pub mod grid;
 pub mod keys;
 pub mod layout;
 pub mod paint;
+pub mod panel;
 pub mod pump;
 
 use std::io::Write as _;
