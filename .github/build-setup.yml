@@ -1,0 +1,31 @@
+# Steps spliced into every build-local-artifacts job by dist's
+# `github-build-setup` (Cargo.toml [workspace.metadata.dist]),
+# immediately after actions/checkout — i.e. before the generated
+# "Install dependencies" step. Keep `run:` blocks literal (`|`):
+# dist's splicer mangles folded/chomped scalars.
+#
+# Why this exists: the ubuntu-22.04 runner image routes apt through
+# mirror+file:/etc/apt/apt-mirrors.txt, which resolves to
+# azure.archive.ubuntu.com — a host that intermittently fails DNS
+# resolution on Actions runners and failed the v1.0.0 musl leg twice
+# (~20 min apart, both at `apt-get install musl-tools`). Repointing
+# the mirror file at archive.ubuntu.com fixes the source; the
+# pre-install then makes dist's own `apt-get install musl-tools` a
+# no-op ("0 newly installed", exit 0) even if apt flakes again.
+- name: Repoint apt off the dead Azure mirror and pre-install musl deps
+  if: ${{ contains(matrix.targets, 'x86_64-unknown-linux-musl') }}
+  run: |
+    sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' \
+      /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources \
+      2>/dev/null || true
+    if [ -f /etc/apt/apt-mirrors.txt ]; then
+      echo 'http://archive.ubuntu.com/ubuntu' | sudo tee /etc/apt/apt-mirrors.txt
+    fi
+    for attempt in 1 2 3; do
+      if sudo apt-get -o Acquire::Retries=3 update && \
+         sudo apt-get -o Acquire::Retries=3 install -y musl-tools; then
+        exit 0
+      fi
+      sleep 10
+    done
+    exit 1
