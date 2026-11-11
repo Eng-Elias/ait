@@ -92,7 +92,7 @@ use ait_app::profile::{self, ProfilePicker};
 use ait_app::scroll::WHEEL_LINES;
 use ait_app::selection::{encode_paste, extract, GridPoint, SelectionRange};
 use ait_app::skills::LiveSkills;
-use ait_app::status::{notification_text, status_text, StatusLine, Toast};
+use ait_app::status::{self, notification_text, status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
 use ait_app::suggest::{self, SuggestionPin};
 use ait_app::tabs::TabManager;
@@ -320,23 +320,34 @@ pub fn run() -> io::Result<ExitCode> {
         Ok(store) => (store, None),
         Err(error) => (StoreHandle::disabled(), Some(error.to_string())),
     };
+    // §5.10.5's control socket (Spec R11): a nonblocking listener on
+    // `${XDG_RUNTIME_DIR}/ait/<pid>.sock`, drained on the tick beside
+    // the other channels. A bind failure degrades to running without
+    // ctl — additive surface, never a launch blocker. Its path rides
+    // the spawn template so every session's env exports
+    // `AIT_CTL_SOCKET` (surviving later config reloads —
+    // `set_session_template` carries it).
+    let (mut ctl, ctl_error) = match ctl::CtlServer::bind() {
+        Ok(server) => (Some(server), None),
+        Err(error) => (None, Some(ctl::socket_error_text(error))),
+    };
     let mut state = AppState {
         screen: Rect::new(0, 0, columns, rows),
         copied_text: None,
         last_exit: None,
-        toast: {
-            // Both failures can land on one launch — the store's
-            // signal must surface even when a config error already
-            // toasted, so they share the line.
-            let failures: Vec<String> = [
-                load_error.map(|text| format!("config error: {text}")),
-                store_error.map(|text| format!("store unavailable: {text}")),
+        // Every degraded subsystem can land on one launch — the
+        // failures share the toast line (`status::boot_toast`).
+        toast: status::boot_toast(
+            [
+                load_error.map(|text| config::error_text(&text)),
+                store_error.map(StoreHandle::unavailable_text),
+                ctl_error,
             ]
             .into_iter()
             .flatten()
-            .collect();
-            (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), Instant::now()))
-        },
+            .collect(),
+            Instant::now(),
+        ),
         config,
         // `OsKeyring` is the default secret store — `api_key_env`
         // first, OS keyring second (§4.1).
@@ -352,23 +363,6 @@ pub fn run() -> io::Result<ExitCode> {
         // the first task still lands in that task's snapshot (Spec
         // R10-T6).
         skills: LiveSkills::new(),
-    };
-    // §5.10.5's control socket (Spec R11): a nonblocking listener on
-    // `${XDG_RUNTIME_DIR}/ait/<pid>.sock`, drained on the tick beside
-    // the other channels. A bind failure degrades to running without
-    // ctl — additive surface, never a launch blocker. Its path rides
-    // the spawn template so every session's env exports
-    // `AIT_CTL_SOCKET` (surviving later config reloads —
-    // `set_session_template` carries it).
-    let mut ctl = match ctl::CtlServer::bind() {
-        Ok(server) => Some(server),
-        Err(error) => {
-            state.toast = Some(Toast::new(
-                format!("ctl socket unavailable: {error}"),
-                Instant::now(),
-            ));
-            None
-        }
     };
     // The PTY winsize is the CONTENT area: the tab bar and the (reserved)
     // status-line row are chrome outside the session grid (Spec R02).

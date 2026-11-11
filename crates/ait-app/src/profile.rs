@@ -133,6 +133,18 @@ impl ProfilePicker {
         }
         self.selected = (self.selected + 1) % self.names.len();
     }
+
+    /// Row `index`'s display text — `▸` on the highlight (the ask
+    /// card's selection idiom). Both frontends paint this verbatim
+    /// (Spec R13 §5.12, CODING_STANDARDS §17).
+    pub fn row_text(&self, index: usize) -> String {
+        let name = &self.names[index];
+        if index == self.selected {
+            format!("▸ {name}")
+        } else {
+            format!("  {name}")
+        }
+    }
 }
 
 #[cfg(test)]

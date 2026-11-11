@@ -18,11 +18,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ait_agent::ApprovalVerdict;
 use ait_agent::CommandSuggester;
-use ait_app::agent_panel::AgentPanel;
+use ait_app::agent_panel::{self, AgentPanel};
 use ait_app::blocks::BlockStatus;
 use ait_app::config::{self, LiveSettings};
 use ait_app::conversations::ConversationPicker;
-use ait_app::ctl::CtlServer;
+use ait_app::ctl::{self, CtlServer};
 use ait_app::integration::IntegrationState;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
 use ait_app::profile::{self, ProfilePicker};
@@ -30,7 +30,7 @@ use ait_app::scroll::WHEEL_LINES;
 use ait_app::search::{FindBar, SearchHit};
 use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
-use ait_app::status::{block_text, status_text, StatusLine, Toast};
+use ait_app::status::{self, block_text, status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
 use ait_app::suggest::{self, SuggestionPin};
 use ait_app::tabs::TabManager;
@@ -175,7 +175,7 @@ impl GuiApp {
         };
         let (ctl, ctl_error) = match CtlServer::bind() {
             Ok(server) => (Some(server), None),
-            Err(error) => (None, Some(format!("ctl socket unavailable: {error}"))),
+            Err(error) => (None, Some(ctl::socket_error_text(error))),
         };
         let mut template = config::session_template(config.settings());
         template.ctl_socket = ctl
@@ -187,17 +187,17 @@ impl GuiApp {
             .map_err(|error| BootError(error.to_string()))?;
         // The first tab's `terminal_sessions` row (Spec R08) — same
         // registration `Alt+T` performs per spawned tab.
-        let mut toast = {
-            let failures: Vec<String> = [
-                load_error.map(|text| format!("config error: {text}")),
-                store_error.map(|text| format!("store unavailable: {text}")),
+        let mut toast = status::boot_toast(
+            [
+                load_error.map(|text| config::error_text(&text)),
+                store_error.map(StoreHandle::unavailable_text),
                 ctl_error,
             ]
             .into_iter()
             .flatten()
-            .collect();
-            (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), Instant::now()))
-        };
+            .collect(),
+            Instant::now(),
+        );
         let mut store = store;
         if let Some(tab) = tabs.active_mut() {
             if let Some(id) = store.session_started(&mut toast, tab.title(), tab.cwd()) {
@@ -1261,9 +1261,9 @@ impl GuiApp {
                     Pos2::new(left, y),
                     Align2::LEFT_TOP,
                     if denying {
-                        format!(" deny {name} — type a reason · enter: deny ")
+                        agent_panel::deny_prompt(name)
                     } else {
-                        format!(" approve {name} ")
+                        agent_panel::approve_title(name)
                     },
                     font.clone(),
                     tone_color(Tone::Alert, self.theme),
@@ -1483,7 +1483,7 @@ impl GuiApp {
                 Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
                 egui::StrokeKind::Inside,
             );
-            for (index, name) in picker.names().iter().enumerate() {
+            for (index, _) in picker.names().iter().enumerate() {
                 let y = rect.top() + 8.0 + index as f32 * row_h;
                 let selected = index == picker.selected();
                 if selected {
@@ -1499,11 +1499,7 @@ impl GuiApp {
                 painter.text(
                     Pos2::new(rect.left() + 12.0, y),
                     Align2::LEFT_TOP,
-                    if selected {
-                        format!("▸ {name}")
-                    } else {
-                        format!("  {name}")
-                    },
+                    picker.row_text(index),
                     font.clone(),
                     Color32::WHITE,
                 );
@@ -1554,13 +1550,7 @@ impl GuiApp {
                 painter.text(
                     Pos2::new(rect.left() + 12.0, y),
                     Align2::LEFT_TOP,
-                    format!(
-                        "{} {}  {} · {} items",
-                        if selected { "▸" } else { " " },
-                        row.title,
-                        row.age,
-                        row.items,
-                    ),
+                    row.display_line(selected),
                     font.clone(),
                     Color32::WHITE,
                 );
@@ -1568,19 +1558,9 @@ impl GuiApp {
             // The bottom row is the keys hint — `Ctrl+D`'s armed
             // state replaces it with the confirm prompt (us-11).
             let (hint, color) = if picker.confirming() {
-                let title = picker
-                    .selected_row()
-                    .map(|row| row.title.as_str())
-                    .unwrap_or_default();
-                (
-                    format!(" ctrl+d again deletes \"{title}\""),
-                    tone_color(Tone::Alert, self.theme),
-                )
+                (picker.hint_text(), tone_color(Tone::Alert, self.theme))
             } else {
-                (
-                    " enter: resume · ctrl+d: delete · esc: close".to_string(),
-                    tone_color(Tone::Dim, self.theme),
-                )
+                (picker.hint_text(), tone_color(Tone::Dim, self.theme))
             };
             painter.text(
                 Pos2::new(rect.left() + 12.0, rect.top() + 8.0 + shown as f32 * row_h),

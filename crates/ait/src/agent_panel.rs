@@ -14,22 +14,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color as RtColor, Modifier, Style};
 
 use ait_agent::{PlanTodo, PlanTodoStatus};
-use ait_app::agent_panel::{AgentPanel, AskCard, CardStatus, Entry, ToolCard};
-
-/// The input line's prompt marker — user text (a submitted task and a
-/// mid-run steering message alike) carries the same marker in the
-/// scrollback.
-const INPUT_PROMPT: &str = "› ";
-
-/// [`INPUT_PROMPT`]'s cell width — `›` is three bytes but one column;
-/// input-line math works in cells, never `str::len`.
-const PROMPT_WIDTH: usize = 2;
-
-/// The pinned plan block's row cap — header, visible todos and the
-/// trailing separator together (Spec R08-T5). A longer plan folds
-/// into a `… N more` row rather than crowding the scrollback out of
-/// the panel.
-const PLAN_BLOCK_MAX: usize = 10;
+use ait_app::agent_panel::{
+    self, AgentPanel, AskCard, CardStatus, Entry, ToolCard, INPUT_PROMPT, PLAN_BLOCK_MAX,
+    PLAN_HEADER, PROMPT_WIDTH,
+};
 
 /// The host cursor's screen position while the panel is focused: the
 /// end of the input line — the input row's tail-clip means it can sit
@@ -40,7 +28,7 @@ pub fn panel_cursor_position(panel: &AgentPanel, area: Rect) -> (u16, u16) {
     let inner_x = area.x + 1;
     let inner_width = usize::from(area.width.saturating_sub(1));
     let room = inner_width.saturating_sub(PROMPT_WIDTH);
-    let shown = tail(panel.input(), room);
+    let shown = agent_panel::tail(panel.input(), room);
     let x = inner_x + PROMPT_WIDTH as u16 + shown.chars().count() as u16;
     (x.min(area.right().saturating_sub(1)), area.bottom() - 1)
 }
@@ -70,13 +58,14 @@ pub fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel) {
     // Title row: the focus affordance — reversed while the panel owns
     // the keyboard — plus the in-flight hint while a task runs.
     reset_span(buf, inner.y, inner.x..inner.right());
-    let title = if panel.is_running() {
-        " agent — working "
-    } else {
-        " agent "
-    };
     let width = usize::from(inner.width);
-    buf.set_stringn(inner.x, inner.y, title, width, Style::default());
+    buf.set_stringn(
+        inner.x,
+        inner.y,
+        agent_panel::title(panel),
+        width,
+        Style::default(),
+    );
     if panel.is_focused() {
         for x in inner.x..inner.right() {
             buf[(x, inner.y)].modifier |= Modifier::REVERSED;
@@ -94,7 +83,7 @@ pub fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel) {
     let input_y = inner.bottom() - 1;
     reset_span(buf, input_y, inner.x..inner.right());
     let room = width.saturating_sub(PROMPT_WIDTH);
-    let shown = tail(panel.input(), room);
+    let shown = agent_panel::tail(panel.input(), room);
     buf.set_stringn(
         inner.x,
         input_y,
@@ -102,37 +91,23 @@ pub fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel) {
         width,
         Style::default(),
     );
-    let prompt_text = if let Some((name, denying)) = panel.pending_approval() {
-        Some(if denying {
-            format!(" deny {name} — type a reason · enter: deny ")
+    let prompt_rows =
+        if let (Some(text), true) = (agent_panel::prompt_text(panel), input_y > inner.y + 1) {
+            let y = input_y - 1;
+            reset_span(buf, y, inner.x..inner.right());
+            buf.set_stringn(
+                inner.x,
+                y,
+                text,
+                width,
+                Style::default()
+                    .fg(RtColor::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            1
         } else {
-            format!(" approve {name} — a: once · t: task · d: deny ")
-        })
-    } else if panel.awaiting_answer() {
-        Some(if panel.ask_has_choices() {
-            " ask — ↑/↓ choose · enter: answer ".to_string()
-        } else {
-            " ask — type your answer · enter: send ".to_string()
-        })
-    } else {
-        None
-    };
-    let prompt_rows = if let (Some(text), true) = (prompt_text, input_y > inner.y + 1) {
-        let y = input_y - 1;
-        reset_span(buf, y, inner.x..inner.right());
-        buf.set_stringn(
-            inner.x,
-            y,
-            text,
-            width,
-            Style::default()
-                .fg(RtColor::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-        1
-    } else {
-        0
-    };
+            0
+        };
     if inner.height < 3 {
         return;
     }
@@ -157,12 +132,7 @@ pub fn paint_agent_panel(buf: &mut Buffer, area: Rect, panel: &AgentPanel) {
     // handlers bound against.
     let conversation = display_lines(panel.entries(), width);
     let height = available - block.len();
-    let max_top = conversation.len().saturating_sub(height);
-    let top = if panel.is_pinned() {
-        max_top
-    } else {
-        panel.view_top().min(max_top)
-    };
+    let (top, max_top) = agent_panel::view_window(panel, conversation.len(), height);
     panel.set_painted_view((top, max_top));
     for row in 0..height {
         let y = inner.y + 1 + plan_rows + row as u16;
@@ -186,7 +156,7 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
         }
         let blocks: Vec<(String, Style)> = match entry {
             Entry::Task(text) | Entry::Steering(text) => vec![(
-                format!("{INPUT_PROMPT}{text}"),
+                agent_panel::task_line(text),
                 Style::default().add_modifier(Modifier::BOLD),
             )],
             Entry::Text(text) => vec![(text.clone(), Style::default())],
@@ -195,7 +165,7 @@ fn display_lines(entries: &[Entry], width: usize) -> Vec<(String, Style)> {
             Entry::Status(text) => vec![(text.clone(), Style::default().fg(RtColor::DarkGray))],
         };
         for (text, style) in blocks {
-            for line in wrap(&text, width) {
+            for line in agent_panel::wrap(&text, width) {
                 lines.push((line, style));
             }
         }
@@ -215,26 +185,26 @@ fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<(String, Style)> {
         return Vec::new();
     }
     let mut lines = vec![(
-        String::from(" plan"),
+        String::from(PLAN_HEADER),
         Style::default().fg(RtColor::DarkGray),
     )];
     // `cap - 2` todo rows at most — one for the header, one for the
     // separator/overflow row.
     let visible = (cap - 2).min(plan.len());
     for todo in &plan[..visible] {
-        let (mark, style) = match todo.status {
-            PlanTodoStatus::Done => ("✓", Style::default().fg(RtColor::DarkGray)),
-            PlanTodoStatus::InProgress => ("▸", Style::default().add_modifier(Modifier::BOLD)),
-            PlanTodoStatus::Pending => ("○", Style::default()),
+        let style = match todo.status {
+            PlanTodoStatus::Done => Style::default().fg(RtColor::DarkGray),
+            PlanTodoStatus::InProgress => Style::default().add_modifier(Modifier::BOLD),
+            PlanTodoStatus::Pending => Style::default(),
         };
-        lines.push((format!("{mark} {}", todo.content), style));
+        lines.push((agent_panel::todo_line(todo), style));
     }
     if plan.len() > visible {
         // The row this note replaces counted as hidden too.
         let hidden = plan.len() - visible + 1;
         lines.pop();
         lines.push((
-            format!("    … {hidden} more"),
+            agent_panel::plan_overflow(hidden),
             Style::default().fg(RtColor::DarkGray),
         ));
     }
@@ -250,41 +220,30 @@ fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<(String, Style)> {
 /// error or denial text) follows indented and dimmed when the
 /// update carried one.
 fn tool_card_lines(card: &ToolCard) -> Vec<(String, Style)> {
-    let (mark, style) = match card.status {
-        CardStatus::AwaitingApproval => (
-            "?",
-            Style::default()
-                .fg(RtColor::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        CardStatus::Running => ("…", Style::default()),
-        CardStatus::Done => ("✓", Style::default().fg(RtColor::Green)),
-        CardStatus::Denied => ("✗", Style::default().fg(RtColor::DarkGray)),
-        CardStatus::Failed => ("!", Style::default().fg(RtColor::Red)),
+    let style = match card.status {
+        CardStatus::AwaitingApproval => Style::default()
+            .fg(RtColor::Yellow)
+            .add_modifier(Modifier::BOLD),
+        CardStatus::Running => Style::default(),
+        CardStatus::Done => Style::default().fg(RtColor::Green),
+        CardStatus::Denied => Style::default().fg(RtColor::DarkGray),
+        CardStatus::Failed => Style::default().fg(RtColor::Red),
     };
-    let mut lines = Vec::new();
+    let mut lines = vec![(agent_panel::card_header(card), style)];
     if card.summary.contains('\n') {
         // A multi-line summary — `edit_files`' unified diff
-        // (Spec R06 us-22): the header carries the name alone and
-        // each diff line paints its own row so `+`/`-` color as
-        // additions/deletions instead of wrapping as one blob.
-        lines.push((format!("{mark} {}", card.name), style));
+        // (Spec R06 us-22): each diff line paints its own row so
+        // `+`/`-` color as additions/deletions instead of wrapping
+        // as one blob.
         lines.extend(
             card.summary
                 .lines()
-                .map(|line| (format!("  {line}"), diff_line_style(line))),
+                .map(|line| (agent_panel::diff_line(line), diff_line_style(line))),
         );
-    } else {
-        let summary = if card.summary.is_empty() {
-            card.name.clone()
-        } else {
-            format!("{} {}", card.name, card.summary)
-        };
-        lines.push((format!("{mark} {summary}"), style));
     }
     if let Some(detail) = &card.detail {
         lines.push((
-            format!("    {detail}"),
+            agent_panel::detail_line(detail),
             Style::default().fg(RtColor::DarkGray),
         ));
     }
@@ -299,17 +258,17 @@ fn ask_card_lines(card: &AskCard) -> Vec<(String, Style)> {
     match &card.answer {
         Some(answer) => vec![
             (
-                format!("✓ {}", card.question),
+                agent_panel::ask_question(card),
                 Style::default().fg(RtColor::Green),
             ),
             (
-                format!("    {answer}"),
+                agent_panel::detail_line(answer),
                 Style::default().fg(RtColor::DarkGray),
             ),
         ],
         None => {
             let mut lines = vec![(
-                format!("? {}", card.question),
+                agent_panel::ask_question(card),
                 Style::default()
                     .fg(RtColor::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -317,11 +276,11 @@ fn ask_card_lines(card: &AskCard) -> Vec<(String, Style)> {
             for (index, choice) in card.choices.iter().enumerate() {
                 lines.push(if index == card.selected {
                     (
-                        format!("    ▸ {choice}"),
+                        agent_panel::choice_line(choice, true),
                         Style::default().add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    (format!("      {choice}"), Style::default())
+                    (agent_panel::choice_line(choice, false), Style::default())
                 });
             }
             lines
@@ -347,40 +306,6 @@ fn diff_line_style(line: &str) -> Style {
     } else {
         Style::default()
     }
-}
-
-/// Char-wrap `text` to `width` columns honoring embedded newlines;
-/// empty input still yields one (empty) line.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for logical in text.split('\n') {
-        let mut line = String::new();
-        let mut columns = 0;
-        for c in logical.chars() {
-            if columns == width {
-                lines.push(std::mem::take(&mut line));
-                columns = 0;
-            }
-            line.push(c);
-            columns += 1;
-        }
-        lines.push(line);
-    }
-    lines
-}
-
-/// The trailing `max` characters of `text` — the input row's view of
-/// a buffer longer than its width (the tail is the end being edited).
-fn tail(text: &str, max: usize) -> &str {
-    let count = text.chars().count();
-    if count <= max {
-        return text;
-    }
-    text.char_indices()
-        .nth(count - max)
-        .map(|(index, _)| &text[index..])
-        .unwrap_or("")
 }
 
 /// `paint_session`'s row-blanking primitive, duplicated locally —
@@ -434,10 +359,10 @@ mod tests {
     /// the conversation's display-line math.
     #[test]
     fn wrap_splits_on_newlines_and_width() {
-        assert_eq!(wrap("ab\ncd", 5), vec!["ab", "cd"]);
-        assert_eq!(wrap("abcd", 2), vec!["ab", "cd"]);
-        assert_eq!(wrap("", 2), vec![""]);
-        assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
+        assert_eq!(agent_panel::wrap("ab\ncd", 5), vec!["ab", "cd"]);
+        assert_eq!(agent_panel::wrap("abcd", 2), vec!["ab", "cd"]);
+        assert_eq!(agent_panel::wrap("", 2), vec![""]);
+        assert_eq!(agent_panel::wrap("a\n\nb", 10), vec!["a", "", "b"]);
     }
 
     /// Paint on a small rect: the `│` separator, the title row

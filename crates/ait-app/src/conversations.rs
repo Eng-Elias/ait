@@ -30,6 +30,21 @@ pub struct ConversationRow {
     pub items: i64,
 }
 
+impl ConversationRow {
+    /// The picker's row text — `▸`-marked while highlighted, then
+    /// `title  age · N items`. Both frontends paint this verbatim
+    /// (Spec R13 §5.12, CODING_STANDARDS §17).
+    pub fn display_line(&self, selected: bool) -> String {
+        format!(
+            "{} {}  {} · {} items",
+            if selected { '▸' } else { ' ' },
+            self.title,
+            self.age,
+            self.items
+        )
+    }
+}
+
 /// The open picker (Spec R08 us-5): stored rows newest-first, the
 /// highlight wrapping on ↑/↓, and `Ctrl+D`'s one-key confirm — the
 /// first press arms the highlighted row, the second deletes it and
@@ -128,6 +143,19 @@ impl ConversationPicker {
             self.selected = self.rows.len().saturating_sub(1);
         }
         Some(row)
+    }
+
+    /// The picker's bottom hint row — the armed `Ctrl+D` swaps in the
+    /// one-key confirm. Empty on an empty picker.
+    pub fn hint_text(&self) -> String {
+        if self.confirming {
+            match self.selected_row() {
+                Some(row) => format!(" ctrl+d again deletes \"{}\"", row.title),
+                None => String::new(),
+            }
+        } else {
+            " enter: resume · ctrl+d: delete · esc: close".to_string()
+        }
     }
 }
 

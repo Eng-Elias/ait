@@ -162,6 +162,16 @@ pub fn notification_text(source: Option<&str>, title: Option<&str>, message: &st
     parts.join(": ")
 }
 
+/// The launch-degradation toast both frontends build: every failed
+/// subsystem's message joined by ` · ` — `None` when the launch was
+/// clean. The config/store/ctl labels live beside their own loaders
+/// (`config::error_text`, `StoreHandle::unavailable_text`,
+/// `ctl::socket_error_text`); this is only the join (Spec R13 §5.12,
+/// CODING_STANDARDS §17).
+pub fn boot_toast(failures: Vec<String>, now: Instant) -> Option<Toast> {
+    (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), now))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,8 +41,8 @@ use std::time::Instant;
 
 use ait_agent::{
     ask_replay_id, result_preview, AgentContext, AgentEvent, AgentRequest, AgentSession,
-    ApprovalVerdict, PlanTodo, ToolStatus, TranscriptItem, INTERRUPTED_RESULT, STATUS_BUDGET,
-    STATUS_CANCELLED, STATUS_DONE,
+    ApprovalVerdict, PlanTodo, PlanTodoStatus, ToolStatus, TranscriptItem, INTERRUPTED_RESULT,
+    STATUS_BUDGET, STATUS_CANCELLED, STATUS_DONE,
 };
 use ait_term::{Key, KeyEvent, Modifiers};
 
@@ -892,6 +892,271 @@ fn card_status(status: ToolStatus) -> CardStatus {
         ToolStatus::Denied => CardStatus::Denied,
         ToolStatus::Failed => CardStatus::Failed,
     }
+}
+
+// ── Frontend-shared display text (Spec R13 §5.12, CODING_STANDARDS
+// §17) ────────────────────────────────────────────────────────────
+// Every literal both frontends' panel paints drew lives here so a
+// wording or glyph change lands once. The frontends map these to
+// their own style vocabularies — the TUI's `Span`s and the GUI's
+// `Tone` rows — which stay theirs to tune.
+
+/// The input line's prompt marker — `›` + a space.
+pub const INPUT_PROMPT: &str = "› ";
+/// `INPUT_PROMPT`'s cell width — `›` is three bytes but one column.
+pub const PROMPT_WIDTH: usize = 2;
+/// The pinned plan block's row cap (Spec R08-T5's
+/// `plan-block-max: 10` bound).
+pub const PLAN_BLOCK_MAX: usize = 10;
+/// The plan block's header row.
+pub const PLAN_HEADER: &str = " plan";
+/// `✓` — a finished tool call, an answered ask, a done plan todo.
+pub const MARK_DONE: char = '✓';
+/// `✗` — a denied tool call.
+pub const MARK_DENIED: char = '✗';
+/// `?` — a parked ask still waiting on an answer.
+pub const MARK_WAITING: char = '?';
+/// `…` — an in-flight tool call.
+pub const MARK_RUNNING: char = '…';
+/// `!` — a tool call that reported an error.
+pub const MARK_FAILED: char = '!';
+/// `▸` — the in-progress plan todo (the pickers' highlight marker
+/// reuses the same glyph).
+pub const MARK_IN_PROGRESS: char = '▸';
+/// `○` — a pending plan todo.
+pub const MARK_PENDING: char = '○';
+/// The parked approve card's prompt row.
+pub fn approve_prompt(name: &str) -> String {
+    format!(" approve {name} — a: once · t: task · d: deny ")
+}
+/// The denial-reason mode's prompt row.
+pub fn deny_prompt(name: &str) -> String {
+    format!(" deny {name} — type a reason · enter: deny ")
+}
+/// The approve card's title text — the card-shaped twin of
+/// [`approve_prompt`] the GUI paints inside its windowed card.
+pub fn approve_title(name: &str) -> String {
+    format!(" approve {name} ")
+}
+/// The parked choices ask's prompt row.
+pub const ASK_CHOICES_PROMPT: &str = " ask — ↑/↓ choose · enter: answer ";
+/// The parked free-text ask's prompt row.
+pub const ASK_TEXT_PROMPT: &str = " ask — type your answer · enter: send ";
+
+/// The title row's text — the `— working` suffix while a task runs.
+pub fn title(panel: &AgentPanel) -> &'static str {
+    if panel.is_running() {
+        " agent — working "
+    } else {
+        " agent "
+    }
+}
+
+/// The parked gate's prompt row text — the approve card's two modes
+/// (denial-reason once `d` landed) or the ask card's choices/free-text
+/// variant. `None` when nothing is parked: the row then shows the
+/// plain `INPUT_PROMPT` input line.
+pub fn prompt_text(panel: &AgentPanel) -> Option<String> {
+    if let Some((name, denying)) = panel.pending_approval() {
+        Some(if denying {
+            deny_prompt(name)
+        } else {
+            approve_prompt(name)
+        })
+    } else if panel.awaiting_answer() {
+        Some(if panel.ask_has_choices() {
+            ASK_CHOICES_PROMPT.to_string()
+        } else {
+            ASK_TEXT_PROMPT.to_string()
+        })
+    } else {
+        None
+    }
+}
+
+/// The parked gate the paint layers over the input row: the approve
+/// card needs its tool name and whether `d` already armed
+/// denial-reason mode; the ask card is handed through whole — its
+/// card-shaped paint owns the question and choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate<'a> {
+    /// An [`AgentEvent::ApprovalRequest`] waits on a verdict.
+    Approve {
+        /// The pending tool name — the card's title.
+        name: &'a str,
+        /// Whether denial-reason mode is armed.
+        denying: bool,
+    },
+    /// An `ask_user_question` waits on an answer.
+    Ask(&'a AskCard),
+}
+
+/// The parked gate, if any — `pending_approval` covers the approve
+/// card; an awaiting ask rides the newest unresolved `Entry::Ask`
+/// (the same card `submit_answer` answers — only one gate parks at
+/// a time).
+pub fn gate(panel: &AgentPanel) -> Option<Gate<'_>> {
+    if let Some((name, denying)) = panel.pending_approval() {
+        return Some(Gate::Approve { name, denying });
+    }
+    if panel.awaiting_answer() {
+        return panel.entries().iter().rev().find_map(|entry| match entry {
+            Entry::Ask(card) if card.answer.is_none() => Some(Gate::Ask(card)),
+            _ => None,
+        });
+    }
+    None
+}
+
+/// The status-mark vocabulary a tool card's header draws.
+pub fn card_mark(status: CardStatus) -> char {
+    match status {
+        CardStatus::AwaitingApproval => MARK_WAITING,
+        CardStatus::Running => MARK_RUNNING,
+        CardStatus::Done => MARK_DONE,
+        CardStatus::Denied => MARK_DENIED,
+        CardStatus::Failed => MARK_FAILED,
+    }
+}
+
+/// The plan todo's status mark — `▸` in progress, `✓` done, `○`
+/// pending.
+pub fn todo_mark(status: PlanTodoStatus) -> char {
+    match status {
+        PlanTodoStatus::Done => MARK_DONE,
+        PlanTodoStatus::InProgress => MARK_IN_PROGRESS,
+        PlanTodoStatus::Pending => MARK_PENDING,
+    }
+}
+
+/// A plan todo's row — `mark content`.
+pub fn todo_line(todo: &PlanTodo) -> String {
+    format!("{} {}", todo_mark(todo.status), todo.content)
+}
+
+/// The tool card's header row text — `mark name summary` inline, or
+/// just `mark name` when the summary carries newlines (a diff explodes
+/// into its own rows beneath via [`diff_line`]).
+pub fn card_header(card: &ToolCard) -> String {
+    let mark = card_mark(card.status);
+    if card.summary.contains('\n') {
+        format!("{mark} {}", card.name)
+    } else {
+        let summary = if card.summary.is_empty() {
+            card.name.clone()
+        } else {
+            format!("{} {}", card.name, card.summary)
+        };
+        format!("{mark} {summary}")
+    }
+}
+
+/// A multi-line summary row — two-space indented under the header.
+pub fn diff_line(line: &str) -> String {
+    format!("  {line}")
+}
+
+/// The detail/error row under a card's header — four-space indented.
+pub fn detail_line(detail: &str) -> String {
+    format!("    {detail}")
+}
+
+/// An ask card's question row — `✓` once answered, `?` while waiting.
+pub fn ask_question(card: &AskCard) -> String {
+    let mark = if card.answer.is_some() {
+        MARK_DONE
+    } else {
+        MARK_WAITING
+    };
+    format!("{mark} {}", card.question)
+}
+
+/// A choice row — `▸` on the highlighted option.
+pub fn choice_line(choice: &str, selected: bool) -> String {
+    if selected {
+        format!("    {MARK_IN_PROGRESS} {choice}")
+    } else {
+        format!("      {choice}")
+    }
+}
+
+/// A task or steering entry's row — the prompt marker plus the
+/// user's words.
+pub fn task_line(text: &str) -> String {
+    format!("{INPUT_PROMPT}{text}")
+}
+
+/// The plan block's fold row — `… N more` while todos exceed the cap.
+pub fn plan_overflow(hidden: usize) -> String {
+    format!("    {MARK_RUNNING} {hidden} more")
+}
+
+/// The (top, bottom) window `view_top` paints — the tail while pinned,
+/// the stored scroll offset clamped otherwise (the same math the
+/// TUI's paint inlines; the GUI's hit-testing needed it as a fn, so
+/// both share this).
+pub fn view_window(panel: &AgentPanel, total: usize, height: usize) -> (usize, usize) {
+    let max_top = total.saturating_sub(height);
+    let top = if panel.is_pinned() {
+        max_top
+    } else {
+        panel.view_top().min(max_top)
+    };
+    (top, max_top)
+}
+
+/// Answer a parked choices ask as if the user had highlighted
+/// choice `index` and pressed Enter — a click on a choice row's
+/// state-level counterpart. Steps `ask_next` around the wrap ring
+/// to the clicked index, then runs the shared `submit_answer` (the
+/// send travels the same channel the keyboard answer does). A
+/// no-op while no choices ask is parked.
+pub fn answer_choice(panel: &mut AgentPanel, index: usize, toast: &mut Option<Toast>) {
+    let Some(card) = panel.entries().iter().rev().find_map(|entry| match entry {
+        Entry::Ask(card) if card.answer.is_none() => Some(card),
+        _ => None,
+    }) else {
+        return;
+    };
+    if !panel.awaiting_answer() || card.choices.is_empty() || index >= card.choices.len() {
+        return;
+    }
+    let steps = (index + card.choices.len() - card.selected) % card.choices.len();
+    for _ in 0..steps {
+        panel.ask_next();
+    }
+    panel.submit_answer(toast);
+}
+
+/// Char-wrap `text` to `width` columns honoring embedded newlines;
+/// empty input still yields one (empty) line.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for logical in text.split('\n') {
+        let mut row = String::new();
+        let mut columns = 0;
+        for c in logical.chars() {
+            if columns == width {
+                lines.push(std::mem::take(&mut row));
+                columns = 0;
+            }
+            row.push(c);
+            columns += 1;
+        }
+        lines.push(row);
+    }
+    lines
+}
+
+/// The last `max` characters of `text` — the input line's tail view
+/// when the draft outgrew the prompt's width.
+pub fn tail(text: &str, max: usize) -> &str {
+    if max == 0 {
+        return "";
+    }
+    let skip = text.chars().count().saturating_sub(max);
+    &text[text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i)..]
 }
 
 /// The `AgentContext` a submitted task carries (Spec R06 §5.6) — the

@@ -52,6 +52,14 @@ impl StoreHandle {
         })
     }
 
+    /// The boot-degradation toast text an `open` failure produces —
+    /// "store unavailable: <error>". Both frontends' launches degrade
+    /// to [`disabled`](Self::disabled) under this message (Spec R13
+    /// §5.12, CODING_STANDARDS §17).
+    pub fn unavailable_text(error: impl std::fmt::Display) -> String {
+        format!("store unavailable: {error}")
+    }
+
     /// An explicitly unpersisted run — what an `open` failure (and the
     /// test `Harness`) degrades to.
     pub fn disabled() -> Self {
@@ -64,6 +72,7 @@ impl StoreHandle {
     /// Wrap a caller-opened `Store` — the seam a frontend's tests
     /// inject a tempdir database through instead of touching the real
     /// XDG path.
+    #[doc(hidden)] // cross-crate test seam — not production surface
     pub fn from_store(store: Store) -> Self {
         Self {
             inner: Some(store),

@@ -311,16 +311,16 @@ pub fn paint_profile_picker(buf: &mut Buffer, area: Rect, picker: &ProfilePicker
     let names = picker.names();
     let rows = names.len().min(usize::from(area.height));
     let top = area.bottom().saturating_sub(rows as u16);
-    for (index, name) in names.iter().take(rows).enumerate() {
+    for (index, _) in names.iter().take(rows).enumerate() {
         let y = top + index as u16;
         reset_span(buf, y, area.x..area.right());
         let (text, style) = if index == picker.selected() {
             (
-                format!("▸ {name}"),
+                picker.row_text(index),
                 ratatui::style::Style::default().add_modifier(Modifier::BOLD),
             )
         } else {
-            (format!("  {name}"), ratatui::style::Style::default())
+            (picker.row_text(index), ratatui::style::Style::default())
         };
         let width = usize::from(area.right() - area.x);
         buf.set_stringn(area.x, y, text, width, style);
@@ -353,18 +353,15 @@ pub fn paint_conversation_picker(buf: &mut Buffer, area: Rect, picker: &Conversa
         let index = start + offset;
         let y = top + offset as u16;
         reset_span(buf, y, area.x..area.right());
-        let (mark, style) = if index == picker.selected() {
-            (
-                "▸",
-                ratatui::style::Style::default().add_modifier(Modifier::BOLD),
-            )
+        let style = if index == picker.selected() {
+            ratatui::style::Style::default().add_modifier(Modifier::BOLD)
         } else {
-            (" ", ratatui::style::Style::default())
+            ratatui::style::Style::default()
         };
         buf.set_stringn(
             area.x,
             y,
-            format!("{mark} {}  {} · {} items", row.title, row.age, row.items),
+            row.display_line(index == picker.selected()),
             width,
             style,
         );
@@ -373,24 +370,14 @@ pub fn paint_conversation_picker(buf: &mut Buffer, area: Rect, picker: &Conversa
     // replaces it with the confirm prompt (us-11).
     let hint_y = area.bottom() - 1;
     reset_span(buf, hint_y, area.x..area.right());
-    let (text, style) = if picker.confirming() {
-        let title = picker
-            .selected_row()
-            .map(|row| row.title.as_str())
-            .unwrap_or_default();
-        (
-            format!(" ctrl+d again deletes \"{title}\""),
-            ratatui::style::Style::default()
-                .fg(RtColor::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+    let style = if picker.confirming() {
+        ratatui::style::Style::default()
+            .fg(RtColor::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
-        (
-            " enter: resume · ctrl+d: delete · esc: close".to_string(),
-            ratatui::style::Style::default().fg(RtColor::DarkGray),
-        )
+        ratatui::style::Style::default().fg(RtColor::DarkGray)
     };
-    buf.set_stringn(area.x, hint_y, text, width, style);
+    buf.set_stringn(area.x, hint_y, picker.hint_text(), width, style);
 }
 
 /// `ait_term` color → ratatui color. Beware the naming trap: ratatui's

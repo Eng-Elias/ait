@@ -123,6 +123,14 @@ pub fn mcp_error_text(error: &ait_config::ConfigError) -> String {
     format!("mcp.json failed to load: {}", error.message())
 }
 
+/// The toast text a `settings.toml` load/reload failure produces —
+/// "config error: <message>". The boot-degradation toast and the
+/// watcher drain both label it identically (Spec R13 §5.12,
+/// CODING_STANDARDS §17); `error.message()` already names the file.
+pub fn error_text(message: &str) -> String {
+    format!("config error: {message}")
+}
+
 /// The status line's model slot (story 24): `profile`'s resolved
 /// `base_model` display name — its alias, else the wire name — or `—`
 /// when the role is unset or unresolvable (e.g. an unknown profile).

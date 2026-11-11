@@ -352,6 +352,15 @@ pub enum FollowUp {
     OpenedTab,
 }
 
+/// The boot-degradation toast text a [`CtlServer::bind`] failure
+/// produces — "ctl socket unavailable: <error>". Both frontends'
+/// launches degrade under this message (Spec R13 §5.12,
+/// CODING_STANDARDS §17). A bind-failed run simply never gets its
+/// ctl socket; the frontend keeps going.
+pub fn socket_error_text(error: impl std::fmt::Display) -> String {
+    format!("ctl socket unavailable: {error}")
+}
+
 /// Whether a pending connection survives this service pass.
 #[cfg(unix)]
 enum Service {

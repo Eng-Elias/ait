@@ -13,23 +13,16 @@
 //! tests asserting the same shapes).
 
 use ait_agent::{PlanTodo, PlanTodoStatus};
-use ait_app::agent_panel::{AgentPanel, AskCard, CardStatus, Entry, ToolCard};
-use ait_app::status::Toast;
+use ait_app::agent_panel::{self, AskCard, CardStatus, Entry, ToolCard};
 
-/// The input line's prompt marker — user text (a submitted task and
-/// a mid-run steering message alike) carries the same marker in the
-/// scrollback. The TUI's `INPUT_PROMPT`.
-pub const INPUT_PROMPT: &str = "› ";
-
-/// [`INPUT_PROMPT`]'s cell width — `›` is three bytes but one
-/// column; input-line math works in cells, never `str::len`.
-pub const PROMPT_WIDTH: usize = 2;
-
-/// The pinned plan block's row cap — header, visible todos and the
-/// trailing separator together (Spec R08-T5). A longer plan folds
-/// into a `… N more` row rather than crowding the scrollback out of
-/// the panel. The TUI's `PLAN_BLOCK_MAX`.
-pub const PLAN_BLOCK_MAX: usize = 10;
+// The shared display vocabulary — re-exported so the app's `panel::`
+// call sites keep resolving while `ait-app` owns every literal
+// (Spec R13 §5.12, CODING_STANDARDS §17: one source for the text
+// both frontends draw).
+pub use ait_app::agent_panel::{
+    answer_choice, gate, prompt_text, tail, title, view_window, wrap, Gate, INPUT_PROMPT,
+    PLAN_BLOCK_MAX, PROMPT_WIDTH,
+};
 
 /// A display row's color slot — the frontend-neutral replacement
 /// for the TUI paint's ratatui `Style`s (bold folds into the tone:
@@ -67,77 +60,6 @@ pub struct PanelLine {
     pub tone: Tone,
 }
 
-/// The parked gate the interactive card above the input row
-/// represents (Spec R06's gates, per-tab): either an
-/// `always_ask`-profiled call waiting on a verdict, or the
-/// `ask_user_question` card waiting on an answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Gate<'a> {
-    /// An `ApprovalRequest` parked: `name` is the tool the card
-    /// titles, `denying` whether `d` already switched the input row
-    /// into denial-reason mode (the card then shows the reason
-    /// prompt instead of verdict buttons).
-    Approve {
-        /// The parked call's tool name.
-        name: &'a str,
-        /// Whether the input row is collecting the denial reason.
-        denying: bool,
-    },
-    /// An `AskRequest` parked — the card itself (question, choices,
-    /// highlighted selection) so the painter and the click targets
-    /// draw from one source.
-    Ask(&'a AskCard),
-}
-
-/// The gate the panel is parked on, if any — what the card zone
-/// above the input row renders. Mirrors [`AgentPanel`]'s parked
-/// state: `pending_approval` for the approve card, the newest
-/// unresolved `Entry::Ask` for the ask card (the same card
-/// `submit_answer` answers — only one gate parks at a time).
-pub fn gate(panel: &AgentPanel) -> Option<Gate<'_>> {
-    if let Some((name, denying)) = panel.pending_approval() {
-        return Some(Gate::Approve { name, denying });
-    }
-    if panel.awaiting_answer() {
-        return panel.entries().iter().rev().find_map(|entry| match entry {
-            Entry::Ask(card) if card.answer.is_none() => Some(Gate::Ask(card)),
-            _ => None,
-        });
-    }
-    None
-}
-
-/// The title row's text — the TUI's working-hint pair.
-pub fn title(panel: &AgentPanel) -> &'static str {
-    if panel.is_running() {
-        " agent — working "
-    } else {
-        " agent "
-    }
-}
-
-/// The parked card's prompt text — what the card shows where the
-/// TUI prints its single hint row. `None` while no gate is parked:
-/// approve waiting (three verdict keys), deny-reason mode, a
-/// choices ask, or a free-text ask.
-pub fn prompt_text(panel: &AgentPanel) -> Option<String> {
-    if let Some((name, denying)) = panel.pending_approval() {
-        return Some(if denying {
-            format!(" deny {name} — type a reason · enter: deny ")
-        } else {
-            format!(" approve {name} — a: once · t: task · d: deny ")
-        });
-    }
-    if panel.awaiting_answer() {
-        return Some(if panel.ask_has_choices() {
-            " ask — ↑/↓ choose · enter: answer ".to_string()
-        } else {
-            " ask — type your answer · enter: send ".to_string()
-        });
-    }
-    None
-}
-
 /// The conversation flattened into display lines at `width`
 /// columns: entries wrap char-wise (never mid-UTF-8), separated by
 /// one blank line, and each role carries its tone — user entries
@@ -151,7 +73,7 @@ pub fn display_lines(entries: &[Entry], width: usize) -> Vec<PanelLine> {
         }
         let blocks: Vec<PanelLine> = match entry {
             Entry::Task(text) | Entry::Steering(text) => {
-                vec![line(format!("{INPUT_PROMPT}{text}"), Tone::Strong)]
+                vec![line(agent_panel::task_line(text), Tone::Strong)]
             }
             Entry::Text(text) => vec![line(text.clone(), Tone::Plain)],
             Entry::Tool(card) => tool_card_lines(card),
@@ -179,23 +101,23 @@ pub fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<PanelLine> {
     if plan.is_empty() || cap < 3 {
         return Vec::new();
     }
-    let mut lines = vec![line(String::from(" plan"), Tone::Dim)];
+    let mut lines = vec![line(String::from(agent_panel::PLAN_HEADER), Tone::Dim)];
     // `cap - 2` todo rows at most — one for the header, one for the
     // separator/overflow row.
     let visible = (cap - 2).min(plan.len());
     for todo in &plan[..visible] {
-        let (mark, tone) = match todo.status {
-            PlanTodoStatus::Done => ("✓", Tone::Dim),
-            PlanTodoStatus::InProgress => ("▸", Tone::Strong),
-            PlanTodoStatus::Pending => ("○", Tone::Plain),
+        let tone = match todo.status {
+            PlanTodoStatus::Done => Tone::Dim,
+            PlanTodoStatus::InProgress => Tone::Strong,
+            PlanTodoStatus::Pending => Tone::Plain,
         };
-        lines.push(line(format!("{mark} {}", todo.content), tone));
+        lines.push(line(agent_panel::todo_line(todo), tone));
     }
     if plan.len() > visible {
         // The row this note replaces counted as hidden too.
         let hidden = plan.len() - visible + 1;
         lines.pop();
-        lines.push(line(format!("    … {hidden} more"), Tone::Dim));
+        lines.push(line(agent_panel::plan_overflow(hidden), Tone::Dim));
     }
     lines.push(line(String::new(), Tone::Plain));
     lines
@@ -209,35 +131,27 @@ pub fn plan_lines(plan: &[PlanTodo], cap: usize) -> Vec<PanelLine> {
 /// detail (result preview, error or denial text) follows indented
 /// and dimmed when the update carried one.
 fn tool_card_lines(card: &ToolCard) -> Vec<PanelLine> {
-    let (mark, tone) = match card.status {
-        CardStatus::AwaitingApproval => ("?", Tone::Alert),
-        CardStatus::Running => ("…", Tone::Plain),
-        CardStatus::Done => ("✓", Tone::Good),
-        CardStatus::Denied => ("✗", Tone::Dim),
-        CardStatus::Failed => ("!", Tone::Bad),
+    let tone = match card.status {
+        CardStatus::AwaitingApproval => Tone::Alert,
+        CardStatus::Running => Tone::Plain,
+        CardStatus::Done => Tone::Good,
+        CardStatus::Denied => Tone::Dim,
+        CardStatus::Failed => Tone::Bad,
     };
-    let mut lines = Vec::new();
+    let mut lines = vec![line(agent_panel::card_header(card), tone)];
     if card.summary.contains('\n') {
         // A multi-line summary — `edit_files`' unified diff
-        // (Spec R06 us-22): the header carries the name alone and
-        // each diff line paints its own row so `+`/`-` color as
-        // additions/deletions instead of wrapping as one blob.
-        lines.push(line(format!("{mark} {}", card.name), tone));
+        // (Spec R06 us-22): each diff line paints its own row so
+        // `+`/`-` color as additions/deletions instead of wrapping
+        // as one blob.
         lines.extend(
             card.summary
                 .lines()
-                .map(|diff| line(format!("  {diff}"), diff_tone(diff))),
+                .map(|diff| line(agent_panel::diff_line(diff), diff_tone(diff))),
         );
-    } else {
-        let summary = if card.summary.is_empty() {
-            card.name.clone()
-        } else {
-            format!("{} {}", card.name, card.summary)
-        };
-        lines.push(line(format!("{mark} {summary}"), tone));
     }
     if let Some(detail) = &card.detail {
-        lines.push(line(format!("    {detail}"), Tone::Dim));
+        lines.push(line(agent_panel::detail_line(detail), Tone::Dim));
     }
     lines
 }
@@ -249,16 +163,16 @@ fn tool_card_lines(card: &ToolCard) -> Vec<PanelLine> {
 fn ask_card_lines(card: &AskCard) -> Vec<PanelLine> {
     match &card.answer {
         Some(answer) => vec![
-            line(format!("✓ {}", card.question), Tone::Good),
-            line(format!("    {answer}"), Tone::Dim),
+            line(agent_panel::ask_question(card), Tone::Good),
+            line(agent_panel::detail_line(answer), Tone::Dim),
         ],
         None => {
-            let mut lines = vec![line(format!("? {}", card.question), Tone::Alert)];
+            let mut lines = vec![line(agent_panel::ask_question(card), Tone::Alert)];
             for (index, choice) in card.choices.iter().enumerate() {
                 lines.push(if index == card.selected {
-                    line(format!("    ▸ {choice}"), Tone::Strong)
+                    line(agent_panel::choice_line(choice, true), Tone::Strong)
                 } else {
-                    line(format!("      {choice}"), Tone::Plain)
+                    line(agent_panel::choice_line(choice, false), Tone::Plain)
                 });
             }
             lines
@@ -286,80 +200,6 @@ fn diff_tone(text: &str) -> Tone {
     }
 }
 
-/// The `(top, max_top)` scroll window the paint should publish via
-/// `AgentPanel::set_painted_view`: pinned views follow the tail
-/// (`top == max_top`); unpinned views clamp `view_top` against this
-/// frame's wrap so appended lines never shift what the user reads.
-/// `total` is this frame's wrapped line count, `height` the rows
-/// the conversation region can show.
-pub fn view_window(panel: &AgentPanel, total: usize, height: usize) -> (usize, usize) {
-    let max_top = total.saturating_sub(height);
-    let top = if panel.is_pinned() {
-        max_top
-    } else {
-        panel.view_top().min(max_top)
-    };
-    (top, max_top)
-}
-
-/// Answer a parked choices ask as if the user had highlighted
-/// choice `index` and pressed Enter — a click on a choice row's
-/// state-level counterpart. Steps `ask_next` around the wrap ring
-/// to the clicked index, then runs the shared `submit_answer` (the
-/// send travels the same channel the keyboard answer does). A
-/// no-op while no choices ask is parked.
-pub fn answer_choice(panel: &mut AgentPanel, index: usize, toast: &mut Option<Toast>) {
-    let Some(card) = panel.entries().iter().rev().find_map(|entry| match entry {
-        Entry::Ask(card) if card.answer.is_none() => Some(card),
-        _ => None,
-    }) else {
-        return;
-    };
-    if !panel.awaiting_answer() || card.choices.is_empty() || index >= card.choices.len() {
-        return;
-    }
-    let steps = (index + card.choices.len() - card.selected) % card.choices.len();
-    for _ in 0..steps {
-        panel.ask_next();
-    }
-    panel.submit_answer(toast);
-}
-
-/// Char-wrap `text` to `width` columns honoring embedded newlines;
-/// empty input still yields one (empty) line.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for logical in text.split('\n') {
-        let mut row = String::new();
-        let mut columns = 0;
-        for c in logical.chars() {
-            if columns == width {
-                lines.push(std::mem::take(&mut row));
-                columns = 0;
-            }
-            row.push(c);
-            columns += 1;
-        }
-        lines.push(row);
-    }
-    lines
-}
-
-/// The trailing `max` characters of `text` — the input row's view
-/// of a buffer longer than its width (the tail is the end being
-/// edited).
-pub fn tail(text: &str, max: usize) -> &str {
-    let count = text.chars().count();
-    if count <= max {
-        return text;
-    }
-    text.char_indices()
-        .nth(count - max)
-        .map(|(index, _)| &text[index..])
-        .unwrap_or("")
-}
-
 fn line(text: String, tone: Tone) -> PanelLine {
     PanelLine { text, tone }
 }
@@ -372,6 +212,7 @@ mod tests {
 
     use super::*;
     use ait_agent::{AgentEvent, AgentSession, ToolCall};
+    use ait_app::agent_panel::AgentPanel;
     use ait_app::config::NoSecrets;
 
     /// A panel over a session whose worker resolves nothing — the
