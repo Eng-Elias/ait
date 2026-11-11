@@ -16,7 +16,7 @@ use ait_store::ListedConversation;
 
 /// One picker row — a stored conversation's display form.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConversationRow {
+pub struct ConversationRow {
     /// The `conversations` row id resume and delete address.
     pub id: i64,
     /// The row's title — the first task's text, truncated at write
@@ -36,7 +36,7 @@ pub(crate) struct ConversationRow {
 /// any other key disarms (us-11: delete is one gesture but never an
 /// accident).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConversationPicker {
+pub struct ConversationPicker {
     /// The display rows, newest first.
     rows: Vec<ConversationRow>,
     /// The highlighted row's index into `rows`.
@@ -49,7 +49,7 @@ pub(crate) struct ConversationPicker {
 impl ConversationPicker {
     /// Rows for the store's listing: every conversation newest-first
     /// with its item count, the age bucketed against `now`.
-    pub(crate) fn new(listed: &[ListedConversation], now: SystemTime) -> Self {
+    pub fn new(listed: &[ListedConversation], now: SystemTime) -> Self {
         Self {
             rows: listed
                 .iter()
@@ -66,40 +66,40 @@ impl ConversationPicker {
     }
 
     /// The listed rows, newest first.
-    pub(crate) fn rows(&self) -> &[ConversationRow] {
+    pub fn rows(&self) -> &[ConversationRow] {
         &self.rows
     }
 
     /// The highlighted row's index.
-    pub(crate) fn selected(&self) -> usize {
+    pub fn selected(&self) -> usize {
         self.selected
     }
 
     /// The highlighted row — Enter's resume target, `Ctrl+D`'s
     /// delete target; `None` on an empty picker.
-    pub(crate) fn selected_row(&self) -> Option<&ConversationRow> {
+    pub fn selected_row(&self) -> Option<&ConversationRow> {
         self.rows.get(self.selected)
     }
 
     /// Whether `Ctrl+D` is armed on the highlighted row — the second
     /// press deletes, anything else disarms.
-    pub(crate) fn confirming(&self) -> bool {
+    pub fn confirming(&self) -> bool {
         self.confirming
     }
 
     /// Arm `Ctrl+D`'s one-key confirm on the highlighted row.
-    pub(crate) fn arm_delete(&mut self) {
+    pub fn arm_delete(&mut self) {
         self.confirming = true;
     }
 
     /// Drop the confirm arm — any key that isn't `Ctrl+D` does.
-    pub(crate) fn disarm_delete(&mut self) {
+    pub fn disarm_delete(&mut self) {
         self.confirming = false;
     }
 
     /// ↑ — the highlight wraps to the tail from the top (the ask
     /// card's/`Alt+P` picker's wrap rule).
-    pub(crate) fn prev(&mut self) {
+    pub fn prev(&mut self) {
         if self.rows.is_empty() {
             return;
         }
@@ -107,7 +107,7 @@ impl ConversationPicker {
     }
 
     /// ↓ — the highlight wraps back to the top.
-    pub(crate) fn next(&mut self) {
+    pub fn next(&mut self) {
         if self.rows.is_empty() {
             return;
         }
@@ -118,7 +118,7 @@ impl ConversationPicker {
     /// for the store call's aftermath; `None` on an empty picker.
     /// The highlight clamps to the new tail; the confirm arm is
     /// spent either way.
-    pub(crate) fn remove_selected(&mut self) -> Option<ConversationRow> {
+    pub fn remove_selected(&mut self) -> Option<ConversationRow> {
         self.confirming = false;
         if self.selected >= self.rows.len() {
             return None;
@@ -135,7 +135,7 @@ impl ConversationPicker {
 /// minutes under an hour, hours under two days, days after.
 /// `updated_at` is a wall clock, so a future skew renders `now`
 /// rather than a nonsense age.
-pub(crate) fn age_label(then: SystemTime, now: SystemTime) -> String {
+pub fn age_label(then: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(then).unwrap_or_default().as_secs();
     if secs < 60 {
         "now".to_string()

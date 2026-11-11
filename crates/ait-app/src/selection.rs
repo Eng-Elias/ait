@@ -248,10 +248,10 @@ fn cell_texts(row: &Row<'_>) -> Vec<String> {
 /// envelope [`encode_paste`] wraps one-shot paste text in. Spec R04's
 /// streaming suggestion insertion opens and closes the same envelope
 /// by hand around a `Delta` stream — the stream isn't one string, so
-/// `encode_paste` can't apply there — hence `pub(crate)`, not private.
-pub(crate) const PASTE_BEGIN: &[u8] = b"\x1b[200~";
+/// `encode_paste` can't apply there — hence `pub`, not private.
+pub const PASTE_BEGIN: &[u8] = b"\x1b[200~";
 /// See [`PASTE_BEGIN`].
-pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
+pub const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Encode paste text for the PTY, wrapped in bracketed-paste markers
 /// (`\x1b[200~` … `\x1b[201~`) iff the session reports mode 2004 —

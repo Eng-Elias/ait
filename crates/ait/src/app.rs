@@ -69,35 +69,33 @@ use ait_term::{
 };
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::queue;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
-use crate::agent_panel::{paint_agent_panel, AgentPanel};
+use crate::agent_panel::paint_agent_panel;
 use crate::backend::StyledBackend;
-use crate::config::{self, LiveSettings};
-use crate::conversations::ConversationPicker;
-use crate::ctl;
-use crate::keymap::{self, AppAction, CapabilityTier, Resolution};
 use crate::keys;
-use crate::profile::{self, ProfilePicker};
 use crate::render::{
     apply_selection, chrome_areas, content_size, grid_line, paint_conversation_picker,
-    paint_profile_picker, paint_session, paint_status_line, paint_tab_bar, split_content,
-    to_cursor_style, UnderlineOverlay,
+    paint_profile_picker, paint_session, paint_status_line, paint_tab_bar, session_size,
+    split_content, to_cursor_style, UnderlineOverlay,
 };
-use crate::scroll::WHEEL_LINES;
-use crate::selection::{encode_paste, extract, GridPoint, SelectionRange};
-use crate::skills::LiveSkills;
-use crate::status::{notification_text, status_text, StatusLine, Toast};
-use crate::store::StoreHandle;
-use crate::suggest::{self, SuggestionPin};
-use crate::tabs::TabManager;
 use crate::terminal::TerminalGuard;
+use ait_app::agent_panel::AgentPanel;
+use ait_app::config::{self, LiveSettings};
+use ait_app::conversations::ConversationPicker;
+use ait_app::ctl;
+use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
+use ait_app::profile::{self, ProfilePicker};
+use ait_app::scroll::WHEEL_LINES;
+use ait_app::selection::{encode_paste, extract, GridPoint, SelectionRange};
+use ait_app::skills::LiveSkills;
+use ait_app::status::{notification_text, status_text, StatusLine, Toast};
+use ait_app::store::StoreHandle;
+use ait_app::suggest::{self, SuggestionPin};
+use ait_app::tabs::TabManager;
 
 /// Upper bound on one loop iteration's wait for input: at 8 ms the loop
 /// idles at ~125 iterations/sec — well above the §6 floor of 30 fps — and
@@ -176,7 +174,7 @@ struct AppState {
     /// live pin also gates the next trigger. `Delta` text streams into
     /// the pinned tab's session, under one bracketed-paste envelope
     /// when the child enabled mode 2004; the pin re-resolves through
-    /// the tab's stable [`id`](crate::tabs::Tab) — see
+    /// the tab's stable [`id`](ait_app::tabs::Tab) — see
     /// [`suggest::SuggestionPin`] for the whole state machine.
     suggestion: SuggestionPin,
     /// The active execution profile's name (Spec R07 §5.7 / issue
@@ -661,7 +659,16 @@ fn handle_event<W: Write>(
             if key_event.kind == KeyEventKind::Release {
                 return Handled::Continue;
             }
-            match keymap::resolve(&key_event, tier) {
+            // Every shared seam — the keymap, the pickers, the agent
+            // panel and the PTY send — resolves the frontend-neutral
+            // `ait_term` event, translated once here (Spec R13-T1).
+            // Events carrying no terminal key (bare modifiers, media
+            // keys) translate to `None` and fall to the pass-through
+            // arm, where they are swallowed exactly like an unbound
+            // key that has no PTY encoding.
+            let key = keys::translate(&key_event);
+            let resolution = key.map_or(Resolution::PassThrough, |key| keymap::resolve(&key, tier));
+            match resolution {
                 Resolution::Action(AppAction::Quit) => return Handled::Quit,
                 Resolution::Action(AppAction::NewTab) => {
                     // `new_tab` clears the outgoing tab's highlight before
@@ -752,7 +759,7 @@ fn handle_event<W: Write>(
                     };
                     tab.clear_selection();
                     tab.toggle_agent_panel();
-                    tabs.resize_active();
+                    tabs.resize_active(session_size);
                 }
                 // `Alt+P` (Spec R07 §5.7 / issue #101): switch the
                 // active execution profile — a picker over three or
@@ -852,9 +859,9 @@ fn handle_event<W: Write>(
                         {
                             tab.snap_to_bottom();
                             if tab.exit_status().is_none() {
-                                if let Some(key_event) = keys::translate(&key_event) {
-                                    tab.shadow.update(&key_event);
-                                    let _ = tab.session.send_key(key_event);
+                                if let Some(key) = key {
+                                    tab.shadow.update(&key);
+                                    let _ = tab.session.send_key(key);
                                 }
                             }
                         }
@@ -912,7 +919,9 @@ fn handle_event<W: Write>(
                     // above — `Alt+P` itself dismisses there, like
                     // `Alt+A` closes the focused panel.
                     if state.picker.is_some() {
-                        picker_key(&key_event, state);
+                        if let Some(key) = key {
+                            picker_key(&key, state);
+                        }
                         return Handled::Continue;
                     }
                     // The open conversation picker owns unbound keys
@@ -923,7 +932,9 @@ fn handle_event<W: Write>(
                     // to the PTY mid-pick. Bound chords already ran
                     // above (`Alt+R` itself toggles it closed).
                     if state.conversations.is_some() {
-                        conversation_key(&key_event, tabs, state);
+                        if let Some(key) = key {
+                            conversation_key(&key, tabs, state);
+                        }
                         return Handled::Continue;
                     }
                     // The active tab's index BEFORE the mutable borrow —
@@ -951,36 +962,44 @@ fn handle_event<W: Write>(
                     // keymap already resolved above — its bindings
                     // still win over panel focus (standard 7).
                     if tab.agent_focused() {
-                        tab.agent_key(
-                            &key_event,
-                            state.config.settings(),
-                            &state.profile,
-                            &mut state.skills,
-                            &mut state.toast,
-                        );
+                        if let Some(key) = key {
+                            tab.agent_key(
+                                &key,
+                                state.config.settings(),
+                                &state.profile,
+                                &mut state.skills,
+                                &mut state.toast,
+                            );
+                        }
                         return Handled::Continue;
                     }
                     // Typing snaps the view back to the live viewport, then
                     // reaches the PTY encoded exactly as before.
                     tab.snap_to_bottom();
                     if suggestion_here {
-                        match key_event.code {
+                        match key.map(|key| key.key) {
                             // Plain Esc cancels: token + envelope close +
                             // `Ctrl+U` to wipe the partial line. A modified
                             // Esc is left for the PTY like any other chord.
-                            KeyCode::Esc if key_event.modifiers.is_empty() => {
+                            Some(ait_term::Key::Escape)
+                                if key.is_some_and(|key| key.modifiers.is_empty()) =>
+                            {
                                 state.suggestion.cancel(&state.suggester, tab);
                                 return Handled::Continue;
                             }
                             // Any Enter variant is swallowed — including
                             // `Ctrl+Enter`, which encodes `\r` and would
-                            // execute the partial command (us-9).
-                            KeyCode::Enter => return Handled::Continue,
+                            // execute the partial command (us-9) — and
+                            // the keypad Enter that encodes the same.
+                            Some(ait_term::Key::Enter)
+                            | Some(ait_term::Key::Keypad(ait_term::Keypad::Enter)) => {
+                                return Handled::Continue;
+                            }
                             _ => {}
                         }
                     }
                     if tab.exit_status().is_none() {
-                        if let Some(key_event) = keys::translate(&key_event) {
+                        if let Some(key_event) = key {
                             // The `# `+Enter trigger (Spec R04): verify
                             // while the shadow still holds the line and
                             // the grid still shows its echo — before the
@@ -1108,7 +1127,7 @@ fn handle_event<W: Write>(
             // EVERY tab's PTY gets the new content-area winsize, not just
             // the visible one (Spec R02 user story 17); selections are
             // cleared inside — reflow invalidates their coordinates.
-            tabs.resize_all(content_size(state.screen));
+            tabs.resize_all(content_size(state.screen), session_size);
         }
         // Focus and paste events have no Round-2 handler yet.
         _ => {}
@@ -1123,7 +1142,7 @@ fn handle_event<W: Write>(
 /// an error. An empty range copies nothing, same rule the drag path
 /// always applied.
 fn copy_range<W: Write>(
-    tab: &crate::tabs::Tab,
+    tab: &ait_app::tabs::Tab,
     range: SelectionRange,
     state: &mut AppState,
     host: &mut W,
@@ -1329,7 +1348,7 @@ fn render_frame(
             if panel.is_focused() {
                 // The input line owns the host cursor while the panel
                 // owns the keyboard.
-                let (x, y) = panel.cursor_position(area);
+                let (x, y) = crate::agent_panel::panel_cursor_position(panel, area);
                 frame.set_cursor_position((x, y));
             }
         }
@@ -1372,14 +1391,14 @@ fn damaged_beyond_cursor(damage: &Damage, cursor: Cursor) -> bool {
 /// Anything else is swallowed: a picker that let `q` through would
 /// have typed it into the shell. `state.picker` is `Some` on entry —
 /// the caller already routed.
-fn picker_key(key: &KeyEvent, state: &mut AppState) {
+fn picker_key(key: &ait_term::KeyEvent, state: &mut AppState) {
     let Some(picker) = state.picker.as_mut() else {
         return;
     };
-    match key.code {
-        KeyCode::Up => picker.prev(),
-        KeyCode::Down => picker.next(),
-        KeyCode::Enter => {
+    match key.key {
+        ait_term::Key::Up => picker.prev(),
+        ait_term::Key::Down => picker.next(),
+        ait_term::Key::Enter => {
             let name = picker.selected_name().to_string();
             state.picker = None;
             activate_profile(state, name);
@@ -1387,7 +1406,7 @@ fn picker_key(key: &KeyEvent, state: &mut AppState) {
         // Plain Esc dismisses; a modified Esc is swallowed like any
         // other key — a chord with modifiers never types into the PTY
         // mid-pick.
-        KeyCode::Esc if key.modifiers.is_empty() => {
+        ait_term::Key::Escape if key.modifiers.is_empty() => {
             state.picker = None;
         }
         _ => {}
@@ -1418,7 +1437,7 @@ fn activate_profile(state: &mut AppState, name: String) {
 /// delete (one gesture, never an accident — any other key disarms),
 /// plain Esc dismisses. `state.conversations` is `Some` on entry —
 /// the caller already routed.
-fn conversation_key(key: &KeyEvent, tabs: &mut TabManager, state: &mut AppState) {
+fn conversation_key(key: &ait_term::KeyEvent, tabs: &mut TabManager, state: &mut AppState) {
     enum Outcome {
         /// Nothing happened — key consumed.
         None,
@@ -1437,7 +1456,7 @@ fn conversation_key(key: &KeyEvent, tabs: &mut TabManager, state: &mut AppState)
         // first press arms, the second deletes. Anything else first
         // disarms, then does its usual thing — a stray key can never
         // sneak a delete past the user (us-11).
-        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+        if key.key == ait_term::Key::Char('d') && key.modifiers == ait_term::Modifiers::CONTROL {
             if picker.confirming() {
                 match picker.selected_row() {
                     Some(row) => Outcome::Delete(row.id),
@@ -1449,20 +1468,20 @@ fn conversation_key(key: &KeyEvent, tabs: &mut TabManager, state: &mut AppState)
             }
         } else {
             picker.disarm_delete();
-            match key.code {
-                KeyCode::Up => {
+            match key.key {
+                ait_term::Key::Up => {
                     picker.prev();
                     Outcome::None
                 }
-                KeyCode::Down => {
+                ait_term::Key::Down => {
                     picker.next();
                     Outcome::None
                 }
-                KeyCode::Enter => match picker.selected_row() {
+                ait_term::Key::Enter => match picker.selected_row() {
                     Some(row) => Outcome::Resume(row.id),
                     None => Outcome::Close,
                 },
-                KeyCode::Esc if key.modifiers.is_empty() => Outcome::Close,
+                ait_term::Key::Escape if key.modifiers.is_empty() => Outcome::Close,
                 _ => Outcome::None,
             }
         }
@@ -1541,7 +1560,7 @@ fn resume_conversation(id: i64, tabs: &mut TabManager, state: &mut AppState) {
     }
     // The panel may have opened on a tab that never had one —
     // re-derive its winsize through the same path `Alt+A` takes.
-    tabs.resize_active();
+    tabs.resize_active(session_size);
 }
 
 /// The last closed tab's exit status as the process exit code.
@@ -1559,8 +1578,8 @@ mod tests {
     //! wiring honest — spawning tiny PTYs needs no host TTY.
 
     use super::*;
-    use crate::tabs::SessionTemplate;
     use ait_agent::SuggestEvent;
+    use ait_app::tabs::SessionTemplate;
     use ait_term::{LiveSessionOptions, Size};
     use crossterm::event::{
         KeyCode, KeyEvent as CtKeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
@@ -3358,7 +3377,7 @@ base_model = "key-1"
     // worker's terminal `Error` lands as a conversation status line.
 
     /// The active tab's panel, staged or toggled live.
-    fn panel(harness: &Harness) -> &crate::agent_panel::AgentPanel {
+    fn panel(harness: &Harness) -> &ait_app::agent_panel::AgentPanel {
         harness
             .tabs
             .active()
@@ -3481,14 +3500,14 @@ base_model = "key-1"
         assert_eq!(panel(&harness).input(), "", "submitted input clears");
         assert_eq!(
             panel(&harness).entries(),
-            &[crate::agent_panel::Entry::Task("fix it".into())]
+            &[ait_app::agent_panel::Entry::Task("fix it".into())]
         );
 
         wait_until(&mut harness, |h| !panel(h).is_running());
         assert!(
             matches!(
                 panel(&harness).entries().last(),
-                Some(crate::agent_panel::Entry::Status(s)) if s.contains("coding_model")
+                Some(ait_app::agent_panel::Entry::Status(s)) if s.contains("coding_model")
             ),
             "the worker's error became a conversation status line: {:?}",
             panel(&harness).entries().last()
@@ -3514,7 +3533,7 @@ base_model = "key-1"
 
         assert_eq!(
             panel(&harness).entries().last(),
-            Some(&crate::agent_panel::Entry::Steering("use sudo".into())),
+            Some(&ait_app::agent_panel::Entry::Steering("use sudo".into())),
             "mid-run input recorded as steering"
         );
         // Let the task die of its unconfigured model — the steering
@@ -3545,7 +3564,7 @@ base_model = "key-1"
         assert!(
             matches!(
                 panel(&harness).entries().last(),
-                Some(crate::agent_panel::Entry::Status(_))
+                Some(ait_app::agent_panel::Entry::Status(_))
             ),
             "a terminal status line closed the task: {:?}",
             panel(&harness).entries().last()
@@ -3719,7 +3738,7 @@ base_model = "key-1"
         );
         wait_until(&mut harness, |h| {
             h.tabs.active().unwrap().integration_state()
-                == crate::integration::IntegrationState::Integrated
+                == ait_app::integration::IntegrationState::Integrated
         });
         // Point `coding_model` at the fixture.
         harness.state.config = LiveSettings::adopt(
@@ -3746,9 +3765,9 @@ coding_model = "coding-key"
         // focused; the service is what `toggle_agent_panel` creates.
         {
             let tab = harness.tabs.active_mut().unwrap();
-            let (_handle, service) = crate::shell_bridge::pair();
+            let (_handle, service) = ait_app::shell_bridge::pair();
             tab.bridge = Some(service);
-            tab.agent = Some(crate::agent_panel::AgentPanel::with_session(
+            tab.agent = Some(ait_app::agent_panel::AgentPanel::with_session(
                 ait_agent::AgentSession::with_secret_store(config::NoSecrets),
             ));
         }
@@ -3781,8 +3800,8 @@ coding_model = "coding-key"
         );
         let tool_card_done = panel(&harness).entries().iter().any(|entry| matches!(
             entry,
-            crate::agent_panel::Entry::Tool(card)
-                if card.name == "run_command" && card.status == crate::agent_panel::CardStatus::Done
+            ait_app::agent_panel::Entry::Tool(card)
+                if card.name == "run_command" && card.status == ait_app::agent_panel::CardStatus::Done
         ));
         assert!(tool_card_done, "{:?}", panel(&harness).entries());
 
@@ -3892,7 +3911,7 @@ coding_model = "coding-key"
         assert_eq!(tab.conversation(), Some(id), "the row bound");
         let panel = tab.agent_panel().expect("the resume built a panel");
         assert!(panel.is_open() && tab.agent_focused());
-        use crate::agent_panel::Entry;
+        use ait_app::agent_panel::Entry;
         assert_eq!(
             panel.entries(),
             &[

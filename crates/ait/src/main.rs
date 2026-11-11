@@ -5,36 +5,22 @@
 //! its JSON Schema (Spec R03, user stories 2–5). Everything the binary
 //! does is presentation + event routing (CODING_STANDARDS.md §9) — the
 //! terminal core lives in `ait-term`, the configuration model in
-//! `ait-config`.
+//! `ait-config`, and the frontend-agnostic session model in `ait-app`
+//! (Spec R13 §5.12): the modules here are only the TUI loop, the
+//! crossterm/ratatui paint and the host-terminal plumbing.
 
 mod agent_panel;
 mod app;
 mod backend;
-mod blocks;
-mod config;
-mod conversations;
 mod ctl;
-mod headless;
-mod inband;
-mod integration;
-mod keymap;
 mod keys;
-mod profile;
-mod remote;
 mod render;
-mod scroll;
-mod selection;
-mod shell_bridge;
-mod skills;
-mod status;
-mod store;
-mod suggest;
-mod tabs;
 mod terminal;
-mod transcript;
 
 use std::env;
 use std::process::ExitCode;
+
+use ait_app::headless;
 
 /// `--help`'s text and the tail of every usage error (Spec R12
 /// §5.11, us-13–16): man-page layout — NAME/SYNOPSIS/DESCRIPTION/

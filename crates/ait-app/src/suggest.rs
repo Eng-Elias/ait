@@ -273,9 +273,9 @@ pub fn recent_output_lines(grid: &GridView) -> Vec<String> {
 /// — a shell emitting nothing degrades exactly as before (§5.5's
 /// graceful-degrade clause). Both sources stay
 /// [`OUTPUT_LINE_BUDGET`]-bounded: "recent terminal output" is always
-/// a last-N answer. `pub(crate)`: the agent panel's `AgentContext`
+/// a last-N answer. `pub`: the agent panel's `AgentContext`
 /// assembly asks the same question (Spec R06 §5.6).
-pub(crate) fn output_lines_for(tab: &Tab) -> Vec<String> {
+pub fn output_lines_for(tab: &Tab) -> Vec<String> {
     let blocks = tab.blocks();
     if blocks.is_empty() {
         recent_output_lines(&tab.grid())
@@ -334,8 +334,8 @@ fn block_output_lines(grid: &GridView<'_>, blocks: &[Block]) -> Vec<String> {
 /// cwd there means the report was lost, not missing, and `/proc` can
 /// only describe the local child); the spawn cwd is the last resort on
 /// hosts without `/proc` (non-Linux) or a child already gone.
-/// `pub(crate)`: the agent panel reports the same cwd (Spec R06 §5.6).
-pub(crate) fn cwd_for(tab: &Tab) -> String {
+/// `pub`: the agent panel reports the same cwd (Spec R06 §5.6).
+pub fn cwd_for(tab: &Tab) -> String {
     if reads_proc_cwd(tab.cwd_reported(), tab.integration_state()) {
         if let Some(pid) = tab.session.child_pid() {
             if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
@@ -497,7 +497,7 @@ pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
 /// an unrelated session (us-14), which is why identity — not position —
 /// is what gets pinned.
 #[derive(Default)]
-pub(crate) struct SuggestionPin {
+pub struct SuggestionPin {
     /// The live pin; `None` while no request is in flight.
     inner: Option<InFlightSuggestion>,
 }
@@ -526,18 +526,18 @@ struct InFlightSuggestion {
 
 impl SuggestionPin {
     /// An idle pin — the state before the first request fires.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Whether a request is in flight — the gate both triggers check
     /// (one request at a time is the suggester's frontend contract).
-    pub(crate) fn is_some(&self) -> bool {
+    pub fn is_some(&self) -> bool {
         self.inner.is_some()
     }
 
     /// Whether no request is in flight.
-    pub(crate) fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> bool {
         self.inner.is_none()
     }
 
@@ -545,7 +545,7 @@ impl SuggestionPin {
     /// at `index` — the in-flight key scope (us-8/9/10): Esc and Enter
     /// are intercepted only on the tab the request streams into; on
     /// every other tab both keys behave normally.
-    pub(crate) fn is_live_for(&self, tabs: &TabManager, index: usize) -> bool {
+    pub fn is_live_for(&self, tabs: &TabManager, index: usize) -> bool {
         self.inner
             .as_ref()
             .is_some_and(|pin| !pin.cancelled && pin.index_in(tabs) == Some(index))
@@ -558,7 +558,7 @@ impl SuggestionPin {
     /// suggester accepted the request and the pin was taken; a dead
     /// suggester surfaces as a §6 toast instead, and the caller must
     /// then leave the user's line — and its shadow — untouched.
-    pub(crate) fn fire(
+    pub fn fire(
         &mut self,
         suggester: &CommandSuggester,
         id: u64,
@@ -596,7 +596,7 @@ impl SuggestionPin {
     /// the honest ordering: a `suggest()` failure (a dead worker)
     /// toasts the error and leaves the typed line exactly as the user
     /// left it, instead of erasing a line whose request never ran.
-    pub(crate) fn suggest_from_line(
+    pub fn suggest_from_line(
         &mut self,
         suggester: &CommandSuggester,
         settings: &Settings,
@@ -628,7 +628,7 @@ impl SuggestionPin {
     /// `Error` arrive silently rather than as a toast the user never
     /// asked about. `tab` is the pinned (== active) tab; writes to an
     /// exited session drop like all PTY input does.
-    pub(crate) fn cancel(&mut self, suggester: &CommandSuggester, tab: &mut Tab) {
+    pub fn cancel(&mut self, suggester: &CommandSuggester, tab: &mut Tab) {
         let Some(pin) = self.inner.as_mut() else {
             return;
         };
@@ -668,12 +668,7 @@ impl SuggestionPin {
     /// rule the notification toasts use — except an Esc-cancelled
     /// request, whose `Error` is the user's own doing and arrives
     /// silently.
-    pub(crate) fn apply(
-        &mut self,
-        tabs: &TabManager,
-        event: SuggestEvent,
-        toast: &mut Option<Toast>,
-    ) {
+    pub fn apply(&mut self, tabs: &TabManager, event: SuggestEvent, toast: &mut Option<Toast>) {
         match event {
             SuggestEvent::Delta(text) => {
                 let Some(pin) = self.inner.as_mut() else {
@@ -727,7 +722,7 @@ impl SuggestionPin {
     /// Drain one tick of suggester events (Spec R04) — every queued
     /// event through [`apply`](Self::apply). `try_recv` keeps the drain
     /// zero-cost inside the app's 8 ms loop.
-    pub(crate) fn drain(
+    pub fn drain(
         &mut self,
         events: &Receiver<SuggestEvent>,
         tabs: &TabManager,
@@ -757,11 +752,10 @@ impl SuggestionPin {
         }
     }
 
-    /// The pinned state a fired request leaves behind — staged directly
-    /// by `app`'s dispatch tests, which inject `SuggestEvent`s through
+    /// The pinned state a fired request leaves behind — staged by a
+    /// frontend's dispatch tests, which inject `SuggestEvent`s through
     /// [`apply`](Self::apply) instead of running a model.
-    #[cfg(test)]
-    pub(crate) fn staged(id: u64) -> Self {
+    pub fn staged(id: u64) -> Self {
         Self {
             inner: Some(InFlightSuggestion {
                 id,
@@ -771,22 +765,20 @@ impl SuggestionPin {
         }
     }
 
-    /// The pinned tab's stable id — what the dispatch tests assert the
-    /// pin resolved to.
-    #[cfg(test)]
-    pub(crate) fn pinned_id(&self) -> Option<u64> {
+    /// The pinned tab's stable id — what a frontend's dispatch tests
+    /// assert the pin resolved to.
+    pub fn pinned_id(&self) -> Option<u64> {
         self.inner.as_ref().map(|pin| pin.id)
     }
 
-    /// Whether the live pin was Esc-cancelled — a test view.
-    #[cfg(test)]
-    pub(crate) fn is_cancelled(&self) -> bool {
+    /// Whether the live pin was Esc-cancelled — a frontend-test view.
+    pub fn is_cancelled(&self) -> bool {
         self.inner.as_ref().is_some_and(|pin| pin.cancelled)
     }
 
-    /// Whether a paste envelope is currently open — a test view.
-    #[cfg(test)]
-    pub(crate) fn paste_is_open(&self) -> bool {
+    /// Whether a paste envelope is currently open — a frontend-test
+    /// view.
+    pub fn paste_is_open(&self) -> bool {
         self.inner.as_ref().is_some_and(|pin| pin.paste_open)
     }
 }

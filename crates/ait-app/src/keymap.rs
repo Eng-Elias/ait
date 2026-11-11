@@ -1,8 +1,8 @@
 //! The app keymap (Spec R02 keymap seam, CODING_STANDARDS.md §7): resolved
 //! **before** a key can reach the PTY.
 //!
-//! [`resolve`] is pure and table-driven: it maps a
-//! [`crossterm::event::KeyEvent`] plus the host's [`CapabilityTier`] to an
+//! [`resolve`] is pure and table-driven: it maps a frontend-neutral
+//! [`ait_term::KeyEvent`] plus the host's [`CapabilityTier`] to an
 //! [`AppAction`] or [`Resolution::PassThrough`]. Bound keys never reach the
 //! PTY; unbound keys — Ctrl+S and Ctrl+Q included — pass through to the
 //! shell unchanged (as XOFF/XON).
@@ -10,9 +10,16 @@
 //! `Ctrl+Shift+T/W/Q` bind only under [`CapabilityTier::Enhanced`]: on
 //! legacy input Ctrl+Shift+letter is byte-identical to Ctrl+letter, so the
 //! binding would eat the plain Ctrl+key (Ctrl+W, Ctrl+Q, …) for every host
-//! that cannot tell the difference — the legacy-collapse guard.
+//! that cannot tell the difference — the legacy-collapse guard. The GUI is
+//! always `Enhanced`: its toolkit reports the modifier set verbatim.
+//!
+//! Each frontend translates its native key events into
+//! [`ait_term::KeyEvent`] before resolving — `ait`'s `keys.rs` is the
+//! crossterm shim; releases never translate, so [`resolve`] sees presses
+//! and repeats only (a repeat re-fires the bound action, which is what
+//! holding `Shift+PageUp` should do).
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ait_term::{Key, KeyEvent, Keypad, Modifiers};
 
 /// Which key encodings the host terminal can distinguish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,13 +29,15 @@ pub enum CapabilityTier {
     Legacy,
     /// Keyboard enhancement confirmed at startup and the disambiguation
     /// flags pushed — Ctrl+Shift+letter arrives distinct from Ctrl+letter.
+    /// The GUI's native event source has the same fidelity, so it always
+    /// reports `Enhanced`.
     Enhanced,
 }
 
 /// What a bound key does.
 ///
 /// The table models the whole Spec R02 keymap; every action has dispatch
-/// in `app` — paste in T3, tabs in T4.
+/// in the frontend's event loop — paste in T3, tabs in T4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
     /// Exit `ait`, restoring the host terminal (`Alt+Q`; enhanced alias
@@ -61,7 +70,8 @@ pub enum AppAction {
     /// Scroll the view to the previous block's start (`Alt+Up`;
     /// Spec R05 §5.5 block navigation).
     PrevBlockStart,
-    /// Scroll the view to the next block's start (`Alt+Down`).
+    /// Scroll the view to the next block's start (`Alt+Down`;
+    /// Spec R05 §5.5 block navigation).
     NextBlockStart,
     /// Select the current block's range through the existing selection
     /// machinery (`Alt+B`; Spec R05 §5.5 — copy rides the OSC-52 path).
@@ -101,17 +111,17 @@ pub enum Resolution {
 /// Alt-prefix encodes `ESC R` the same way), so a case-insensitive
 /// `Char('r')` match would steal `Alt+Shift+R` for `Conversations`.
 struct Binding {
-    code: KeyCode,
-    modifiers: KeyModifiers,
+    key: Key,
+    modifiers: Modifiers,
     enhanced_only: bool,
     case_sensitive: bool,
     action: AppAction,
 }
 
-const SHIFT: KeyModifiers = KeyModifiers::SHIFT;
-const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
-const ALT: KeyModifiers = KeyModifiers::ALT;
-const CTRL_SHIFT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT);
+const SHIFT: Modifiers = Modifiers::SHIFT;
+const CONTROL: Modifiers = Modifiers::CONTROL;
+const ALT: Modifiers = Modifiers::ALT;
+const CTRL_SHIFT: Modifiers = Modifiers::CONTROL.union(Modifiers::SHIFT);
 
 /// The Spec R02 keymap. Every binding is a byte-distinguishable combo so
 /// nothing the shell expects (Ctrl+S XOFF, Ctrl+Q XON, plain typing,
@@ -120,28 +130,28 @@ const CTRL_SHIFT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::SHIFT
 const BINDINGS: &[Binding] = &[
     // Scrollback navigation — both tiers.
     Binding {
-        code: KeyCode::PageUp,
+        key: Key::PageUp,
         modifiers: SHIFT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::ScrollPageUp,
     },
     Binding {
-        code: KeyCode::PageDown,
+        key: Key::PageDown,
         modifiers: SHIFT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::ScrollPageDown,
     },
     Binding {
-        code: KeyCode::Home,
+        key: Key::Home,
         modifiers: SHIFT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::ScrollTop,
     },
     Binding {
-        code: KeyCode::End,
+        key: Key::End,
         modifiers: SHIFT,
         enhanced_only: false,
         case_sensitive: false,
@@ -149,91 +159,91 @@ const BINDINGS: &[Binding] = &[
     },
     // Tabs — both tiers.
     Binding {
-        code: KeyCode::PageUp,
+        key: Key::PageUp,
         modifiers: CONTROL,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::PrevTab,
     },
     Binding {
-        code: KeyCode::PageDown,
+        key: Key::PageDown,
         modifiers: CONTROL,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::NextTab,
     },
     Binding {
-        code: KeyCode::Char('t'),
+        key: Key::Char('t'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::NewTab,
     },
     Binding {
-        code: KeyCode::Char('w'),
+        key: Key::Char('w'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::CloseTab,
     },
     Binding {
-        code: KeyCode::Char('1'),
+        key: Key::Char('1'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(1),
     },
     Binding {
-        code: KeyCode::Char('2'),
+        key: Key::Char('2'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(2),
     },
     Binding {
-        code: KeyCode::Char('3'),
+        key: Key::Char('3'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(3),
     },
     Binding {
-        code: KeyCode::Char('4'),
+        key: Key::Char('4'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(4),
     },
     Binding {
-        code: KeyCode::Char('5'),
+        key: Key::Char('5'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(5),
     },
     Binding {
-        code: KeyCode::Char('6'),
+        key: Key::Char('6'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(6),
     },
     Binding {
-        code: KeyCode::Char('7'),
+        key: Key::Char('7'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(7),
     },
     Binding {
-        code: KeyCode::Char('8'),
+        key: Key::Char('8'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::JumpToTab(8),
     },
     Binding {
-        code: KeyCode::Char('9'),
+        key: Key::Char('9'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -241,7 +251,7 @@ const BINDINGS: &[Binding] = &[
     },
     // Paste own selection — T3.
     Binding {
-        code: KeyCode::Insert,
+        key: Key::Insert,
         modifiers: SHIFT,
         enhanced_only: false,
         case_sensitive: false,
@@ -249,7 +259,7 @@ const BINDINGS: &[Binding] = &[
     },
     // Quit — both tiers.
     Binding {
-        code: KeyCode::Char('q'),
+        key: Key::Char('q'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -260,7 +270,7 @@ const BINDINGS: &[Binding] = &[
     // kitty modifier report agree), and the chord is unbound in default
     // readline, so the binding steals no shell input.
     Binding {
-        code: KeyCode::Enter,
+        key: Key::Enter,
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -274,21 +284,21 @@ const BINDINGS: &[Binding] = &[
     // chord the spec trades for block select — the grid-side feature
     // wins per the spec's keymap decision).
     Binding {
-        code: KeyCode::Up,
+        key: Key::Up,
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::PrevBlockStart,
     },
     Binding {
-        code: KeyCode::Down,
+        key: Key::Down,
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
         action: AppAction::NextBlockStart,
     },
     Binding {
-        code: KeyCode::Char('b'),
+        key: Key::Char('b'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -300,7 +310,7 @@ const BINDINGS: &[Binding] = &[
     // so the binding steals no shell input (the same trade the
     // `Alt+Enter`/`Alt+B` comments record).
     Binding {
-        code: KeyCode::Char('a'),
+        key: Key::Char('a'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -312,7 +322,7 @@ const BINDINGS: &[Binding] = &[
     // readline, so the binding steals no shell input (the same trade
     // the `Alt+A`/`Alt+B` comments record).
     Binding {
-        code: KeyCode::Char('p'),
+        key: Key::Char('p'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: false,
@@ -328,7 +338,7 @@ const BINDINGS: &[Binding] = &[
     // (alternate-key hosts fold SHIFT into the codepoint and clear
     // the flag) — that chord stays the shell's.
     Binding {
-        code: KeyCode::Char('r'),
+        key: Key::Char('r'),
         modifiers: ALT,
         enhanced_only: false,
         case_sensitive: true,
@@ -338,21 +348,21 @@ const BINDINGS: &[Binding] = &[
     // `Char(letter)` + CONTROL|SHIFT via CSI-u — byte-distinct from
     // Ctrl+letter, so the collapse rule no longer applies.
     Binding {
-        code: KeyCode::Char('t'),
+        key: Key::Char('t'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
         case_sensitive: false,
         action: AppAction::NewTab,
     },
     Binding {
-        code: KeyCode::Char('w'),
+        key: Key::Char('w'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
         case_sensitive: false,
         action: AppAction::CloseTab,
     },
     Binding {
-        code: KeyCode::Char('q'),
+        key: Key::Char('q'),
         modifiers: CTRL_SHIFT,
         enhanced_only: true,
         case_sensitive: false,
@@ -360,15 +370,52 @@ const BINDINGS: &[Binding] = &[
     },
 ];
 
+/// A numpad key reports like its typing equivalent for binding purposes:
+/// `ait_term`'s translation distinguishes keypad keys (their PTY encoding
+/// differs under application keypad mode), but the keymap resolves the
+/// gesture — `Alt+Enter` is the suggest trigger from either Enter key,
+/// `Alt+5` jumps to tab 5 from either `5`, exactly as the crossterm-level
+/// table matched them before the re-type. Punctuation-only keypad keys
+/// (`+`, `*`, `/`, `=`, `,`, `.`, `-`) likewise normalize to their
+/// `Char` codepoint — no binding owns them today, so this only keeps the
+/// door open rather than changing a verdict. `Tab::agent_key` routes
+/// through the same map so a keypad Enter submits the panel's input
+/// like Return.
+pub fn normalize(key: Key) -> Key {
+    let keypad = match key {
+        Key::Keypad(keypad) => keypad,
+        _ => return key,
+    };
+    match keypad {
+        Keypad::Enter => Key::Enter,
+        Keypad::Zero => Key::Char('0'),
+        Keypad::One => Key::Char('1'),
+        Keypad::Two => Key::Char('2'),
+        Keypad::Three => Key::Char('3'),
+        Keypad::Four => Key::Char('4'),
+        Keypad::Five => Key::Char('5'),
+        Keypad::Six => Key::Char('6'),
+        Keypad::Seven => Key::Char('7'),
+        Keypad::Eight => Key::Char('8'),
+        Keypad::Nine => Key::Char('9'),
+        Keypad::Decimal => Key::Char('.'),
+        Keypad::Comma => Key::Char(','),
+        Keypad::Minus => Key::Char('-'),
+        Keypad::Plus => Key::Char('+'),
+        Keypad::Multiply => Key::Char('*'),
+        Keypad::Divide => Key::Char('/'),
+        Keypad::Equal => Key::Char('='),
+    }
+}
+
 /// Resolve one host key event against the keymap.
 ///
-/// `Release` events never bind (they also never arrive — `ait` pushes only
-/// `DISAMBIGUATE_ESCAPE_CODES`); `Repeat` re-fires the bound action, which
-/// is what holding `Shift+PageUp` should do.
+/// Key releases never reach here — the frontend's translation drops
+/// them (a terminal sends bytes on key-down only); a key *repeat*
+/// re-fires the bound action, which is what holding `Shift+PageUp`
+/// should do.
 pub fn resolve(event: &KeyEvent, tier: CapabilityTier) -> Resolution {
-    if event.kind == KeyEventKind::Release {
-        return Resolution::PassThrough;
-    }
+    let key = normalize(event.key);
     for binding in BINDINGS {
         if binding.enhanced_only && tier == CapabilityTier::Legacy {
             continue;
@@ -376,12 +423,12 @@ pub fn resolve(event: &KeyEvent, tier: CapabilityTier) -> Resolution {
         if binding.modifiers != event.modifiers {
             continue;
         }
-        let matched = match (binding.code, event.code) {
+        let matched = match (binding.key, key) {
             // Letter bindings are case-insensitive: terminals differ on
             // whether Alt+letter reports the shifted codepoint — except
             // `case_sensitive` rows, where the shifted codepoint IS the
             // folded shift and must not bind (see `struct Binding`).
-            (KeyCode::Char(expected), KeyCode::Char(actual)) => {
+            (Key::Char(expected), Key::Char(actual)) => {
                 if binding.case_sensitive {
                     expected == actual
                 } else {
@@ -400,30 +447,24 @@ pub fn resolve(event: &KeyEvent, tier: CapabilityTier) -> Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent as CtKeyEvent, KeyEventState};
 
-    fn press(code: KeyCode, modifiers: KeyModifiers) -> CtKeyEvent {
-        CtKeyEvent::new(code, modifiers)
+    fn press(key: Key, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent::new(key, modifiers)
     }
 
-    fn assert_action(
-        code: KeyCode,
-        modifiers: KeyModifiers,
-        tier: CapabilityTier,
-        action: AppAction,
-    ) {
+    fn assert_action(key: Key, modifiers: Modifiers, tier: CapabilityTier, action: AppAction) {
         assert_eq!(
-            resolve(&press(code, modifiers), tier),
+            resolve(&press(key, modifiers), tier),
             Resolution::Action(action),
-            "{code:?} + {modifiers:?} in {tier:?}"
+            "{key:?} + {modifiers:?} in {tier:?}"
         );
     }
 
-    fn assert_pass(code: KeyCode, modifiers: KeyModifiers, tier: CapabilityTier) {
+    fn assert_pass(key: Key, modifiers: Modifiers, tier: CapabilityTier) {
         assert_eq!(
-            resolve(&press(code, modifiers), tier),
+            resolve(&press(key, modifiers), tier),
             Resolution::PassThrough,
-            "{code:?} + {modifiers:?} in {tier:?}"
+            "{key:?} + {modifiers:?} in {tier:?}"
         );
     }
 
@@ -432,10 +473,10 @@ mod tests {
     #[test]
     fn scrollback_bindings_both_tiers() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::PageUp, SHIFT, tier, AppAction::ScrollPageUp);
-            assert_action(KeyCode::PageDown, SHIFT, tier, AppAction::ScrollPageDown);
-            assert_action(KeyCode::Home, SHIFT, tier, AppAction::ScrollTop);
-            assert_action(KeyCode::End, SHIFT, tier, AppAction::ScrollBottom);
+            assert_action(Key::PageUp, SHIFT, tier, AppAction::ScrollPageUp);
+            assert_action(Key::PageDown, SHIFT, tier, AppAction::ScrollPageDown);
+            assert_action(Key::Home, SHIFT, tier, AppAction::ScrollTop);
+            assert_action(Key::End, SHIFT, tier, AppAction::ScrollBottom);
         }
     }
 
@@ -443,7 +484,7 @@ mod tests {
     #[test]
     fn alt_q_quits_both_tiers() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Char('q'), ALT, tier, AppAction::Quit);
+            assert_action(Key::Char('q'), ALT, tier, AppAction::Quit);
         }
     }
 
@@ -451,15 +492,15 @@ mod tests {
     #[test]
     fn tab_and_paste_bindings_resolve() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::PageUp, CONTROL, tier, AppAction::PrevTab);
-            assert_action(KeyCode::PageDown, CONTROL, tier, AppAction::NextTab);
-            assert_action(KeyCode::Char('t'), ALT, tier, AppAction::NewTab);
-            assert_action(KeyCode::Char('w'), ALT, tier, AppAction::CloseTab);
-            assert_action(KeyCode::Insert, SHIFT, tier, AppAction::Paste);
+            assert_action(Key::PageUp, CONTROL, tier, AppAction::PrevTab);
+            assert_action(Key::PageDown, CONTROL, tier, AppAction::NextTab);
+            assert_action(Key::Char('t'), ALT, tier, AppAction::NewTab);
+            assert_action(Key::Char('w'), ALT, tier, AppAction::CloseTab);
+            assert_action(Key::Insert, SHIFT, tier, AppAction::Paste);
             for digit in 1..=9 {
-                let code = KeyCode::Char(char::from_digit(digit, 10).unwrap());
+                let key = Key::Char(char::from_digit(digit, 10).unwrap());
                 assert_eq!(
-                    resolve(&press(code, ALT), tier),
+                    resolve(&press(key, ALT), tier),
                     Resolution::Action(AppAction::JumpToTab(digit as usize)),
                 );
             }
@@ -477,14 +518,14 @@ mod tests {
             ('q', AppAction::Quit),
         ] {
             assert_action(
-                KeyCode::Char(c),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                Key::Char(c),
+                Modifiers::CONTROL | Modifiers::SHIFT,
                 CapabilityTier::Enhanced,
                 action,
             );
             assert_pass(
-                KeyCode::Char(c),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                Key::Char(c),
+                Modifiers::CONTROL | Modifiers::SHIFT,
                 CapabilityTier::Legacy,
             );
         }
@@ -496,25 +537,20 @@ mod tests {
     #[test]
     fn enhanced_tier_matches_shifted_codepoint() {
         assert_action(
-            KeyCode::Char('T'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            Key::Char('T'),
+            Modifiers::CONTROL | Modifiers::SHIFT,
             CapabilityTier::Enhanced,
             AppAction::NewTab,
         );
-        assert_pass(KeyCode::Char('t'), CONTROL, CapabilityTier::Enhanced);
-        assert_pass(KeyCode::Char('q'), CONTROL, CapabilityTier::Enhanced);
+        assert_pass(Key::Char('t'), CONTROL, CapabilityTier::Enhanced);
+        assert_pass(Key::Char('q'), CONTROL, CapabilityTier::Enhanced);
     }
 
     /// Letter bindings match the letter, not the case — hosts disagree on
     /// whether Alt+letter reports 'q' or 'Q'.
     #[test]
     fn letter_bindings_ignore_case() {
-        assert_action(
-            KeyCode::Char('Q'),
-            ALT,
-            CapabilityTier::Legacy,
-            AppAction::Quit,
-        );
+        assert_action(Key::Char('Q'), ALT, CapabilityTier::Legacy, AppAction::Quit);
     }
 
     /// Bound keys are exact combos: adding a modifier unbinds them, so
@@ -522,21 +558,9 @@ mod tests {
     #[test]
     fn extra_modifiers_unbind() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_pass(
-                KeyCode::Char('q'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
-                tier,
-            );
-            assert_pass(
-                KeyCode::Char('q'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
-            assert_pass(
-                KeyCode::PageUp,
-                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
-                tier,
-            );
+            assert_pass(Key::Char('q'), Modifiers::ALT | Modifiers::SHIFT, tier);
+            assert_pass(Key::Char('q'), Modifiers::ALT | Modifiers::CONTROL, tier);
+            assert_pass(Key::PageUp, Modifiers::SHIFT | Modifiers::CONTROL, tier);
         }
     }
 
@@ -550,173 +574,55 @@ mod tests {
     #[test]
     fn block_chords_bind_in_both_tiers() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Up, ALT, tier, AppAction::PrevBlockStart);
-            assert_action(KeyCode::Down, ALT, tier, AppAction::NextBlockStart);
-            assert_action(KeyCode::Char('b'), ALT, tier, AppAction::SelectBlock);
-            // The un-modified keys are shell input, not app actions.
-            assert_pass(KeyCode::Up, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Down, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Char('b'), KeyModifiers::NONE, tier);
+            assert_action(Key::Up, ALT, tier, AppAction::PrevBlockStart);
+            assert_action(Key::Down, ALT, tier, AppAction::NextBlockStart);
+            assert_action(Key::Char('b'), ALT, tier, AppAction::SelectBlock);
+            assert_pass(Key::Up, Modifiers::NONE, tier);
+            assert_pass(Key::Char('b'), Modifiers::NONE, tier);
+            assert_pass(Key::Up, Modifiers::ALT | Modifiers::SHIFT, tier);
         }
     }
 
-    /// Bound means the exact combo: `Alt+Shift`/`Ctrl+Alt` variants and
-    /// a shifted codepoint with an extra modifier all fall through to
-    /// the PTY (same rule `extra_modifiers_unbind` enforces).
+    /// The `Alt+A`/`Alt+P`/`Alt+R` app chords bind in both tiers — and
+    /// `Alt+R`'s case-sensitive match leaves `Alt+Shift+R` to the shell.
     #[test]
-    fn block_chords_unbind_with_extra_modifiers() {
+    fn panel_profile_and_conversations_chords() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_pass(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT, tier);
-            assert_pass(
-                KeyCode::Down,
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
-            assert_pass(
-                KeyCode::Char('b'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
-                tier,
-            );
-            assert_pass(
-                KeyCode::Char('b'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
+            assert_action(Key::Char('a'), ALT, tier, AppAction::AgentPanel);
+            assert_action(Key::Char('p'), ALT, tier, AppAction::SwitchProfile);
+            assert_action(Key::Char('r'), ALT, tier, AppAction::Conversations);
+            assert_pass(Key::Char('R'), ALT, tier);
         }
     }
 
-    /// `Alt+A` is the Spec R06 agent-panel toggle (`AgentPanel`):
-    /// `ESC a` vs `a` is byte-distinct on every host — no tier gate —
-    /// and `M-a` is unbound in default readline, so binding it steals
-    /// no shell input. Plain `a` still passes through, and the exact-
-    /// modifier rule keeps `Alt+Shift+A`/`Ctrl+Alt+A` for the PTY.
+    /// `Alt+Enter` fires the suggest trigger in both tiers — and a
+    /// keypad Enter reports the same (`ESC CR` is the chord; which
+    /// physical Enter produced it is a PTY-encoding detail, not a
+    /// binding distinction).
     #[test]
-    fn alt_a_binds_in_both_tiers() {
+    fn alt_enter_suggests_both_tiers() {
         for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Char('a'), ALT, tier, AppAction::AgentPanel);
-            // Case-insensitive like every letter binding.
-            assert_action(KeyCode::Char('A'), ALT, tier, AppAction::AgentPanel);
-            assert_pass(KeyCode::Char('a'), KeyModifiers::NONE, tier);
-            assert_pass(
-                KeyCode::Char('a'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            assert_action(Key::Enter, ALT, tier, AppAction::SuggestCommand);
+            assert_action(
+                Key::Keypad(Keypad::Enter),
+                ALT,
                 tier,
+                AppAction::SuggestCommand,
             );
-            assert_pass(
-                KeyCode::Char('a'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
+            assert_pass(Key::Enter, Modifiers::NONE, tier);
         }
     }
 
-    /// `Alt+P` is the Spec R07 §5.7 profile switch (`SwitchProfile`):
-    /// `ESC p` vs `p` is byte-distinct on every host — no tier gate —
-    /// and `M-p` is unbound in default readline, so binding it steals
-    /// no shell input. Plain `p` still passes through, and the exact-
-    /// modifier rule keeps `Alt+Shift+P`/`Ctrl+Alt+P` for the PTY.
+    /// Numpad digits bind like their typing equivalents — `Alt+5` jumps
+    /// to tab 5 off either `5` key, the gesture the crossterm-level
+    /// table resolved before the re-type.
     #[test]
-    fn alt_p_binds_in_both_tiers() {
-        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Char('p'), ALT, tier, AppAction::SwitchProfile);
-            // Case-insensitive like every letter binding.
-            assert_action(KeyCode::Char('P'), ALT, tier, AppAction::SwitchProfile);
-            assert_pass(KeyCode::Char('p'), KeyModifiers::NONE, tier);
-            assert_pass(
-                KeyCode::Char('p'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
-                tier,
-            );
-            assert_pass(
-                KeyCode::Char('p'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
-        }
-    }
-
-    /// `Alt+R` is the Spec R08 conversation picker (`Conversations`):
-    /// `ESC r` vs `r` is byte-distinct on every host — no tier gate.
-    /// `M-r` is bound in default readline (revert-line) — the same
-    /// sanctioned trade `Alt+B`/`M-b` makes — and `Alt+Shift+R` is
-    /// NEVER stolen: the exact-modifier rule covers `Char('R')` +
-    /// ALT|SHIFT, and the case-sensitive match covers the
-    /// alternate-key hosts that report `Char('R')` + ALT.
-    #[test]
-    fn alt_r_binds_in_both_tiers() {
-        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Char('r'), ALT, tier, AppAction::Conversations);
-            assert_pass(KeyCode::Char('r'), KeyModifiers::NONE, tier);
-            // `Char('R')` + ALT is `Alt+Shift+R` — the shifted
-            // codepoint means shift was folded in; it passes through.
-            assert_pass(KeyCode::Char('R'), ALT, tier);
-            assert_pass(
-                KeyCode::Char('r'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT,
-                tier,
-            );
-            assert_pass(
-                KeyCode::Char('r'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL,
-                tier,
-            );
-        }
-    }
-
-    /// `Alt+Enter` is the Spec R04 second trigger (`SuggestCommand`):
-    /// `ESC CR` vs `CR` is byte-distinct on every host — no tier gate —
-    /// and unbound in default readline, so binding it steals nothing
-    /// the shell expects (ADR-0005). Plain Enter still passes through.
-    #[test]
-    fn alt_enter_binds_in_both_tiers() {
-        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_action(KeyCode::Enter, ALT, tier, AppAction::SuggestCommand);
-            assert_pass(KeyCode::Enter, KeyModifiers::NONE, tier);
-        }
-    }
-
-    /// The pass-through contract: ordinary typing, arrows, and the
-    /// Ctrl+S/Ctrl+Q flow-control keys are never captured.
-    #[test]
-    fn unbound_keys_pass_through() {
-        for tier in [CapabilityTier::Legacy, CapabilityTier::Enhanced] {
-            assert_pass(KeyCode::Char('a'), KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Char('s'), CONTROL, tier); // XOFF
-            assert_pass(KeyCode::Char('q'), CONTROL, tier); // XON
-            assert_pass(KeyCode::Enter, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Up, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Tab, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::F(1), KeyModifiers::NONE, tier);
-            // Unmodified navigation keys are input, not scrolling.
-            assert_pass(KeyCode::PageUp, KeyModifiers::NONE, tier);
-            assert_pass(KeyCode::Home, KeyModifiers::NONE, tier);
-        }
-    }
-
-    /// Releases never bind; repeats re-fire the action (hold Shift+PageUp
-    /// to keep paging).
-    #[test]
-    fn release_passes_repeat_binds() {
-        let release = CtKeyEvent::new_with_kind_and_state(
-            KeyCode::PageUp,
-            SHIFT,
-            KeyEventKind::Release,
-            KeyEventState::NONE,
-        );
-        assert_eq!(
-            resolve(&release, CapabilityTier::Enhanced),
-            Resolution::PassThrough
-        );
-
-        let repeat = CtKeyEvent::new_with_kind_and_state(
-            KeyCode::PageUp,
-            SHIFT,
-            KeyEventKind::Repeat,
-            KeyEventState::NONE,
-        );
-        assert_eq!(
-            resolve(&repeat, CapabilityTier::Enhanced),
-            Resolution::Action(AppAction::ScrollPageUp)
+    fn keypad_digits_bind_like_chars() {
+        assert_action(
+            Key::Keypad(Keypad::Five),
+            ALT,
+            CapabilityTier::Enhanced,
+            AppAction::JumpToTab(5),
         );
     }
 }

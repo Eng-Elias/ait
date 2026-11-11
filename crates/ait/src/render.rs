@@ -18,9 +18,9 @@ use std::ops::Range;
 use ait_term::{AnsiColor, CellKind, Color, CursorShape, GridView, Size, Style, Underline};
 use crossterm::cursor::SetCursorStyle;
 
-use crate::conversations::ConversationPicker;
-use crate::profile::ProfilePicker;
-use crate::selection::SelectionRange;
+use ait_app::conversations::ConversationPicker;
+use ait_app::profile::ProfilePicker;
+use ait_app::selection::SelectionRange;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RtColor, Modifier};
@@ -469,7 +469,7 @@ pub fn to_cursor_style(shape: CursorShape) -> Option<SetCursorStyle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selection::{GridPoint, SelectionRange};
+    use ait_app::selection::{GridPoint, SelectionRange};
     use ait_term::{Session, SessionOptions, Size};
 
     /// Byte-fed session fixture (the R01 seam): feed PTY output bytes, get a

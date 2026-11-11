@@ -1,0 +1,48 @@
+[package]
+name = "ait-app"
+version.workspace = true
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "AIT's frontend-agnostic application layer (Spec R13 §5.12): the session model every frontend renders — tabs, blocks, the agent panel's state, pickers, the ctl socket, the headless driver and the keymap — with no frontend toolkit inside."
+repository = "https://github.com/Eng-Elias/ait"
+
+[dependencies]
+# The byte-fed terminal core the session model drives — `LiveSession`,
+# `GridView`, `Size`, the frontend-neutral `KeyEvent` the keymap and
+# `Tab::agent_key` resolve (Spec R13-T1).
+ait-term = { path = "../ait-term" }
+# `Settings` snapshots ride every `AgentRequest`/`SuggestRequest`; the
+# `watch` feature arms `LiveSettings`' hot reload and `LiveSkills`'
+# `DirsWatcher` on the skills roots (Spec R03 us-10–11, R10 §5.10.2).
+ait-config = { path = "../ait-config", features = ["watch"] }
+# `AgentSession`/`CommandSuggester` channel handles, the `TranscriptItem`
+# vocabulary and the §5.10.4 classifier's `ProgramIndex`.
+ait-agent = { path = "../ait-agent" }
+# The §5.5 injection planner + OSC 7700 codec vocabulary — blocks,
+# integration state, in-band exec and the remote-context fold all
+# decode `ShellEvent`s.
+ait-shell = { path = "../ait-shell" }
+# `StoreHandle`'s facade (Spec R08 §5.8): terminal-session rows, sealed
+# blocks, transcripts, plans and the conversation picker read-out.
+ait-store = { path = "../ait-store" }
+# Semver requirements per Spec R02; chosen releases are >=7 days old
+# (ADR-0002 supply-chain rule): serde 1.0.229 (2026-07-18) + serde_json
+# 1.0.154 (2026-10-11), already in the tree — the ctl wire codec's
+# `Request`/`Response` single-line JSON (Spec R11 §5.10.5), the
+# headless driver's stderr `tool_call` envelopes and the transcript's
+# persisted payload passthrough.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+# libc 0.2.191 (2026-10-16), already in the tree — `signal`/`raise` for
+# `--headless`'s SIGINT→cancel wiring (Spec R11 us-27).
+libc = "0.2"
+
+[dev-dependencies]
+# Tempdirs for the ctl socket-dir, store and staged-tab fixtures.
+# Release >=7 days old per ADR-0002: tempfile 3.27.0 (2026-03-11).
+tempfile = "3"
+# In-process SSE stub for the headless driver's model-loop tests —
+# `ait_llm::testing`'s shared fixture server behind `test-fixtures`.
+ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }

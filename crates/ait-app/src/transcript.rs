@@ -24,7 +24,7 @@ const TITLE_CHARS: usize = 60;
 /// [`ait_agent::TranscriptMirror`] fold plus the per-drain flush
 /// watermark the store's append batching needs.
 #[derive(Default)]
-pub(crate) struct Transcript {
+pub struct Transcript {
     /// The whole accumulated transcript — the store's append source
     /// AND the `prior` continuity record (T4): a disabled store never
     /// truncates it. The fold rules live on `TranscriptMirror`.
@@ -43,7 +43,7 @@ impl Transcript {
     /// starts empty: a restored `ask` is long recorded, and no
     /// in-flight call survives a restore — resume refuses while a
     /// task runs).
-    pub(crate) fn restored(items: Vec<TranscriptItem>) -> Self {
+    pub fn restored(items: Vec<TranscriptItem>) -> Self {
         let mut mirror = ait_agent::TranscriptMirror::default();
         for item in items {
             mirror.record(item);
@@ -54,27 +54,27 @@ impl Transcript {
 
     /// The send-side record of a submitted task — first task of a
     /// flush is what [`conversation_title`] reads.
-    pub(crate) fn task(&mut self, text: &str) {
+    pub fn task(&mut self, text: &str) {
         self.mirror.task(text);
     }
 
     /// The send-side record of a steering message — in send order,
     /// even while the worker only reads it inside the next task's
     /// conversation.
-    pub(crate) fn steering(&mut self, text: &str) {
+    pub fn steering(&mut self, text: &str) {
         self.mirror.steering(text);
     }
 
     /// The send-side record of an `ask_user_question` answer — the
     /// full text is known here; the matching `ToolUpdate` only ever
     /// carries a preview (and is skipped on it).
-    pub(crate) fn answer(&mut self, text: &str) {
+    pub fn answer(&mut self, text: &str) {
         self.mirror.answer(text);
     }
 
     /// Fold one drained [`AgentEvent`] into items — the shared
     /// mirror rules. Called for every event the panel applies.
-    pub(crate) fn apply(&mut self, event: &AgentEvent) {
+    pub fn apply(&mut self, event: &AgentEvent) {
         self.mirror.apply(event);
     }
 
@@ -82,7 +82,7 @@ impl Transcript {
     /// per-drain batch. The watermark advances regardless of what
     /// the caller does with them (the unpersisted-run rule); the
     /// full vec stays — it is the `prior` continuity record too.
-    pub(crate) fn take_new(&mut self) -> Vec<TranscriptItem> {
+    pub fn take_new(&mut self) -> Vec<TranscriptItem> {
         let items = self.mirror.items();
         let new = items[self.flushed..].to_vec();
         self.flushed = items.len();
@@ -91,7 +91,7 @@ impl Transcript {
 
     /// The whole accumulated transcript — what a resumed tab's next
     /// `AgentRequest.prior` hands the worker (R08-T4).
-    pub(crate) fn items(&self) -> &[TranscriptItem] {
+    pub fn items(&self) -> &[TranscriptItem] {
         self.mirror.items()
     }
 }
@@ -103,7 +103,7 @@ impl Transcript {
 /// detach) can hold no task at all, so `history` — the panel's
 /// whole transcript — names the row from the conversation's own
 /// first task instead; only a taskless history gets the generic.
-pub(crate) fn conversation_title(batch: &[TranscriptItem], history: &[TranscriptItem]) -> String {
+pub fn conversation_title(batch: &[TranscriptItem], history: &[TranscriptItem]) -> String {
     let line = batch
         .iter()
         .chain(history)

@@ -27,9 +27,9 @@ name = "ait"
 version = "1.0.0"
 dependencies = [
  "ait-agent",
+ "ait-app",
  "ait-config",
  "ait-llm",
- "ait-shell",
  "ait-store",
  "ait-term",
  "ait-testkit",
@@ -37,7 +37,6 @@ dependencies = [
  "insta",
  "libc",
  "ratatui",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -58,6 +57,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "ait-app"
+version = "1.0.0"
+dependencies = [
+ "ait-agent",
+ "ait-config",
+ "ait-llm",
+ "ait-shell",
+ "ait-store",
+ "ait-term",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -34,10 +34,9 @@ use std::time::{Instant, SystemTime};
 use ait_agent::{AgentRequest, ApprovalVerdict, ProgramIndex};
 use ait_config::Settings;
 use ait_term::{
-    Cursor, ExitStatus, GridView, LiveEvent, LiveSession, LiveSessionOptions, PromptMarkKind,
-    SessionEvent, Size, SpawnError,
+    Cursor, ExitStatus, GridView, Key, KeyEvent, LiveEvent, LiveSession, LiveSessionOptions,
+    PromptMarkKind, SessionEvent, Size, SpawnError,
 };
-use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::agent_panel::{context_for, edit_input, AgentPanel};
 use crate::blocks::{
@@ -46,8 +45,8 @@ use crate::blocks::{
 use crate::config::mcp_error_text;
 use crate::inband::{InBandError, InBandExec, RunRequest};
 use crate::integration::{self, IntegrationState};
+use crate::keymap;
 use crate::remote::RemoteContext;
-use crate::render::session_size;
 use crate::scroll::ScrollState;
 use crate::selection::{extract, GridPoint, Selection, SelectionRange};
 use crate::shell_bridge::{self, BridgeRequest, BridgeService};
@@ -64,7 +63,7 @@ const FALLBACK_TITLE: &str = "sh";
 /// How many prompt marks a tab retains — four arrive per shell
 /// command (A/B/C/D), so this covers ~1000 commands of history; the
 /// oldest drop off the front, same rule as scrollback.
-pub(crate) const PROMPT_MARK_CAP: usize = 4096;
+pub const PROMPT_MARK_CAP: usize = 4096;
 
 /// One OSC 133 mark recorded against the line it landed on (Spec R01
 /// user story 14). `line` indexes the "scrollback then viewport" row
@@ -114,30 +113,30 @@ pub struct Tab {
     /// neither the list index (shifts on every close) nor the child
     /// pid (`None` on pid-less platforms, recycled by the OS) can be
     /// trusted to keep pointing at the same session.
-    pub(crate) id: u64,
+    pub id: u64,
     /// The live PTY session this tab drives.
     pub session: LiveSession,
     /// How far above the live viewport this tab's view sits.
-    /// `pub(crate)`: tests reach the raw state to stage offsets the
+    /// `pub`: tests reach the raw state to stage offsets the
     /// clamping methods can't produce; production callers use the
     /// `scroll_*`/`page_*`/`snap_to_bottom` methods.
-    pub(crate) scroll: ScrollState,
-    /// This tab's mouse-selection state — same `pub(crate)` test seam;
+    pub scroll: ScrollState,
+    /// This tab's mouse-selection state — same `pub` test seam;
     /// production callers use the `*_selection` methods.
-    pub(crate) selection: Selection,
+    pub selection: Selection,
     /// The shadow of this tab's printable input since the last line
     /// submission — what the `# `+Enter and `Alt+Enter` triggers verify
     /// against the grid's echoed line (Spec R04, user story 29). Same
-    /// `pub(crate)` test seam; production drives it through
+    /// `pub` test seam; production drives it through
     /// `crate::suggest` from the keypress path.
-    pub(crate) shadow: InputShadow,
+    pub shadow: InputShadow,
     /// The §5.10.4 program index — this session's shell builtins
     /// merged with the executable basenames on `$PATH`, harvested ONCE
     /// at spawn (Spec R11 us-15): the classifier's per-Enter check is
     /// a set lookup, never a `$PATH` walk. Keyed on the same program
-    /// basename the title resolves. Same `pub(crate)` test seam as
+    /// basename the title resolves. Same `pub` test seam as
     /// `shadow` — tests stage `ProgramIndex::with_path_entries`.
-    pub(crate) program_index: ProgramIndex,
+    pub program_index: ProgramIndex,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
     cwd: PathBuf,
@@ -184,9 +183,9 @@ pub struct Tab {
     /// The `AIT_SESSION_ID` this tab's spawn allocated (`id` as text)
     /// — `Some` only when the injection materialized. Hook payloads
     /// must echo it before [`IntegrationState`] honors them.
-    /// `pub(crate)`: same test seam as `scroll`/`selection` — tests
+    /// `pub`: same test seam as `scroll`/`selection` — tests
     /// stage a vetted stream without a real injected shell.
-    pub(crate) session_id: Option<String>,
+    pub session_id: Option<String>,
     /// The configured scrollback cap (`SessionOptions::scrollback`).
     /// `GridView` doesn't expose it, and [`observe_scrollback`]
     /// (Self::observe_scrollback) needs it: a gap that lands AT the cap
@@ -196,9 +195,9 @@ pub struct Tab {
     /// The §5.5.1 in-band exec seam: per-tab `__ait_run` request ids,
     /// the frame accumulator and the `id → waiter` map
     /// (`crate::inband`, Spec R05 / issue #75). `drain_events` feeds it
-    /// every observed OSC; `pub(crate)` so tests inspect pending
+    /// every observed OSC; `pub` so tests inspect pending
     /// state — production callers go through [`run_in_shell`](Self::run_in_shell).
-    pub(crate) inband: InBandExec,
+    pub inband: InBandExec,
     /// The materialized injection the session was spawned with —
     /// holding the guard here ties the per-session `0700` snippet dir's
     /// lifetime to the tab's (drop removes it best-effort, Spec R05
@@ -225,25 +224,25 @@ pub struct Tab {
     /// drops the `AgentSession` inside, which is what cancels and
     /// joins the agent worker when the tab closes (standard 14 — the
     /// conversation's identity IS the tab's; no pin needed). Same
-    /// `pub(crate)` seam as `scroll`/`shadow` — tests stage a panel;
+    /// `pub` seam as `scroll`/`shadow` — tests stage a panel;
     /// production drives it through the `agent_*` methods.
-    pub(crate) agent: Option<AgentPanel>,
+    pub agent: Option<AgentPanel>,
     /// The service side of this tab's `ShellBridge` (Spec R06-T4):
     /// created with the panel — `Alt+A` is the only thing that can
     /// spawn a worker wanting to reach the shell — and answered by
     /// `drain_events` every tick. `agent_key` clones its
     /// [`TabBridge`](crate::shell_bridge::TabBridge) handle into each
-    /// submitted `AgentRequest`; `pub(crate)` so tests can attach a
+    /// submitted `AgentRequest`; `pub` so tests can attach a
     /// service to a staged tab.
-    pub(crate) bridge: Option<BridgeService>,
+    pub bridge: Option<BridgeService>,
     /// This tab's live remote-context stack (Spec R09-T4): nonempty
     /// while `ssh()`-wrapped sessions are open — `ssh_begin` pushes a
     /// level, a hop-attributed `ssh_end`/remote `exit_shell` closes
     /// it (and everything above it — a dead shell kills its nested
     /// sessions). The LAST level is the innermost: the status line,
     /// the bridge's `remote_state` and `blocks.host` all read it;
-    /// `pub(crate)` so tests stage remote hooks without a real ssh.
-    pub(crate) remote: Vec<RemoteContext>,
+    /// `pub` so tests stage remote hooks without a real ssh.
+    pub remote: Vec<RemoteContext>,
     /// The ait control dir this spawn armed (the template's at spawn
     /// time) — `RemoteContext::fold`'s "is this socket ours" check:
     /// only sockets under it retire on teardown.
@@ -276,7 +275,7 @@ impl Tab {
     /// events stay attributable (CODING_STANDARDS.md 14 — never an
     /// index or a pid). Opt-out, unknown shells and materialize
     /// failures all degrade to a plain spawn (standard 1).
-    pub(crate) fn spawn(
+    pub fn spawn(
         mut options: LiveSessionOptions,
         cwd: PathBuf,
         id: u64,
@@ -394,7 +393,7 @@ impl Tab {
     /// arrived: nothing is then *known* to be output, and a
     /// range-clamped `start > end` means the output rows left the grid
     /// entirely.
-    pub(crate) fn block_output(&self, block: &Block) -> String {
+    pub fn block_output(&self, block: &Block) -> String {
         let Some(start) = block.output_start() else {
             return String::new();
         };
@@ -484,7 +483,7 @@ impl Tab {
     /// cwd/exit/mark recording; then the shared `ait_shell::decode`
     /// feeds integration state, the block assembler, the remote
     /// context stack, the in-band accumulator and bridge subscribers.
-    pub(crate) fn observe_event(&mut self, event: &LiveEvent) {
+    pub fn observe_event(&mut self, event: &LiveEvent) {
         // Keeps `dropped_lines` current — shrinkage directly, cap
         // rotation via the anchor window — so a mark recorded
         // mid-batch maps into absolute space with a post-eviction
@@ -620,7 +619,7 @@ impl Tab {
     /// its own thread while this drain keeps resolving it. Every
     /// request is answered in place: the ~8 ms input tick bounds the
     /// latency, and a `None` service answers nothing.
-    pub(crate) fn service_bridge(&mut self) {
+    pub fn service_bridge(&mut self) {
         loop {
             let request = match &self.bridge {
                 Some(service) => match service.try_recv() {
@@ -851,7 +850,7 @@ impl Tab {
 
     /// Bind the `terminal_sessions` row `app` opened for this tab's
     /// session — called once, right after the spawn insert lands.
-    pub(crate) fn set_store_session(&mut self, id: i64) {
+    pub fn set_store_session(&mut self, id: i64) {
         self.store_session = Some(id);
     }
 
@@ -864,7 +863,7 @@ impl Tab {
 
     /// Bind the `conversations` row the first transcript flush
     /// created — the same row every later task in this tab appends to.
-    pub(crate) fn set_conversation(&mut self, id: i64) {
+    pub fn set_conversation(&mut self, id: i64) {
         self.conversation = Some(id);
     }
 
@@ -877,7 +876,7 @@ impl Tab {
     /// is created like `Alt+A`'s first toggle when the tab never
     /// had one. Callers refuse while a task runs — a live run is
     /// never clobbered (us-10).
-    pub(crate) fn resume_conversation(
+    pub fn resume_conversation(
         &mut self,
         id: i64,
         items: Vec<ait_agent::TranscriptItem>,
@@ -897,7 +896,7 @@ impl Tab {
     /// right here (the `preexec` hook's text, else the `B→C` echo
     /// slice); the queue drains regardless of whether a store row
     /// exists, so an unpersisted tab's queue can't grow.
-    pub(crate) fn take_persisted_blocks(&mut self) -> Vec<PersistedBlock> {
+    pub fn take_persisted_blocks(&mut self) -> Vec<PersistedBlock> {
         let sealed = self.blocks.take_sealed();
         if sealed.is_empty() {
             return Vec::new();
@@ -1068,19 +1067,23 @@ impl Tab {
             return;
         }
         let panel = self.agent.as_mut().expect("focused implies a panel");
-        match key.code {
-            KeyCode::Esc if key.modifiers.is_empty() => panel.escape(),
+        // A numpad key routes like its typing equivalent — keypad Enter
+        // submits, exactly as the crossterm-level routing treated
+        // `Key::Enter` + `KEYPAD` state (the keymap's `normalize`).
+        let code = keymap::normalize(key.key);
+        match code {
+            Key::Escape if key.modifiers.is_empty() => panel.escape(),
             _ if panel.awaiting_answer() => {
                 if panel.ask_has_choices() {
-                    match key.code {
-                        KeyCode::Up if key.modifiers.is_empty() => panel.ask_prev(),
-                        KeyCode::Down if key.modifiers.is_empty() => panel.ask_next(),
-                        KeyCode::Enter => panel.submit_answer(toast),
+                    match code {
+                        Key::Up if key.modifiers.is_empty() => panel.ask_prev(),
+                        Key::Down if key.modifiers.is_empty() => panel.ask_next(),
+                        Key::Enter => panel.submit_answer(toast),
                         _ => {} // stray keys ignored while a choice waits
                     }
                 } else {
-                    match key.code {
-                        KeyCode::Enter => panel.submit_answer(toast),
+                    match code {
+                        Key::Enter => panel.submit_answer(toast),
                         _ => {
                             edit_input(panel, key);
                         }
@@ -1092,8 +1095,8 @@ impl Tab {
             // typable — and Enter answers `Deny` with the input as
             // the reason (an empty one falls back to the worker's
             // default text). Esc above still cancels the task.
-            _ if panel.deny_reason_active() => match key.code {
-                KeyCode::Enter => {
+            _ if panel.deny_reason_active() => match code {
+                Key::Enter => {
                     let reason = panel.take_input();
                     panel.decide(ApprovalVerdict::Deny(reason), toast)
                 }
@@ -1104,7 +1107,7 @@ impl Tab {
             // Any Enter submits — `Alt+Enter` already dispatched to the
             // suggester upstream, so no chord collides here. A parked
             // gate does not change this: Enter with text steers.
-            KeyCode::Enter => {
+            Key::Enter => {
                 let text = panel.take_input().trim_end().to_string();
                 if text.is_empty() {
                     return;
@@ -1119,14 +1122,14 @@ impl Tab {
             // opens the denial-reason mode — all only on an EMPTY
             // input, so a typed draft is never mistaken for a verdict
             // and a verdict never swallows a draft.
-            _ if panel.awaiting_verdict() => match key.code {
-                KeyCode::Char('a') if key.modifiers.is_empty() && panel.input_is_empty() => {
+            _ if panel.awaiting_verdict() => match code {
+                Key::Char('a') if key.modifiers.is_empty() && panel.input_is_empty() => {
                     panel.decide(ApprovalVerdict::AllowOnce, toast)
                 }
-                KeyCode::Char('t') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                Key::Char('t') if key.modifiers.is_empty() && panel.input_is_empty() => {
                     panel.decide(ApprovalVerdict::AllowForTask, toast)
                 }
-                KeyCode::Char('d') if key.modifiers.is_empty() && panel.input_is_empty() => {
+                Key::Char('d') if key.modifiers.is_empty() && panel.input_is_empty() => {
                     panel.begin_deny_reason()
                 }
                 _ => {
@@ -1406,9 +1409,10 @@ pub struct TabManager {
     /// Where `ait` itself was started — the cwd a tab inherits when the
     /// active tab never reported one.
     launch_cwd: PathBuf,
-    /// The content-area PTY size every tab's session gets (chrome rows
-    /// live outside it); updated by [`resize_all`](Self::resize_all) so
-    /// tabs spawned later match.
+    /// The PTY winsize a freshly spawned tab gets — the frontend's
+    /// band→session derivation evaluated for a panel-less tab (a new
+    /// tab never has one). Updated by [`resize_all`](Self::resize_all)
+    /// so tabs spawned later match.
     size: Size,
     /// The spawn template [`new_tab`](Self::new_tab) clones — where
     /// `[terminal]` `shell`/`scrollback_lines`/`shell_integration`
@@ -1592,7 +1596,7 @@ impl TabManager {
     /// same value `ctl`'s `open-tab` response hands out, and reaches
     /// uninjected tabs too (they answer to their id even without the
     /// env var landing).
-    pub(crate) fn session_tab(&self, session_id: &str) -> Option<&Tab> {
+    pub fn session_tab(&self, session_id: &str) -> Option<&Tab> {
         self.tabs
             .iter()
             .find(|tab| tab.id.to_string() == session_id)
@@ -1600,7 +1604,7 @@ impl TabManager {
 
     /// [`session_tab`](Self::session_tab), mutably — the `send` verb's
     /// target resolution.
-    pub(crate) fn session_tab_mut(&mut self, session_id: &str) -> Option<&mut Tab> {
+    pub fn session_tab_mut(&mut self, session_id: &str) -> Option<&mut Tab> {
         self.tabs
             .iter_mut()
             .find(|tab| tab.id.to_string() == session_id)
@@ -1627,16 +1631,18 @@ impl TabManager {
     }
 
     /// Forward a host resize to EVERY tab's session, not just the
-    /// visible one (Spec R02 user story 17), and remember the band
-    /// size for tabs spawned later. Each session gets the size its own
-    /// layout implies — a tab with an open agent panel keeps its
-    /// split, so `size` is the CONTENT BAND and [`session_size`]
-    /// derives the per-tab winsize (Spec R06). Reflow invalidates the
-    /// grid coordinates a selection range points at, so every tab's
-    /// highlight is cleared. PTY-write failures on a just-dead child
-    /// are tolerated — the session's `Exited` event carries that
-    /// state.
-    pub fn resize_all(&mut self, size: Size) {
+    /// visible one (Spec R02 user story 17), and remember the
+    /// panel-less session size for tabs spawned later. `session_size`
+    /// is the FRONTEND's band→winsize derivation — it maps the band
+    /// `size` plus a tab's panel-open flag to that tab's winsize (the
+    /// TUI's `render::session_size`; the GUI injects its own panel
+    /// math, Spec R13): each session gets the size its own layout
+    /// implies — a tab with an open agent panel keeps its split (Spec
+    /// R06). Reflow invalidates the grid coordinates a selection range
+    /// points at, so every tab's highlight is cleared. PTY-write
+    /// failures on a just-dead child are tolerated — the session's
+    /// `Exited` event carries that state.
+    pub fn resize_all(&mut self, size: Size, session_size: impl Fn(Size, bool) -> Size) {
         self.size = size;
         for tab in &mut self.tabs {
             tab.clear_selection();
@@ -1647,10 +1653,11 @@ impl TabManager {
     }
 
     /// Re-derive the ACTIVE tab's PTY winsize from the stored band
-    /// size — `Alt+A` opens or closes one tab's panel, so only its
-    /// session shrinks or restores through the same [`session_size`]
-    /// derivation [`resize_all`](Self::resize_all) applies.
-    pub fn resize_active(&mut self) {
+    /// size through the same frontend derivation
+    /// [`resize_all`](Self::resize_all) applies — `Alt+A` opens or
+    /// closes one tab's panel, so only its session shrinks or
+    /// restores.
+    pub fn resize_active(&mut self, session_size: impl Fn(Size, bool) -> Size) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let _ = tab
                 .session
@@ -1770,7 +1777,7 @@ impl TabManager {
 /// [`LiveSessionOptions::resolved_program`] — the same resolution
 /// [`LiveSession::spawn`] applies — so the title can never drift from
 /// what actually spawned.
-pub(crate) fn title_for(options: &LiveSessionOptions) -> String {
+pub fn title_for(options: &LiveSessionOptions) -> String {
     Path::new(&options.resolved_program())
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -2419,7 +2426,7 @@ mod tests {
         let mut manager = manager(3, "/tmp");
         manager.jump_to(2);
 
-        manager.resize_all(Size::new(50, 15));
+        manager.resize_all(Size::new(50, 15), |size, _| size);
 
         for tab in manager.tabs() {
             assert_eq!(tab.session.size(), Size::new(50, 15));
@@ -2447,7 +2454,7 @@ mod tests {
             .selection
             .begin(crate::selection::GridPoint::new(1, 1));
 
-        manager.resize_all(Size::new(40, 10));
+        manager.resize_all(Size::new(40, 10), |size, _| size);
 
         assert!(manager
             .tabs()
@@ -3791,15 +3798,28 @@ mod tests {
     }
 
     /// Spec R06 / issue #85: `Alt+A`'s toggle and a host resize share
-    /// the band→session derivation — opening shrinks only THIS tab's
-    /// session to the terminal side of the split, a resize keeps the
-    /// split proportional, and closing restores the whole band.
+    /// the frontend's band→session derivation — the injected
+    /// `session_size` maps a tab's panel-open flag to its winsize, so
+    /// opening shrinks only THIS tab's session to the terminal side of
+    /// the split, a resize keeps the split proportional, and closing
+    /// restores the whole band. The test's derive mirrors the TUI's
+    /// `render::session_size` (two fifths of the band to the panel).
     #[test]
     fn agent_panel_toggle_and_resize_share_the_split_math() {
         let mut manager = manager(1, "/tmp");
+        let session_size = |band: Size, panel_open: bool| {
+            Size::new(
+                if panel_open {
+                    band.columns - (band.columns * 2 / 5).min(band.columns - 1)
+                } else {
+                    band.columns
+                },
+                band.lines,
+            )
+        };
 
         manager.active_mut().unwrap().toggle_agent_panel();
-        manager.resize_active();
+        manager.resize_active(session_size);
         assert_eq!(
             manager.active().unwrap().session.size(),
             Size::new(24, 10),
@@ -3808,11 +3828,11 @@ mod tests {
 
         // A host resize re-derives the same tab's split — the panel
         // keeps its share rather than restoring full width.
-        manager.resize_all(Size::new(80, 20));
+        manager.resize_all(Size::new(80, 20), session_size);
         assert_eq!(manager.active().unwrap().session.size(), Size::new(48, 20));
 
         manager.active_mut().unwrap().toggle_agent_panel();
-        manager.resize_active();
+        manager.resize_active(session_size);
         assert_eq!(
             manager.active().unwrap().session.size(),
             Size::new(80, 20),
@@ -3881,12 +3901,11 @@ mod tests {
     /// the letters are ordinary input.
     #[test]
     fn approve_card_keys_answer_the_gate() {
-        use crossterm::event::KeyEvent as CtKeyEvent;
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
         let mut skills = LiveSkills::unwatched();
-        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let key = |key| KeyEvent::new(key, ait_term::Modifiers::NONE);
         let staged = |id: &str| ait_agent::AgentEvent::ApprovalRequest {
             call: ait_agent::ToolCall {
                 id: id.into(),
@@ -3903,7 +3922,7 @@ mod tests {
         tab.agent.as_mut().unwrap().apply(staged("call_1"));
         assert!(tab.agent.as_ref().unwrap().awaiting_verdict());
         tab.agent_key(
-            &key(KeyCode::Char('a')),
+            &key(Key::Char('a')),
             &settings,
             "default",
             &mut skills,
@@ -3916,7 +3935,7 @@ mod tests {
         // parked and the reason can contain the verdict letters.
         tab.agent.as_mut().unwrap().apply(staged("call_2"));
         tab.agent_key(
-            &key(KeyCode::Char('d')),
+            &key(Key::Char('d')),
             &settings,
             "default",
             &mut skills,
@@ -3932,7 +3951,7 @@ mod tests {
         }
         for c in "don't allow".chars() {
             tab.agent_key(
-                &key(KeyCode::Char(c)),
+                &key(Key::Char(c)),
                 &settings,
                 "default",
                 &mut skills,
@@ -3946,7 +3965,7 @@ mod tests {
         }
         // Enter answers `Deny` with the reason — the wait clears.
         tab.agent_key(
-            &key(KeyCode::Enter),
+            &key(Key::Enter),
             &settings,
             "default",
             &mut skills,
@@ -3962,14 +3981,14 @@ mod tests {
         // still denies (the worker substitutes its default text).
         tab.agent.as_mut().unwrap().apply(staged("call_3"));
         tab.agent_key(
-            &key(KeyCode::Char('d')),
+            &key(Key::Char('d')),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Enter),
+            &key(Key::Enter),
             &settings,
             "default",
             &mut skills,
@@ -3982,21 +4001,21 @@ mod tests {
         // until the input is emptied and `a` pressed again.
         tab.agent.as_mut().unwrap().apply(staged("call_4"));
         tab.agent_key(
-            &key(KeyCode::Char('x')),
+            &key(Key::Char('x')),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Char('d')),
+            &key(Key::Char('d')),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Char('a')),
+            &key(Key::Char('a')),
             &settings,
             "default",
             &mut skills,
@@ -4009,7 +4028,7 @@ mod tests {
         }
         tab.agent.as_mut().unwrap().take_input();
         tab.agent_key(
-            &key(KeyCode::Char('a')),
+            &key(Key::Char('a')),
             &settings,
             "default",
             &mut skills,
@@ -4020,7 +4039,7 @@ mod tests {
         // And with nothing pending, `d` edits the input like any
         // other character.
         tab.agent_key(
-            &key(KeyCode::Char('d')),
+            &key(Key::Char('d')),
             &settings,
             "default",
             &mut skills,
@@ -4036,12 +4055,11 @@ mod tests {
     /// takes the input line on Enter.
     #[test]
     fn ask_card_keys_select_or_take_free_text() {
-        use crossterm::event::KeyEvent as CtKeyEvent;
         let mut manager = manager(1, "/tmp");
         let mut toast = None;
         let settings = Settings::default();
         let mut skills = LiveSkills::unwatched();
-        let key = |code| CtKeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let key = |key| KeyEvent::new(key, ait_term::Modifiers::NONE);
         let ask = |id: &str, choices: &[&str]| ait_agent::AgentEvent::AskRequest {
             call: ait_agent::ToolCall {
                 id: id.into(),
@@ -4061,21 +4079,21 @@ mod tests {
         panel.apply(ask("call_1", &["a", "b"]));
         assert!(panel.awaiting_answer());
         tab.agent_key(
-            &key(KeyCode::Char('x')),
+            &key(Key::Char('x')),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Left),
+            &key(Key::Left),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Backspace),
+            &key(Key::Backspace),
             &settings,
             "default",
             &mut skills,
@@ -4087,14 +4105,14 @@ mod tests {
             assert_eq!(panel.input(), "", "stray keys never reached the input");
         }
         tab.agent_key(
-            &key(KeyCode::Down),
+            &key(Key::Down),
             &settings,
             "default",
             &mut skills,
             &mut toast,
         );
         tab.agent_key(
-            &key(KeyCode::Enter),
+            &key(Key::Enter),
             &settings,
             "default",
             &mut skills,
@@ -4116,7 +4134,7 @@ mod tests {
         assert!(!panel.ask_has_choices());
         for c in "why not".chars() {
             tab.agent_key(
-                &key(KeyCode::Char(c)),
+                &key(Key::Char(c)),
                 &settings,
                 "default",
                 &mut skills,
@@ -4126,7 +4144,7 @@ mod tests {
         // ↓ on a free-text ask navigates nothing — the card keeps
         // waiting and the input is untouched.
         tab.agent_key(
-            &key(KeyCode::Down),
+            &key(Key::Down),
             &settings,
             "default",
             &mut skills,
@@ -4134,7 +4152,7 @@ mod tests {
         );
         assert!(tab.agent.as_ref().unwrap().awaiting_answer());
         tab.agent_key(
-            &key(KeyCode::Enter),
+            &key(Key::Enter),
             &settings,
             "default",
             &mut skills,

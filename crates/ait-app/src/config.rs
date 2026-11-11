@@ -119,7 +119,7 @@ pub fn session_template(settings: &Settings) -> SessionTemplate {
 /// later drain site.
 ///
 /// [`ConfigError`]: ait_config::ConfigError
-pub(crate) fn mcp_error_text(error: &ait_config::ConfigError) -> String {
+pub fn mcp_error_text(error: &ait_config::ConfigError) -> String {
     format!("mcp.json failed to load: {}", error.message())
 }
 
