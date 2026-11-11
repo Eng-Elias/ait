@@ -128,7 +128,15 @@ impl GuiApp {
             zoom: 1.0,
         };
         let chrome = Chrome::default();
-        let cell = cell_metrics(ctx, &metrics);
+        // egui installs fonts on the first `Context::run` — the
+        // creation callback runs BEFORE it, so `fonts_mut` (what
+        // `cell_metrics` reads) panics here (eframe 0.37 calls the
+        // creator pre-run). Spawn the first tab at a provisional cell
+        // — typical monospace ratios, nothing the user sees: the
+        // first `ui()` frame computes the real band, and the
+        // `last_band` diff drives `resize_all` before a frame ever
+        // paints.
+        let cell = provisional_cell(&metrics);
         let regions = chrome_regions(ctx.content_rect(), chrome);
         let band = grid_size(regions.content, cell);
 
@@ -984,6 +992,18 @@ impl eframe::App for GuiApp {
         if let Some(mut pump) = self.pump.take() {
             pump.stop();
         }
+    }
+}
+
+/// The creation-time cell estimate — fonts don't exist until the
+/// first `Context::run`, so `GuiApp::new` can't read the glyph table.
+/// Typical monospace ratios (advance ~0.6×em, line ~1.2×em) seed the
+/// first tab's winsize; the first frame's real `cell_metrics` +
+/// `resize_all` correct it before anything paints.
+fn provisional_cell(metrics: &GuiMetrics) -> CellMetrics {
+    CellMetrics {
+        width: metrics.font_px() * 0.6,
+        height: metrics.font_px() * 1.2,
     }
 }
 

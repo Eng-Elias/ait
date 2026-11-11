@@ -36,3 +36,14 @@ eframe = { version = "0.37", default-features = false, features = [
     "wgpu", "x11", "wayland", "default_fonts", "system_fonts",
     "clipboard", "accesskit",
 ] }
+
+[dev-dependencies]
+# Tempdirs for the pump tests' store database and settings-watcher
+# fixtures. Release >=7 days old per ADR-0002: tempfile 3.27.0
+# (2026-03-11), already in the tree.
+tempfile = "3"
+# The pump tests inject a real tempdir `Store` through
+# `StoreHandle::from_store` and read persisted session/block rows back
+# with a second connection — production reaches the store only through
+# `ait_app::store::StoreHandle`.
+ait-store = { path = "../ait-store" }
