@@ -156,6 +156,7 @@ dependencies = [
  "ait-agent",
  "ait-app",
  "ait-config",
+ "ait-gui",
  "ait-llm",
  "ait-store",
  "ait-term",

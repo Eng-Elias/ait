@@ -38,6 +38,18 @@ ratatui = { version = "0.30", default-features = false, features = [
 # clipboard writes (R02-T3). It does NOT touch child-app OSC 52, which
 # stays off in ait-term's `SessionOptions`.
 crossterm = { version = "0.29", features = ["osc52"] }
+# Spec R13 §5.12's binary shape: `ait gui`/`ait --gui` launches the GUI
+# frontend in-process — optional and OFF by default, so
+# `cargo build -p ait` carries zero GUI dependencies (us-23). Local
+# builds opt in with `--features gui`; the packaged GUI is the
+# `ait-gui` binary and release builds never enable this.
+ait-gui = { path = "../ait-gui", optional = true }
+
+[features]
+# The `dep:` reference suppresses the implicit `ait-gui` feature —
+# `gui` is the only switch (Spec R13 §5.12: default off, never on in
+# dist builds).
+gui = ["dep:ait-gui"]
 
 [dev-dependencies]
 # Test-only e2e harness over ait-term's LiveSession (Spec E01) — never a
