@@ -125,3 +125,17 @@ reverse once relied on:
   the release object is already public, so the remedy is a manual yank
   (delete the release + tag) and re-tag after the fix — never a silent
   re-announce.
+
+## Amendment — 2026-11-12 (Spec R13, ADR-0016)
+
+`ait-gui` joined the release unit for §5.12: `packages` grew to
+`["ait", "ait-gui"]` and dist emits a second generated installer,
+`ait-gui-installer.sh`. The GUI ships on the four glibc/macOS targets
+only — `x86_64-unknown-linux-musl` stays ait-only (a fully static GUI
+is unsupportable; GPU drivers are never static), expressed through
+dist's package-local `targets` in `ait-gui`'s `[package.metadata.dist]`.
+The pre-tag checklist sanity in AGENTS.md now expects both artifact
+sets: `ait` on all five targets, `ait-gui` on its four, musl absent
+from the latter. The musl-detection caveat above applies to both
+generated installers — the curl|sh path picks the gnu archive for
+`ait-gui` on Alpine too, and no musl archive exists to fall back to.
