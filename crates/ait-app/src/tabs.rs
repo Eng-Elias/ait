@@ -933,8 +933,10 @@ impl Tab {
     /// Scroll so live line `line` tops the viewport — `offset =
     /// scrollback − line`, reached through the same clamped
     /// `scroll_up`/`scroll_down` the page bindings use. Lines inside
-    /// the live viewport clamp to the bottom (offset 0).
-    fn scroll_to_line(&mut self, line: usize) {
+    /// the live viewport clamp to the bottom (offset 0). `pub` for the
+    /// GUI's find bar, which reveals a match the same way block
+    /// navigation reveals a start line.
+    pub fn scroll_to_line(&mut self, line: usize) {
         let target = self.scrollback().saturating_sub(line);
         let offset = self.scroll.offset();
         match target.cmp(&offset) {

@@ -19,15 +19,18 @@ use std::time::{Duration, Instant, SystemTime};
 use ait_agent::ApprovalVerdict;
 use ait_agent::CommandSuggester;
 use ait_app::agent_panel::AgentPanel;
+use ait_app::blocks::BlockStatus;
 use ait_app::config::{self, LiveSettings};
 use ait_app::conversations::ConversationPicker;
 use ait_app::ctl::CtlServer;
+use ait_app::integration::IntegrationState;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
 use ait_app::profile::{self, ProfilePicker};
 use ait_app::scroll::WHEEL_LINES;
+use ait_app::search::{FindBar, SearchHit};
 use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
-use ait_app::status::{status_text, StatusLine, Toast};
+use ait_app::status::{block_text, status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
 use ait_app::suggest::{self, SuggestionPin};
 use ait_app::tabs::TabManager;
@@ -40,10 +43,10 @@ use eframe::egui::{
 use crate::grid::GridTheme;
 use crate::keys::{translate_key, translate_text};
 use crate::layout::{
-    chrome_regions, grid_point, grid_size, session_size, split_content, tab_chips, CellMetrics,
-    Chrome, GuiMetrics, CHIP_PAD,
+    chrome_regions, grid_point, grid_size, plan_block_chrome, session_size, split_content,
+    tab_chips, BlockDivider, BlockLabel, CellMetrics, Chrome, GuiMetrics, CHIP_PAD, FIND_BAR_H,
 };
-use crate::paint::paint_grid;
+use crate::paint::{paint_grid, FindOverlay, Overlays};
 use crate::panel::{self, Gate, Tone};
 use crate::pump::Pump;
 
@@ -89,6 +92,11 @@ pub struct Shared {
     /// (Spec R04 us-14) — the same one-request state machine the TUI
     /// delegates to.
     pub suggestion: SuggestionPin,
+    /// The find bar's state while it's open (Spec R13-T4) — `Some` IS
+    /// the bar's visibility. It lives in `Shared` (not `GuiApp`) so the
+    /// pump's drain pass can rescan hits when session output shifts
+    /// the grid under them.
+    pub find: Option<FindBar>,
 }
 
 /// The GUI frontend's `eframe::App` — T3's agent/suggest wiring,
@@ -124,11 +132,6 @@ pub struct GuiApp {
     /// applied after `ui` returns so the frame can't see a
     /// half-drained state.
     quit: bool,
-    /// The find bar's open state (Spec R13-T4 hook): the skeleton keeps
-    /// the field and the modal-region paint site; the binding, the
-    /// grid scan and the highlight pass are T4's.
-    #[allow(dead_code)]
-    find_open: bool,
 }
 
 impl GuiApp {
@@ -214,6 +217,7 @@ impl GuiApp {
             copied_text: None,
             suggester: CommandSuggester::new(),
             suggestion: SuggestionPin::new(),
+            find: None,
         }));
         let watcher = config::watcher();
         let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher);
@@ -228,7 +232,6 @@ impl GuiApp {
             panel_pane: None,
             panel_rows: 0,
             quit: false,
-            find_open: false,
         })
     }
 
@@ -256,6 +259,13 @@ impl GuiApp {
                     if self.zoom_key(key, modifiers) {
                         continue;
                     }
+                    // The find bar's open chord — Ctrl+F/⌘F (Spec
+                    // R13-T4). The keymap can't own it: the TUI has no
+                    // find bar, so the chord is GUI-local like zoom.
+                    if find_open_chord(key, modifiers) {
+                        self.open_find(shared);
+                        continue;
+                    }
                     self.dispatch_key(ctx, shared, translate_key(key, modifiers));
                 }
                 // Releases carry no input — same as the TUI's
@@ -264,7 +274,13 @@ impl GuiApp {
                 // Composed text: one Char event per character through
                 // the same resolver (every Char resolves PassThrough —
                 // the trip costs nothing and keeps ONE dispatch path).
+                // While the find bar is open, text is the query —
+                // nothing reaches the PTY mid-search.
                 egui::Event::Text(text) => {
+                    if shared.find.is_some() {
+                        self.find_text(shared, &text);
+                        continue;
+                    }
                     for key in translate_text(&text) {
                         self.dispatch_key(ctx, shared, Some(key));
                     }
@@ -272,8 +288,14 @@ impl GuiApp {
                 // A native paste (Ctrl+V / ⌘V, menu paste): encode the
                 // payload through the shared `encode_paste` so
                 // bracketed-paste children see their mode honored.
+                // While the find bar is open it pastes into the query
+                // — the browser convention.
                 egui::Event::Paste(text) => {
-                    self.paste(shared, &text);
+                    if shared.find.is_some() {
+                        self.find_text(shared, &text);
+                    } else {
+                        self.paste(shared, &text);
+                    }
                 }
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     self.wheel(shared, ctx, unit, delta);
@@ -473,6 +495,16 @@ impl GuiApp {
                 if shared.conversations.is_some() {
                     if let Some(key) = key {
                         conversation_key(&key, shared);
+                    }
+                    return;
+                }
+                // An open find bar owns unbound keys the same way —
+                // Enter/Shift+Enter/arrows step matches, Backspace
+                // edits, Esc closes; everything else is swallowed so
+                // nothing reaches the PTY mid-search.
+                if shared.find.is_some() {
+                    if let Some(key) = key {
+                        self.find_key(shared, key);
                     }
                     return;
                 }
@@ -684,6 +716,95 @@ impl GuiApp {
     }
 
     // -----------------------------------------------------------------
+    // Find bar (Spec R13-T4) — `Shared.find` being `Some` IS the open
+    // state; the pump rescans its hits as output lands, these handlers
+    // own the input side. Unbound keys route here while it's open
+    // (text arrives through `Event::Text`/`Paste` → `find_text`).
+
+    /// `Ctrl+F`/`⌘F`: open the bar over the active tab. Idempotent — a
+    /// second press keeps the bar and its query (the browser rule).
+    fn open_find(&mut self, shared: &mut Shared) {
+        if shared.find.is_some() {
+            return;
+        }
+        let Some(tab) = shared.tabs.active() else {
+            return;
+        };
+        // The anchor is the view's top row in grid-line space —
+        // `-scroll_offset` — so the first match is measured from what's
+        // on screen, not from the oldest scrollback line.
+        let anchor = -(i32::try_from(tab.scroll_offset()).unwrap_or(i32::MAX));
+        shared.find = Some(FindBar::new(tab.id, anchor));
+    }
+
+    /// Composed text or a paste while the bar is open: append to the
+    /// query, rescan against the active tab's grid, and reveal the
+    /// match it lands on — the find-as-you-type jump.
+    fn find_text(&mut self, shared: &mut Shared, text: &str) {
+        let hit = {
+            let Some(tab) = shared.tabs.active() else {
+                return;
+            };
+            let Some(find) = shared.find.as_mut() else {
+                return;
+            };
+            find.push_str(&tab.grid(), text);
+            find.current()
+        };
+        if let Some(hit) = hit {
+            reveal_hit(shared, hit);
+        }
+    }
+
+    /// One unbound key while the bar is open — named keys only (plain
+    /// text arrives through `Event::Text`, so any `Char` here is a
+    /// modifier chord and falls to the swallow arm like everything
+    /// else). Esc closes; Enter/Shift+Enter (and ↓/↑) step matches.
+    fn find_key(&mut self, shared: &mut Shared, key: KeyEvent) {
+        match keymap::normalize(key.key) {
+            Key::Escape if key.modifiers.is_empty() => {
+                shared.find = None;
+            }
+            Key::Enter if key.modifiers.is_empty() => self.find_step(shared, false),
+            Key::Enter if key.modifiers == Modifiers::SHIFT => self.find_step(shared, true),
+            Key::Backspace if key.modifiers.is_empty() => {
+                let hit = {
+                    let Some(tab) = shared.tabs.active() else {
+                        return;
+                    };
+                    let Some(find) = shared.find.as_mut() else {
+                        return;
+                    };
+                    find.pop(&tab.grid());
+                    find.current()
+                };
+                if let Some(hit) = hit {
+                    reveal_hit(shared, hit);
+                }
+            }
+            // ↑/↓ ride along as second prev/next chords.
+            Key::Up if key.modifiers.is_empty() => self.find_step(shared, true),
+            Key::Down if key.modifiers.is_empty() => self.find_step(shared, false),
+            _ => {}
+        }
+    }
+
+    /// Enter / Shift+Enter / ↓ / ↑: step the current match and reveal
+    /// the one the bar landed on.
+    fn find_step(&mut self, shared: &mut Shared, backward: bool) {
+        let hit = shared.find.as_mut().and_then(|find| {
+            if backward {
+                find.prev_match()
+            } else {
+                find.next_match()
+            }
+        });
+        if let Some(hit) = hit {
+            reveal_hit(shared, hit);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Tab lifecycle — shared by the keymap actions above and the tab
     // bar's click targets below, so binding and button can never drift.
 
@@ -852,6 +973,41 @@ impl GuiApp {
                 ctx.copy_text(text);
             }
         }
+        // The find bar rides the tab it opened on: a tab switch
+        // retargets its hits to the new session (the query carries
+        // over — the browser convention); the pump's rescan keeps
+        // them fresh as output lands.
+        if let Some(find) = shared.find.as_mut() {
+            if find.tab() != tab.id {
+                let anchor = -(i32::try_from(scroll).unwrap_or(i32::MAX));
+                find.retarget(tab.id, anchor, &tab.grid());
+            }
+        }
+        // Block chrome is `Integrated`-only: MarksOnly/Absent sessions
+        // skip the resolve pass entirely and render identically to
+        // plain output — no chrome, no errors (Spec R05's degrade
+        // rule; R13-T4's acceptance). The label is `block_text`'s —
+        // the same `✓/✗ <code> · <dur>` the status line renders.
+        let blocks = if tab.integration_state() == IntegrationState::Integrated {
+            tab.blocks()
+        } else {
+            Vec::new()
+        };
+        let dividers: Vec<BlockDivider> = blocks
+            .iter()
+            .map(|block| BlockDivider {
+                start: *block.range().start(),
+                label: block.exit().map(|exit| BlockLabel {
+                    text: block_text(BlockStatus {
+                        exit,
+                        duration: block.duration().unwrap_or_default(),
+                    }),
+                    ok: exit == 0,
+                }),
+            })
+            .collect();
+        let pane_rows = (pane.height() / cell.height).floor() as usize;
+        let chips = plan_block_chrome(&dividers, tab.scrollback(), scroll, pane_rows);
         let painter = ui.painter().with_clip_rect(pane);
         paint_grid(
             &crate::paint::GridSurface {
@@ -865,6 +1021,13 @@ impl GuiApp {
             scroll,
             tab.cursor(),
             tab.selection_range(),
+            Overlays {
+                find: shared.find.as_ref().map(|find| FindOverlay {
+                    hits: find.hits(),
+                    current: find.current_index(),
+                }),
+                block_chips: Some(&chips),
+            },
         );
     }
 
@@ -1427,8 +1590,66 @@ impl GuiApp {
                 color,
             );
         }
-        // T4 hook: the find bar anchors above the status strip here.
-        let _ = self.find_open;
+        // The find bar (Spec R13-T4) — anchored above the status
+        // strip, same modal slot as the picker.
+        if let Some(find) = shared.find.as_ref() {
+            let bar = Rect::from_min_max(
+                Pos2::new(area.left(), area.bottom() - self.chrome.status - FIND_BAR_H),
+                Pos2::new(area.right(), area.bottom() - self.chrome.status),
+            );
+            let painter = ui.painter().with_clip_rect(bar);
+            painter.rect_filled(bar, 0.0, Color32::from_rgb(0x22, 0x22, 0x22));
+            painter.line_segment(
+                [bar.left_top(), bar.right_top()],
+                Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+            );
+            let font = FontId::monospace(13.0);
+            let y = bar.center().y;
+            painter.text(
+                bar.left_center() + Vec2::new(8.0, 0.0),
+                Align2::LEFT_CENTER,
+                "find:",
+                font.clone(),
+                Color32::from_rgb(0x88, 0x88, 0x88),
+            );
+            // The query text, then a caret — the bar's input model is
+            // append/backspace, so the caret always sits at the end.
+            let query_x = bar.left() + 52.0;
+            let galley =
+                painter.layout_no_wrap(find.query().to_string(), font.clone(), Color32::WHITE);
+            painter.galley(
+                Pos2::new(query_x, y - galley.size().y / 2.0),
+                galley.clone(),
+                Color32::WHITE,
+            );
+            painter.rect_filled(
+                Rect::from_center_size(
+                    Pos2::new(query_x + galley.size().x + 3.0, y),
+                    Vec2::new(2.0, 14.0),
+                ),
+                0.0,
+                Color32::from_rgb(0xD8, 0xD8, 0xD8),
+            );
+            // Right edge: the `n/m` count (or "no matches") plus the
+            // bar's key hints.
+            let count = match find.position() {
+                Some((n, total)) => format!("{n}/{total}"),
+                None if find.query().is_empty() => String::new(),
+                None => "no matches".to_string(),
+            };
+            let hint = if count.is_empty() {
+                "type to search · Esc close".to_string()
+            } else {
+                format!("{count} · Enter/↓ next · Shift+Enter/↑ prev · Esc close")
+            };
+            painter.text(
+                bar.right_center() + Vec2::new(-8.0, 0.0),
+                Align2::RIGHT_CENTER,
+                hint,
+                font,
+                Color32::from_rgb(0x88, 0x88, 0x88),
+            );
+        }
     }
 }
 
@@ -1742,6 +1963,39 @@ fn activate_profile(shared: &mut Shared, name: String) {
     shared.profile = name;
 }
 
+/// The find bar's open chord: `Ctrl+F` (Linux/Windows) or `⌘F`
+/// (macOS) — the `command` modifiers' source bits, with `Alt` excluded
+/// so `Option-F`/`Alt+F` chords keep passing through. Shift is allowed
+/// (`Ctrl+Shift+F` is the other find convention). GUI-local like zoom:
+/// the TUI has no find bar so the keymap can't own the chord — and it
+/// does shadow readline's `C-f` forward-char, the same sanctioned
+/// trade the keymap records for `Alt+B`/`M-b`.
+fn find_open_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    key == egui::Key::F && (modifiers.ctrl || modifiers.mac_cmd) && !modifiers.alt
+}
+
+/// Scroll the view the minimum amount that puts `hit`'s row on screen:
+/// a visible match doesn't move the view, one above tops at its line
+/// (the block-nav rule `scroll_to_line` applies), one below lands on
+/// the bottom row.
+fn reveal_hit(shared: &mut Shared, hit: SearchHit) {
+    let Some(tab) = shared.tabs.active_mut() else {
+        return;
+    };
+    let scrollback = i64::try_from(tab.scrollback()).unwrap_or(i64::MAX);
+    let offset = i64::try_from(tab.scroll_offset()).unwrap_or(i64::MAX);
+    let rows = tab.grid().lines() as i64;
+    // Grid line → live coordinate: `live = line + scrollback` — the
+    // same conversion `select_block`'s `to_grid` runs in reverse.
+    let live = hit.line as i64 + scrollback;
+    let screen = hit.line as i64 + offset;
+    if screen < 0 {
+        tab.scroll_to_line(live.max(0) as usize);
+    } else if screen >= rows {
+        tab.scroll_to_line((live - rows + 1).max(0) as usize);
+    }
+}
+
 /// Boot failures that abort the window — spawn errors only; config,
 /// store and ctl failures degrade to toasts like the TUI.
 #[derive(Debug)]
@@ -1815,6 +2069,7 @@ mod tests {
                 // resolution never blocks on the Secret Service.
                 suggester: CommandSuggester::with_secret_store(config::NoSecrets),
                 suggestion: SuggestionPin::new(),
+                find: None,
             }));
             Self {
                 app: GuiApp {
@@ -1831,7 +2086,6 @@ mod tests {
                     panel_pane: None,
                     panel_rows: 0,
                     quit: false,
-                    find_open: false,
                 },
                 shared,
                 ctx: egui::Context::default(),

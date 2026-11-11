@@ -7,7 +7,8 @@
 //! [`remote::SshSpawn`], [`shell_bridge::TabBridge`], the [`ctl`]
 //! server/codec/dispatch, the [`headless`] driver,
 //! [`suggest::InputShadow`] + the suggestion triggers,
-//! [`selection`]/[`scroll`] state, [`status::StatusLine`] +
+//! [`selection`]/[`scroll`] state, [`search`] (the §5.12 scrollback
+//! search + find-bar state), [`status::StatusLine`] +
 //! [`status::Toast`], [`store::StoreHandle`],
 //! [`transcript::Transcript`], [`config::LiveSettings`],
 //! [`skills::LiveSkills`], the [`profile`]/[`conversations`] picker
@@ -35,6 +36,7 @@ pub mod keymap;
 pub mod profile;
 pub mod remote;
 pub mod scroll;
+pub mod search;
 pub mod selection;
 pub mod shell_bridge;
 pub mod skills;
