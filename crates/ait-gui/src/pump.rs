@@ -23,12 +23,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use ait_app::config::{self, LiveSettings};
+use ait_app::config;
 use ait_app::ctl::{CtlServer, FollowUp};
-use ait_app::profile;
-use ait_app::status::{notification_text, Toast};
+use ait_app::dispatch;
 use ait_config::SettingsWatcher;
 use ait_term::{Cursor, LiveEvent, SessionEvent};
 use eframe::egui::Context;
@@ -184,35 +183,15 @@ fn drain_pass(
         ..
     } = &mut *shared;
 
-    // Settings reload (Spec R03 us-10/11): a good save adopts the new
-    // `LiveSettings` and replaces the NEW-session template — existing
-    // tabs keep spawn-time values; a broken save toasts and keeps
-    // last-good.
+    // Settings reload (Spec R03 us-10/11): the shared drain — a good
+    // save adopts the new `LiveSettings` and replaces the NEW-session
+    // template (existing tabs keep spawn-time values), a vanished
+    // armed profile toasts, an open picker drops, and a broken save
+    // toasts while keeping last-good.
     if let Some(watcher) = watcher {
-        while let Ok(event) = watcher.receiver().try_recv() {
-            activity.config = true;
-            match event {
-                Ok(settings) => {
-                    tabs.set_session_template(config::session_template(&settings));
-                    let vanished = profile::active_missing(config.settings(), &settings, profile)
-                        .then(|| profile.clone());
-                    *config = LiveSettings::adopt(settings);
-                    *picker = None;
-                    if let Some(name) = vanished {
-                        *toast = Some(Toast::new(
-                            format!("execution profile \"{name}\" no longer declared"),
-                            Instant::now(),
-                        ));
-                    }
-                }
-                Err(error) => {
-                    *toast = Some(Toast::new(
-                        format!("config error: {}", error.message()),
-                        Instant::now(),
-                    ));
-                }
-            }
-        }
+        activity.config |=
+            config::drain_config_events(watcher.receiver(), config, profile, picker, toast, tabs)
+                > 0;
     }
     // The skills catalog drains beside it (§5.10.2): each debounced
     // burst refreshes what the next `AgentRequest` snapshots.
@@ -239,11 +218,7 @@ fn drain_pass(
             activity.ctl = true;
             match follow {
                 FollowUp::OpenedTab => {
-                    if let Some(tab) = tabs.active_mut() {
-                        if let Some(id) = store.session_started(toast, tab.title(), tab.cwd()) {
-                            tab.set_store_session(id);
-                        }
-                    }
+                    dispatch::register_active_session(tabs, store, toast);
                 }
             }
         }
@@ -258,24 +233,13 @@ fn drain_pass(
     // opted into.
     for tab_event in tabs.drain_events() {
         activity.session = true;
+        // OSC 9/777: the child asked for a notification — the shared
+        // fold prefixes a background tab's toast with its `N:title`
+        // label (Spec R02 user story 16).
+        if dispatch::notification_toast(&tab_event, tabs, toast) {
+            continue;
+        }
         match tab_event.event {
-            // OSC 9/777: the child asked for a notification. A
-            // background tab's toast is prefixed with its `N:title`
-            // label so it surfaces with attribution (Spec R02 user
-            // story 16) — the TUI's status-line rule, verbatim.
-            LiveEvent::Osc(SessionEvent::Notification { title, message }) => {
-                let source = if tab_event.tab == tabs.active_index() {
-                    None
-                } else {
-                    tabs.tabs()
-                        .get(tab_event.tab)
-                        .map(|tab| tab.label(tab_event.tab))
-                };
-                *toast = Some(Toast::new(
-                    notification_text(source.as_deref(), title.as_deref(), &message),
-                    Instant::now(),
-                ));
-            }
             // Child-app OSC 52 (`[terminal] osc52` opt-in, Spec R02):
             // the GUI IS the host, so the request writes the one
             // system clipboard egui exposes — `Selection` (X11
@@ -351,7 +315,9 @@ mod tests {
     //! headless seam; these tests drive the pump's `Shared` exactly
     //! the way `new`+`Pump::start` wire it.
     use super::*;
+    use ait_app::config::LiveSettings;
     use ait_app::ctl::{decode_response, encode_request, Request, Response};
+    use ait_app::profile;
     use ait_app::skills::LiveSkills;
     use ait_app::store::StoreHandle;
     use ait_app::tabs::{SessionTemplate, Tab, TabManager};
@@ -359,6 +325,7 @@ mod tests {
     use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
+    use std::time::Instant;
 
     /// Options spawning an interactive `/bin/sh` — the cheap real
     /// session the ait-app ctl tests also drive.

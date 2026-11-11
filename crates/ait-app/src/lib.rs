@@ -29,6 +29,7 @@ pub mod blocks;
 pub mod config;
 pub mod conversations;
 pub mod ctl;
+pub mod dispatch;
 pub mod headless;
 pub mod inband;
 pub mod integration;

@@ -11,7 +11,13 @@
 //! roles the selection drives live in `ait-agent`/`ait-config`
 //! (standard 9 — the binary stores the selection and passes the name).
 
+use std::time::Instant;
+
 use ait_config::Settings;
+use ait_term::{Key, KeyEvent};
+
+use crate::keymap;
+use crate::status::Toast;
 
 /// The profile every launch starts on (Spec R07 us-27: the selection
 /// is ephemeral — nothing ever writes it back to `settings.toml`).
@@ -56,6 +62,74 @@ pub fn switch(names: &[String], active: &str) -> Switch {
 /// slot entirely so the R03 layout is byte-for-byte what it was.
 pub fn status_slot(active: &str) -> Option<&str> {
     (active != DEFAULT_PROFILE).then_some(active)
+}
+
+/// The `Alt+P` dispatch (Spec R07 us-23): a second press dismisses an
+/// open picker; otherwise the declared-profile count decides — a
+/// picker over three or more, a direct cycle between two, a toast
+/// when there is nothing to switch to.
+pub fn switch_profile(
+    settings: &Settings,
+    picker: &mut Option<ProfilePicker>,
+    profile: &mut String,
+    toast: &mut Option<Toast>,
+) {
+    if picker.take().is_some() {
+        return;
+    }
+    let names: Vec<String> = settings.agents.execution_profiles.keys().cloned().collect();
+    match switch(&names, profile) {
+        Switch::Picker => *picker = Some(ProfilePicker::new(names, profile)),
+        Switch::Cycle(name) => activate_profile(profile, name, toast),
+        Switch::Unavailable => {
+            *toast = Some(Toast::new(
+                "no other execution profiles declared",
+                Instant::now(),
+            ));
+        }
+    }
+}
+
+/// Arm `name` as the active profile — a real switch confirms with
+/// the spec's toast; arming the already-active name is a no-op
+/// (us-23's picker-Enter on the same row stays silent).
+pub fn activate_profile(profile: &mut String, name: String, toast: &mut Option<Toast>) {
+    if name == *profile {
+        return;
+    }
+    *toast = Some(Toast::new(
+        format!("execution profile switched to \"{name}\""),
+        Instant::now(),
+    ));
+    *profile = name;
+}
+
+/// One key while the picker is open: ↑/↓ wrap the highlight, Enter
+/// (either key — `keymap::normalize` folds the keypad's in) arms the
+/// highlighted name, plain Esc dismisses, everything else swallows.
+pub fn picker_key(
+    key: &KeyEvent,
+    picker: &mut Option<ProfilePicker>,
+    profile: &mut String,
+    toast: &mut Option<Toast>,
+) {
+    let Some(p) = picker.as_mut() else {
+        return;
+    };
+    if keymap::normalize(key.key) == Key::Enter {
+        let name = p.selected_name().to_string();
+        *picker = None;
+        activate_profile(profile, name, toast);
+        return;
+    }
+    match key.key {
+        Key::Up => p.prev(),
+        Key::Down => p.next(),
+        Key::Escape if key.modifiers.is_empty() => {
+            *picker = None;
+        }
+        _ => {}
+    }
 }
 
 /// The reload fail-safe's toast condition (Spec R07 us-28): the armed

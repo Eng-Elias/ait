@@ -21,8 +21,9 @@ use ait_agent::CommandSuggester;
 use ait_app::agent_panel::{self, AgentPanel};
 use ait_app::blocks::BlockStatus;
 use ait_app::config::{self, LiveSettings};
-use ait_app::conversations::ConversationPicker;
+use ait_app::conversations::{self, ConversationPicker};
 use ait_app::ctl::{self, CtlServer};
+use ait_app::dispatch;
 use ait_app::integration::IntegrationState;
 use ait_app::keymap::{self, AppAction, CapabilityTier, Resolution};
 use ait_app::profile::{self, ProfilePicker};
@@ -32,10 +33,10 @@ use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
 use ait_app::status::{self, block_text, status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
-use ait_app::suggest::{self, SuggestionPin};
+use ait_app::suggest::SuggestionPin;
 use ait_app::tabs::TabManager;
 use ait_config::Settings;
-use ait_term::{Key, KeyEvent, Keypad, Modifiers, Size};
+use ait_term::{Key, KeyEvent, Modifiers, Size};
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2, ViewportCommand,
 };
@@ -199,11 +200,7 @@ impl GuiApp {
             Instant::now(),
         );
         let mut store = store;
-        if let Some(tab) = tabs.active_mut() {
-            if let Some(id) = store.session_started(&mut toast, tab.title(), tab.cwd()) {
-                tab.set_store_session(id);
-            }
-        }
+        dispatch::register_active_session(&mut tabs, &mut store, &mut toast);
 
         let shared = Arc::new(Mutex::new(Shared {
             tabs,
@@ -336,39 +333,23 @@ impl GuiApp {
             Resolution::Action(AppAction::NextTab) => shared.tabs.activate_next(),
             Resolution::Action(AppAction::PrevTab) => shared.tabs.activate_prev(),
             Resolution::Action(AppAction::JumpToTab(n)) => shared.tabs.jump_to(n),
+            // `Alt+A` (Spec R06): the shared toggle — open focuses,
+            // a second press while focused closes — then `resize_active`
+            // re-derives THIS tab's winsize through the GUI's
+            // `session_size` (panels are per-tab).
             Resolution::Action(AppAction::AgentPanel) => {
-                let Some(tab) = shared.tabs.active_mut() else {
-                    return;
-                };
-                tab.clear_selection();
-                tab.toggle_agent_panel();
-                // Only THIS tab's winsize changed — `resize_active`
-                // re-derives it through the same GUI session_size.
-                shared.tabs.resize_active(session_size);
+                dispatch::toggle_agent_panel(&mut shared.tabs, session_size);
             }
+            // `Alt+P` (Spec R07 §5.7): the shared switch — a second
+            // press dismisses the open picker; otherwise the declared
+            // count picks picker/cycle/unavailable.
             Resolution::Action(AppAction::SwitchProfile) => {
-                if shared.picker.take().is_none() {
-                    let names: Vec<String> = shared
-                        .config
-                        .settings()
-                        .agents
-                        .execution_profiles
-                        .keys()
-                        .cloned()
-                        .collect();
-                    match profile::switch(&names, &shared.profile) {
-                        profile::Switch::Picker => {
-                            shared.picker = Some(ProfilePicker::new(names, &shared.profile));
-                        }
-                        profile::Switch::Cycle(name) => activate_profile(shared, name),
-                        profile::Switch::Unavailable => {
-                            shared.toast = Some(Toast::new(
-                                "no other execution profiles declared",
-                                Instant::now(),
-                            ));
-                        }
-                    }
-                }
+                profile::switch_profile(
+                    shared.config.settings(),
+                    &mut shared.picker,
+                    &mut shared.profile,
+                    &mut shared.toast,
+                );
             }
             // `Alt+Enter` (Spec R04 us-11/12) — the TUI's arm verbatim:
             // the input line itself is the request, verified through
@@ -399,27 +380,13 @@ impl GuiApp {
             // a time. The list is a snapshot taken here; an empty
             // store toasts instead of opening nothing.
             Resolution::Action(AppAction::Conversations) => {
-                if shared.conversations.take().is_some() {
-                    // Toggled closed — the highlight is dropped.
-                } else {
-                    shared.picker = None;
-                    match shared.store.conversations() {
-                        Ok(listed) if listed.is_empty() => {
-                            shared.toast =
-                                Some(Toast::new("no stored conversations", Instant::now()));
-                        }
-                        Ok(listed) => {
-                            shared.conversations =
-                                Some(ConversationPicker::new(&listed, SystemTime::now()));
-                        }
-                        Err(error) => {
-                            shared.toast = Some(Toast::new(
-                                format!("conversations list failed: {error}"),
-                                Instant::now(),
-                            ));
-                        }
-                    }
-                }
+                conversations::toggle(
+                    &mut shared.conversations,
+                    &mut shared.picker,
+                    &shared.store,
+                    &mut shared.toast,
+                    SystemTime::now(),
+                );
             }
             Resolution::Action(action) => {
                 let Some(tab) = shared.tabs.active_mut() else {
@@ -480,21 +447,24 @@ impl GuiApp {
                 }
             }
             Resolution::PassThrough => {
-                // An open profile picker owns unbound keys (same as the
-                // TUI): nothing leaks to the PTY mid-pick.
-                if shared.picker.is_some() {
+                // An open picker owns unbound keys (Spec R07 §5.7 /
+                // R08-T6) — the shared overlay routing: ↑/↓ move the
+                // highlight, Enter arms/resumes the highlighted row,
+                // `Ctrl+D` deletes behind its one-key confirm, plain
+                // Esc dismisses, and everything else is swallowed so
+                // nothing leaks to the PTY mid-pick.
+                if shared.picker.is_some() || shared.conversations.is_some() {
                     if let Some(key) = key {
-                        picker_key(&key, shared);
-                    }
-                    return;
-                }
-                // The open conversation picker owns unbound keys the
-                // same way (Spec R08-T6): ↑/↓ move, Enter resumes,
-                // `Ctrl+D` deletes behind its confirm, plain Esc
-                // dismisses — nothing leaks to the PTY mid-pick.
-                if shared.conversations.is_some() {
-                    if let Some(key) = key {
-                        conversation_key(&key, shared);
+                        dispatch::overlay_key(
+                            &key,
+                            &mut shared.picker,
+                            &mut shared.conversations,
+                            &mut shared.tabs,
+                            &mut shared.store,
+                            &mut shared.profile,
+                            &mut shared.toast,
+                            session_size,
+                        );
                     }
                     return;
                 }
@@ -508,113 +478,23 @@ impl GuiApp {
                     }
                     return;
                 }
-                // The active tab's index BEFORE the mutable borrow —
-                // in-flight keys are scoped to the pinned tab (Spec
-                // R04 user story 14).
-                let index = shared.tabs.active_index();
-                // In-flight keys (Spec R04 us-8/9/10): intercepted
-                // BEFORE the PTY-input path, and scoped to the pinned
-                // tab — on the tab whose request is streaming, Esc
-                // cancels and Enter is swallowed so a half-written
-                // command can't run; on every other tab both keys
-                // behave normally.
-                let suggestion_here = shared.suggestion.is_live_for(&shared.tabs, index);
-                let Some(tab) = shared.tabs.active_mut() else {
-                    return;
-                };
-                tab.clear_selection();
-                // A focused agent panel owns the keystroke (Spec R06)
-                // — never the PTY, never the input shadow.
-                if tab.agent_focused() {
-                    if let Some(key) = key {
-                        tab.agent_key(
-                            &key,
-                            shared.config.settings(),
-                            &shared.profile,
-                            &mut shared.skills,
-                            &mut shared.toast,
-                        );
-                    }
-                    return;
-                }
-                tab.snap_to_bottom();
-                if suggestion_here {
-                    match key.map(|key| key.key) {
-                        // Plain Esc cancels: token + envelope close +
-                        // `Ctrl+U` to wipe the partial line. A modified
-                        // Esc is left for the PTY like any other chord.
-                        Some(Key::Escape) if key.is_some_and(|key| key.modifiers.is_empty()) => {
-                            shared.suggestion.cancel(&shared.suggester, tab);
-                            return;
-                        }
-                        // Any Enter variant is swallowed — including
-                        // `Ctrl+Enter`, which encodes `\r` and would
-                        // execute the partial command (us-9) — and the
-                        // keypad Enter that encodes the same.
-                        Some(Key::Enter) | Some(Key::Keypad(Keypad::Enter)) => {
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                if tab.exit_status().is_none() {
-                    if let Some(key_event) = key {
-                        // The `# `+Enter trigger (Spec R04): verify
-                        // while the shadow still holds the line and
-                        // the grid still shows its echo — before the
-                        // submission resets the shadow and the
-                        // forwarded `\r` moves the cursor. Enter is
-                        // sent to the PTY either way: `# …` is a
-                        // comment no-op that lands in history
-                        // (us-2). A live pin gates the next
-                        // trigger — one request in flight at a time.
-                        if shared.suggestion.is_none() && suggest::is_submission(&key_event) {
-                            if let Some(request) =
-                                suggest::request_for(tab, shared.config.settings(), &shared.profile)
-                            {
-                                shared.suggestion.fire(
-                                    &shared.suggester,
-                                    tab.id,
-                                    request,
-                                    &mut shared.toast,
-                                );
-                            } else if let Some((line, request)) = suggest::classified_request(
-                                tab,
-                                shared.config.settings(),
-                                &shared.profile,
-                            ) {
-                                // The third trigger (§5.10.4, Spec
-                                // R11-T2): a natural-language verdict
-                                // swallows the Enter and rewrites the
-                                // submission — `Ctrl+U` wipes the
-                                // typed line, `# <line>` + `\r` lands
-                                // the request in history as a comment
-                                // and draws the fresh prompt the
-                                // armed suggestion streams onto
-                                // (ADR-0007 semantics). The rewrite
-                                // goes out ONLY once the request is
-                                // armed: a refused `fire` falls
-                                // through to the ordinary verbatim
-                                // submission below — the
-                                // erase-after-fire ordering
-                                // `suggest_from_line` established.
-                                if shared.suggestion.fire(
-                                    &shared.suggester,
-                                    tab.id,
-                                    request,
-                                    &mut shared.toast,
-                                ) {
-                                    suggest::rewrite_as_comment(tab, &line);
-                                    return;
-                                }
-                            }
-                        }
-                        // The input shadow tracks what reaches the
-                        // PTY — the `# `-trigger verification reads it.
-                        tab.shadow.update(&key_event);
-                        let _ = tab.session.send_key(key_event);
-                    }
-                }
+                // The pass-through tail — a focused agent panel owns
+                // the keystroke (Spec R06); an in-flight suggestion
+                // swallows Enter/cancels on Esc scoped to the pinned
+                // tab (Spec R04 us-8/9/10); the `# `+Enter and
+                // classifier triggers arm the suggester; anything
+                // left encodes through the input shadow to the PTY —
+                // the shared fold the TUI runs.
+                dispatch::passthrough_key(
+                    key,
+                    &mut shared.tabs,
+                    &shared.suggester,
+                    &mut shared.suggestion,
+                    shared.config.settings(),
+                    &shared.profile,
+                    &mut shared.skills,
+                    &mut shared.toast,
+                );
             }
         }
     }
@@ -808,39 +688,19 @@ impl GuiApp {
     // Tab lifecycle — shared by the keymap actions above and the tab
     // bar's click targets below, so binding and button can never drift.
 
-    /// `Alt+T` / the bar's "+": spawn a tab and register its
-    /// `terminal_sessions` row. A spawn failure toasts instead of
-    /// taking the window down — the session model stays up (graceful
-    /// degrade, like the TUI).
+    /// `Alt+T` / the bar's "+": the shared spawn — a tab plus its
+    /// `terminal_sessions` row; a spawn failure toasts instead of
+    /// taking the window down (graceful degrade, like the TUI).
     fn open_tab(&mut self, shared: &mut Shared) {
-        if let Err(error) = shared.tabs.new_tab() {
-            shared.toast = Some(Toast::new(
-                format!("new tab failed: {error}"),
-                Instant::now(),
-            ));
-        } else if let Some(tab) = shared.tabs.active_mut() {
-            if let Some(id) =
-                shared
-                    .store
-                    .session_started(&mut shared.toast, tab.title(), tab.cwd())
-            {
-                tab.set_store_session(id);
-            }
-        }
+        dispatch::new_tab(&mut shared.tabs, &mut shared.store, &mut shared.toast);
     }
 
-    /// `Alt+W` / a chip's "×": store bookkeeping lands BEFORE the tab
-    /// goes (same order the TUI captures it), then the manager drops
-    /// it. Closing the last tab leaves an empty manager — guard before
-    /// indexing and exit (CODING_STANDARDS §6).
+    /// `Alt+W` / a chip's "×": the shared close — store bookkeeping
+    /// (`ended_at`, `closed`) lands BEFORE the tab goes, then the
+    /// manager drops it. `false` = the set is now empty: exit rather
+    /// than ever indexing it (CODING_STANDARDS §6).
     fn close_active_tab(&mut self, shared: &mut Shared) {
-        if let Some(id) = shared.tabs.active().and_then(|tab| tab.store_session()) {
-            shared.store.session_ended(&mut shared.toast, id);
-        }
-        if let Some(id) = shared.tabs.active().and_then(|tab| tab.conversation()) {
-            shared.store.conversation_closed(&mut shared.toast, id);
-        }
-        if !shared.tabs.close_active() {
+        if !dispatch::close_active_tab(&mut shared.tabs, &mut shared.store, &mut shared.toast) {
             self.quit = true;
         }
     }
@@ -1752,140 +1612,10 @@ fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
     }
 }
 
-/// One key while the conversation picker is open (Spec R08-T6,
-/// us-5/11) — the TUI's `conversation_key`, verbatim: ↑/↓ move the
-/// highlight, Enter resumes the highlighted row into the active
-/// tab's panel, `Ctrl+D` arms then confirms the delete (one
-/// gesture, never an accident — any other key disarms), plain Esc
-/// dismisses. `shared.conversations` is `Some` on entry — the
-/// caller already routed.
-fn conversation_key(key: &KeyEvent, shared: &mut Shared) {
-    enum Outcome {
-        /// Nothing happened — key consumed.
-        None,
-        /// Close the picker.
-        Close,
-        /// Resume `id` into the active tab's panel.
-        Resume(i64),
-        /// The armed confirm fired: delete `id`.
-        Delete(i64),
-    }
-    let outcome = {
-        let Some(picker) = shared.conversations.as_mut() else {
-            return;
-        };
-        // `Ctrl+D` is the one-key confirm's whole vocabulary: the
-        // first press arms, the second deletes. Anything else first
-        // disarms, then does its usual thing — a stray key can never
-        // sneak a delete past the user (us-11).
-        if key.key == Key::Char('d') && key.modifiers == Modifiers::CONTROL {
-            if picker.confirming() {
-                match picker.selected_row() {
-                    Some(row) => Outcome::Delete(row.id),
-                    None => Outcome::Close,
-                }
-            } else {
-                picker.arm_delete();
-                Outcome::None
-            }
-        } else {
-            picker.disarm_delete();
-            match key.key {
-                Key::Up => {
-                    picker.prev();
-                    Outcome::None
-                }
-                Key::Down => {
-                    picker.next();
-                    Outcome::None
-                }
-                Key::Enter => match picker.selected_row() {
-                    Some(row) => Outcome::Resume(row.id),
-                    None => Outcome::Close,
-                },
-                Key::Escape if key.modifiers.is_empty() => Outcome::Close,
-                _ => Outcome::None,
-            }
-        }
-    };
-    match outcome {
-        Outcome::None => {}
-        Outcome::Close => shared.conversations = None,
-        Outcome::Resume(id) => {
-            shared.conversations = None;
-            resume_conversation(id, shared);
-        }
-        Outcome::Delete(id) => {
-            if shared.store.delete_conversation(&mut shared.toast, id) {
-                // The row is gone — every tab bound to it must open
-                // a new row rather than append to a deleted one.
-                shared.tabs.detach_conversation(id);
-                if let Some(picker) = shared.conversations.as_mut() {
-                    picker.remove_selected();
-                    if picker.rows().is_empty() {
-                        shared.conversations = None;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// `Enter` on a picker row: load the conversation and swap the
-/// active tab's panel to it (Spec R08-T6, us-6/10) — the TUI's
-/// `resume_conversation`, verbatim. Refused with a toast while the
-/// tab's task runs — a live run is never clobbered. The reads land
-/// BEFORE the swap so a failed load changes nothing; the row binds
-/// so every later flush appends to it.
-fn resume_conversation(id: i64, shared: &mut Shared) {
-    let running = shared
-        .tabs
-        .active()
-        .and_then(|tab| tab.agent_panel())
-        .is_some_and(AgentPanel::is_running);
-    if running {
-        shared.toast = Some(Toast::new(
-            "a task is still running — resume refused",
-            Instant::now(),
-        ));
-        return;
-    }
-    let items = match shared.store.load_transcript(id) {
-        Ok(items) => items,
-        Err(error) => {
-            shared.toast = Some(Toast::new(
-                format!("transcript load failed: {error}"),
-                Instant::now(),
-            ));
-            return;
-        }
-    };
-    let plan = match shared.store.load_plan(id) {
-        Ok(Some(ait_agent::TranscriptItem::Plan { todos })) => Some(todos),
-        Ok(_) => None,
-        Err(error) => {
-            shared.toast = Some(Toast::new(
-                format!("plan load failed: {error}"),
-                Instant::now(),
-            ));
-            return;
-        }
-    };
-    if let Some(tab) = shared.tabs.active_mut() {
-        let previous = tab.conversation();
-        tab.resume_conversation(id, items, plan);
-        shared.toast = Some(Toast::new("conversation resumed", Instant::now()));
-        // `status` mirrors the binding: the resumed row re-opens,
-        // and the row this tab just swapped away from is unowned now.
-        shared.store.conversation_reopened(&mut shared.toast, id);
-        if let Some(old) = previous.filter(|old| *old != id) {
-            shared.store.conversation_closed(&mut shared.toast, old);
-        }
-    }
-    // The panel may have opened on a tab that never had one —
-    // re-derive its winsize through the same path `Alt+A` takes.
-    shared.tabs.resize_active(session_size);
-}
+/// `Enter` on a picker row, `Ctrl+D`'s delete, and every other picker
+/// key all route through `conversations::picker_key` now — the
+/// frontend-neutral half the TUI's `conversation_key` shared
+/// (Spec R13 §5.12, ADR-0016).
 
 /// The creation-time cell estimate — fonts don't exist until the
 /// first `Context::run`, so `GuiApp::new` can't read the glyph table.
@@ -1907,40 +1637,6 @@ fn cell_metrics(ctx: &egui::Context, metrics: &GuiMetrics) -> CellMetrics {
         width: fonts.glyph_width(&font, 'M').max(1.0),
         height: fonts.row_height(&font).max(1.0),
     })
-}
-
-/// `Alt+P` picker keys — the TUI's `picker_key` unchanged: ↑/↓ move,
-/// Enter arms, plain Esc dismisses, everything else is swallowed.
-fn picker_key(key: &KeyEvent, shared: &mut Shared) {
-    let Some(picker) = shared.picker.as_mut() else {
-        return;
-    };
-    match key.key {
-        Key::Up => picker.prev(),
-        Key::Down => picker.next(),
-        Key::Enter | Key::Keypad(Keypad::Enter) => {
-            let name = picker.selected_name().to_string();
-            shared.picker = None;
-            activate_profile(shared, name);
-        }
-        Key::Escape if key.modifiers.is_empty() => {
-            shared.picker = None;
-        }
-        _ => {}
-    }
-}
-
-/// Arm the chosen profile — the TUI's `activate_profile`: a real
-/// switch confirms with the spec's toast, re-arming stays silent.
-fn activate_profile(shared: &mut Shared, name: String) {
-    if name == shared.profile {
-        return;
-    }
-    shared.toast = Some(Toast::new(
-        format!("execution profile switched to \"{name}\""),
-        Instant::now(),
-    ));
-    shared.profile = name;
 }
 
 /// The find bar's open chord: `Ctrl+F` (Linux/Windows) or `⌘F`
@@ -2001,6 +1697,7 @@ mod tests {
 
     use super::*;
     use ait_agent::SuggestEvent;
+    use ait_app::suggest;
     use ait_app::tabs::SessionTemplate;
     use ait_term::{LiveSessionOptions, Modifiers};
 
