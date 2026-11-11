@@ -6,6 +6,16 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
 - **Session** — one PTY + shell process + its grid and blocks.
 - **Tab** — one session plus its viewport, scroll offset and selection
   state.
+- **Frontend** — one user-facing shell over the session model: the `ait`
+  TUI (ratatui/crossterm), the `ait-gui` desktop binary (eframe/egui on
+  wgpu), or the headless driver. A frontend owns only its native
+  event→`KeyEvent` translation and its paint — it holds no business
+  logic (§1.1, §5.12, ADR-0016).
+- **Session model** — the frontend-agnostic state in `ait-app` that
+  every frontend renders identically: the `TabManager`'s tabs with
+  their grids, blocks, scroll/selection, the agent panel's
+  entries/gates/plan, the pickers, the status line and the ctl
+  surface (§5.12, ADR-0016).
 - **Grid** — the styled cell matrix plus scrollback for a session.
 - **Block** — one command, its output and exit code, delimited by shell hooks.
 - **Shell integration / rc snippet** — the script injected into a shell that
