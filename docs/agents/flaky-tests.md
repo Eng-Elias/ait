@@ -25,6 +25,7 @@ investigate, don't retry-loop the gate hoping for green.
 | `app::tests::esc_after_the_rewrite_only_cancels_the_suggestion` | fixed in R12 (wait_until wrap); was ~3/8 failures under load |
 | `tabs::tests::sealed_blocks_surface_once_as_persisted_rows` | open — flake seen R12, untouched since R11 |
 | `shell_integration::bash_blocks_copy_and_inband_roundtrip` | open — flake seen R12, untouched since R05 |
+| `ait-agent pty::tests::the_agent_shell_arms_the_ssh_policy` | open — flake seen R13-T2 (fails while other test binaries still compile; passes isolated and under a quiet parallel load), file untouched since R09 |
 
 The underlying PTY races are tracked in the `Backlog: PTY-timing
 flakes under parallel test load` issue — the entries above leave the
