@@ -1590,6 +1590,14 @@ impl TabManager {
         &self.tabs
     }
 
+    /// All tabs, mutably, in tab-bar order — the per-tab drain pass a
+    /// frontend runs when its own bookkeeping (e.g. the GUI pump's
+    /// damage/cursor diff, Spec R13 §5.12) needs `&mut` access the
+    /// manager's batched drains don't already cover.
+    pub fn tabs_mut(&mut self) -> &mut [Tab] {
+        &mut self.tabs
+    }
+
     /// The tab whose `AIT_SESSION_ID` is `session_id` — `ait ctl`'s
     /// `--tab` targeting (Spec R11 §5.10.5). The env-exported identity
     /// IS the stable [`Tab::id`] as text, so the lookup resolves the

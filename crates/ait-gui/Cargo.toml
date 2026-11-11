@@ -1,0 +1,38 @@
+[package]
+name = "ait-gui"
+version.workspace = true
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "AIT's GUI frontend (Spec R13 §5.12): a native desktop window — eframe/egui over wgpu — rendering the same ait-app session model the TUI renders."
+# cargo-dist (Spec R12 §5.11) requires the source host to compute the
+# release artifact URLs for the shell installer.
+repository = "https://github.com/Eng-Elias/ait"
+
+[dependencies]
+# The byte-fed terminal core: `KeyEvent`/`Key`/`Modifiers` the key shim
+# produces, `GridView`/`Cell`/`Style` the grid painter plans from, and
+# `Size`/`Damage`/`Cursor` for layout + repaint decisions.
+ait-term = { path = "../ait-term" }
+# The shared session model (Spec R13-T1): `TabManager`/`Tab`/
+# `SessionTemplate`, the `keymap` resolver over `CapabilityTier::Enhanced`,
+# `LiveSettings`/`session_template`/`watcher`, `StoreHandle`, the picker
+# states, `StatusLine`/`Toast`, scroll/selection state and the ctl server.
+ait-app = { path = "../ait-app" }
+# `Settings`/`load` for the live config the pump forwards and the
+# `ConfigError` toast text; the `watch` feature arrives via ait-app.
+ait-config = { path = "../ait-config" }
+# `CommandSuggester`'s channel handle — the `# `/`Alt+Enter` NL→command
+# triggers' event source (Spec R04).
+ait-agent = { path = "../ait-agent" }
+# Semver requirement per ADR-0002 (release >=7 days old): eframe 0.37.0
+# (2026-10-15) — egui + egui-wgpu + winit arrive transitively at the same
+# line; the toolkit ADR-0017 picks eframe on wgpu with the egui-wgpu
+# paint-callback escape hatch reserved for the grid pass.
+eframe = { version = "0.37", default-features = false, features = [
+    # wgpu is the renderer (ADR-0017); x11+wayland cover the Linux legs,
+    # default_fonts the bundled monospace the grid metrics derive from,
+    # system_fonts the missing-glyph fallback, clipboard the OS copy/paste
+    # path, accesskit the default-on a11y tree.
+    "wgpu", "x11", "wayland", "default_fonts", "system_fonts",
+    "clipboard", "accesskit",
+] }
