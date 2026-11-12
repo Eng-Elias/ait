@@ -61,6 +61,11 @@ pub struct Overlays<'a> {
     /// `Integrated` sessions, which is what keeps MarksOnly/Absent
     /// tabs identical to plain output.
     pub block_chips: Option<&'a [BlockChip]>,
+    /// The Ctrl+hover link affordance (Spec R14 §5.13 us-24): the
+    /// detected token under the pointer, painted as a single
+    /// underline over its cells — `None` unless Ctrl is held and the
+    /// hover sits on a token.
+    pub detect: Option<DetectOverlay>,
 }
 
 /// The find bar's paint inputs — the full hit list plus which index
@@ -71,6 +76,19 @@ pub struct FindOverlay<'a> {
     pub hits: &'a [SearchHit],
     /// The bar's current hit's index into `hits`.
     pub current: Option<usize>,
+}
+
+/// The detected token's paint inputs — the cell span the underline
+/// covers, in `GridView` line space like a find hit (negative lines
+/// are scrollback).
+#[derive(Debug, Clone, Copy)]
+pub struct DetectOverlay {
+    /// The token's grid line.
+    pub line: i32,
+    /// The first covered column.
+    pub column: usize,
+    /// The covered cell count — the underline's width.
+    pub cells: usize,
 }
 
 impl GridSurface<'_> {
@@ -449,6 +467,33 @@ fn paint_find(
     }
 }
 
+/// The detected token's underline — one segment at the underline's
+/// usual offset under the token's cell span, in the theme's `link`
+/// color so it reads as clickable rather than as SGR-underlined text.
+/// `line` maps to a screen row by the same `line + offset` rule the
+/// planner and the find wash share.
+fn paint_detect(
+    surface: &GridSurface<'_>,
+    detect: DetectOverlay,
+    scroll_offset: usize,
+    rows: usize,
+) {
+    let offset = i64::try_from(scroll_offset).unwrap_or(i64::MAX);
+    let row = detect.line as i64 + offset;
+    if row < 0 || row >= rows as i64 {
+        return;
+    }
+    let y = underline_y(surface.y(row as usize), surface.cell);
+    let x = surface.x(detect.column);
+    surface.painter.line_segment(
+        [
+            Pos2::new(x, y),
+            Pos2::new(x + detect.cells as f32 * surface.cell.width, y),
+        ],
+        Stroke::new(1.0, surface.theme.link),
+    );
+}
+
 /// Command-block chrome (Spec R13-T4): a divider at each block's start
 /// row plus a right-aligned exit-status chip straddling it — the
 /// `✓/✗ <code> · <dur>` label `block_text` formats for the status
@@ -501,9 +546,10 @@ fn paint_block_chrome(surface: &GridSurface<'_>, chips: &[BlockChip]) {
 }
 
 /// Paint the whole grid pane: theme-bg fill, then planned rows, the
-/// find wash, selection wash, block chrome, cursor — the order that
-/// keeps text over backgrounds, both washes over text, the chrome over
-/// the washes, and the cursor over everything. `galleys` is the
+/// find wash, selection wash, the detect underline, block chrome,
+/// cursor — the order that keeps text over backgrounds, both washes
+/// over text, the affordance over the washes, the chrome over that,
+/// and the cursor over everything. `galleys` is the
 /// caller's cross-frame row cache — the pump's damage filter decides
 /// whether this runs at all; the cache keeps the rows it didn't touch
 /// free.
@@ -534,6 +580,9 @@ pub fn paint_grid(
     }
     if let Some(range) = selection {
         paint_selection(surface, range, scroll_offset, width, rows);
+    }
+    if let Some(detect) = overlays.detect {
+        paint_detect(surface, detect, scroll_offset, rows);
     }
     if let Some(chips) = overlays.block_chips {
         paint_block_chrome(surface, chips);

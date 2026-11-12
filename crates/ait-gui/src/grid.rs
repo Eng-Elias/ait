@@ -37,6 +37,10 @@ pub struct GridTheme {
     pub block_ok: Color32,
     /// The exit-status chip's failure color (`✗`).
     pub block_err: Color32,
+    /// The Ctrl+hover link affordance's underline (Spec R14 §5.13 —
+    /// distinct from SGR-underlined text so the token reads as
+    /// clickable).
+    pub link: Color32,
 }
 
 impl Default for GridTheme {
@@ -51,6 +55,7 @@ impl Default for GridTheme {
             block_edge: Color32::from_rgba_unmultiplied(0x88, 0x88, 0x88, 0x40),
             block_ok: Color32::from_rgb(0x4C, 0xAF, 0x50),
             block_err: Color32::from_rgb(0xE0, 0x50, 0x50),
+            link: Color32::from_rgb(0x50, 0xC0, 0xC0),
         }
     }
 }
