@@ -23,7 +23,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ait_term::{CellKind, GridView, Row};
+#[cfg(test)]
+use ait_term::GridView;
+use ait_term::{CellKind, Row};
 
 /// What a detected token routes to — the Ctrl+click targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,12 +198,15 @@ pub fn url_tokens(text: &str) -> Vec<Token> {
     url_scan(&chars)
 }
 
-/// The token under `column` on grid `line`, if any — the seam the
-/// hover affordance and the Ctrl+click route share. `remote`
-/// restricts the scan to URLs: a remote session's paths name remote
-/// entries the local fs can't resolve, so they never afford (the
-/// explorer's own marker rule, from the other side). `cwd` is the
-/// tab's `suggest::cwd_for` answer, `home` the `~` expansion root.
+/// The token under `column` on grid `line`, if any — the uncached
+/// `line_cells` + [`detect_in`] composition the tests drive (the live
+/// affordance goes through [`DetectCache`], which memoizes the same
+/// inputs so the fs probes don't run per frame). `remote` restricts
+/// the scan to URLs: a remote session's paths name remote entries the
+/// local fs can't resolve, so they never afford (the explorer's own
+/// marker rule, from the other side). `cwd` is the tab's
+/// `suggest::cwd_for` answer, `home` the `~` expansion root.
+#[cfg(test)]
 pub fn detect_at(
     grid: &GridView<'_>,
     line: i32,

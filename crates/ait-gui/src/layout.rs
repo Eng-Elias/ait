@@ -121,15 +121,21 @@ pub fn chrome_regions(area: Rect, chrome: Chrome) -> Regions {
 }
 
 /// The tab bar's interactive geometry: one [`TabChip`] per title plus
-/// the trailing new-tab button — [`tab_chips`]'s return, kept whole so
-/// the painter and the hit-tester can never disagree about where a
-/// chip sits (CODING_STANDARDS §17).
+/// the trailing new-tab button and the right-anchored pane button —
+/// [`tab_chips`]'s return, kept whole so the painter and the
+/// hit-tester can never disagree about where a chip sits
+/// (CODING_STANDARDS §17).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabBar {
     /// One chip per title that fit, in tab order.
     pub tabs: Vec<TabChip>,
     /// The "+" button's rect — `None` when even it doesn't fit.
     pub new_tab: Option<Rect>,
+    /// The "panes" button's rect — the pane host's always-on click
+    /// affordance (Spec R14 §5.13 us-1), right-anchored so it never
+    /// wanders as tabs grow; `None` only on a bar too narrow for it
+    /// and "+" together.
+    pub pane_button: Option<Rect>,
 }
 
 /// One tab chip: click the body to activate the tab, click `close` to
@@ -145,12 +151,13 @@ pub struct TabChip {
 
 /// Tab-chip chrome in points: the label's left padding, the close
 /// slot's width (padding included — the glyph centers inside it), the
-/// gap between chips, the new-tab button's width, and the bar's side
-/// margin / vertical inset.
+/// gap between chips, the new-tab button's width, the pane button's
+/// width, and the bar's side margin / vertical inset.
 pub const CHIP_PAD: f32 = 8.0;
 pub const CHIP_CLOSE_W: f32 = 18.0;
 pub const CHIP_GAP: f32 = 2.0;
 pub const NEW_TAB_W: f32 = 24.0;
+pub const PANE_BTN_W: f32 = 44.0;
 pub const CHIP_INSET: f32 = 3.0;
 pub const BAR_MARGIN: f32 = 6.0;
 
@@ -162,17 +169,30 @@ pub const FIND_BAR_H: f32 = 26.0;
 /// in points — the caller measures through egui's font tables, so this
 /// stays pure `f32` math testable without a GPU context (the same seam
 /// as [`grid_size`]). Each chip is `pad label | ×`, the whole chip
-/// width reserved up front so hover never reflows the row. A chip that
-/// wouldn't fit whole before the new-tab button ends the row —
-/// mirroring the TUI bar's right-edge clip — and the "+" trails the
-/// last chip, `None` once even it can't fit.
+/// width reserved up front so hover never reflows the row. The
+/// right-anchored "panes" button is the bar's other always-on
+/// affordance; chips reserve its width and the "+"'s, so a chip that
+/// wouldn't fit whole before the buttons ends the row — mirroring the
+/// TUI bar's right-edge clip — and the "+" trails the last chip,
+/// `None` once even it can't fit.
 pub fn tab_chips(bar: Rect, widths: &[f32]) -> TabBar {
     let inner = bar.shrink2(Vec2::new(BAR_MARGIN, CHIP_INSET));
+    let pane_button = (inner.width() >= NEW_TAB_W + CHIP_GAP + PANE_BTN_W).then(|| {
+        Rect::from_min_size(
+            Pos2::new(inner.right() - PANE_BTN_W, inner.top()),
+            Vec2::new(PANE_BTN_W, inner.height()),
+        )
+    });
+    let pane_w = if pane_button.is_some() {
+        CHIP_GAP + PANE_BTN_W
+    } else {
+        0.0
+    };
     let mut x = inner.left();
     let mut tabs = Vec::with_capacity(widths.len());
     for &width in widths {
         let chip_w = width + CHIP_PAD + CHIP_CLOSE_W;
-        if x + chip_w + NEW_TAB_W > inner.right() {
+        if x + chip_w + NEW_TAB_W + pane_w > inner.right() {
             break;
         }
         let rect =
@@ -184,13 +204,17 @@ pub fn tab_chips(bar: Rect, widths: &[f32]) -> TabBar {
         tabs.push(TabChip { rect, close });
         x += chip_w + CHIP_GAP;
     }
-    let new_tab = (x + NEW_TAB_W <= inner.right()).then(|| {
+    let new_tab = (x + NEW_TAB_W + pane_w <= inner.right()).then(|| {
         Rect::from_min_size(
             Pos2::new(x, inner.top()),
             Vec2::new(NEW_TAB_W, inner.height()),
         )
     });
-    TabBar { tabs, new_tab }
+    TabBar {
+        tabs,
+        new_tab,
+        pane_button,
+    }
 }
 
 /// The side panel's column share on a `width`-column band: two fifths,
@@ -437,34 +461,47 @@ mod tests {
         assert_eq!(second.rect.left(), first.rect.right() + CHIP_GAP);
         assert_eq!(second.rect.width(), 50.0 + CHIP_PAD + CHIP_CLOSE_W);
 
-        // "+" trails the second chip, still inside the bar.
+        // "+" trails the second chip, still inside the bar; "panes"
+        // anchors the bar's right edge.
         let new_tab = layout.new_tab.unwrap();
         assert_eq!(new_tab.left(), second.rect.right() + CHIP_GAP);
         assert_eq!(new_tab.width(), NEW_TAB_W);
         assert!(bar.contains_rect(new_tab));
+        let pane_button = layout.pane_button.unwrap();
+        assert_eq!(pane_button.right(), bar.right() - BAR_MARGIN);
+        assert_eq!(pane_button.width(), PANE_BTN_W);
+        assert!(new_tab.right() + CHIP_GAP <= pane_button.left());
     }
 
-    /// Chips that don't fit whole before the "+" slot end the row —
-    /// the TUI bar's right-edge clip — and an empty bar yields no
-    /// chips and no button (the empty-tab-set guard, standard 6).
+    /// Chips that don't fit whole before the buttons' reserved width
+    /// end the row — the TUI bar's right-edge clip — and an empty bar
+    /// yields no chips and no "+" (the empty-tab-set guard, standard
+    /// 6). The pane button keeps its anchor as long as the bar can
+    /// hold it and "+" together.
     #[test]
     fn tab_chips_clip_at_the_bar_edge() {
-        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(120.0, 28.0));
-        // inner.right() = 114; a 40-wide label needs 66 px + the
-        // trailing 24 px "+" (96 fits at x=6), while a second 60-wide
-        // chip would need 86 more (breaks at x=74) — only one fits.
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(170.0, 28.0));
+        // inner.right() = 158; a 40-wide label needs 66 px + the
+        // reserved "+" (24) + gap + "panes" (44) — 142 fits at x=6 —
+        // while a second 60-wide chip would need 86 more (breaks at
+        // x=74) — only one fits.
         let layout = tab_chips(bar, &[40.0, 60.0, 60.0]);
         assert_eq!(layout.tabs.len(), 1);
         let new_tab = layout.new_tab.unwrap();
         assert_eq!(new_tab.left(), 74.0);
         assert!(bar.contains_rect(new_tab), "+ stays inside the bar");
+        let pane_button = layout.pane_button.unwrap();
+        assert_eq!(pane_button.right(), bar.right() - BAR_MARGIN);
 
         // A bar too narrow for even one chip — or for the "+" itself —
-        // still can't produce a hit target outside its own pixels.
+        // still can't produce a hit target outside its own pixels;
+        // too narrow for "+" and "panes" together drops the pane
+        // button too.
         let sliver = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 28.0));
         let layout = tab_chips(sliver, &[60.0]);
         assert!(layout.tabs.is_empty());
         assert!(layout.new_tab.is_none());
+        assert!(layout.pane_button.is_none());
         let layout = tab_chips(sliver, &[]);
         assert!(layout.tabs.is_empty());
         assert!(layout.new_tab.is_none());

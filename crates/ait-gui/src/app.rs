@@ -1066,7 +1066,7 @@ impl GuiApp {
                 new_rect.center(),
                 Align2::CENTER_CENTER,
                 "+",
-                font,
+                font.clone(),
                 if new_hit.hovered() {
                     Color32::WHITE
                 } else {
@@ -1075,6 +1075,33 @@ impl GuiApp {
             );
             if new_hit.clicked() {
                 self.open_tab(shared);
+            }
+        }
+        // The pane host's always-on click affordance (Spec R14 §5.13
+        // us-1 — "a chord AND a clickable affordance"): the switcher
+        // chips only exist once the region is open, so this is the
+        // mouse path onto the host. It toggles the last selection,
+        // explorer by default — the same state move the pane's own
+        // chord makes, so click and chord can never disagree.
+        if let Some(pane_rect) = bar.pane_button {
+            let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
+            if pane_hit.hovered() {
+                painter.rect_filled(pane_rect, 4.0, Color32::from_rgb(0x2A, 0x2A, 0x2A));
+            }
+            painter.text(
+                pane_rect.center(),
+                Align2::CENTER_CENTER,
+                "panes",
+                font,
+                if pane_hit.hovered() {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0xAA, 0xAA, 0xAA)
+                },
+            );
+            if pane_hit.clicked() {
+                let id = shared.panes.selected().unwrap_or(PaneId::Explorer);
+                self.toggle_pane(shared, id);
             }
         }
     }
@@ -3276,7 +3303,7 @@ mod tests {
     fn a_new_listing_error_yields_to_a_live_toast() {
         let fixture = tempfile::tempdir().unwrap();
         let missing = fixture.path().join("gone");
-        let mut harness = Harness::new(sh_manager());
+        let harness = Harness::new(sh_manager());
         report_cwd(&harness, &missing);
         {
             let mut shared = harness.shared();
@@ -3487,16 +3514,22 @@ mod tests {
         std::fs::write(fixture.path().join("file.txt"), "x\n").unwrap();
         let harness = Harness::new(sh_manager());
         report_cwd(&harness, fixture.path());
-        // 29 columns of output — under the harness's 40-wide grid so
-        // the whole row stays one line (no mid-token wrap).
-        run_line(&harness, "echo 'see https://a/b then file.txt'");
+        // The `out=` marker exists ONLY in the printf output — the
+        // typed command never contains it, so the wait gates on
+        // execution-produced output, not the input echo
+        // (CODING_STANDARDS §15). 34 columns of output — under the
+        // harness's 40-wide grid so the whole row stays one line.
+        run_line(
+            &harness,
+            "printf 'out=%s\\n' 'see https://a/b then file.txt'",
+        );
         wait_until(&harness, |h| {
             let shared = h.shared();
             let tab = shared.tabs.active().unwrap();
             let grid = tab.grid();
             (-(grid.scrollback() as i32)..grid.lines() as i32).any(|line| {
                 grid.line(line)
-                    .is_some_and(|row| row.text().contains("see https://a/b then file.txt"))
+                    .is_some_and(|row| row.text().contains("out=see https://a/b then file.txt"))
             })
         });
 
@@ -3507,7 +3540,7 @@ mod tests {
             .find_map(|line| {
                 grid.line(line)
                     .map(|row| (line, row.text()))
-                    .filter(|(_, text)| text.contains("see https://a/b then file.txt"))
+                    .filter(|(_, text)| text.contains("out=see https://a/b then file.txt"))
             })
             .unwrap();
         let home = fixture.path().to_path_buf();

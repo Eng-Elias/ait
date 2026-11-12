@@ -83,6 +83,18 @@ impl WebSlot {
             }
         }
 
+        // The reverse direction — navigations the WEBVIEW initiated
+        // (a link click inside the page) land on `BrowserState` so
+        // the address entry and history track the page it's actually
+        // on (us-18). Reports ride the frame's cadence: on X11 the
+        // handler fires inside `pump_glib` below and lands this same
+        // sync; elsewhere it surfaces next frame at the latest.
+        if let Some(host) = &self.host {
+            for url in host.drain_navigations() {
+                shared.browser.webview_navigated(&url);
+            }
+        }
+
         // Bounds + visibility — `set_bounds` every frame is the X11
         // contract ("the webview will not auto-resize"); macOS takes
         // the same call for free. A missing rect is the pane's hide
@@ -155,6 +167,14 @@ impl WebSlot {
 struct Host {
     /// The `!Send` wry handle — created and driven on the UI thread.
     webview: wry::WebView,
+    /// Webview-initiated navigations the navigation handler queued —
+    /// link clicks the pane's own `load_url` didn't start (plus our
+    /// own loads reporting back, which `BrowserState` dedupes). The
+    /// handler can't touch `Shared` — on Linux it fires inside the
+    /// glib pump, which runs under the UI's lock — so it reports
+    /// through this channel and `sync` folds the URLs into the
+    /// model.
+    nav_rx: std::sync::mpsc::Receiver<String>,
 }
 
 #[cfg(feature = "web")]
@@ -169,8 +189,22 @@ impl Host {
     fn new(frame: &eframe::Frame, rect: Option<egui::Rect>) -> Result<Self, WhyExternal> {
         #[cfg(target_os = "linux")]
         gtk::init().map_err(|_| WhyExternal::InitFailed)?;
+        let (nav_tx, nav_rx) = std::sync::mpsc::channel();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let builder = wry::WebViewBuilder::new();
+            // Webview-initiated navigations — a link click, a script's
+            // location change — queue for `BrowserState` so the
+            // address entry and history track the page the webview is
+            // actually on (us-18). `true` always allows: the handler
+            // observes, never gates — our own `load_url`s report
+            // through the same hook, and `webview_navigated` dedupes
+            // them. Honest residue: WebKitGTK/WKWebView fire this only
+            // for navigation ACTIONS — a mid-load redirect hop doesn't
+            // report, so the entry can lag a hop behind until the next
+            // navigation (WebView2 reports redirects too).
+            let builder = wry::WebViewBuilder::new().with_navigation_handler(move |url| {
+                let _ = nav_tx.send(url);
+                true
+            });
             let builder = match rect {
                 Some(rect) => builder.with_bounds(to_wry_rect(rect)),
                 None => builder,
@@ -178,7 +212,7 @@ impl Host {
             builder.build_as_child(frame)
         }));
         match built {
-            Ok(Ok(webview)) => Ok(Self { webview }),
+            Ok(Ok(webview)) => Ok(Self { webview, nav_rx }),
             Ok(Err(_)) | Err(_) => Err(WhyExternal::InitFailed),
         }
     }
@@ -191,6 +225,16 @@ impl Host {
     /// Re-fetch the current page.
     fn reload(&self) {
         let _ = self.webview.reload();
+    }
+
+    /// Webview-initiated navigations since the last drain — the
+    /// navigation handler's queued reports.
+    fn drain_navigations(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        while let Ok(url) = self.nav_rx.try_recv() {
+            urls.push(url);
+        }
+        urls
     }
 
     /// Reposition the child over the pane's staged body rect.
@@ -216,6 +260,10 @@ impl Host {
     fn load_url(&self, _url: &str) {}
 
     fn reload(&self) {}
+
+    fn drain_navigations(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     fn set_bounds(&self, _rect: egui::Rect) {}
 
@@ -271,12 +319,10 @@ fn open_external(url: &str, toast: &mut Option<Toast>) {
 
 #[cfg(test)]
 mod tests {
-    //! R14-T3 at the adapter's only testable edge — the opener
-    //! command's verb and argument shape per platform. The `wry`
-    //! handle itself is the agreed-untested seam: it needs a live
-    //! window and is covered by `docs/gui-verification.md`.
-
-    use super::*;
+    //! R14-T3 at the adapter's only testable edge — the shared
+    //! opener command's verb and argument shape per platform. The
+    //! `wry` handle itself is the agreed-untested seam: it needs a
+    //! live window and is covered by `docs/gui-verification.md`.
 
     /// The shared opener is the platform's verb plus the URL as the
     /// sole payload argument — detached stdio so the child can't hold
