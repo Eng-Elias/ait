@@ -2,7 +2,7 @@
 //! region the agent panel has always occupied generalizes into a host
 //! that shows ONE pane at a time — the active tab's agent panel, or
 //! one of the registered auxiliary panes (the explorer and browser
-//! slots the round's later tickets fill).
+//! slots — both landed: R14-T2 and R14-T3).
 //!
 //! Everything a pane is lives here, inside `ait-gui`: the [`Pane`]
 //! trait, the static [`PANES`] registry it enumerates, the
@@ -21,7 +21,7 @@
 //! switch can never disagree about what's on screen.
 
 use ait_term::KeyEvent;
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect};
+use eframe::egui::{self, Rect};
 
 use crate::app::Shared;
 use crate::grid::GridTheme;
@@ -33,9 +33,9 @@ use crate::grid::GridTheme;
 /// claim on the region rather than a registry entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneId {
-    /// The file explorer slot — `Ctrl+Shift+E` (R14-T2 fills it).
+    /// The file explorer slot — `Ctrl+Shift+E` (R14-T2).
     Explorer,
-    /// The web browser slot — `Ctrl+Shift+B` (R14-T3 fills it).
+    /// The web browser slot — `Ctrl+Shift+B` (R14-T3).
     Browser,
 }
 
@@ -78,9 +78,9 @@ pub trait Pane: Sync {
 }
 
 /// The static registry — the host's enumeration of auxiliary panes,
-/// in switcher order. The explorer slot landed in R14-T2; the
-/// browser's placeholder stands until its ticket swaps it.
-pub static PANES: &[&'static dyn Pane] = &[&crate::explorer::EXPLORER, &BROWSER];
+/// in switcher order. Both slots are real: the explorer landed in
+/// R14-T2, the browser in R14-T3 — no placeholders remain.
+pub static PANES: &[&'static dyn Pane] = &[&crate::explorer::EXPLORER, &crate::browser::BROWSER];
 
 /// The registry entry for a slot — the paint and input paths'
 /// `PaneId` → `Pane` resolution.
@@ -161,61 +161,6 @@ impl PaneHost {
     /// ON (the claim yields), never silently off.
     pub fn showing(&self, id: PaneId, agent_open: bool) -> bool {
         self.visible(agent_open) == Some(SidePane::Aux(id))
-    }
-}
-
-/// A slot's stand-in until its ticket lands — paints a marker into
-/// the body so the host and the chords are demoable, and swallows
-/// every routed input.
-struct PlaceholderPane {
-    id: PaneId,
-    title: &'static str,
-    chord: egui::Key,
-    /// The ticket that fills the slot — the marker's "lands in"
-    /// half.
-    landing: &'static str,
-}
-
-static BROWSER: PlaceholderPane = PlaceholderPane {
-    id: PaneId::Browser,
-    title: "browser",
-    chord: egui::Key::B,
-    landing: "R14-T3",
-};
-
-impl Pane for PlaceholderPane {
-    fn id(&self) -> PaneId {
-        self.id
-    }
-
-    fn title(&self) -> &'static str {
-        self.title
-    }
-
-    fn chord(&self) -> egui::Key {
-        self.chord
-    }
-
-    fn key(&self, _shared: &mut Shared, _key: KeyEvent) {}
-
-    fn text(&self, _shared: &mut Shared, _text: &str) {}
-
-    fn paint(&self, ui: &mut egui::Ui, _shared: &mut Shared, rect: Rect, theme: GridTheme) {
-        let painter = ui.painter().with_clip_rect(rect);
-        painter.text(
-            Pos2::new(rect.center().x, rect.center().y - 10.0),
-            Align2::CENTER_CENTER,
-            format!("{} pane", self.title),
-            FontId::monospace(13.0),
-            theme.fg,
-        );
-        painter.text(
-            Pos2::new(rect.center().x, rect.center().y + 10.0),
-            Align2::CENTER_CENTER,
-            format!("lands in {}", self.landing),
-            FontId::monospace(11.0),
-            Color32::from_rgb(0x77, 0x77, 0x77),
-        );
     }
 }
 

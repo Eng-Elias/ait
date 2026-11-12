@@ -389,6 +389,7 @@ mod tests {
             find: None,
             panes: crate::pane::PaneHost::default(),
             explorer: crate::explorer::ExplorerState::default(),
+            browser: crate::browser::BrowserState::default(),
         }))
     }
 

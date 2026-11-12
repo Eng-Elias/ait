@@ -21,6 +21,11 @@
 //! - [`explorer`] — the file-explorer pane (R14-T2): the read-only
 //!   `cwd_for`-rooted browser's model, its fs/editor seams and its
 //!   `Pane` impl.
+//! - [`browser`] — the web browser pane (R14-T3): entry/history/nav
+//!   model and the embed-vs-external fallback decision, all pure.
+//! - [`webview`] — the `wry` adapter behind the `web` feature: the
+//!   child-webview handle, the gtk/glib plumbing and the platform
+//!   opener the external surface delegates to.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -36,6 +41,7 @@
 // internals (`app`'s `GuiApp`/`Shared`, the pump, the painters),
 // shared inside the crate and invisible outside it.
 pub(crate) mod app;
+pub(crate) mod browser;
 pub(crate) mod explorer;
 pub(crate) mod grid;
 pub(crate) mod keys;
@@ -44,6 +50,7 @@ pub(crate) mod paint;
 pub(crate) mod pane;
 pub(crate) mod panel;
 pub(crate) mod pump;
+pub(crate) mod webview;
 
 use std::io::Write as _;
 
