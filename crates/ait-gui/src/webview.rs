@@ -12,8 +12,11 @@
 //! staged rect — `None` is the hide signal. `feature = "web"` swaps
 //! the real host in; feature-off builds get the stub that probes to
 //! [`WhyExternal::FeatureOff`] and sinks every navigation to the
-//! opener. The pump/repaint model is untouched: the sync adds no
-//! blocking calls, and an idle window still paints zero frames.
+//! opener. While a live webview has a staged surface the sync also
+//! schedules a bounded next-frame repaint — the X11 pump only
+//! advances while egui paints, and a static-looking page can still
+//! animate — but with no host or no staged surface nothing is
+//! scheduled and the idle window still paints zero frames.
 
 use std::time::Instant;
 
@@ -45,10 +48,18 @@ impl WebSlot {
     /// The per-frame sync — probe once (the pane's first shown frame),
     /// drain the queued navigations into the right sink, keep the
     /// child's bounds on the staged rect (hiding it whenever no rect
-    /// is staged), and pump the glib context the X11 webview lives
-    /// on. Cheap when idle: `None` surfaces, empty queues and a
-    /// `feature = "web"`-less build all fall through.
-    pub fn sync(&mut self, frame: &eframe::Frame, shared: &mut Shared, browser_shown: bool) {
+    /// is staged), pump the glib context the X11 webview lives on,
+    /// and — while a live host has a staged surface — schedule the
+    /// bounded repaint that keeps the pump fed. Cheap when idle:
+    /// `None` surfaces, empty queues and a `feature = "web"`-less
+    /// build all fall through, and nothing schedules a frame.
+    pub fn sync(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &eframe::Frame,
+        shared: &mut Shared,
+        browser_shown: bool,
+    ) {
         // The one-shot probe — needs a live frame for the window
         // handle, so it runs only while the pane shows. Its verdict
         // lands on `Shared.browser` where the pane's paint reads it.
@@ -107,6 +118,19 @@ impl WebSlot {
                 }
                 None => host.set_visible(false),
             }
+        }
+
+        // Keep frames flowing while a live webview has a staged
+        // surface — the glib pump below (and wry's own callbacks on
+        // every platform) only advance while egui repaints, and a
+        // static-looking page can still run video or JS. A bounded
+        // `request_repaint_after` (~30 fps) instead of a raw
+        // `request_repaint` keeps an idle-but-visible webview from
+        // pinning a core; with no host or no staged surface — pane
+        // closed — nothing is scheduled and the window still paints
+        // zero frames at idle.
+        if self.host.is_some() && shared.browser.surface().is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // The glib pump is only safe — and only needed — while a
@@ -305,15 +329,23 @@ impl WindowKind {
 
 /// Hand `url` to the system browser via the shared
 /// [`crate::platform_opener`] — spawned detached (stdio nulled) so
-/// the pane never blocks on the child's lifetime; a spawn failure
-/// toasts like every other GUI-side failure rather than passing
-/// silently.
+/// the pane never blocks on the child's lifetime, and reaped on a
+/// helper thread since a spawned-and-dropped child stays a zombie
+/// until it exits; a spawn failure toasts like every other GUI-side
+/// failure rather than passing silently.
 fn open_external(url: &str, toast: &mut Option<Toast>) {
-    if let Err(error) = crate::platform_opener(std::ffi::OsStr::new(url)).spawn() {
-        *toast = Some(Toast::new(
-            format!("couldn't open the system browser: {error}"),
-            Instant::now(),
-        ));
+    match crate::platform_opener(std::ffi::OsStr::new(url)).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => {
+            *toast = Some(Toast::new(
+                format!("couldn't open the system browser: {error}"),
+                Instant::now(),
+            ));
+        }
     }
 }
 
