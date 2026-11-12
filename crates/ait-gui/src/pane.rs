@@ -78,10 +78,9 @@ pub trait Pane: Sync {
 }
 
 /// The static registry — the host's enumeration of auxiliary panes,
-/// in switcher order. R14-T1 registers placeholder entries so the
-/// chords and the host are demoable; the explorer and browser
-/// tickets swap in their real implementations additively.
-pub static PANES: &[&'static dyn Pane] = &[&EXPLORER, &BROWSER];
+/// in switcher order. The explorer slot landed in R14-T2; the
+/// browser's placeholder stands until its ticket swaps it.
+pub static PANES: &[&'static dyn Pane] = &[&crate::explorer::EXPLORER, &BROWSER];
 
 /// The registry entry for a slot — the paint and input paths'
 /// `PaneId` → `Pane` resolution.
@@ -176,13 +175,6 @@ struct PlaceholderPane {
     /// half.
     landing: &'static str,
 }
-
-static EXPLORER: PlaceholderPane = PlaceholderPane {
-    id: PaneId::Explorer,
-    title: "explorer",
-    chord: egui::Key::E,
-    landing: "R14-T2",
-};
 
 static BROWSER: PlaceholderPane = PlaceholderPane {
     id: PaneId::Browser,
