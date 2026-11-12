@@ -57,6 +57,14 @@ use crate::pump::Pump;
 /// needs exactly one frame when the toast ages out).
 const TOAST_REFRESH: Duration = Duration::from_millis(500);
 
+/// How still the content band must sit before a winsize reflow
+/// applies — a reflow walks each session's full scrollback, so
+/// resizing on every frame of a window drag is the resize jank.
+/// `pending_band` applies once the band is unchanged this long;
+/// a `request_repaint_after` wakes the frame that applies it even
+/// after the pointer stops (no input, no frame).
+const RESIZE_SETTLE: Duration = Duration::from_millis(120);
+
 /// The app state the pump's drain thread and the UI thread share —
 /// the GUI's `AppState` minus the frontend-local fields. One mutex:
 /// the drains and the paint are both short passes, and sharing one
@@ -148,6 +156,19 @@ pub struct GuiApp {
     /// The conversation rows the panel's last paint fit — a Page-unit
     /// wheel's scroll distance over the panel region.
     panel_rows: usize,
+    /// Sub-line wheel distance carried between deltas, per region —
+    /// touchpads emit Point deltas far under a row each; truncating
+    /// every event to whole lines dropped them to zero (touchpad
+    /// scroll felt dead), so each region accumulates its own
+    /// remainder and scrolls the whole lines it crosses.
+    grid_wheel_rem: f32,
+    /// The panel arm's own carry — same reason.
+    panel_wheel_rem: f32,
+    /// The winsize a resize left pending — a reflow walks each
+    /// session's full scrollback, so applying every frame of a window
+    /// drag is the resize jank; the band applies once it sits still
+    /// for `RESIZE_SETTLE` instead.
+    pending_band: Option<(Size, Instant)>,
     /// The cross-frame row-galley cache — one `LayoutJob` per row,
     /// shaped once and reused while the row's plan is unchanged
     /// (REQUIREMENTS §6; the pump's damage filter decides whether a
@@ -253,6 +274,9 @@ impl GuiApp {
             grid_pane: None,
             panel_pane: None,
             panel_rows: 0,
+            grid_wheel_rem: 0.0,
+            panel_wheel_rem: 0.0,
+            pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
             quit: false,
         })
@@ -268,6 +292,12 @@ impl GuiApp {
     /// (they need the pane rect, which is layout state).
     fn dispatch_events(&mut self, ctx: &egui::Context, shared: &mut Shared) {
         let events = ctx.input(|input| input.events.clone());
+        // Chord chars whose `Event::Text` twin would be the same input
+        // twice: some platforms emit BOTH `Key{A, alt}` and `Text("a")`
+        // for `Alt+A`, which typed `a` into the PTY beside the panel
+        // the chord opened. The Key event carries the whole chord to
+        // the resolver — a matching Text char is its twin, eaten here.
+        let mut eaten: Vec<char> = Vec::new();
         for event in events {
             match event {
                 egui::Event::Key {
@@ -291,7 +321,14 @@ impl GuiApp {
                         self.open_find(shared);
                         continue;
                     }
-                    self.dispatch_key(ctx, shared, translate_key(key, modifiers));
+                    let translated = translate_key(key, modifiers);
+                    if let Some(KeyEvent {
+                        key: Key::Char(c), ..
+                    }) = translated
+                    {
+                        eaten.push(c);
+                    }
+                    self.dispatch_key(ctx, shared, translated);
                 }
                 // Releases carry no input — same as the TUI's
                 // `KeyEventKind::Release` guard.
@@ -306,7 +343,22 @@ impl GuiApp {
                         self.find_text(shared, &text);
                         continue;
                     }
+                    // A Meta chord still held while Text composes wants
+                    // the chord's bytes (Option-as-Alt), never a
+                    // literal — the guard holds even if the twin's Key
+                    // event lands after this Text.
+                    let meta_held =
+                        ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
                     for key in translate_text(&text) {
+                        let eaten_twin = matches!(key.key, Key::Char(c)
+                            if eaten
+                                .iter()
+                                .position(|e| e.eq_ignore_ascii_case(&c))
+                                .map(|pos| eaten.remove(pos))
+                                .is_some());
+                        if meta_held || eaten_twin {
+                            continue;
+                        }
                         self.dispatch_key(ctx, shared, Some(key));
                     }
                 }
@@ -558,11 +610,13 @@ impl GuiApp {
             let Some(tab) = shared.tabs.active_mut() else {
                 return;
             };
-            let lines = self.wheel_lines(ctx, unit, delta.y);
-            if delta.y > 0.0 {
-                tab.agent_scroll_up(lines);
-            } else {
-                tab.agent_scroll_down(lines);
+            let cell = self.cell_height(ctx);
+            let pages = self.panel_rows.max(1);
+            let lines = wheel_lines(unit, delta.y, cell, pages, &mut self.panel_wheel_rem);
+            if lines > 0 {
+                tab.agent_scroll_up(lines as usize);
+            } else if lines < 0 {
+                tab.agent_scroll_down((-lines) as usize);
             }
             return;
         }
@@ -572,7 +626,6 @@ impl GuiApp {
         let Some(tab) = shared.tabs.active_mut() else {
             return;
         };
-        let lines = self.wheel_lines(ctx, unit, delta.y);
         match unit {
             egui::MouseWheelUnit::Page => {
                 if delta.y > 0.0 {
@@ -582,33 +635,14 @@ impl GuiApp {
                 }
             }
             _ => {
-                if delta.y > 0.0 {
-                    tab.scroll_up(lines);
-                } else {
-                    tab.scroll_down(lines);
+                let cell = self.cell_height(ctx);
+                let lines = wheel_lines(unit, delta.y, cell, 0, &mut self.grid_wheel_rem);
+                if lines > 0 {
+                    tab.scroll_up(lines as usize);
+                } else if lines < 0 {
+                    tab.scroll_down((-lines) as usize);
                 }
             }
-        }
-    }
-
-    /// One wheel delta → scroll lines: Line units scale by the shared
-    /// `WHEEL_LINES` so a tick scrolls the same 3 lines the TUI's
-    /// wheel binding does (CODING_STANDARDS §17 — one constant, both
-    /// frontends); Point units divide by the cell height; Page units
-    /// are handled by the grid arm's page_up/page_down (the panel's
-    /// conversation scrolls in lines regardless).
-    fn wheel_lines(&self, ctx: &egui::Context, unit: egui::MouseWheelUnit, delta_y: f32) -> usize {
-        match unit {
-            egui::MouseWheelUnit::Line => {
-                (delta_y.abs() * WHEEL_LINES as f32).ceil().max(1.0) as usize
-            }
-            egui::MouseWheelUnit::Point => {
-                let cell = self.cell_height(ctx);
-                (delta_y / cell).trunc().abs() as usize
-            }
-            // The panel arm uses this as its page distance (the grid
-            // arm handles Page through page_up/page_down itself).
-            egui::MouseWheelUnit::Page => self.panel_rows.max(1),
         }
     }
 
@@ -934,6 +968,29 @@ impl GuiApp {
                 block_chips: Some(&chips),
             },
         );
+        // Scrolled into scrollback: the jump-to-bottom affordance
+        // over the pane's corner — the wheel's trip back is the depth
+        // itself, and the typing-snap rule means the button only ever
+        // offers a no-op when the view is already live.
+        if scroll > 0 {
+            let mut snap = false;
+            egui::Area::new(egui::Id::unique("scroll-bottom"))
+                .order(egui::Order::Foreground)
+                .pivot(Align2::RIGHT_BOTTOM)
+                .fixed_pos(pane.right_bottom() - Vec2::new(8.0, 8.0))
+                .show(ctx, |ui| {
+                    let button = egui::Button::new(egui::RichText::new("⤓").monospace())
+                        .fill(Color32::from_rgba_premultiplied(0x2A, 0x2A, 0x2A, 0xDC))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)));
+                    snap = ui
+                        .add(button)
+                        .on_hover_text("jump to the live output")
+                        .clicked();
+                });
+            if snap {
+                tab.snap_to_bottom();
+            }
+        }
     }
 
     /// The side-panel region (Spec R13-T5): the agent conversation
@@ -1575,15 +1632,39 @@ impl eframe::App for GuiApp {
         self.dispatch_events(&ctx, &mut shared);
 
         // 2. Regions + cell metrics (zoom included), then the band→
-        //    winsize resize when they moved.
+        //    winsize resize — settled, not per-frame: a reflow walks
+        //    each session's scrollback, so mid-drag reflows are the
+        //    resize jank. The band applies once it's still for
+        //    `RESIZE_SETTLE` (a dragged window keeps moving the pending
+        //    value until release, then the repaint timer fires it).
         let area = ctx.content_rect();
         let regions = chrome_regions(area, self.chrome);
         let font = FontId::monospace(self.metrics.font_px());
         let cell = cell_metrics(&ctx, &self.metrics);
         let band = grid_size(regions.content, cell);
         if band != self.last_band {
-            shared.tabs.resize_all(band, session_size);
-            self.last_band = band;
+            let now = Instant::now();
+            match self.pending_band {
+                Some((pending, since)) if pending == band => {
+                    let elapsed = now.saturating_duration_since(since);
+                    if elapsed >= RESIZE_SETTLE {
+                        shared.tabs.resize_all(band, session_size);
+                        self.last_band = band;
+                        self.pending_band = None;
+                    } else {
+                        ctx.request_repaint_after(RESIZE_SETTLE - elapsed);
+                    }
+                }
+                _ => {
+                    self.pending_band = Some((band, now));
+                    ctx.request_repaint_after(RESIZE_SETTLE);
+                }
+            }
+        } else if self
+            .pending_band
+            .is_some_and(|(pending, _)| pending == band)
+        {
+            self.pending_band = None;
         }
 
         // 3. The content split — the panel's share comes off the band
@@ -1683,6 +1764,36 @@ fn provisional_cell(metrics: &GuiMetrics) -> CellMetrics {
         width: metrics.font_px() * 0.6,
         height: metrics.font_px() * 1.2,
     }
+}
+
+/// One wheel delta → signed scroll lines, carrying the sub-line
+/// remainder in `rem`: touchpads emit Point deltas well under a row
+/// each and truncating every event to `usize` dropped them all to
+/// zero — touchpad scroll felt dead. Line units scale by the shared
+/// `WHEEL_LINES` so a tick scrolls the same 3 lines the TUI's wheel
+/// binding does (CODING_STANDARDS §17 — one constant, both
+/// frontends); Point divides by `cell_h`; a Page unit is `page_rows`
+/// whole lines, unaccumulated (the grid arm pages through
+/// `page_up`/`page_down` itself and never calls this for Page).
+fn wheel_lines(
+    unit: egui::MouseWheelUnit,
+    delta_y: f32,
+    cell_h: f32,
+    page_rows: usize,
+    rem: &mut f32,
+) -> i32 {
+    let lines = match unit {
+        egui::MouseWheelUnit::Line => delta_y * WHEEL_LINES as f32,
+        egui::MouseWheelUnit::Point => delta_y / cell_h,
+        egui::MouseWheelUnit::Page => {
+            *rem = 0.0;
+            return (delta_y.signum() * page_rows.max(1) as f32) as i32;
+        }
+    };
+    *rem += lines;
+    let whole = rem.trunc() as i32;
+    *rem -= whole as f32;
+    whole
 }
 
 /// `char`-less cell metrics from egui's font tables — 'M' is the
@@ -1821,6 +1932,9 @@ mod tests {
                     grid_pane: None,
                     panel_pane: None,
                     panel_rows: 0,
+                    grid_wheel_rem: 0.0,
+                    panel_wheel_rem: 0.0,
+                    pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
                     quit: false,
                 },
@@ -2363,5 +2477,40 @@ mod tests {
         assert_eq!(wait_file(&harness, &path, 1), b"\x06");
         assert!(harness.shared().find.is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Touchpad Point deltas arrive well under a row each — the
+    /// remainder carries them into whole lines instead of
+    /// truncating every event to zero (the dead-touchpad fix);
+    /// a direction reversal eats the carry first, and a Line tick
+    /// still lands its `WHEEL_LINES` whole.
+    #[test]
+    fn sub_row_deltas_accumulate_into_whole_lines() {
+        use egui::MouseWheelUnit as Unit;
+        let cell = 18.0;
+        let mut rem = 0.0;
+        // Five 0.3-row flicks: none scrolls alone, together 1.5 rows.
+        for _ in 0..5 {
+            let lines = wheel_lines(Unit::Point, 0.3 * cell, cell, 0, &mut rem);
+            assert!((0..=1).contains(&lines));
+        }
+        assert_eq!(
+            wheel_lines(Unit::Point, 0.3 * cell, cell, 0, &mut rem),
+            0,
+            "1.8 rows in — the carry keeps the sixth flick short"
+        );
+        assert_eq!(
+            wheel_lines(Unit::Point, 0.3 * cell, cell, 0, &mut rem),
+            1,
+            "the accumulated 2.1 rows cross the second line"
+        );
+        // A reverse flick eats the carry before scrolling back.
+        assert_eq!(wheel_lines(Unit::Point, -0.2 * cell, cell, 0, &mut rem), 0);
+        // A Line tick is its whole `WHEEL_LINES` — no carry needed.
+        let mut rem = 0.0;
+        assert_eq!(
+            wheel_lines(Unit::Line, 1.0, cell, 0, &mut rem),
+            WHEEL_LINES as i32
+        );
     }
 }
