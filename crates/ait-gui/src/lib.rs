@@ -23,6 +23,9 @@
 //!   `Pane` impl.
 //! - [`browser`] — the web browser pane (R14-T3): entry/history/nav
 //!   model and the embed-vs-external fallback decision, all pure.
+//! - [`detect`] — the Ctrl+click affordance's detector (R14-T4):
+//!   line text + tab cwd + the filesystem → the URL/path token spans
+//!   the hover underline and the click route share.
 //! - [`webview`] — the `wry` adapter behind the `web` feature: the
 //!   child-webview handle, the gtk/glib plumbing and the platform
 //!   opener the external surface delegates to.
@@ -42,6 +45,7 @@
 // shared inside the crate and invisible outside it.
 pub(crate) mod app;
 pub(crate) mod browser;
+pub(crate) mod detect;
 pub(crate) mod explorer;
 pub(crate) mod grid;
 pub(crate) mod keys;
