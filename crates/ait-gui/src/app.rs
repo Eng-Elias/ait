@@ -45,7 +45,7 @@ use eframe::egui::{
 use crate::browser::BrowserState;
 use crate::detect;
 use crate::explorer::ExplorerState;
-use crate::grid::GridTheme;
+use crate::grid::{chrome, GridTheme};
 use crate::keys::{translate_key, translate_text};
 use crate::layout::{
     chrome_regions, grid_point, grid_size, plan_block_chrome, session_size, split_content,
@@ -149,12 +149,18 @@ impl Shared {
         }
     }
 
+    /// Whether the active tab's agent panel claims the region — the
+    /// precedence input `PaneHost` resolves against; the dispatch,
+    /// the paint pass and the chord toggle all ask the same question.
+    fn agent_claiming(&self) -> bool {
+        self.tabs.active().is_some_and(|tab| tab.agent_panel_open())
+    }
+
     /// What the side region shows on the active tab right now — the
     /// agent panel's per-tab claim first, else the app-global aux
     /// selection, else the region is closed.
     fn shown_pane(&self) -> Option<SidePane> {
-        let agent_open = self.tabs.active().is_some_and(|tab| tab.agent_panel_open());
-        self.panes.visible(agent_open)
+        self.panes.visible(self.agent_claiming())
     }
 }
 
@@ -350,6 +356,7 @@ impl GuiApp {
                 egui::Event::Key {
                     key,
                     pressed: true,
+                    repeat,
                     modifiers,
                     ..
                 } => {
@@ -382,7 +389,13 @@ impl GuiApp {
                         || shared.conversations.is_some();
                     if !overlay_owns_focus {
                         if let Some(id) = pane_chord(key, modifiers) {
-                            self.toggle_pane(shared, id);
+                            // A held chord's autorepeat must not
+                            // strobe the toggle — one flip per
+                            // physical press; the repeat is still
+                            // swallowed, never PTY input.
+                            if !repeat {
+                                self.toggle_pane(shared, id);
+                            }
                             continue;
                         }
                     }
@@ -404,6 +417,31 @@ impl GuiApp {
                 // While the find bar is open, text is the query —
                 // nothing reaches the PTY mid-search.
                 egui::Event::Text(text) => {
+                    // The twin/meta guard runs BEFORE any routing: on
+                    // twin-emitting platforms an `Alt+<letter>` chord
+                    // arrives as `Key{.., alt}` + `Text("a")`, and the
+                    // Text twin must land nowhere — not the PTY, not
+                    // the find query, not an aux pane's address entry.
+                    // `meta_held` also eats the twin whose Key event
+                    // lands after this Text (a Meta chord still held
+                    // while Text composes wants the chord's bytes —
+                    // Option-as-Alt — never a literal).
+                    let meta_held =
+                        ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
+                    let text: String = text
+                        .chars()
+                        .filter(|c| {
+                            !meta_held
+                                && !eaten
+                                    .iter()
+                                    .position(|e| e.eq_ignore_ascii_case(c))
+                                    .map(|pos| eaten.remove(pos))
+                                    .is_some()
+                        })
+                        .collect();
+                    if text.is_empty() {
+                        continue;
+                    }
                     if shared.find.is_some() {
                         self.find_text(shared, &text);
                         continue;
@@ -415,22 +453,7 @@ impl GuiApp {
                         pane(id).text(shared, &text);
                         continue;
                     }
-                    // A Meta chord still held while Text composes wants
-                    // the chord's bytes (Option-as-Alt), never a
-                    // literal — the guard holds even if the twin's Key
-                    // event lands after this Text.
-                    let meta_held =
-                        ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
                     for key in translate_text(&text) {
-                        let eaten_twin = matches!(key.key, Key::Char(c)
-                            if eaten
-                                .iter()
-                                .position(|e| e.eq_ignore_ascii_case(&c))
-                                .map(|pos| eaten.remove(pos))
-                                .is_some());
-                        if meta_held || eaten_twin {
-                            continue;
-                        }
                         self.dispatch_key(ctx, shared, Some(key));
                     }
                 }
@@ -839,11 +862,7 @@ impl GuiApp {
     /// press deselects (the region falls back to the agent claim or
     /// closes); any other press runs the shared [`select_pane`] arm.
     fn toggle_pane(&mut self, shared: &mut Shared, id: PaneId) {
-        let agent_open = shared
-            .tabs
-            .active()
-            .is_some_and(|tab| tab.agent_panel_open());
-        if shared.panes.showing(id, agent_open) {
+        if shared.panes.showing(id, shared.agent_claiming()) {
             shared.panes.clear();
         } else {
             self.select_pane(shared, id);
@@ -852,15 +871,13 @@ impl GuiApp {
     }
 
     /// The select arm `toggle_pane` and `show_pane` share: pick the
-    /// pane, and ask an open agent panel to yield its claim —
-    /// `toggle_agent_panel` walks its open→focus→close cycle until
-    /// closed; the conversation survives and `Alt+A` reopens it.
+    /// pane, and close an open agent panel outright so its claim
+    /// yields — [`Tab::close_agent_panel`] is a close, never a
+    /// cycle; the conversation survives and `Alt+A` reopens it.
     fn select_pane(&mut self, shared: &mut Shared, id: PaneId) {
         shared.panes.select(id);
         if let Some(tab) = shared.tabs.active_mut() {
-            while tab.agent_panel_open() {
-                tab.toggle_agent_panel();
-            }
+            tab.close_agent_panel();
         }
     }
 
@@ -890,11 +907,7 @@ impl GuiApp {
     /// plus the every-tab resize, minus `toggle_pane`'s off half (an
     /// explicit open never closes the pane).
     fn show_pane(&mut self, shared: &mut Shared, id: PaneId) {
-        let agent_open = shared
-            .tabs
-            .active()
-            .is_some_and(|tab| tab.agent_panel_open());
-        if !shared.panes.showing(id, agent_open) {
+        if !shared.panes.showing(id, shared.agent_claiming()) {
             self.select_pane(shared, id);
         }
         self.resize_for_panes(shared);
@@ -980,7 +993,7 @@ impl GuiApp {
     /// here.
     fn paint_tab_bar(&mut self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect) {
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1E, 0x1E, 0x1E));
+        painter.rect_filled(rect, 0.0, chrome::STRIP);
         let font = FontId::proportional(12.0);
         let titles = shared.tabs.titles();
         let widths: Vec<f32> = titles
@@ -1010,9 +1023,9 @@ impl GuiApp {
                 Sense::click(),
             );
             let bg = if index == active {
-                Color32::from_rgb(0x3A, 0x3A, 0x3A)
+                chrome::FIELD_HI
             } else if chip_hit.hovered() || close_hit.hovered() {
-                Color32::from_rgb(0x2A, 0x2A, 0x2A)
+                chrome::FIELD
             } else {
                 Color32::TRANSPARENT
             };
@@ -1032,7 +1045,7 @@ impl GuiApp {
                 if close_hit.hovered() {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(0x88, 0x88, 0x88)
+                    chrome::IDLE
                 },
             );
             if close_hit.clicked() {
@@ -1060,7 +1073,7 @@ impl GuiApp {
         if let Some(new_rect) = bar.new_tab {
             let new_hit = ui.interact(new_rect, egui::Id::unique("tab-new"), Sense::click());
             if new_hit.hovered() {
-                painter.rect_filled(new_rect, 4.0, Color32::from_rgb(0x2A, 0x2A, 0x2A));
+                painter.rect_filled(new_rect, 4.0, chrome::FIELD);
             }
             painter.text(
                 new_rect.center(),
@@ -1070,7 +1083,7 @@ impl GuiApp {
                 if new_hit.hovered() {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(0xAA, 0xAA, 0xAA)
+                    chrome::SUBTEXT
                 },
             );
             if new_hit.clicked() {
@@ -1086,7 +1099,7 @@ impl GuiApp {
         if let Some(pane_rect) = bar.pane_button {
             let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
             if pane_hit.hovered() {
-                painter.rect_filled(pane_rect, 4.0, Color32::from_rgb(0x2A, 0x2A, 0x2A));
+                painter.rect_filled(pane_rect, 4.0, chrome::FIELD);
             }
             painter.text(
                 pane_rect.center(),
@@ -1096,7 +1109,7 @@ impl GuiApp {
                 if pane_hit.hovered() {
                     Color32::WHITE
                 } else {
-                    Color32::from_rgb(0xAA, 0xAA, 0xAA)
+                    chrome::SUBTEXT
                 },
             );
             if pane_hit.clicked() {
@@ -1143,24 +1156,27 @@ impl GuiApp {
             response.hover_pos().and_then(|pos| {
                 let (line, column) = grid_point(pos, pane, cell, scroll);
                 let remote = !tab.remote.is_empty();
-                let cwd = PathBuf::from(suggest::cwd_for(tab));
-                let home = std::env::home_dir().unwrap_or_default();
                 let (text, cols) = tab
                     .grid()
                     .line(line)
                     .map(|row| detect::line_cells(&row))
                     .unwrap_or_default();
+                // The expensive halves — the `/proc` readlink
+                // `cwd_for` can cost and `home_dir`'s env resolve —
+                // ride the cache's `env` closure: a held Ctrl at an
+                // unchanged position never evaluates either (§6).
                 self.detect_cache
-                    .resolve(&detect::HoverAt {
-                        tab: tab.id,
-                        line,
-                        column,
-                        text: &text,
-                        cols: &cols,
-                        remote,
-                        cwd: &cwd,
-                        home: &home,
-                    })
+                    .resolve(
+                        &detect::HoverAt {
+                            tab: tab.id,
+                            line,
+                            column,
+                            text: &text,
+                            cols: &cols,
+                            remote,
+                        },
+                        || (PathBuf::from(suggest::cwd_for(tab)), home_dir()),
+                    )
                     .map(|hit| (line, hit))
             })
         } else {
@@ -1272,7 +1288,7 @@ impl GuiApp {
                 .show(ctx, |ui| {
                     let button = egui::Button::new(egui::RichText::new("⤓").monospace())
                         .fill(Color32::from_rgba_premultiplied(0x2A, 0x2A, 0x2A, 0xDC))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)));
+                        .stroke(Stroke::new(1.0, chrome::EDGE));
                     snap = ui
                         .add(button)
                         .on_hover_text("jump to the live output")
@@ -1313,14 +1329,14 @@ impl GuiApp {
         painter.rect_filled(rect, 0.0, PANEL_BG);
         painter.line_segment(
             [rect.left_top(), rect.left_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
+            Stroke::new(1.0, chrome::SEP),
         );
         // The switcher strip across the region's top — the host's
         // visible switch affordance.
         let bar = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), PANE_BAR_H));
         painter.line_segment(
             [bar.left_bottom(), bar.right_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
+            Stroke::new(1.0, chrome::SEP),
         );
         let font = FontId::monospace(12.0);
         let chips: Vec<(SidePane, &str)> = std::iter::once((SidePane::Agent, "agent"))
@@ -1349,9 +1365,9 @@ impl GuiApp {
             let (bg, fg) = if active {
                 (self.theme.fg, PANEL_BG)
             } else if hit.hovered() {
-                (Color32::from_rgb(0x2A, 0x2A, 0x2A), self.theme.fg)
+                (chrome::FIELD, self.theme.fg)
             } else {
-                (Color32::TRANSPARENT, Color32::from_rgb(0xAA, 0xAA, 0xAA))
+                (Color32::TRANSPARENT, chrome::SUBTEXT)
             };
             painter.rect_filled(chip, 3.0, bg);
             painter.text(
@@ -1608,11 +1624,11 @@ impl GuiApp {
             Pos2::new(left - 4.0, input_top - height),
             Pos2::new(right, input_top - 2.0),
         );
-        painter.rect_filled(card, 4.0, Color32::from_rgb(0x22, 0x22, 0x22));
+        painter.rect_filled(card, 4.0, chrome::WELL);
         painter.rect_stroke(
             card,
             4.0,
-            Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+            Stroke::new(1.0, chrome::EDGE),
             egui::StrokeKind::Inside,
         );
         let mut y = card.top() + 4.0;
@@ -1661,9 +1677,9 @@ impl GuiApp {
                             button,
                             3.0,
                             if hit.hovered() {
-                                Color32::from_rgb(0x3A, 0x3A, 0x3A)
+                                chrome::FIELD_HI
                             } else {
-                                Color32::from_rgb(0x2A, 0x2A, 0x2A)
+                                chrome::FIELD
                             },
                         );
                         painter.text(
@@ -1710,7 +1726,7 @@ impl GuiApp {
                         );
                         let selected = index == ask.selected;
                         if selected || hit.hovered() {
-                            painter.rect_filled(row, 2.0, Color32::from_rgb(0x33, 0x44, 0x66));
+                            painter.rect_filled(row, 2.0, chrome::SELECT);
                         }
                         painter.text(
                             Pos2::new(left, y),
@@ -1778,7 +1794,7 @@ impl GuiApp {
     /// and the first streamed Delta is otherwise silent.
     fn paint_status(&self, ui: &mut egui::Ui, shared: &Shared, rect: Rect) {
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1E, 0x1E, 0x1E));
+        painter.rect_filled(rect, 0.0, chrome::STRIP);
         let now = Instant::now();
         let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
         let mut text = match shared.tabs.active() {
@@ -1818,10 +1834,10 @@ impl GuiApp {
         let color = if highlighted {
             Color32::BLACK
         } else {
-            Color32::from_rgb(0xAA, 0xAA, 0xAA)
+            chrome::SUBTEXT
         };
         if highlighted {
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(0xD8, 0xD8, 0xD8));
+            painter.rect_filled(rect, 0.0, self.theme.fg);
         }
         painter.text(
             rect.left_center() + Vec2::new(8.0, 0.0),
@@ -1850,11 +1866,11 @@ impl GuiApp {
                 ),
                 Vec2::new(260.0, h),
             );
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(0x22, 0x22, 0x22));
+            painter.rect_filled(rect, 4.0, chrome::WELL);
             painter.rect_stroke(
                 rect,
                 4.0,
-                Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+                Stroke::new(1.0, chrome::EDGE),
                 egui::StrokeKind::Inside,
             );
             for (index, _) in picker.names().iter().enumerate() {
@@ -1867,7 +1883,7 @@ impl GuiApp {
                             Vec2::new(rect.width() - 8.0, row_h),
                         ),
                         2.0,
-                        Color32::from_rgb(0x33, 0x44, 0x66),
+                        chrome::SELECT,
                     );
                 }
                 painter.text(
@@ -1900,11 +1916,11 @@ impl GuiApp {
                 ),
                 Vec2::new(440.0, h),
             );
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(0x22, 0x22, 0x22));
+            painter.rect_filled(rect, 4.0, chrome::WELL);
             painter.rect_stroke(
                 rect,
                 4.0,
-                Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+                Stroke::new(1.0, chrome::EDGE),
                 egui::StrokeKind::Inside,
             );
             for (offset, row) in picker.rows().iter().skip(start).take(shown).enumerate() {
@@ -1918,7 +1934,7 @@ impl GuiApp {
                             Vec2::new(rect.width() - 8.0, row_h),
                         ),
                         2.0,
-                        Color32::from_rgb(0x33, 0x44, 0x66),
+                        chrome::SELECT,
                     );
                 }
                 painter.text(
@@ -1952,10 +1968,10 @@ impl GuiApp {
                 Pos2::new(area.right(), area.bottom() - self.chrome.status),
             );
             let painter = ui.painter().with_clip_rect(bar);
-            painter.rect_filled(bar, 0.0, Color32::from_rgb(0x22, 0x22, 0x22));
+            painter.rect_filled(bar, 0.0, chrome::WELL);
             painter.line_segment(
                 [bar.left_top(), bar.right_top()],
-                Stroke::new(1.0, Color32::from_rgb(0x55, 0x55, 0x55)),
+                Stroke::new(1.0, chrome::EDGE),
             );
             let font = FontId::monospace(13.0);
             let y = bar.center().y;
@@ -1964,7 +1980,7 @@ impl GuiApp {
                 Align2::LEFT_CENTER,
                 "find:",
                 font.clone(),
-                Color32::from_rgb(0x88, 0x88, 0x88),
+                chrome::IDLE,
             );
             // The query text, then a caret — the bar's input model is
             // append/backspace, so the caret always sits at the end.
@@ -1982,7 +1998,7 @@ impl GuiApp {
                     Vec2::new(2.0, 14.0),
                 ),
                 0.0,
-                Color32::from_rgb(0xD8, 0xD8, 0xD8),
+                self.theme.fg,
             );
             // Right edge: the `n/m` count (or "no matches") plus the
             // bar's key hints.
@@ -2001,7 +2017,7 @@ impl GuiApp {
                 Align2::RIGHT_CENTER,
                 hint,
                 font,
-                Color32::from_rgb(0x88, 0x88, 0x88),
+                chrome::IDLE,
             );
         }
     }
@@ -2105,10 +2121,13 @@ impl eframe::App for GuiApp {
         // The webview sync — post-paint so the browser pane's staged
         // rect is this frame's: probe once while the pane shows,
         // drain the queued navigations, keep the child's bounds on
-        // the staged rect (or hide it), and pump glib on X11. No
-        // blocking calls — the idle window still paints zero frames.
+        // the staged rect (or hide it), pump glib on X11, and —
+        // while a live webview is staged — schedule the bounded
+        // repaint that keeps the pump fed. No blocking calls, and
+        // with no staged webview the idle window still paints zero
+        // frames.
         let browser_shown = shown == Some(SidePane::Aux(PaneId::Browser));
-        self.web.sync(frame, &mut shared, browser_shown);
+        self.web.sync(&ctx, frame, &mut shared, browser_shown);
         drop(shared);
 
         if self.quit {
@@ -2173,11 +2192,11 @@ fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
     match tone {
         Tone::Plain => theme.fg,
         Tone::Strong => Color32::WHITE,
-        Tone::Dim => Color32::from_rgb(0x77, 0x77, 0x77),
-        Tone::Alert => Color32::from_rgb(0xE0, 0xC0, 0x40),
-        Tone::Good => Color32::from_rgb(0x50, 0xC8, 0x50),
-        Tone::Bad => Color32::from_rgb(0xE0, 0x50, 0x50),
-        Tone::Info => Color32::from_rgb(0x50, 0xC0, 0xC0),
+        Tone::Dim => chrome::DIM,
+        Tone::Alert => chrome::WARN,
+        Tone::Good => chrome::GOOD,
+        Tone::Bad => chrome::ERR,
+        Tone::Info => theme.link,
     }
 }
 
@@ -2191,6 +2210,15 @@ fn provisional_cell(metrics: &GuiMetrics) -> CellMetrics {
         width: metrics.font_px() * 0.6,
         height: metrics.font_px() * 1.2,
     }
+}
+
+/// The `~` expansion root, resolved once per process — `home_dir`
+/// reads the env on every call and the detect cache's `env` closure
+/// asks it on each miss (§6's never-per-frame rule).
+fn home_dir() -> PathBuf {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| std::env::home_dir().unwrap_or_default())
+        .clone()
 }
 
 /// One wheel delta → signed scroll lines, carrying the sub-line
@@ -2997,19 +3025,33 @@ mod tests {
             command: true,
             ..egui::Modifiers::NONE
         };
-        let press = |key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
+        // A physical tap — press AND release: egui marks a second
+        // press while the key is still down as `repeat`, so distinct
+        // toggles need the release like real input delivers.
+        let tap = |key| {
+            vec![
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
         };
 
-        feed(&mut harness, vec![press(egui::Key::E)]);
+        feed(&mut harness, tap(egui::Key::E));
         assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
-        feed(&mut harness, vec![press(egui::Key::B)]);
+        feed(&mut harness, tap(egui::Key::B));
         assert_eq!(harness.shared().panes.selected(), Some(PaneId::Browser));
-        feed(&mut harness, vec![press(egui::Key::B)]);
+        feed(&mut harness, tap(egui::Key::B));
         assert_eq!(harness.shared().panes.selected(), None);
 
         // `head -c 1` is still blocked on its first byte — nothing
@@ -3031,17 +3073,31 @@ mod tests {
             &format!("stty raw; head -c 1 > {}", path.display()),
             &path,
         );
-        let press = |key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                ctrl: true,
-                shift: true,
-                command: true,
-                ..egui::Modifiers::NONE
-            },
+        // A physical tap — press AND release (see the strobe test:
+        // a held-down key's later presses read as `repeat`).
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let tap = |key| {
+            vec![
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+            ]
         };
 
         // The find bar owns focus — the chord is swallowed.
@@ -3049,21 +3105,116 @@ mod tests {
             let mut shared = harness.shared.lock().unwrap();
             harness.app.open_find(&mut shared);
         }
-        feed(&mut harness, vec![press(egui::Key::E)]);
+        feed(&mut harness, tap(egui::Key::E));
         assert_eq!(harness.shared().panes.selected(), None);
 
         // A modal picker owns it the same way.
         harness.shared().find = None;
         harness.shared().picker = Some(ProfilePicker::new(vec!["a".into()], "a"));
-        feed(&mut harness, vec![press(egui::Key::E)]);
+        feed(&mut harness, tap(egui::Key::E));
         assert_eq!(harness.shared().panes.selected(), None);
 
         // Overlays gone — the same chord toggles again.
         harness.shared().picker = None;
-        feed(&mut harness, vec![press(egui::Key::E)]);
+        feed(&mut harness, tap(egui::Key::E));
         assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
 
         // Nothing leaked through three chord presses.
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A held chord's autorepeat must not strobe the toggle — one
+    /// flip per physical press; the repeat event is still swallowed
+    /// (nothing reaches the PTY either way).
+    #[test]
+    fn a_held_pane_chord_does_not_strobe_the_toggle() {
+        let path = capture_path("panerepeat");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let press = |repeat| egui::Event::Key {
+            key: egui::Key::E,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        };
+        let release = egui::Event::Key {
+            key: egui::Key::E,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        };
+
+        feed(&mut harness, vec![press(false)]);
+        assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
+        // Autorepeat while the chord is held — the selection stays.
+        // (egui itself marks a press while the key is still down as
+        // `repeat`, so real autorepeat arrives exactly like this.)
+        for _ in 0..3 {
+            feed(&mut harness, vec![press(true)]);
+        }
+        assert_eq!(
+            harness.shared().panes.selected(),
+            Some(PaneId::Explorer),
+            "repeats never toggled the pane back off"
+        );
+        // The key comes up and goes down again — a real second press
+        // still toggles.
+        feed(&mut harness, vec![release, press(false)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// On twin-emitting platforms an `Alt+<letter>` chord arrives as
+    /// `Key{.., alt}` + `Text("x")` — the Text twin must land
+    /// nowhere: not the PTY, and not a shown pane's address entry
+    /// (R14-T3's browser used to append it). Real text while the
+    /// pane shows still appends normally.
+    #[test]
+    fn an_alt_chord_text_twin_never_reaches_a_shown_pane() {
+        let path = capture_path("panetwin");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        harness.toggle_pane(PaneId::Browser);
+        let chord = egui::Event::Key {
+            key: egui::Key::X,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        // The twin pair — the Key's translated char is eaten, so the
+        // Text payload appends nothing to the entry.
+        feed(&mut harness, vec![chord, egui::Event::Text("x".into())]);
+        assert_eq!(harness.shared().browser.entry(), "");
+
+        // Ordinary text still lands — the filter only eats twins.
+        feed(&mut harness, vec![egui::Event::Text("docs".into())]);
+        assert_eq!(harness.shared().browser.entry(), "docs");
+
+        // `head -c 1` is still blocked — nothing leaked to the PTY.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         let _ = std::fs::remove_file(&path);
     }
