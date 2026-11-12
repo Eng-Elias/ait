@@ -438,10 +438,11 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
   (tracked via OSC 7), preview files, and open them in the system editor.
   Read-only by default — any write goes through a confirmation or the
   agent's `edit_files` diff flow, never a silent mutation.
-- An embedded web browser pane for docs and links. Toolkit: **Proposed** —
-  a system-webview embedding (e.g. `wry`/`tao`), decided in the round's
-  grilling and recorded as an ADR; opening links in the external browser is
-  the fallback if embedding is rejected.
+- An embedded web browser pane for docs and links. Toolkit: **Decided**
+  (ADR-0018) — a `wry` child webview embedded over the pane on macOS and
+  Linux/X11, degrading to open-in-external-browser on Wayland, on
+  builds without the `web` feature, and when the webview fails to
+  initialize.
 - Links and file paths detected in terminal output can open in the
   corresponding pane (opt-in per click; exact gesture decided in the round).
 - Both panes are `ait-gui`-only: the core crates and the `ait` TUI gain no

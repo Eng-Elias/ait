@@ -7,3 +7,4 @@ ait bash_blocks_copy_and_inband_roundtrip
 ait-agent pty::tests::the_agent_shell_arms_the_ssh_policy
 ait-agent pty::tests::prompt_marks_settle_an_injected_shell
 ait-agent write_to_pty_first_write_asks_then_the_session_runs_free
+ait-term the_output_mirror_receives_bytes_as_the_reader_reads_them

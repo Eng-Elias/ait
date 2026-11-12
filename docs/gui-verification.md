@@ -40,12 +40,13 @@ Work top to bottom; each item is cheap once the window is up.
   must register before the card's).
 - **Find chord** — `Ctrl+Shift+F` opens the find bar; `Ctrl+F` reaches
   the shell (readline forward-char — terminals never steal it).
-- **Pane chords** — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle their side
-  panes (`Ctrl+Shift+B` is placeholder content until T3): the switcher
-  strip atop the region reverses the shown chip, a second press of the
-  shown pane's chord releases it, and plain `Esc` while a pane shows
-  returns focus to the grid. Bare `Ctrl+E`/`Ctrl+B` and the `Alt`
-  variants must still reach the shell (readline).
+- **Pane chords** — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle the
+  explorer and browser panes: the switcher strip atop the region
+  reverses the shown chip, a second press of the shown pane's chord
+  releases it, and plain `Esc` while a pane shows returns focus to
+  the grid. Bare `Ctrl+E`/`Ctrl+B` and the `Alt` variants must still
+  reach the shell (readline) — type `echo MARKER` after each chord:
+  no stray chars on the line.
 - **Explorer cwd tracking** — `Ctrl+Shift+E` opens the explorer rooted
   at the shell's cwd: `cd elsewhere` (an OSC-7-reporting shell)
   re-roots the listing, and switching tabs re-roots to that tab's cwd.
@@ -61,6 +62,31 @@ Work top to bottom; each item is cheap once the window is up.
 - **Explorer remote gate** — inside an `ssh()` session the pane shows
   `remote session — browsing unavailable` and never lists the local
   disk under the remote path.
+- **Browser webview** — on X11 or macOS, `Ctrl+Shift+B` embeds a
+  `wry` child over the pane body: typing `example.com` + Enter loads
+  it in place (a bare `not a url` turns amber and fetches nothing),
+  `‹`/`›` or `Alt+←`/`Alt+→` walk history, `⟳`/`Ctrl+R` reloads,
+  `ext ↗` hands the page to the system browser, and the child tracks
+  the body rect on window resize and hides when the pane closes.
+- **Browser external surface** — where the embed verdict isn't
+  `Embedded` (Wayland, a `web`-less build, a failed init) the body
+  names the reason (`embedded webviews aren't supported on
+  Wayland`, `this build has no webview runtime`, `the webview
+  runtime failed to initialize`) and keeps the whole chrome: Enter
+  on a URL still navigates — via the system browser — and the
+  surface is never a blank rect.
+- **Missing-webkit degradation** — `libwebkit2gtk-4.1.so.0` is a
+  hard `DT_NEEDED` (ADR-0018): `ldd` on a `web`-feature binary
+  lists it, and a webkit-less system kills that binary in the ELF
+  loader, before the fallback can run. The mitigation is
+  `cargo build -p ait-gui --no-default-features`: that build needs
+  no webkit/gtk packages and the pane reports `this build has no
+  webview runtime`.
+- **Webview frame discipline** — the webview shares the UI thread
+  (§6): with a page loaded, a genuinely idle window still paints
+  zero frames, and typing/grid output stays responsive while a
+  heavy page loads — a stall there wedges input, which is the one
+  risk wry leaves us no off-thread answer for.
 - **Ctrl+click affordance** — hold Ctrl over an `https://`/`file://`
   URL and an existing path in output: detected tokens underline and
   the cursor turns to the pointer; non-tokens, nonexistent paths and
