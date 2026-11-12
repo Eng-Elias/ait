@@ -60,6 +60,96 @@ pub struct Detection {
     pub target: Target,
 }
 
+/// One Ctrl+hover position's detection inputs — the cache key AND
+/// the probe's arguments in one bundle, so the key compare really is
+/// the probe's whole input.
+pub struct HoverAt<'a> {
+    /// The hovered tab's id — the same (line, column, text) on
+    /// another tab is another position.
+    pub tab: u64,
+    /// The pointer's grid line (negative in scrollback).
+    pub line: i32,
+    /// The pointer's cell column.
+    pub column: usize,
+    /// The row's text — `line_cells`'s first half.
+    pub text: &'a str,
+    /// `text`'s char→column map — `line_cells`'s second half.
+    pub cols: &'a [usize],
+    /// The remote gate `detect_in` reads.
+    pub remote: bool,
+    /// The tab's `suggest::cwd_for` answer.
+    pub cwd: &'a Path,
+    /// The `~` expansion root.
+    pub home: &'a Path,
+}
+
+/// `detect_in` memoized on its whole input — the Ctrl+hover
+/// affordance's §6 guard: the filesystem probes (`exists()` per
+/// path-shaped candidate) run once per hover position+content, not
+/// once per frame while Ctrl is held. A mouse move, a scroll, new
+/// output on the row or a `cd` lands a new key and re-probes; a file
+/// created or deleted under an UNCHANGED hover keeps the stale
+/// verdict until one of those moves — the accepted trade for never
+/// probing per frame.
+#[derive(Debug, Default)]
+pub struct DetectCache {
+    key: Option<OwnedKey>,
+    hit: Option<Detection>,
+}
+
+/// The remembered inputs — owned copies of `HoverAt`'s borrows, so
+/// the cache outlives the frame's row text.
+#[derive(Debug)]
+struct OwnedKey {
+    /// `HoverAt::tab`.
+    tab: u64,
+    /// `HoverAt::line`.
+    line: i32,
+    /// `HoverAt::column`.
+    column: usize,
+    /// `HoverAt::remote`.
+    remote: bool,
+    /// `HoverAt::cwd`.
+    cwd: PathBuf,
+    /// `HoverAt::home`.
+    home: PathBuf,
+    /// `HoverAt::text`.
+    text: String,
+}
+
+impl DetectCache {
+    /// `detect_in` on `at`, re-probing only when an input moved —
+    /// identical inputs return the remembered verdict without
+    /// touching the filesystem (and, per the struct doc, possibly a
+    /// stale one).
+    pub fn resolve(&mut self, at: &HoverAt<'_>) -> Option<Detection> {
+        let remembered = self.key.as_ref().is_some_and(|key| {
+            key.tab == at.tab
+                && key.line == at.line
+                && key.column == at.column
+                && key.remote == at.remote
+                && key.cwd.as_path() == at.cwd
+                && key.home.as_path() == at.home
+                && key.text == at.text
+        });
+        if remembered {
+            return self.hit.clone();
+        }
+        let hit = detect_in(at.text, at.cols, at.column, at.remote, at.cwd, at.home);
+        self.key = Some(OwnedKey {
+            tab: at.tab,
+            line: at.line,
+            column: at.column,
+            remote: at.remote,
+            cwd: at.cwd.to_path_buf(),
+            home: at.home.to_path_buf(),
+            text: at.text.to_owned(),
+        });
+        self.hit = hit.clone();
+        hit
+    }
+}
+
 /// `text` → the tokens that afford a route: URLs first (their spans
 /// are claimed before the path pass runs, so a `//x` inside a URL
 /// never starts a path candidate), then path-shaped tokens resolved
@@ -610,5 +700,52 @@ mod tests {
         let file_col = text.find("main.rs").unwrap();
         assert!(detect_in(&text, &cols, url_col, true, fixture.path(), fixture.path()).is_some());
         assert!(detect_in(&text, &cols, file_col, true, fixture.path(), fixture.path()).is_none());
+    }
+
+    // ---- The §6 cache ----
+
+    /// `DetectCache` re-probes only when an input moves — proven
+    /// against the filesystem itself: a file created after a miss is
+    /// invisible to the SAME key (no second `exists()` ran) but found
+    /// the moment the column, the row text or the cwd changes.
+    #[test]
+    fn the_cache_remembers_a_position_until_an_input_moves() {
+        let fixture = fixture();
+        let cwd = fixture.path().join("sub2");
+        std::fs::create_dir(&cwd).unwrap();
+        let text = "open newfile.txt now";
+        let cols: Vec<usize> = (0..text.chars().count()).collect();
+        let column = text.find("newfile.txt").unwrap();
+        let mut cache = DetectCache::default();
+        let at = |column| HoverAt {
+            tab: 0,
+            line: -1,
+            column,
+            text,
+            cols: &cols,
+            remote: false,
+            cwd: &cwd,
+            home: &cwd,
+        };
+
+        assert!(cache.resolve(&at(column)).is_none(), "no file → no afford");
+        std::fs::write(cwd.join("newfile.txt"), "x\n").unwrap();
+        assert!(
+            cache.resolve(&at(column)).is_none(),
+            "the same key never re-probed — the new file is invisible"
+        );
+        // A moved pointer is a new key — the probe runs and finds it.
+        assert!(
+            cache.resolve(&at(column + 1)).is_some(),
+            "a new position re-probes"
+        );
+        // A changed row re-probes too.
+        let mut moved = at(column);
+        moved.text = "open newfile.txt again";
+        assert!(cache.resolve(&moved).is_some());
+        // …and a changed cwd (a `cd`) — the root is different, so the
+        // same text resolves under the other dir and misses.
+        moved.cwd = fixture.path();
+        assert!(cache.resolve(&moved).is_none());
     }
 }

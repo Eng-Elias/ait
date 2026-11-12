@@ -205,6 +205,11 @@ pub struct GuiApp {
     /// (REQUIREMENTS §6; the pump's damage filter decides whether a
     /// frame runs at all, this keeps the frame cheap).
     row_galleys: crate::paint::RowGalleys,
+    /// The Ctrl+hover detection cache — [`detect::DetectCache`]
+    /// memoizes the probe on its whole input so the filesystem
+    /// `exists()` checks run once per hover position+content, not
+    /// once per frame while Ctrl is held (§6).
+    detect_cache: detect::DetectCache,
     /// The browser pane's webview slot (Spec R14 §5.13, R14-T3): the
     /// `!Send` wry child once the probe embeds it — frontend-local
     /// like the galley cache, since `Shared` is touched by the pump's
@@ -318,6 +323,7 @@ impl GuiApp {
             panel_wheel_rem: 0.0,
             pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
+            detect_cache: detect::DetectCache::default(),
             web: WebSlot::new(),
             quit: false,
         })
@@ -1097,7 +1103,11 @@ impl GuiApp {
         // under it underlines and the pointer turns to the hand —
         // Ctrl+click routes the same hit. Plain Ctrl only, so chords
         // that add a modifier keep their other meanings and the
-        // affordance never fights them.
+        // affordance never fights them. The probe rides the frame's
+        // [`detect::DetectCache`]: the row's text/column map still
+        // rebuilds each frame (cheap, O(row)) but the filesystem
+        // probes run only when the position, the text or the cwd
+        // moved — never once per held frame (§6).
         let ctrl = ctx.input(|input| {
             let modifiers = input.modifiers;
             modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
@@ -1108,7 +1118,22 @@ impl GuiApp {
                 let remote = !tab.remote.is_empty();
                 let cwd = PathBuf::from(suggest::cwd_for(tab));
                 let home = std::env::home_dir().unwrap_or_default();
-                detect::detect_at(&tab.grid(), line, column, remote, &cwd, &home)
+                let (text, cols) = tab
+                    .grid()
+                    .line(line)
+                    .map(|row| detect::line_cells(&row))
+                    .unwrap_or_default();
+                self.detect_cache
+                    .resolve(&detect::HoverAt {
+                        tab: tab.id,
+                        line,
+                        column,
+                        text: &text,
+                        cols: &cols,
+                        remote,
+                        cwd: &cwd,
+                        home: &home,
+                    })
                     .map(|hit| (line, hit))
             })
         } else {
@@ -2326,6 +2351,7 @@ mod tests {
                     panel_wheel_rem: 0.0,
                     pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
+                    detect_cache: detect::DetectCache::default(),
                     web: WebSlot::new(),
                     quit: false,
                 },
