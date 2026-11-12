@@ -4,6 +4,8 @@ One-line pitch: drive the **real `ait` binary** in a real PTY with
 keystrokes and mouse, assert on the rendered screen. Deep docs:
 [testing-toolkit.md](testing-toolkit.md) (architecture, record/replay,
 dumps). Agent skill: `.devin/skills/e2e/SKILL.md`.
+GUI frontend (`ait-gui`) has no e2e harness — the manual checklist
+is [gui-verification.md](gui-verification.md).
 
 ## Run
 
@@ -152,18 +154,7 @@ honest last resort — mark the retry in the test name or comment so
 flakes surface in the dump instead of hiding; never weaken an
 assertion to silence drift.
 
-Known flakes — a gate failure on one of these that goes green on a
-plain re-run needs no re-diagnosis; add a name here when a new one
-surfaces, and file the real fix on the ladder above:
-
-- `agent_profile.rs::write_to_pty_first_write_asks_then_the_session_runs_free`
-  — first-write timing race (R08 merge gate; green on re-run).
-- `shell_integration.rs::bash_blocks_copy_and_inband_roundtrip`
-  — block-seal timing (R08 gate; green on re-run).
-- `executor.rs::control_master_runs_commands_over_the_socket` and
-  `executor.rs::demotion_never_replays_and_never_recovers`
-  (ait-agent) — executor timing; green on re-run.
-- `pty.rs::the_agent_shell_arms_the_ssh_policy` (ait-agent) —
-  PTY timing; green on re-run.
-- `scenario.rs::deterministic_verbs_drive_a_shell_scenario`
-  (ait-testkit self-test) — timing; green on re-run.
+The canonical flake list is `docs/agents/flaky-tests.md` (with
+`scripts/flaky-tests.txt` as the machine-readable copy check.sh
+consumes) — add a name there when a new one surfaces, and file the
+real fix on the ladder above.

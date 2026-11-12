@@ -1,9 +1,14 @@
 # Known flaky tests
 
 PTY/timing-sensitive tests that intermittently fail under `cargo test
---workspace` parallel load and pass in isolation. A gate failure in one
-of these is probably a flake, not your change — but verify before
-dismissing it.
+--workspace` parallel load and pass in isolation. `scripts/check.sh`
+skips them in the parallel sweep and re-runs each one serially — the
+sweep red means real breakage; a red serial leg means the flake became
+deterministic or is a real failure.
+
+The machine-readable list check.sh consumes is
+`scripts/flaky-tests.txt`; the table below carries the provenance and
+status behind each entry.
 
 ## Recognition rule
 
@@ -23,18 +28,21 @@ investigate, don't retry-loop the gate hoping for green.
 | Test | Status |
 |---|---|
 | `app::tests::esc_after_the_rewrite_only_cancels_the_suggestion` | fixed in R12 (wait_until wrap); was ~3/8 failures under load |
-| `tabs::tests::sealed_blocks_surface_once_as_persisted_rows` | open — flake seen R12, untouched since R11 |
+| `ait-app tabs::tests::sealed_blocks_surface_once_as_persisted_rows` | open — flake seen R12 (file moved `ait` → `ait-app` in R13) |
 | `shell_integration::bash_blocks_copy_and_inband_roundtrip` | open — flake seen R12, untouched since R05 |
 | `ait-agent pty::tests::the_agent_shell_arms_the_ssh_policy` | open — flake seen R13-T2 (fails while other test binaries still compile; passes isolated and under a quiet parallel load), file untouched since R09 |
 | `ait-agent pty::tests::prompt_marks_settle_an_injected_shell` | open — flake seen R13-T6 (the `QUIET_WINDOW + SETTLE_POLL * 8` bound tripped under compile load, 718 ms; passes serially and isolated), file untouched since R09 |
 
 The underlying PTY races are tracked in the `Backlog: PTY-timing
 flakes under parallel test load` issue — the entries above leave the
-list when that issue (or a fix) lands.
+list when that issue (or a fix) lands. Older R08-era sightings lived
+in `docs/using-the-testkit.md`'s retired local list (removed R13);
+their tests were one-off reruns, not recurring flakes.
 
 ## Adding an entry
 
 A test earns a row when it fails under load and passes isolated twice —
 two sightings, not one bad run. Note the round it was seen in and the
 last commit that touched its file; a flake in freshly edited code is a
-bug in the round, not a flake.
+bug in the round, not a flake. Append the `<crate> <test-name>` line to
+`scripts/flaky-tests.txt` in the same commit so check.sh picks it up.

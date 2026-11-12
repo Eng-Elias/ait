@@ -1,0 +1,8 @@
+# Known-flaky tests, machine-readable — docs/agents/flaky-tests.md owns
+# the recognition rule, the reasons, and when entries are added or
+# removed; this file is the list check.sh consumes.
+# Format: <crate> <exact-test-name>  (one per line, no trailing fields)
+ait-app tabs::tests::sealed_blocks_surface_once_as_persisted_rows
+ait bash_blocks_copy_and_inband_roundtrip
+ait-agent pty::tests::the_agent_shell_arms_the_ssh_policy
+ait-agent pty::tests::prompt_marks_settle_an_injected_shell
