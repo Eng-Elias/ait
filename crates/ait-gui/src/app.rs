@@ -205,6 +205,11 @@ pub struct GuiApp {
     /// (REQUIREMENTS §6; the pump's damage filter decides whether a
     /// frame runs at all, this keeps the frame cheap).
     row_galleys: crate::paint::RowGalleys,
+    /// The Ctrl+hover detection cache — [`detect::DetectCache`]
+    /// memoizes the probe on its whole input so the filesystem
+    /// `exists()` checks run once per hover position+content, not
+    /// once per frame while Ctrl is held (§6).
+    detect_cache: detect::DetectCache,
     /// The browser pane's webview slot (Spec R14 §5.13, R14-T3): the
     /// `!Send` wry child once the probe embeds it — frontend-local
     /// like the galley cache, since `Shared` is touched by the pump's
@@ -318,6 +323,7 @@ impl GuiApp {
             panel_wheel_rem: 0.0,
             pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
+            detect_cache: detect::DetectCache::default(),
             web: WebSlot::new(),
             quit: false,
         })
@@ -366,10 +372,19 @@ impl GuiApp {
                     // explorer, `Ctrl+Shift+B` browser (Spec R14
                     // §5.13). GUI-local like the find chord: the
                     // keymap can't own them and they never reach
-                    // the PTY.
-                    if let Some(id) = pane_chord(key, modifiers) {
-                        self.toggle_pane(shared, id);
-                        continue;
+                    // the PTY. They hold while an overlay owns focus
+                    // — the find bar or a modal picker would lose the
+                    // region under it mid-interaction; the chord
+                    // falls through to the overlay's swallow arm, so
+                    // nothing reaches the PTY either way.
+                    let overlay_owns_focus = shared.find.is_some()
+                        || shared.picker.is_some()
+                        || shared.conversations.is_some();
+                    if !overlay_owns_focus {
+                        if let Some(id) = pane_chord(key, modifiers) {
+                            self.toggle_pane(shared, id);
+                            continue;
+                        }
                     }
                     let translated = translate_key(key, modifiers);
                     if let Some(KeyEvent {
@@ -822,10 +837,7 @@ impl GuiApp {
 
     /// A pane chord's or switcher chip's toggle: the shown pane's
     /// press deselects (the region falls back to the agent claim or
-    /// closes); any other press selects. An open agent panel yields
-    /// its claim to an explicit selection — `toggle_agent_panel`
-    /// walks its open→focus→close cycle until closed; the
-    /// conversation survives and `Alt+A` reopens it.
+    /// closes); any other press runs the shared [`select_pane`] arm.
     fn toggle_pane(&mut self, shared: &mut Shared, id: PaneId) {
         let agent_open = shared
             .tabs
@@ -834,14 +846,22 @@ impl GuiApp {
         if shared.panes.showing(id, agent_open) {
             shared.panes.clear();
         } else {
-            shared.panes.select(id);
-            if let Some(tab) = shared.tabs.active_mut() {
-                while tab.agent_panel_open() {
-                    tab.toggle_agent_panel();
-                }
-            }
+            self.select_pane(shared, id);
         }
         self.resize_for_panes(shared);
+    }
+
+    /// The select arm `toggle_pane` and `show_pane` share: pick the
+    /// pane, and ask an open agent panel to yield its claim —
+    /// `toggle_agent_panel` walks its open→focus→close cycle until
+    /// closed; the conversation survives and `Alt+A` reopens it.
+    fn select_pane(&mut self, shared: &mut Shared, id: PaneId) {
+        shared.panes.select(id);
+        if let Some(tab) = shared.tabs.active_mut() {
+            while tab.agent_panel_open() {
+                tab.toggle_agent_panel();
+            }
+        }
     }
 
     /// One unbound key while an aux pane shows: plain Esc returns
@@ -866,22 +886,16 @@ impl GuiApp {
         shared.tabs.resize_all(self.last_band, session_size);
     }
 
-    /// Make `id` the region's pane — the select + agent-claim yield +
-    /// every-tab resize the chord's open arm runs, minus its
-    /// toggle-off half (an explicit open never closes the pane).
-    /// `toggle_pane` keeps the on/off decision; this is just the show.
+    /// Make `id` the region's pane — the shared [`select_pane`] arm
+    /// plus the every-tab resize, minus `toggle_pane`'s off half (an
+    /// explicit open never closes the pane).
     fn show_pane(&mut self, shared: &mut Shared, id: PaneId) {
         let agent_open = shared
             .tabs
             .active()
             .is_some_and(|tab| tab.agent_panel_open());
         if !shared.panes.showing(id, agent_open) {
-            shared.panes.select(id);
-            if let Some(tab) = shared.tabs.active_mut() {
-                while tab.agent_panel_open() {
-                    tab.toggle_agent_panel();
-                }
-            }
+            self.select_pane(shared, id);
         }
         self.resize_for_panes(shared);
     }
@@ -1052,7 +1066,7 @@ impl GuiApp {
                 new_rect.center(),
                 Align2::CENTER_CENTER,
                 "+",
-                font,
+                font.clone(),
                 if new_hit.hovered() {
                     Color32::WHITE
                 } else {
@@ -1061,6 +1075,33 @@ impl GuiApp {
             );
             if new_hit.clicked() {
                 self.open_tab(shared);
+            }
+        }
+        // The pane host's always-on click affordance (Spec R14 §5.13
+        // us-1 — "a chord AND a clickable affordance"): the switcher
+        // chips only exist once the region is open, so this is the
+        // mouse path onto the host. It toggles the last selection,
+        // explorer by default — the same state move the pane's own
+        // chord makes, so click and chord can never disagree.
+        if let Some(pane_rect) = bar.pane_button {
+            let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
+            if pane_hit.hovered() {
+                painter.rect_filled(pane_rect, 4.0, Color32::from_rgb(0x2A, 0x2A, 0x2A));
+            }
+            painter.text(
+                pane_rect.center(),
+                Align2::CENTER_CENTER,
+                "panes",
+                font,
+                if pane_hit.hovered() {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0xAA, 0xAA, 0xAA)
+                },
+            );
+            if pane_hit.clicked() {
+                let id = shared.panes.selected().unwrap_or(PaneId::Explorer);
+                self.toggle_pane(shared, id);
             }
         }
     }
@@ -1089,7 +1130,11 @@ impl GuiApp {
         // under it underlines and the pointer turns to the hand —
         // Ctrl+click routes the same hit. Plain Ctrl only, so chords
         // that add a modifier keep their other meanings and the
-        // affordance never fights them.
+        // affordance never fights them. The probe rides the frame's
+        // [`detect::DetectCache`]: the row's text/column map still
+        // rebuilds each frame (cheap, O(row)) but the filesystem
+        // probes run only when the position, the text or the cwd
+        // moved — never once per held frame (§6).
         let ctrl = ctx.input(|input| {
             let modifiers = input.modifiers;
             modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
@@ -1100,7 +1145,22 @@ impl GuiApp {
                 let remote = !tab.remote.is_empty();
                 let cwd = PathBuf::from(suggest::cwd_for(tab));
                 let home = std::env::home_dir().unwrap_or_default();
-                detect::detect_at(&tab.grid(), line, column, remote, &cwd, &home)
+                let (text, cols) = tab
+                    .grid()
+                    .line(line)
+                    .map(|row| detect::line_cells(&row))
+                    .unwrap_or_default();
+                self.detect_cache
+                    .resolve(&detect::HoverAt {
+                        tab: tab.id,
+                        line,
+                        column,
+                        text: &text,
+                        cols: &cols,
+                        remote,
+                        cwd: &cwd,
+                        home: &home,
+                    })
                     .map(|hit| (line, hit))
             })
         } else {
@@ -2318,6 +2378,7 @@ mod tests {
                     panel_wheel_rem: 0.0,
                     pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
+                    detect_cache: detect::DetectCache::default(),
                     web: WebSlot::new(),
                     quit: false,
                 },
@@ -2957,6 +3018,56 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The chords hold while an overlay owns focus — the find bar's
+    /// query and a picker's rows would lose the region under them,
+    /// so `Ctrl+Shift+E` is swallowed rather than toggled (and the
+    /// swallowed chord still never reaches the PTY).
+    #[test]
+    fn pane_chords_hold_while_an_overlay_owns_focus() {
+        let path = capture_path("panemodal");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        // The find bar owns focus — the chord is swallowed.
+        {
+            let mut shared = harness.shared.lock().unwrap();
+            harness.app.open_find(&mut shared);
+        }
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        // A modal picker owns it the same way.
+        harness.shared().find = None;
+        harness.shared().picker = Some(ProfilePicker::new(vec!["a".into()], "a"));
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        // Overlays gone — the same chord toggles again.
+        harness.shared().picker = None;
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
+
+        // Nothing leaked through three chord presses.
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The winsize invariant under the host: a pane toggle narrows
     /// EVERY session to the grid-pane columns and the deselect
     /// restores the band — the agent-open rule, unchanged for a new
@@ -3184,6 +3295,47 @@ mod tests {
         assert_eq!(shared.explorer.dir(), first.path());
     }
 
+    /// us-13's toast defers to a live one: a newly-failed listing
+    /// wants a toast, but a live toast in the strip is never
+    /// clobbered — the error row still reports the failure in-pane.
+    /// Once the strip is free, the NEXT new error toasts normally.
+    #[test]
+    fn a_new_listing_error_yields_to_a_live_toast() {
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("gone");
+        let harness = Harness::new(sh_manager());
+        report_cwd(&harness, &missing);
+        {
+            let mut shared = harness.shared();
+            shared.toast = Some(Toast::new("keep me", Instant::now()));
+            crate::explorer::sync_explorer(&mut shared);
+            assert!(
+                shared.explorer.error().is_some(),
+                "the missing root failed to list"
+            );
+            assert_eq!(
+                shared.toast.as_ref().unwrap().text(),
+                "keep me",
+                "the live toast was not clobbered"
+            );
+        }
+        // The strip free again — a NEW error toasts like before.
+        report_cwd(&harness, &missing.join("deeper"));
+        {
+            let mut shared = harness.shared();
+            shared.toast = None;
+            crate::explorer::sync_explorer(&mut shared);
+            assert!(
+                shared
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.text().contains("deeper")),
+                "the fresh error toasts: {:?}",
+                shared.toast.as_ref().map(Toast::text)
+            );
+        }
+    }
+
     // ---- The browser pane (Spec R14 §5.13, R14-T3) ----
 
     /// While the browser shows, `Event::Text` is the address entry —
@@ -3362,16 +3514,22 @@ mod tests {
         std::fs::write(fixture.path().join("file.txt"), "x\n").unwrap();
         let harness = Harness::new(sh_manager());
         report_cwd(&harness, fixture.path());
-        // 29 columns of output — under the harness's 40-wide grid so
-        // the whole row stays one line (no mid-token wrap).
-        run_line(&harness, "echo 'see https://a/b then file.txt'");
+        // The `out=` marker exists ONLY in the printf output — the
+        // typed command never contains it, so the wait gates on
+        // execution-produced output, not the input echo
+        // (CODING_STANDARDS §15). 34 columns of output — under the
+        // harness's 40-wide grid so the whole row stays one line.
+        run_line(
+            &harness,
+            "printf 'out=%s\\n' 'see https://a/b then file.txt'",
+        );
         wait_until(&harness, |h| {
             let shared = h.shared();
             let tab = shared.tabs.active().unwrap();
             let grid = tab.grid();
             (-(grid.scrollback() as i32)..grid.lines() as i32).any(|line| {
                 grid.line(line)
-                    .is_some_and(|row| row.text().contains("see https://a/b then file.txt"))
+                    .is_some_and(|row| row.text().contains("out=see https://a/b then file.txt"))
             })
         });
 
@@ -3382,7 +3540,7 @@ mod tests {
             .find_map(|line| {
                 grid.line(line)
                     .map(|row| (line, row.text()))
-                    .filter(|(_, text)| text.contains("see https://a/b then file.txt"))
+                    .filter(|(_, text)| text.contains("out=see https://a/b then file.txt"))
             })
             .unwrap();
         let home = fixture.path().to_path_buf();

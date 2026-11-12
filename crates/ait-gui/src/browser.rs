@@ -298,6 +298,30 @@ impl BrowserState {
         self.pending.push_back(NavCommand::Navigate(url));
     }
 
+    /// A webview-reported navigation — a link click or script-driven
+    /// location change the PAGE initiated (the wry adapter's
+    /// `with_navigation_handler` report; us-18). The webview is
+    /// already loading it, so history records it without queueing
+    /// another `NavCommand` — the entry and back/forward then track
+    /// the page the webview is actually on instead of the last typed
+    /// URL. A report naming the current page is a no-op: our own
+    /// `load_url`s report back through the same hook on every
+    /// platform, and a page's same-URL refresh must not double-count.
+    /// The URL lands verbatim — the webview already fetched it, so
+    /// the `normalize_url` gate (which exists to keep unfetchable
+    /// text out of the fetch path) doesn't apply.
+    pub fn webview_navigated(&mut self, url: &str) {
+        let url = url.trim();
+        if url.is_empty() || self.current() == Some(url) {
+            return;
+        }
+        self.bad_entry = false;
+        self.history.truncate(self.index + 1);
+        self.history.push(url.to_owned());
+        self.index = self.history.len() - 1;
+        self.entry = url.to_owned();
+    }
+
     /// Re-fetch the current page — a no-op with no page loaded.
     pub fn reload(&mut self) {
         if self.current().is_some() {
@@ -815,6 +839,46 @@ mod tests {
             ],
             "External verdict: navigate→external, reload dropped"
         );
+    }
+
+    /// us-18: a webview-reported navigation lands as a real history
+    /// entry — entry synced, forward half truncated — while queueing
+    /// NO load of its own (the webview is already there). Our own
+    /// queued navigations reporting back dedupe against the current
+    /// page, and an empty report is ignored outright.
+    #[test]
+    fn webview_navigations_sync_entry_and_history_without_queueing() {
+        let mut browser = BrowserState::default();
+        browser.set_embed(Embed::Embedded);
+        browser.navigate("https://a.dev");
+        let _ = browser.drain_nav();
+
+        // Our own `load_url` reporting back dedupes — no second
+        // history entry, no new command.
+        browser.webview_navigated("https://a.dev");
+        assert_eq!(browser.current(), Some("https://a.dev"));
+        assert!(browser.drain_nav().is_empty());
+        browser.webview_navigated("  ");
+        assert_eq!(browser.current(), Some("https://a.dev"));
+
+        // A link click inside the page is a fresh history entry.
+        browser.webview_navigated("https://a.dev/docs");
+        assert_eq!(browser.current(), Some("https://a.dev/docs"));
+        assert_eq!(browser.entry(), "https://a.dev/docs");
+        assert!(browser.can_go_back());
+        assert!(
+            browser.drain_nav().is_empty(),
+            "no re-fetch queued — the webview already navigated"
+        );
+
+        // Back still replays the pre-click page; a reported
+        // navigation mid-history truncates the forward half.
+        browser.go_back();
+        assert_eq!(browser.current(), Some("https://a.dev"));
+        let _ = browser.drain_nav();
+        browser.webview_navigated("https://else.dev");
+        assert!(!browser.can_go_forward());
+        assert_eq!(browser.current(), Some("https://else.dev"));
     }
 
     /// The entry's edit surface: text appends, Backspace pops,

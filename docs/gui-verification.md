@@ -46,7 +46,15 @@ Work top to bottom; each item is cheap once the window is up.
   releases it, and plain `Esc` while a pane shows returns focus to
   the grid. Bare `Ctrl+E`/`Ctrl+B` and the `Alt` variants must still
   reach the shell (readline) — type `echo MARKER` after each chord:
-  no stray chars on the line.
+  no stray chars on the line. While the find bar or a picker is up,
+  the chords hold — a `Ctrl+Shift+E` mid-search or mid-pick is
+  swallowed, never toggles the region out from under the overlay.
+- **Pane click affordance** — the `panes` button anchored at the tab
+  bar's right edge opens the host with the mouse (explorer on a
+  fresh window, the last selection after): a click while the region
+  is closed opens it, a click while that pane shows toggles it off.
+  `..` in the explorer stops at the session root — it never climbs
+  to `/`.
 - **Explorer cwd tracking** — `Ctrl+Shift+E` opens the explorer rooted
   at the shell's cwd: `cd elsewhere` (an OSC-7-reporting shell)
   re-roots the listing, and switching tabs re-roots to that tab's cwd.
@@ -68,6 +76,10 @@ Work top to bottom; each item is cheap once the window is up.
   `‹`/`›` or `Alt+←`/`Alt+→` walk history, `⟳`/`Ctrl+R` reloads,
   `ext ↗` hands the page to the system browser, and the child tracks
   the body rect on window resize and hides when the pane closes.
+  A link click inside the page syncs the address entry and pushes
+  history (the wry navigation handler's report), so `‹`/`Alt+←`
+  returns to the pre-click page rather than the last typed URL —
+  mid-load redirect hops can lag the entry one step on webkit.
 - **Browser external surface** — where the embed verdict isn't
   `Embedded` (Wayland, a `web`-less build, a failed init) the body
   names the reason (`embedded webviews aren't supported on
