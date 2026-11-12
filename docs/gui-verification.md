@@ -40,6 +40,17 @@ Work top to bottom; each item is cheap once the window is up.
   must register before the card's).
 - **Find chord** — `Ctrl+Shift+F` opens the find bar; `Ctrl+F` reaches
   the shell (readline forward-char — terminals never steal it).
+- **Pane chords** — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle their side
+  panes (placeholder content in T1): the switcher strip atop the region
+  reverses the shown chip, a second press of the shown pane's chord
+  releases it, and plain `Esc` while a pane shows returns focus to the
+  grid. Bare `Ctrl+E`/`Ctrl+B` and the `Alt` variants must still reach
+  the shell (readline).
+- **Pane/agent precedence** — with the agent panel open, a pane chord
+  switches the region to that pane (the panel's conversation survives —
+  `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
+  over the live selection. Chord leak: type `echo MARKER` after each —
+  no stray chars on the line.
 - **Paste trigger** — OS-paste `# list files here` + Enter fires the
   suggestion path; a paste containing newline/tab/escape bytes stays
   inert; `ait ctl send` is never classified (by design).
