@@ -95,8 +95,13 @@ Work top to bottom; each item is cheap once the window is up.
   no webkit/gtk packages and the pane reports `this build has no
   webview runtime`.
 - **Webview frame discipline** — the webview shares the UI thread
-  (§6): with a page loaded, a genuinely idle window still paints
-  zero frames, and typing/grid output stays responsive while a
+  (§6): while a live webview is staged the sync schedules a bounded
+  ~33 ms repaint so the glib pump and page animation keep
+  progressing between egui frames — an embedded page visibly plays
+  video/animation rather than freezing on the last painted frame.
+  With the pane closed (no staged surface, or no host) nothing is
+  scheduled and the idle window still paints zero frames; and
+  typing/grid output stays responsive while a
   heavy page loads — a stall there wedges input, which is the one
   risk wry leaves us no off-thread answer for.
 - **Ctrl+click affordance** — hold Ctrl over an `https://`/`file://`
