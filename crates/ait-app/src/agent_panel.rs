@@ -522,6 +522,20 @@ impl AgentPanel {
         self.revision += 1;
     }
 
+    /// Close the split outright — `toggle`'s "open-and-focused"
+    /// arm's effect directly, for a caller that must close rather
+    /// than cycle (the GUI's pane host yielding the region to an
+    /// aux selection, Spec R14). The conversation — and any running
+    /// task — survives exactly like a toggled close. Idempotent: a
+    /// closed or absent split stays closed.
+    pub fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            self.focused = false;
+            self.revision += 1;
+        }
+    }
+
     /// Plain Esc while focused: a running task cancels (the terminal
     /// `Cancelled` event lands on the next drain and releases
     /// `running`); an idle one returns focus to the terminal while
