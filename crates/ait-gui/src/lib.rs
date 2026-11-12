@@ -18,6 +18,9 @@
 //! - [`pane`] — the side region's pane host (Spec R14 §5.13): the
 //!   `Pane` trait, the static registry, the app-global selection
 //!   state and the `Ctrl+Shift+E`/`Ctrl+Shift+B` chord interception.
+//! - [`explorer`] — the file-explorer pane (R14-T2): the read-only
+//!   `cwd_for`-rooted browser's model, its fs/editor seams and its
+//!   `Pane` impl.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -33,6 +36,7 @@
 // internals (`app`'s `GuiApp`/`Shared`, the pump, the painters),
 // shared inside the crate and invisible outside it.
 pub(crate) mod app;
+pub(crate) mod explorer;
 pub(crate) mod grid;
 pub(crate) mod keys;
 pub(crate) mod layout;

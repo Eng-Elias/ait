@@ -41,6 +41,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2, ViewportCommand,
 };
 
+use crate::explorer::ExplorerState;
 use crate::grid::GridTheme;
 use crate::keys::{translate_key, translate_text};
 use crate::layout::{
@@ -112,6 +113,11 @@ pub struct Shared {
     /// the active tab while each tab's own agent claim resolves per
     /// tab.
     pub panes: PaneHost,
+    /// The file explorer's model (Spec R14 §5.13, R14-T2) — the
+    /// listing, selection, preview and navigation the `explorer`
+    /// pane's `key`/`paint` drive; re-synced to the active tab's
+    /// `cwd_for` answer on every touch.
+    pub explorer: ExplorerState,
 }
 
 impl Shared {
@@ -275,6 +281,7 @@ impl GuiApp {
             suggestion: SuggestionPin::new(),
             find: None,
             panes: PaneHost::default(),
+            explorer: ExplorerState::default(),
         }));
         let watcher = config::watcher();
         let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
@@ -2158,6 +2165,7 @@ mod tests {
                 suggestion: SuggestionPin::new(),
                 find: None,
                 panes: PaneHost::default(),
+                explorer: ExplorerState::default(),
             }));
             Self {
                 app: GuiApp {
@@ -2934,5 +2942,111 @@ mod tests {
         let shared = harness.shared();
         assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
         assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+    }
+
+    // ---- The explorer pane (Spec R14 §5.13, R14-T2) ----
+
+    /// Emit an OSC 7 cwd report on the active tab's shell — the same
+    /// `printf` line ait-app's `cwd_for` tests use — and wait for the
+    /// fold to land on THIS path (a second report on the same tab must
+    /// not pass on the first's flag).
+    fn report_cwd(harness: &Harness, path: &std::path::Path) {
+        run_line(
+            harness,
+            &format!("printf '\\033]7;file://h{}\\a'", path.display()),
+        );
+        wait_until(harness, |h| h.shared().tabs.active().unwrap().cwd() == path);
+    }
+
+    /// While the explorer shows, its routed keys drive the model on
+    /// `Shared` — arrows move the highlight and load the file
+    /// preview, `Enter` descends, `⌫` walks back — and nothing
+    /// reaches the PTY (the input shadow stays empty).
+    #[test]
+    fn explorer_keys_drive_the_shared_model() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("subdir")).unwrap();
+        std::fs::write(fixture.path().join("file.txt"), "x\n").unwrap();
+        let mut harness = Harness::new(sh_manager());
+        report_cwd(&harness, fixture.path());
+        harness.toggle_pane(PaneId::Explorer);
+        {
+            let mut shared = harness.shared();
+            crate::explorer::sync_explorer(&mut shared);
+            assert_eq!(shared.explorer.dir(), fixture.path());
+            assert_eq!(shared.explorer.selected_entry().unwrap().name, "subdir");
+        }
+
+        harness.press(Key::Down, Modifiers::NONE);
+        {
+            let shared = harness.shared();
+            assert_eq!(shared.explorer.selected_entry().unwrap().name, "file.txt");
+            assert!(
+                matches!(
+                    shared.explorer.preview(),
+                    Some(crate::explorer::Preview::Text { .. })
+                ),
+                "selecting the file loaded its preview"
+            );
+            assert!(
+                shared.tabs.active().unwrap().shadow.text().is_empty(),
+                "the pane owns the key — the PTY saw nothing"
+            );
+        }
+
+        // Up onto the dir row, Enter descends into it.
+        harness.press(Key::Up, Modifiers::NONE);
+        harness.press(Key::Enter, Modifiers::NONE);
+        {
+            let shared = harness.shared();
+            assert_eq!(shared.explorer.dir(), fixture.path().join("subdir"));
+        }
+
+        // ⌫ walks back and re-selects the dir we left.
+        harness.press(Key::Backspace, Modifiers::NONE);
+        let shared = harness.shared();
+        assert_eq!(shared.explorer.dir(), fixture.path());
+        assert_eq!(shared.explorer.selected_entry().unwrap().name, "subdir");
+    }
+
+    /// us-3/4: the explorer's root tracks the active tab — an OSC-7
+    /// report re-roots the listing, and switching tabs re-roots to
+    /// that tab's own cwd.
+    #[test]
+    fn the_explorer_re_roots_on_osc7_and_tab_switch() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir(first.path().join("alpha")).unwrap();
+        std::fs::create_dir(second.path().join("beta")).unwrap();
+        let mut harness = Harness::new(sh_manager());
+        report_cwd(&harness, first.path());
+        harness.toggle_pane(PaneId::Explorer);
+        {
+            let mut shared = harness.shared();
+            crate::explorer::sync_explorer(&mut shared);
+            assert_eq!(shared.explorer.dir(), first.path());
+        }
+
+        // The new tab reports its own cwd — the pane re-roots to it.
+        harness.press(Key::Char('t'), Modifiers::ALT);
+        report_cwd(&harness, second.path());
+        {
+            let mut shared = harness.shared();
+            crate::explorer::sync_explorer(&mut shared);
+            assert_eq!(shared.explorer.dir(), second.path());
+            let names: Vec<_> = shared
+                .explorer
+                .visible()
+                .map(|(_, entry)| entry.name.as_str())
+                .collect();
+            assert_eq!(names, ["beta"], "the listing re-read the new root");
+        }
+
+        // Back on tab 1 its cwd is the root again — the browsed
+        // position doesn't follow across a re-root.
+        harness.press(Key::Char('1'), Modifiers::ALT);
+        let mut shared = harness.shared();
+        crate::explorer::sync_explorer(&mut shared);
+        assert_eq!(shared.explorer.dir(), first.path());
     }
 }

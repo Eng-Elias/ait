@@ -36,6 +36,12 @@ pub struct Settings {
     /// Spec R11).
     #[serde(default)]
     pub input: InputSettings,
+    /// `[gui]` — the ait-gui-only settings (§4.3, §5.13, Spec R14):
+    /// the TUI never reads them but must still parse the table — the
+    /// frontends share one `settings.toml`, and `deny_unknown_fields`
+    /// would otherwise reject the file for both.
+    #[serde(default)]
+    pub gui: GuiSettings,
 }
 
 impl Settings {
@@ -324,6 +330,21 @@ pub enum ClassifierMode {
     Heuristic,
     /// `off` — classification disabled; Enter always submits verbatim.
     Off,
+}
+
+/// `[gui]` (§4.3, §5.13, Spec R14) — the ait-gui frontend's settings:
+/// parsed here so the shared `settings.toml` loads for both
+/// frontends, read only by `ait-gui`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GuiSettings {
+    /// The file-explorer pane's "open in system editor" override —
+    /// wins over `$VISUAL`/`$EDITOR`; unset falls through to the env
+    /// chain, then the platform opener. May carry arguments
+    /// (`"code --goto"`): it's spawned through the shell, never split
+    /// here.
+    pub editor: Option<String>,
 }
 
 /// `[terminal]` (§4.3) — settings applied when spawning NEW sessions.

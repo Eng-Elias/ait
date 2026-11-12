@@ -66,6 +66,13 @@ pub fn default_template() -> String {
 # enable  = []            # opt in: the pii_* categories
 # disable = []            # turn a built-in off, e.g. ["jwt"]
 
+# GUI frontend (§5.13): settings only `ait-gui` reads — the TUI
+# parses the section but ignores it.
+# [gui]
+# editor = "code --goto"   # file-explorer "open in editor" override;
+#                          # unset: $VISUAL → $EDITOR → the platform
+#                          # opener (open/xdg-open)
+#
 # A declared endpoint — any OpenAI- or Anthropic-compatible server.
 [agents.custom_endpoints.local]
 name     = "Local Ollama"
