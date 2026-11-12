@@ -208,3 +208,20 @@ fn template_documents_the_input_section() {
         "the [input] block stays commented"
     );
 }
+
+/// Spec R14 §5.13: `ait --init`'s template documents the `[gui]`
+/// section — the explorer pane's editor override — in a commented
+/// block.
+#[test]
+fn template_documents_the_gui_section() {
+    let template = default_template();
+    assert!(template.contains("editor"), "template missing [gui] key");
+    assert!(
+        template.contains("# [gui]"),
+        "the [gui] block stays commented"
+    );
+    // `--print-schema` covers the `[gui]` model.
+    let schema: serde_json::Value = serde_json::from_str(&json_schema()).unwrap();
+    assert!(schema["properties"]["gui"].is_object());
+    assert!(schema["$defs"]["GuiSettings"].is_object());
+}
