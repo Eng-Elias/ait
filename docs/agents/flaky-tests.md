@@ -32,6 +32,7 @@ investigate, don't retry-loop the gate hoping for green.
 | `shell_integration::bash_blocks_copy_and_inband_roundtrip` | open — flake seen R12, untouched since R05 |
 | `ait-agent pty::tests::the_agent_shell_arms_the_ssh_policy` | open — flake seen R13-T2 (fails while other test binaries still compile; passes isolated and under a quiet parallel load), file untouched since R09 |
 | `ait-agent pty::tests::prompt_marks_settle_an_injected_shell` | open — flake seen R13-T6 (the `QUIET_WINDOW + SETTLE_POLL * 8` bound tripped under compile load, 718 ms; passes serially and isolated), file untouched since R09 |
+| `ait-agent write_to_pty_first_write_asks_then_the_session_runs_free` | open — flake seen R14-T2 (the third captured request raced the shell's `READ-hello` echo under sweep load, twice; passes isolated twice), file untouched since R10 |
 
 The underlying PTY races are tracked in the `Backlog: PTY-timing
 flakes under parallel test load` issue — the entries above leave the
