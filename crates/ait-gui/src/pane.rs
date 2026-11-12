@@ -35,7 +35,7 @@ use crate::grid::GridTheme;
 pub enum PaneId {
     /// The file explorer slot — `Ctrl+Shift+E` (R14-T2 fills it).
     Explorer,
-    /// The web browser slot — `Ctrl+Shift+B` (R14-T3 fills it).
+    /// The web browser slot — `Ctrl+Shift+B` (R14-T3).
     Browser,
 }
 
@@ -78,10 +78,10 @@ pub trait Pane: Sync {
 }
 
 /// The static registry — the host's enumeration of auxiliary panes,
-/// in switcher order. R14-T1 registers placeholder entries so the
-/// chords and the host are demoable; the explorer and browser
-/// tickets swap in their real implementations additively.
-pub static PANES: &[&'static dyn Pane] = &[&EXPLORER, &BROWSER];
+/// in switcher order. R14-T3 swapped the browser slot's placeholder
+/// for the real [`crate::browser::BROWSER`]; the explorer ticket does
+/// the same for its slot.
+pub static PANES: &[&'static dyn Pane] = &[&EXPLORER, &crate::browser::BROWSER];
 
 /// The registry entry for a slot — the paint and input paths'
 /// `PaneId` → `Pane` resolution.
@@ -182,13 +182,6 @@ static EXPLORER: PlaceholderPane = PlaceholderPane {
     title: "explorer",
     chord: egui::Key::E,
     landing: "R14-T2",
-};
-
-static BROWSER: PlaceholderPane = PlaceholderPane {
-    id: PaneId::Browser,
-    title: "browser",
-    chord: egui::Key::B,
-    landing: "R14-T3",
 };
 
 impl Pane for PlaceholderPane {

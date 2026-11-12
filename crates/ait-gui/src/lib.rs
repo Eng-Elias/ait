@@ -18,6 +18,11 @@
 //! - [`pane`] — the side region's pane host (Spec R14 §5.13): the
 //!   `Pane` trait, the static registry, the app-global selection
 //!   state and the `Ctrl+Shift+E`/`Ctrl+Shift+B` chord interception.
+//! - [`browser`] — the web browser pane (R14-T3): entry/history/nav
+//!   model and the embed-vs-external fallback decision, all pure.
+//! - [`webview`] — the `wry` adapter behind the `web` feature: the
+//!   child-webview handle, the gtk/glib plumbing and the platform
+//!   opener the external surface delegates to.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -33,6 +38,7 @@
 // internals (`app`'s `GuiApp`/`Shared`, the pump, the painters),
 // shared inside the crate and invisible outside it.
 pub(crate) mod app;
+pub(crate) mod browser;
 pub(crate) mod grid;
 pub(crate) mod keys;
 pub(crate) mod layout;
@@ -40,6 +46,7 @@ pub(crate) mod paint;
 pub(crate) mod pane;
 pub(crate) mod panel;
 pub(crate) mod pump;
+pub(crate) mod webview;
 
 use std::io::Write as _;
 

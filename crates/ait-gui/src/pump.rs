@@ -388,6 +388,7 @@ mod tests {
             suggestion: ait_app::suggest::SuggestionPin::new(),
             find: None,
             panes: crate::pane::PaneHost::default(),
+            browser: crate::browser::BrowserState::default(),
         }))
     }
 

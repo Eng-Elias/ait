@@ -41,6 +41,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2, ViewportCommand,
 };
 
+use crate::browser::BrowserState;
 use crate::grid::GridTheme;
 use crate::keys::{translate_key, translate_text};
 use crate::layout::{
@@ -51,6 +52,7 @@ use crate::paint::{paint_grid, FindOverlay, Overlays};
 use crate::pane::{pane, pane_chord, PaneHost, PaneId, SidePane, PANES};
 use crate::panel::{self, Gate, Tone};
 use crate::pump::Pump;
+use crate::webview::WebSlot;
 
 /// How long before a live toast's expiry the UI asks for one more
 /// frame — the only *timed* repaint the GUI schedules (everything
@@ -112,6 +114,13 @@ pub struct Shared {
     /// the active tab while each tab's own agent claim resolves per
     /// tab.
     pub panes: PaneHost,
+    /// The browser pane's model (Spec R14 §5.13, R14-T3): the address
+    /// entry, the navigation history, the queued `NavCommand`s the
+    /// frame's webview sync drains and the embed verdict the probe
+    /// reports back — app-global and ephemeral like the selection.
+    /// The `!Send` wry handle itself is `GuiApp`'s, never this
+    /// struct's (the pump's drain thread shares `Shared`).
+    pub browser: BrowserState,
 }
 
 impl Shared {
@@ -188,6 +197,12 @@ pub struct GuiApp {
     /// (REQUIREMENTS §6; the pump's damage filter decides whether a
     /// frame runs at all, this keeps the frame cheap).
     row_galleys: crate::paint::RowGalleys,
+    /// The browser pane's webview slot (Spec R14 §5.13, R14-T3): the
+    /// `!Send` wry child once the probe embeds it — frontend-local
+    /// like the galley cache, since `Shared` is touched by the pump's
+    /// drain thread and the webview is UI-thread-bound. Its per-frame
+    /// [`WebSlot::sync`] runs post-paint.
+    web: WebSlot,
     /// Set when the input dispatch decided the app should close —
     /// applied after `ui` returns so the frame can't see a
     /// half-drained state.
@@ -275,6 +290,7 @@ impl GuiApp {
             suggestion: SuggestionPin::new(),
             find: None,
             panes: PaneHost::default(),
+            browser: BrowserState::default(),
         }));
         let watcher = config::watcher();
         let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
@@ -293,6 +309,7 @@ impl GuiApp {
             panel_wheel_rem: 0.0,
             pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
+            web: WebSlot::new(),
             quit: false,
         })
     }
@@ -838,6 +855,32 @@ impl GuiApp {
     fn resize_for_panes(&mut self, shared: &mut Shared) {
         let session_size = region_session_size(&shared.panes);
         shared.tabs.resize_all(self.last_band, session_size);
+    }
+
+    /// R14-T4's "open the browser pane at this URL" entry point —
+    /// the Ctrl+click-on-URL route and any other caller that names a
+    /// destination: queue the navigation (the address entry follows
+    /// it) and make the browser pane show — the same claim-yield and
+    /// resize a chord performs, minus the toggle-off arm (an explicit
+    /// open never closes the pane). Whether the page embeds or hands
+    /// to the system browser is the probe's verdict, not this
+    /// caller's concern.
+    #[allow(dead_code)] // R14-T4's Ctrl+click route is the caller; until it lands only the harness test exercises this
+    pub(crate) fn open_browser_at(&mut self, shared: &mut Shared, url: &str) {
+        shared.browser.navigate(url);
+        let agent_open = shared
+            .tabs
+            .active()
+            .is_some_and(|tab| tab.agent_panel_open());
+        if !shared.panes.showing(PaneId::Browser, agent_open) {
+            shared.panes.select(PaneId::Browser);
+            if let Some(tab) = shared.tabs.active_mut() {
+                while tab.agent_panel_open() {
+                    tab.toggle_agent_panel();
+                }
+            }
+        }
+        self.resize_for_panes(shared);
     }
 
     // -----------------------------------------------------------------
@@ -1836,7 +1879,7 @@ impl eframe::App for GuiApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // Clone the Arc BEFORE locking: a `MutexGuard` borrows the
         // Mutex, which would hold `self.shared` immutably for the
@@ -1890,8 +1933,11 @@ impl eframe::App for GuiApp {
         // 3. The content split — the pane host's share comes off the
         //    band exactly like `session_size` told the PTY (the region
         //    is open while the agent claims OR an aux pane is
-        //    selected).
+        //    selected). The browser's staged webview rect clears here
+        //    — the pane's paint re-stages it while embedded; a `None`
+        //    surviving to the sync is the hide signal.
         let shown = shared.shown_pane();
+        shared.browser.set_surface(None);
         let (grid_pane, region_rect) = split_content(regions.content, shown.is_some(), cell);
 
         self.paint_tab_bar(ui, &mut shared, regions.tab_bar);
@@ -1910,6 +1956,13 @@ impl eframe::App for GuiApp {
         }
         self.paint_status(ui, &shared, regions.status);
         self.paint_modals(ui, &shared, area);
+        // The webview sync — post-paint so the browser pane's staged
+        // rect is this frame's: probe once while the pane shows,
+        // drain the queued navigations, keep the child's bounds on
+        // the staged rect (or hide it), and pump glib on X11. No
+        // blocking calls — the idle window still paints zero frames.
+        let browser_shown = shown == Some(SidePane::Aux(PaneId::Browser));
+        self.web.sync(frame, &mut shared, browser_shown);
         drop(shared);
 
         if self.quit {
@@ -2158,6 +2211,7 @@ mod tests {
                 suggestion: SuggestionPin::new(),
                 find: None,
                 panes: PaneHost::default(),
+                browser: BrowserState::default(),
             }));
             Self {
                 app: GuiApp {
@@ -2177,6 +2231,7 @@ mod tests {
                     panel_wheel_rem: 0.0,
                     pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
+                    web: WebSlot::new(),
                     quit: false,
                 },
                 shared,
@@ -2934,5 +2989,104 @@ mod tests {
         let shared = harness.shared();
         assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
         assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+    }
+
+    // ---- The browser pane (Spec R14 §5.13, R14-T3) ----
+
+    /// While the browser shows, `Event::Text` is the address entry —
+    /// through the real dispatch path, so nothing reaches the PTY —
+    /// and Enter queues the normalized navigation. The harness's
+    /// `embed` stays `Unknown` (no frame to probe), so the drain maps
+    /// it to the external-open sink: the fallback decision exercised
+    /// at the same seam the app drains.
+    #[test]
+    fn browser_entry_takes_text_and_enter_queues_the_navigation() {
+        let path = capture_path("browserentry");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        harness.toggle_pane(PaneId::Browser);
+
+        feed(&mut harness, vec![egui::Event::Text("docs.rs".into())]);
+        assert_eq!(harness.shared().browser.entry(), "docs.rs");
+
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        feed(&mut harness, vec![enter]);
+        {
+            let mut shared = harness.shared();
+            assert_eq!(shared.browser.entry(), "https://docs.rs");
+            assert_eq!(
+                shared.browser.drain_nav(),
+                vec![crate::browser::NavCommand::OpenExternal(
+                    "https://docs.rs".into()
+                )],
+                "Unknown verdict drains to the system-browser sink"
+            );
+        }
+        // `head -c 1` is still blocked — nothing leaked to the PTY.
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `open_browser_at` — T4's Ctrl+click entry point: the URL
+    /// queues normalized, the browser selection lands, an agent
+    /// claim yields, and every session keeps the grid-pane winsize.
+    #[test]
+    fn open_browser_at_navigates_and_shows_the_pane() {
+        let mut harness = Harness::new(sh_manager());
+        harness.press(Key::Char('a'), Modifiers::ALT);
+        assert!(harness.shared().tabs.active().unwrap().agent_panel_open());
+        {
+            // The `toggle_pane` helper's own pattern: the field lock
+            // borrows `shared`, `app` borrows disjointly.
+            let mut shared = harness.shared.lock().unwrap();
+            harness.app.open_browser_at(&mut shared, "example.com");
+        }
+        {
+            let mut shared = harness.shared();
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Browser)));
+            assert!(
+                !shared.tabs.active().unwrap().agent_panel_open(),
+                "the claim yielded"
+            );
+            assert_eq!(shared.browser.current(), Some("https://example.com"));
+            assert_eq!(shared.browser.entry(), "https://example.com");
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+            let _ = shared.browser.drain_nav();
+        }
+
+        // Already showing: a second open only navigates — the
+        // selection is never toggled off by an explicit open.
+        {
+            let mut shared = harness.shared.lock().unwrap();
+            harness.app.open_browser_at(&mut shared, "https://b.dev");
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Browser)));
+            assert_eq!(shared.browser.current(), Some("https://b.dev"));
+            assert!(shared.browser.can_go_back());
+        }
+    }
+
+    /// A rejected address input stays out of every queue — the
+    /// hint flag is the only trace, and nothing unfetchable is
+    /// fetched (§5.13 local-first).
+    #[test]
+    fn a_rejected_address_never_queues() {
+        let mut harness = Harness::new(sh_manager());
+        harness.toggle_pane(PaneId::Browser);
+        feed(&mut harness, vec![egui::Event::Text("not a url".into())]);
+        harness.press(Key::Enter, Modifiers::NONE);
+        let mut shared = harness.shared();
+        assert!(shared.browser.bad_entry());
+        assert!(shared.browser.drain_nav().is_empty());
+        assert_eq!(shared.browser.current(), None);
     }
 }
