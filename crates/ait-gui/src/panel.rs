@@ -20,8 +20,8 @@ use ait_app::agent_panel::{self, AskCard, CardStatus, Entry, ToolCard};
 // (Spec R13 §5.12, CODING_STANDARDS §17: one source for the text
 // both frontends draw).
 pub use ait_app::agent_panel::{
-    answer_choice, gate, prompt_text, tail, title, view_window, wrap, Gate, INPUT_PROMPT,
-    PLAN_BLOCK_MAX, PROMPT_WIDTH,
+    answer_choice, gate, tail, title, view_window, wrap, Gate, INPUT_PROMPT, PLAN_BLOCK_MAX,
+    PROMPT_WIDTH,
 };
 
 /// A display row's color slot — the frontend-neutral replacement
@@ -212,7 +212,7 @@ mod tests {
 
     use super::*;
     use ait_agent::{AgentEvent, AgentSession, ToolCall};
-    use ait_app::agent_panel::AgentPanel;
+    use ait_app::agent_panel::{prompt_text, AgentPanel};
     use ait_app::config::NoSecrets;
 
     /// A panel over a session whose worker resolves nothing — the

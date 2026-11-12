@@ -110,27 +110,57 @@ pub fn notification_toast(event: &TabEvent, tabs: &TabManager, toast: &mut Optio
     }
 }
 
+/// The session-model context a key event may touch — the tab set,
+/// the overlays, the store and toast slots, the profile, and the
+/// suggestion machinery — bundled once rather than trailed through
+/// every dispatch fn as half a dozen positional `&mut`s. Frontends
+/// build one per event from their `Shared`/`AppState`; a field a
+/// stage doesn't need simply goes unread.
+pub struct KeyCtx<'a> {
+    /// The armed-execution-profile picker — open, it owns the key.
+    pub picker: &'a mut Option<ProfilePicker>,
+    /// The conversation picker — ditto.
+    pub conversations: &'a mut Option<ConversationPicker>,
+    /// The session model.
+    pub tabs: &'a mut TabManager,
+    /// The persistence facade.
+    pub store: &'a mut StoreHandle,
+    /// The active profile's name — pickers rewrite it.
+    pub profile: &'a mut String,
+    /// The toast slot every failure path writes.
+    pub toast: &'a mut Option<Toast>,
+    /// The NL→command suggester.
+    pub suggester: &'a CommandSuggester,
+    /// The pinned in-flight suggestion.
+    pub suggestion: &'a mut SuggestionPin,
+    /// The live settings (classifier mode, model roles).
+    pub settings: &'a Settings,
+    /// The skills watcher — `agent_key` materializes prompts from it.
+    pub skills: &'a mut LiveSkills,
+}
+
 /// Overlay routing for a pass-through key: an open profile or
 /// conversation picker owns it whole. `true` = consumed (the key
 /// never reaches the PTY); `false` = no overlay open — the caller
 /// routes on (the GUI's find bar next, then the PTY path).
-#[allow(clippy::too_many_arguments)]
 pub fn overlay_key(
     key: &KeyEvent,
-    picker: &mut Option<ProfilePicker>,
-    conversations: &mut Option<ConversationPicker>,
-    tabs: &mut TabManager,
-    store: &mut StoreHandle,
-    profile: &mut String,
-    toast: &mut Option<Toast>,
+    ctx: &mut KeyCtx<'_>,
     session_size: impl Fn(Size, bool) -> Size,
 ) -> bool {
-    if picker.is_some() {
-        profile::picker_key(key, picker, profile, toast);
+    if ctx.picker.is_some() {
+        profile::picker_key(key, ctx.picker, ctx.profile, ctx.toast);
         return true;
     }
-    if conversations.is_some() {
-        conversations::picker_key(key, conversations, tabs, store, toast, session_size);
+    if ctx.conversations.is_some() {
+        conversations::picker_key(
+            key,
+            ctx.conversations,
+            ctx.tabs,
+            ctx.store,
+            ctx.toast,
+            session_size,
+        );
         return true;
     }
     false
@@ -142,26 +172,16 @@ pub fn overlay_key(
 /// `# `+Enter and classifier triggers arm the suggester — and
 /// anything left encodes through the input shadow to the PTY,
 /// byte-for-byte the path both frontends ran.
-#[allow(clippy::too_many_arguments)]
-pub fn passthrough_key(
-    key: Option<KeyEvent>,
-    tabs: &mut TabManager,
-    suggester: &CommandSuggester,
-    suggestion: &mut SuggestionPin,
-    settings: &Settings,
-    profile: &str,
-    skills: &mut LiveSkills,
-    toast: &mut Option<Toast>,
-) {
-    let index = tabs.active_index();
-    let suggestion_here = suggestion.is_live_for(tabs, index);
-    let Some(tab) = tabs.active_mut() else {
+pub fn passthrough_key(key: Option<KeyEvent>, ctx: &mut KeyCtx<'_>) {
+    let index = ctx.tabs.active_index();
+    let suggestion_here = ctx.suggestion.is_live_for(ctx.tabs, index);
+    let Some(tab) = ctx.tabs.active_mut() else {
         return;
     };
     tab.clear_selection();
     if tab.agent_focused() {
         if let Some(key) = key {
-            tab.agent_key(&key, settings, profile, skills, toast);
+            tab.agent_key(&key, ctx.settings, ctx.profile, ctx.skills, ctx.toast);
         }
         return;
     }
@@ -169,7 +189,7 @@ pub fn passthrough_key(
     if suggestion_here {
         match key.map(|key| key.key) {
             Some(Key::Escape) if key.is_some_and(|key| key.modifiers.is_empty()) => {
-                suggestion.cancel(suggester, tab);
+                ctx.suggestion.cancel(ctx.suggester, tab);
                 return;
             }
             Some(Key::Enter) | Some(Key::Keypad(Keypad::Enter)) => {
@@ -184,13 +204,17 @@ pub fn passthrough_key(
             // input against the grid echo before arming a request —
             // the suggestion pin suppresses double-fires while one
             // is live.
-            if suggestion.is_none() && suggest::is_submission(&key_event) {
-                if let Some(request) = suggest::request_for(tab, settings, profile) {
-                    suggestion.fire(suggester, tab.id, request, toast);
+            if ctx.suggestion.is_none() && suggest::is_submission(&key_event) {
+                if let Some(request) = suggest::request_for(tab, ctx.settings, ctx.profile) {
+                    ctx.suggestion
+                        .fire(ctx.suggester, tab.id, request, ctx.toast);
                 } else if let Some((line, request)) =
-                    suggest::classified_request(tab, settings, profile)
+                    suggest::classified_request(tab, ctx.settings, ctx.profile)
                 {
-                    if suggestion.fire(suggester, tab.id, request, toast) {
+                    if ctx
+                        .suggestion
+                        .fire(ctx.suggester, tab.id, request, ctx.toast)
+                    {
                         suggest::rewrite_as_comment(tab, &line);
                         return;
                     }

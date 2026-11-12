@@ -755,6 +755,7 @@ impl SuggestionPin {
     /// The pinned state a fired request leaves behind — staged by a
     /// frontend's dispatch tests, which inject `SuggestEvent`s through
     /// [`apply`](Self::apply) instead of running a model.
+    #[doc(hidden)]
     pub fn staged(id: u64) -> Self {
         Self {
             inner: Some(InFlightSuggestion {
@@ -767,17 +768,20 @@ impl SuggestionPin {
 
     /// The pinned tab's stable id — what a frontend's dispatch tests
     /// assert the pin resolved to.
+    #[doc(hidden)]
     pub fn pinned_id(&self) -> Option<u64> {
         self.inner.as_ref().map(|pin| pin.id)
     }
 
     /// Whether the live pin was Esc-cancelled — a frontend-test view.
+    #[doc(hidden)]
     pub fn is_cancelled(&self) -> bool {
         self.inner.as_ref().is_some_and(|pin| pin.cancelled)
     }
 
     /// Whether a paste envelope is currently open — a frontend-test
     /// view.
+    #[doc(hidden)]
     pub fn paste_is_open(&self) -> bool {
         self.inner.as_ref().is_some_and(|pin| pin.paste_open)
     }

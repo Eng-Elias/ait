@@ -594,6 +594,23 @@ pub fn run() -> io::Result<ExitCode> {
     Ok(exit_code(state.last_exit.as_ref()))
 }
 
+/// The [`dispatch::KeyCtx`] view of (state, tabs) — one bundle for
+/// the shared dispatch fns' per-event session-model access.
+fn key_ctx<'a>(state: &'a mut AppState, tabs: &'a mut TabManager) -> dispatch::KeyCtx<'a> {
+    dispatch::KeyCtx {
+        picker: &mut state.picker,
+        conversations: &mut state.conversations,
+        tabs,
+        store: &mut state.store,
+        profile: &mut state.profile,
+        toast: &mut state.toast,
+        suggester: &state.suggester,
+        suggestion: &mut state.suggestion,
+        settings: state.config.settings(),
+        skills: &mut state.skills,
+    }
+}
+
 /// Route one host event. Keys hit the app keymap **before** PTY input
 /// (standard 7): a bound key runs its action and never reaches the PTY —
 /// tab actions mutate the [`TabManager`], scroll/paste actions act on the
@@ -845,16 +862,7 @@ fn handle_event<W: Write>(
                     // `Alt+R` toggle their pickers closed there.
                     if state.picker.is_some() || state.conversations.is_some() {
                         if let Some(key) = key {
-                            dispatch::overlay_key(
-                                &key,
-                                &mut state.picker,
-                                &mut state.conversations,
-                                tabs,
-                                &mut state.store,
-                                &mut state.profile,
-                                &mut state.toast,
-                                session_size,
-                            );
+                            dispatch::overlay_key(&key, &mut key_ctx(state, tabs), session_size);
                         }
                         return Handled::Continue;
                     }
@@ -864,16 +872,7 @@ fn handle_event<W: Write>(
                     // tab (Spec R04 us-8/9/10); the `# `+Enter and
                     // classifier triggers arm the suggester; anything
                     // left encodes through the input shadow to the PTY.
-                    dispatch::passthrough_key(
-                        key,
-                        tabs,
-                        &state.suggester,
-                        &mut state.suggestion,
-                        state.config.settings(),
-                        &state.profile,
-                        &mut state.skills,
-                        &mut state.toast,
-                    );
+                    dispatch::passthrough_key(key, &mut key_ctx(state, tabs));
                 }
             }
         }

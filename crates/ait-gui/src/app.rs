@@ -100,6 +100,25 @@ pub struct Shared {
     pub find: Option<FindBar>,
 }
 
+impl Shared {
+    /// The [`dispatch::KeyCtx`] view of this state — one bundle for
+    /// the shared dispatch fns' per-event session-model access.
+    fn key_ctx(&mut self) -> dispatch::KeyCtx<'_> {
+        dispatch::KeyCtx {
+            picker: &mut self.picker,
+            conversations: &mut self.conversations,
+            tabs: &mut self.tabs,
+            store: &mut self.store,
+            profile: &mut self.profile,
+            toast: &mut self.toast,
+            suggester: &self.suggester,
+            suggestion: &mut self.suggestion,
+            settings: self.config.settings(),
+            skills: &mut self.skills,
+        }
+    }
+}
+
 /// The GUI frontend's `eframe::App` — T3's agent/suggest wiring,
 /// T4's find bar and T5's panel content all extend this struct and
 /// its `paint_*` regions; the seams are named in the paint methods.
@@ -222,7 +241,8 @@ impl GuiApp {
             find: None,
         }));
         let watcher = config::watcher();
-        let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher);
+        let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
+            .map_err(|error| BootError(format!("pump spawn failed: {error}")))?;
         Ok(Self {
             shared,
             pump: Some(pump),
@@ -312,10 +332,12 @@ impl GuiApp {
 
     /// Ctrl+=/+-/0 — the terminal-text zoom (never `set_zoom_factor`:
     /// only the grid font grows, the tabs/status/panel stay put — the
-    /// spec's terminal-text-only zoom rule). Returns whether the key
-    /// was a zoom chord.
+    /// spec's terminal-text-only zoom rule). The spec's chord is
+    /// literal Ctrl (US21); ⌘± also works on macOS — egui's `command`
+    /// — as the desktop convention. Returns whether the key was a
+    /// zoom chord.
     fn zoom_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
-        if !(modifiers.command && !modifiers.alt) {
+        if !((modifiers.command || modifiers.ctrl) && !modifiers.alt) {
             return false;
         }
         match key {
@@ -474,16 +496,7 @@ impl GuiApp {
                 // nothing leaks to the PTY mid-pick.
                 if shared.picker.is_some() || shared.conversations.is_some() {
                     if let Some(key) = key {
-                        dispatch::overlay_key(
-                            &key,
-                            &mut shared.picker,
-                            &mut shared.conversations,
-                            &mut shared.tabs,
-                            &mut shared.store,
-                            &mut shared.profile,
-                            &mut shared.toast,
-                            session_size,
-                        );
+                        dispatch::overlay_key(&key, &mut shared.key_ctx(), session_size);
                     }
                     return;
                 }
@@ -504,16 +517,7 @@ impl GuiApp {
                 // classifier triggers arm the suggester; anything
                 // left encodes through the input shadow to the PTY —
                 // the shared fold the TUI runs.
-                dispatch::passthrough_key(
-                    key,
-                    &mut shared.tabs,
-                    &shared.suggester,
-                    &mut shared.suggestion,
-                    shared.config.settings(),
-                    &shared.profile,
-                    &mut shared.skills,
-                    &mut shared.toast,
-                );
+                dispatch::passthrough_key(key, &mut shared.key_ctx());
             }
         }
     }
@@ -964,6 +968,13 @@ impl GuiApp {
             )
         });
         let mut action: Option<PanelAction> = None;
+        // The whole region is the focus affordance — a click
+        // anywhere that isn't a button re-focuses an unfocused
+        // panel. Registered BEFORE the gate card's buttons so they
+        // win the overlap in egui's hit test (last registered =
+        // topmost) — registered after, this rect would swallow
+        // every verdict/choice click.
+        let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
         {
             let Some(panel) = shared.tabs.active().and_then(|tab| tab.agent_panel()) else {
                 return;
@@ -1002,11 +1013,13 @@ impl GuiApp {
                 ui,
                 &painter,
                 panel,
-                &font,
-                line_h,
-                left,
-                right,
-                input_rect.top(),
+                &GateCardLayout {
+                    font: &font,
+                    line_h,
+                    left,
+                    right,
+                    input_top: input_rect.top(),
+                },
                 &mut action,
             );
             let card_top = input_rect.top() - card_height;
@@ -1085,10 +1098,6 @@ impl GuiApp {
                 );
             }
         }
-        // The whole region is the focus affordance: a click anywhere
-        // that isn't a button re-focuses an unfocused panel (the
-        // `Alt+A` refocus arm's mouse counterpart — never a close).
-        let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
         if body.clicked()
             && shared
                 .tabs
@@ -1109,19 +1118,22 @@ impl GuiApp {
     /// choices / free-text hint. Paints inside `painter`, queues the
     /// click's [`PanelAction`] into `action`, and returns the card's
     /// height in points (`0.0` while no gate is parked).
-    #[allow(clippy::too_many_arguments)]
     fn paint_gate_card(
         &self,
         ui: &mut egui::Ui,
         painter: &egui::Painter,
         panel: &AgentPanel,
-        font: &FontId,
-        line_h: f32,
-        left: f32,
-        right: f32,
-        input_top: f32,
+        layout: &GateCardLayout<'_>,
         action: &mut Option<PanelAction>,
     ) -> f32 {
+        let GateCardLayout {
+            font,
+            line_h,
+            left,
+            right,
+            input_top,
+        } = *layout;
+        let font = font.clone();
         let gate = panel::gate(panel);
         // Rows of card content: the prompt row, plus the buttons row
         // for a waiting approve or one row per choice for a choices
@@ -1224,7 +1236,7 @@ impl GuiApp {
                     painter.text(
                         Pos2::new(left, y),
                         Align2::LEFT_TOP,
-                        " ask — type your answer · enter: send ",
+                        agent_panel::ASK_TEXT_PROMPT,
                         font.clone(),
                         tone_color(Tone::Alert, self.theme),
                     );
@@ -1255,11 +1267,7 @@ impl GuiApp {
                         painter.text(
                             Pos2::new(left, y),
                             Align2::LEFT_TOP,
-                            if selected {
-                                format!("    ▸ {choice}")
-                            } else {
-                                format!("      {choice}")
-                            },
+                            agent_panel::choice_line(choice, selected),
                             font.clone(),
                             if selected {
                                 tone_color(Tone::Strong, self.theme)
@@ -1635,6 +1643,18 @@ enum PanelAction {
     /// Answer the parked choices ask as if choice `index` had been
     /// highlighted and Enter pressed.
     AnswerChoice(usize),
+}
+
+/// The gate card's paint geometry — the row metrics, the
+/// horizontal span it draws inside, and the input row's top edge
+/// the card anchors above. Bundles what the paint pass needs in
+/// one type rather than trailing five scalars through the call.
+struct GateCardLayout<'a> {
+    font: &'a FontId,
+    line_h: f32,
+    left: f32,
+    right: f32,
+    input_top: f32,
 }
 
 /// A panel row's [`Tone`] → the paint color — `Strong` lifts the

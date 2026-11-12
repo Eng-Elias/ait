@@ -79,22 +79,24 @@ impl Pump {
     /// `ctx` is cloned onto the thread: `egui::Context` is an
     /// internally-shared handle built for exactly this — the wake side
     /// of `request_repaint` from a worker.
+    /// The spawn is fallible — a thread-starved machine fails the
+    /// boot with `Err` rather than panicking over a window that
+    /// would never drain.
     pub fn start(
         ctx: Context,
         shared: Arc<Mutex<Shared>>,
         ctl: Option<CtlServer>,
         watcher: Option<SettingsWatcher>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("ait-gui-pump".into())
-            .spawn(move || pump_loop(ctx, shared, ctl, watcher, thread_stop))
-            .expect("spawn ait-gui-pump");
-        Self {
+            .spawn(move || pump_loop(ctx, shared, ctl, watcher, thread_stop))?;
+        Ok(Self {
             stop,
             thread: Some(thread),
-        }
+        })
     }
 
     /// Signal the thread and join it.

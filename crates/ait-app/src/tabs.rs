@@ -117,25 +117,26 @@ pub struct Tab {
     /// The live PTY session this tab drives.
     pub session: LiveSession,
     /// How far above the live viewport this tab's view sits.
-    /// `pub`: tests reach the raw state to stage offsets the
-    /// clamping methods can't produce; production callers use the
-    /// `scroll_*`/`page_*`/`snap_to_bottom` methods.
+    /// `pub`: frontends read/drive the raw state and tests stage
+    /// offsets the clamping methods can't produce; the
+    /// `scroll_*`/`page_*`/`snap_to_bottom` methods cover the
+    /// common operations.
     pub scroll: ScrollState,
-    /// This tab's mouse-selection state — same `pub` test seam;
-    /// production callers use the `*_selection` methods.
+    /// This tab's mouse-selection state — same `pub` frontend/test
+    /// seam; the `*_selection` methods cover the common operations.
     pub selection: Selection,
     /// The shadow of this tab's printable input since the last line
     /// submission — what the `# `+Enter and `Alt+Enter` triggers verify
     /// against the grid's echoed line (Spec R04, user story 29). Same
-    /// `pub` test seam; production drives it through
-    /// `crate::suggest` from the keypress path.
+    /// `pub` frontend/test seam — `crate::suggest` drives it from the
+    /// keypress path and frontends mark it stale on edits.
     pub shadow: InputShadow,
     /// The §5.10.4 program index — this session's shell builtins
     /// merged with the executable basenames on `$PATH`, harvested ONCE
     /// at spawn (Spec R11 us-15): the classifier's per-Enter check is
     /// a set lookup, never a `$PATH` walk. Keyed on the same program
-    /// basename the title resolves. Same `pub` test seam as
-    /// `shadow` — tests stage `ProgramIndex::with_path_entries`.
+    /// basename the title resolves. Same `pub` seam as `shadow` —
+    /// tests stage `ProgramIndex::with_path_entries`.
     pub program_index: ProgramIndex,
     /// The cwd the shell last reported via OSC 7 — the spawn cwd until
     /// then. It is what a new tab inherits.
@@ -195,8 +196,9 @@ pub struct Tab {
     /// The §5.5.1 in-band exec seam: per-tab `__ait_run` request ids,
     /// the frame accumulator and the `id → waiter` map
     /// (`crate::inband`, Spec R05 / issue #75). `drain_events` feeds it
-    /// every observed OSC; `pub` so tests inspect pending
-    /// state — production callers go through [`run_in_shell`](Self::run_in_shell).
+    /// every observed OSC; `pub` so frontends and tests inspect
+    /// pending state — the guarded entry is
+    /// [`run_in_shell`](Self::run_in_shell).
     pub inband: InBandExec,
     /// The materialized injection the session was spawned with —
     /// holding the guard here ties the per-session `0700` snippet dir's
@@ -224,8 +226,8 @@ pub struct Tab {
     /// drops the `AgentSession` inside, which is what cancels and
     /// joins the agent worker when the tab closes (standard 14 — the
     /// conversation's identity IS the tab's; no pin needed). Same
-    /// `pub` seam as `scroll`/`shadow` — tests stage a panel;
-    /// production drives it through the `agent_*` methods.
+    /// `pub` seam as `scroll`/`shadow` — frontends read it to paint,
+    /// tests stage a panel; the `agent_*` methods drive it.
     pub agent: Option<AgentPanel>,
     /// The service side of this tab's `ShellBridge` (Spec R06-T4):
     /// created with the panel — `Alt+A` is the only thing that can
@@ -241,7 +243,8 @@ pub struct Tab {
     /// it (and everything above it — a dead shell kills its nested
     /// sessions). The LAST level is the innermost: the status line,
     /// the bridge's `remote_state` and `blocks.host` all read it;
-    /// `pub` so tests stage remote hooks without a real ssh.
+    /// `pub` so frontends paint it and tests stage remote hooks
+    /// without a real ssh.
     pub remote: Vec<RemoteContext>,
     /// The ait control dir this spawn armed (the template's at spawn
     /// time) — `RemoteContext::fold`'s "is this socket ours" check:

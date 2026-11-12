@@ -25,17 +25,21 @@
 //! [`run`] is the binary's one call — `ait gui` (Spec R13's
 //! subcommand seam, wired in T7) and the `ait-gui` binary share it.
 
-pub mod app;
-pub mod grid;
-pub mod keys;
-pub mod layout;
-pub mod paint;
-pub mod panel;
-pub mod pump;
+// `pub(crate)` across the board: the crate's binary-facing surface
+// is `run` + `report_error` below — the modules are the frontend's
+// internals (`app`'s `GuiApp`/`Shared`, the pump, the painters),
+// shared inside the crate and invisible outside it.
+pub(crate) mod app;
+pub(crate) mod grid;
+pub(crate) mod keys;
+pub(crate) mod layout;
+pub(crate) mod paint;
+pub(crate) mod panel;
+pub(crate) mod pump;
 
 use std::io::Write as _;
 
-pub use app::{BootError, GuiApp, Shared};
+use app::GuiApp;
 
 /// Open the native window and run the GUI frontend — the counterpart
 /// of `ait`'s TUI `run`. Blocks until the window closes; a spawn
