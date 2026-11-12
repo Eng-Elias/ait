@@ -86,3 +86,39 @@ pub fn run() -> eframe::Result<()> {
 pub fn report_error(error: &eframe::Error) {
     let _ = writeln!(std::io::stderr(), "ait-gui: {error}");
 }
+
+/// The platform's "open this target" command — `open` on macOS,
+/// `xdg-open` on the freedesktop desktops, `cmd /c start` on Windows
+/// (§5.14, not yet shipped); the target is the single payload
+/// argument. Both OS-handoff surfaces share it: the explorer's
+/// platform-opener editor resolution (a file path) and the browser
+/// pane's external-open sink (a URL). Stdio is detached so the child
+/// never holds the terminal's pipes.
+pub(crate) fn platform_opener(target: &std::ffi::OsStr) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(target);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        // `start` reads its first quoted arg as a window title —
+        // the empty one keeps the target from being eaten as it.
+        command.args(["/c", "start", ""]);
+        command.arg(target);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(target);
+        command
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}

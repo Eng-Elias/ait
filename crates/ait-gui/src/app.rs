@@ -822,10 +822,7 @@ impl GuiApp {
 
     /// A pane chord's or switcher chip's toggle: the shown pane's
     /// press deselects (the region falls back to the agent claim or
-    /// closes); any other press selects. An open agent panel yields
-    /// its claim to an explicit selection — `toggle_agent_panel`
-    /// walks its open→focus→close cycle until closed; the
-    /// conversation survives and `Alt+A` reopens it.
+    /// closes); any other press runs the shared [`select_pane`] arm.
     fn toggle_pane(&mut self, shared: &mut Shared, id: PaneId) {
         let agent_open = shared
             .tabs
@@ -834,14 +831,22 @@ impl GuiApp {
         if shared.panes.showing(id, agent_open) {
             shared.panes.clear();
         } else {
-            shared.panes.select(id);
-            if let Some(tab) = shared.tabs.active_mut() {
-                while tab.agent_panel_open() {
-                    tab.toggle_agent_panel();
-                }
-            }
+            self.select_pane(shared, id);
         }
         self.resize_for_panes(shared);
+    }
+
+    /// The select arm `toggle_pane` and `show_pane` share: pick the
+    /// pane, and ask an open agent panel to yield its claim —
+    /// `toggle_agent_panel` walks its open→focus→close cycle until
+    /// closed; the conversation survives and `Alt+A` reopens it.
+    fn select_pane(&mut self, shared: &mut Shared, id: PaneId) {
+        shared.panes.select(id);
+        if let Some(tab) = shared.tabs.active_mut() {
+            while tab.agent_panel_open() {
+                tab.toggle_agent_panel();
+            }
+        }
     }
 
     /// One unbound key while an aux pane shows: plain Esc returns
@@ -866,22 +871,16 @@ impl GuiApp {
         shared.tabs.resize_all(self.last_band, session_size);
     }
 
-    /// Make `id` the region's pane — the select + agent-claim yield +
-    /// every-tab resize the chord's open arm runs, minus its
-    /// toggle-off half (an explicit open never closes the pane).
-    /// `toggle_pane` keeps the on/off decision; this is just the show.
+    /// Make `id` the region's pane — the shared [`select_pane`] arm
+    /// plus the every-tab resize, minus `toggle_pane`'s off half (an
+    /// explicit open never closes the pane).
     fn show_pane(&mut self, shared: &mut Shared, id: PaneId) {
         let agent_open = shared
             .tabs
             .active()
             .is_some_and(|tab| tab.agent_panel_open());
         if !shared.panes.showing(id, agent_open) {
-            shared.panes.select(id);
-            if let Some(tab) = shared.tabs.active_mut() {
-                while tab.agent_panel_open() {
-                    tab.toggle_agent_panel();
-                }
-            }
+            self.select_pane(shared, id);
         }
         self.resize_for_panes(shared);
     }
@@ -3182,6 +3181,47 @@ mod tests {
         let mut shared = harness.shared();
         crate::explorer::sync_explorer(&mut shared);
         assert_eq!(shared.explorer.dir(), first.path());
+    }
+
+    /// us-13's toast defers to a live one: a newly-failed listing
+    /// wants a toast, but a live toast in the strip is never
+    /// clobbered — the error row still reports the failure in-pane.
+    /// Once the strip is free, the NEXT new error toasts normally.
+    #[test]
+    fn a_new_listing_error_yields_to_a_live_toast() {
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("gone");
+        let mut harness = Harness::new(sh_manager());
+        report_cwd(&harness, &missing);
+        {
+            let mut shared = harness.shared();
+            shared.toast = Some(Toast::new("keep me", Instant::now()));
+            crate::explorer::sync_explorer(&mut shared);
+            assert!(
+                shared.explorer.error().is_some(),
+                "the missing root failed to list"
+            );
+            assert_eq!(
+                shared.toast.as_ref().unwrap().text(),
+                "keep me",
+                "the live toast was not clobbered"
+            );
+        }
+        // The strip free again — a NEW error toasts like before.
+        report_cwd(&harness, &missing.join("deeper"));
+        {
+            let mut shared = harness.shared();
+            shared.toast = None;
+            crate::explorer::sync_explorer(&mut shared);
+            assert!(
+                shared
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.text().contains("deeper")),
+                "the fresh error toasts: {:?}",
+                shared.toast.as_ref().map(Toast::text)
+            );
+        }
     }
 
     // ---- The browser pane (Spec R14 §5.13, R14-T3) ----

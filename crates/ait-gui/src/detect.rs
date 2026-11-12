@@ -235,11 +235,17 @@ fn url_scan(chars: &[char]) -> Vec<Token> {
 }
 
 /// `chars`'s leading scheme length, if it starts with one of
-/// [`SCHEMES`].
+/// [`SCHEMES`]. The schemes are ASCII, so the compare runs byte-wise
+/// against each scalar's low value — no per-position `Vec<char>`
+/// collection (the scan calls this once per char).
 fn scheme_len(chars: &[char]) -> Option<usize> {
     SCHEMES.iter().find_map(|scheme| {
-        let scheme: Vec<char> = scheme.chars().collect();
-        (chars.len() >= scheme.len() && chars[..scheme.len()] == scheme[..]).then_some(scheme.len())
+        let matches = chars.len() >= scheme.len()
+            && scheme
+                .bytes()
+                .zip(chars.iter())
+                .all(|(byte, c)| u32::from(byte) == *c as u32);
+        matches.then_some(scheme.len())
     })
 }
 

@@ -255,50 +255,18 @@ impl WindowKind {
     }
 }
 
-/// Hand `url` to the system browser via the platform opener — spawned
-/// detached (stdio nulled) so the pane never blocks on the child's
-/// lifetime; a spawn failure toasts like every other GUI-side
-/// failure rather than passing silently.
+/// Hand `url` to the system browser via the shared
+/// [`crate::platform_opener`] — spawned detached (stdio nulled) so
+/// the pane never blocks on the child's lifetime; a spawn failure
+/// toasts like every other GUI-side failure rather than passing
+/// silently.
 fn open_external(url: &str, toast: &mut Option<Toast>) {
-    if let Err(error) = opener_command(url).spawn() {
+    if let Err(error) = crate::platform_opener(std::ffi::OsStr::new(url)).spawn() {
         *toast = Some(Toast::new(
             format!("couldn't open the system browser: {error}"),
             Instant::now(),
         ));
     }
-}
-
-/// The platform opener command — `open` on macOS, `xdg-open` on the
-/// freedesktop desktops, `cmd /c start` on Windows (§5.14, not yet
-/// shipped); the URL is the single argument. Built here so the verb
-/// and its argument shape stay unit-testable; spawning it is the
-/// untestable half.
-fn opener_command(url: &str) -> std::process::Command {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        // `start` reads its first quoted arg as a window title —
-        // the empty one keeps the URL from being eaten as it.
-        command.args(["/c", "start", "", url]);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command
 }
 
 #[cfg(test)]
@@ -310,12 +278,12 @@ mod tests {
 
     use super::*;
 
-    /// The opener is the platform's verb plus the URL as the sole
-    /// payload argument — detached stdio so the child can't hold the
-    /// terminal's pipes.
+    /// The shared opener is the platform's verb plus the URL as the
+    /// sole payload argument — detached stdio so the child can't hold
+    /// the terminal's pipes.
     #[test]
     fn opener_names_the_platform_verb_with_the_url_as_its_arg() {
-        let command = opener_command("https://docs.rs/ait");
+        let command = crate::platform_opener(std::ffi::OsStr::new("https://docs.rs/ait"));
         #[cfg(target_os = "macos")]
         {
             assert_eq!(command.get_program(), "open");

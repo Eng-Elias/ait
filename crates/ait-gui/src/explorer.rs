@@ -103,9 +103,9 @@ pub enum Activate {
 
 /// The explorer's mutable state on `Shared` — app-global like the
 /// pane selection, re-synced to the active tab every routed key and
-/// paint. `dir` can drift below the root (parent navigation is
-/// unbounded — the pane is read-only, so browsing anywhere is safe);
-/// `root` only changes hands when the tab's cwd answer does.
+/// paint. `dir` is clamped at `root` upward (`..` never ascends past
+/// the session cwd — the spec's rooted-at-cwd rule) while descending
+/// is free; `root` only changes hands when the tab's cwd answer does.
 #[derive(Debug, Default)]
 pub struct ExplorerState {
     /// A live remote session gates the pane — while set, every
@@ -335,8 +335,14 @@ impl ExplorerState {
 
     /// `..`/Left/Backspace — browse to `dir`'s parent and re-select
     /// the dir we left (the "up" affordance's return breadcrumb).
+    /// The session root is the ceiling: a `..` at `root` is a no-op,
+    /// so the listing never escapes the cwd the pane is rooted on
+    /// (us-7's "from the session root" bound).
     pub fn go_parent(&mut self) {
         if self.remote {
+            return;
+        }
+        if self.root.as_deref() == Some(self.dir.as_path()) {
             return;
         }
         let Some(parent) = self.dir.parent().map(Path::to_path_buf) else {
@@ -532,7 +538,8 @@ pub enum EditorResolution {
     /// `[gui].editor`, `$VISUAL` or `$EDITOR` — a shell-evaluated
     /// command line, so `"code --goto"` carries its own arguments.
     Program(String),
-    /// The platform opener — `open` on macOS, `xdg-open` elsewhere.
+    /// The platform opener — [`crate::platform_opener`]'s verb
+    /// (`open`/`xdg-open`/`cmd /c start` per OS).
     Opener,
 }
 
@@ -558,8 +565,9 @@ pub fn resolve_editor(
 /// The `Command` a resolution spawns — `Program` goes through `sh -c`
 /// so `editor = "code --goto"` splits its own arguments while the
 /// target path stays literal argv (never spliced into the evaluated
-/// string — no quoting bug can smuggle it); `Opener` execs the
-/// platform tool directly.
+/// string — no quoting bug can smuggle it); `Opener` delegates to the
+/// shared [`crate::platform_opener`] the browser pane's external
+/// surface also uses.
 pub fn editor_command(resolution: &EditorResolution, path: &Path) -> Command {
     match resolution {
         EditorResolution::Program(program) => {
@@ -571,15 +579,7 @@ pub fn editor_command(resolution: &EditorResolution, path: &Path) -> Command {
                 .arg(path);
             command
         }
-        EditorResolution::Opener => {
-            #[cfg(target_os = "macos")]
-            const PLATFORM_OPENER: &str = "open";
-            #[cfg(not(target_os = "macos"))]
-            const PLATFORM_OPENER: &str = "xdg-open";
-            let mut command = Command::new(PLATFORM_OPENER);
-            command.arg(path);
-            command
-        }
+        EditorResolution::Opener => crate::platform_opener(path.as_os_str()),
     }
 }
 
@@ -604,8 +604,11 @@ pub fn spawn_detached(resolution: &EditorResolution, path: &Path) -> io::Result<
 /// The pane's tab→model sync: compute the remote gate and the
 /// `cwd_for` root from the active tab, fold them into the model, and
 /// toast a NEWLY-failed listing once (us-13 — a persistently
-/// unreadable cwd doesn't re-toast every frame). `pub(crate)` so the
-/// app tests drive the same seam the pane's `key`/`paint` do.
+/// unreadable cwd doesn't re-toast every frame). A live toast wins
+/// over the listing error — the error row still shows it in-pane,
+/// so a background re-sync never clobbers what the status strip is
+/// saying. `pub(crate)` so the app tests drive the same seam the
+/// pane's `key`/`paint` do.
 pub(crate) fn sync_explorer(shared: &mut Shared) {
     let (remote, root) = shared
         .tabs
@@ -621,7 +624,11 @@ pub(crate) fn sync_explorer(shared: &mut Shared) {
     shared.explorer.sync(remote, root.as_deref());
     let after = shared.explorer.error().map(str::to_owned);
     if let Some(error) = after {
-        if Some(error.as_str()) != before.as_deref() {
+        let toast_live = shared
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.is_live(Instant::now()));
+        if Some(error.as_str()) != before.as_deref() && !toast_live {
             shared.toast = Some(Toast::new(error, Instant::now()));
         }
     }
@@ -1173,6 +1180,26 @@ mod tests {
             "adir",
             "the dir we left is re-selected"
         );
+    }
+
+    /// us-7's ceiling: `..` never climbs past the session root — the
+    /// pane is rooted at the tab's `cwd_for` answer, so parent
+    /// navigation stops there instead of escaping toward `/`.
+    #[test]
+    fn go_parent_clamps_at_the_session_root() {
+        let dir = fixture();
+        let mut state = ExplorerState::default();
+        state.sync(false, Some(dir.path()));
+
+        state.go_parent();
+        assert_eq!(state.dir(), dir.path(), "the root is `..`'s ceiling");
+
+        // Descend and climb back — the last climb still stops at root.
+        state.navigate_to_dir(&dir.path().join("adir"));
+        state.go_parent();
+        assert_eq!(state.dir(), dir.path());
+        state.go_parent();
+        assert_eq!(state.dir(), dir.path());
     }
 
     /// `activate` is the Enter/`o` read: a dir enters, a file opens,

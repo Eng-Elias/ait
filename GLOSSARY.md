@@ -25,6 +25,10 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `Ctrl+Shift+E`/`Ctrl+Shift+B` chords; the agent panel claims the
   region while open, the `PaneHost` selection on `Shared` is
   app-global, ephemeral and follows the active tab (§5.13).
+- **Aux pane** — a GUI pane that isn't the agent panel: a `Pane`
+  trait implementation registered in `ait-gui`'s `PANES` (the
+  explorer, the browser), the `SidePane::Aux` half of what the pane
+  host can show (§5.13).
 - **Grid** — the styled cell matrix plus scrollback for a session.
 - **Block** — one command, its output and exit code, delimited by shell hooks.
 - **Shell integration / rc snippet** — the script injected into a shell that
