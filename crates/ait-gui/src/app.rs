@@ -366,10 +366,19 @@ impl GuiApp {
                     // explorer, `Ctrl+Shift+B` browser (Spec R14
                     // §5.13). GUI-local like the find chord: the
                     // keymap can't own them and they never reach
-                    // the PTY.
-                    if let Some(id) = pane_chord(key, modifiers) {
-                        self.toggle_pane(shared, id);
-                        continue;
+                    // the PTY. They hold while an overlay owns focus
+                    // — the find bar or a modal picker would lose the
+                    // region under it mid-interaction; the chord
+                    // falls through to the overlay's swallow arm, so
+                    // nothing reaches the PTY either way.
+                    let overlay_owns_focus = shared.find.is_some()
+                        || shared.picker.is_some()
+                        || shared.conversations.is_some();
+                    if !overlay_owns_focus {
+                        if let Some(id) = pane_chord(key, modifiers) {
+                            self.toggle_pane(shared, id);
+                            continue;
+                        }
                     }
                     let translated = translate_key(key, modifiers);
                     if let Some(KeyEvent {
@@ -2952,6 +2961,56 @@ mod tests {
 
         // `head -c 1` is still blocked on its first byte — nothing
         // leaked through three chord presses.
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The chords hold while an overlay owns focus — the find bar's
+    /// query and a picker's rows would lose the region under them,
+    /// so `Ctrl+Shift+E` is swallowed rather than toggled (and the
+    /// swallowed chord still never reaches the PTY).
+    #[test]
+    fn pane_chords_hold_while_an_overlay_owns_focus() {
+        let path = capture_path("panemodal");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        // The find bar owns focus — the chord is swallowed.
+        {
+            let mut shared = harness.shared.lock().unwrap();
+            harness.app.open_find(&mut shared);
+        }
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        // A modal picker owns it the same way.
+        harness.shared().find = None;
+        harness.shared().picker = Some(ProfilePicker::new(vec!["a".into()], "a"));
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        // Overlays gone — the same chord toggles again.
+        harness.shared().picker = None;
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
+
+        // Nothing leaked through three chord presses.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         let _ = std::fs::remove_file(&path);
     }
