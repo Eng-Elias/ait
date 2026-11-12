@@ -61,6 +61,15 @@ Work top to bottom; each item is cheap once the window is up.
 - **Explorer remote gate** — inside an `ssh()` session the pane shows
   `remote session — browsing unavailable` and never lists the local
   disk under the remote path.
+- **Ctrl+click affordance** — hold Ctrl over an `https://`/`file://`
+  URL and an existing path in output: detected tokens underline and
+  the cursor turns to the pointer; non-tokens, nonexistent paths and
+  scrollback rows behave the same way. Ctrl+click on a URL opens the
+  browser pane at it (or hands it to the system browser on the
+  external surface), on a file previews it in the explorer, on a
+  directory navigates the explorer to it. Inside an `ssh()` session
+  only URLs afford — paths never resolve under a remote cwd. Ordinary
+  click-drag selection is untouched (a Ctrl+press never starts one).
 - **Pane/agent precedence** — with the agent panel open, a pane chord
   switches the region to that pane (the panel's conversation survives —
   `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
