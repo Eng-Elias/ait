@@ -387,6 +387,7 @@ mod tests {
             suggester: ait_agent::CommandSuggester::with_secret_store(config::NoSecrets),
             suggestion: ait_app::suggest::SuggestionPin::new(),
             find: None,
+            panes: crate::pane::PaneHost::default(),
         }))
     }
 

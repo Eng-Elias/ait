@@ -15,6 +15,9 @@
 //! - [`paint`] — the `Painter` pass over the planner's output.
 //! - [`panel`] — the agent panel's pure line planning (entries →
 //!   styled rows, the pinned plan block, the parked gate card).
+//! - [`pane`] — the side region's pane host (Spec R14 §5.13): the
+//!   `Pane` trait, the static registry, the app-global selection
+//!   state and the `Ctrl+Shift+E`/`Ctrl+Shift+B` chord interception.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -34,6 +37,7 @@ pub(crate) mod grid;
 pub(crate) mod keys;
 pub(crate) mod layout;
 pub(crate) mod paint;
+pub(crate) mod pane;
 pub(crate) mod panel;
 pub(crate) mod pump;
 

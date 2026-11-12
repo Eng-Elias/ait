@@ -48,6 +48,7 @@ use crate::layout::{
     tab_chips, BlockDivider, BlockLabel, CellMetrics, Chrome, GuiMetrics, CHIP_PAD, FIND_BAR_H,
 };
 use crate::paint::{paint_grid, FindOverlay, Overlays};
+use crate::pane::{pane, pane_chord, PaneHost, PaneId, SidePane, PANES};
 use crate::panel::{self, Gate, Tone};
 use crate::pump::Pump;
 
@@ -106,6 +107,11 @@ pub struct Shared {
     /// pump's drain pass can rescan hits when session output shifts
     /// the grid under them.
     pub find: Option<FindBar>,
+    /// The side region's pane host (Spec R14 §5.13): which auxiliary
+    /// pane is selected — app-global and ephemeral (us-31), following
+    /// the active tab while each tab's own agent claim resolves per
+    /// tab.
+    pub panes: PaneHost,
 }
 
 impl Shared {
@@ -124,6 +130,14 @@ impl Shared {
             settings: self.config.settings(),
             skills: &mut self.skills,
         }
+    }
+
+    /// What the side region shows on the active tab right now — the
+    /// agent panel's per-tab claim first, else the app-global aux
+    /// selection, else the region is closed.
+    fn shown_pane(&self) -> Option<SidePane> {
+        let agent_open = self.tabs.active().is_some_and(|tab| tab.agent_panel_open());
+        self.panes.visible(agent_open)
     }
 }
 
@@ -260,6 +274,7 @@ impl GuiApp {
             suggester: CommandSuggester::new(),
             suggestion: SuggestionPin::new(),
             find: None,
+            panes: PaneHost::default(),
         }));
         let watcher = config::watcher();
         let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
@@ -321,6 +336,15 @@ impl GuiApp {
                         self.open_find(shared);
                         continue;
                     }
+                    // The pane host's toggle chords — `Ctrl+Shift+E`
+                    // explorer, `Ctrl+Shift+B` browser (Spec R14
+                    // §5.13). GUI-local like the find chord: the
+                    // keymap can't own them and they never reach
+                    // the PTY.
+                    if let Some(id) = pane_chord(key, modifiers) {
+                        self.toggle_pane(shared, id);
+                        continue;
+                    }
                     let translated = translate_key(key, modifiers);
                     if let Some(KeyEvent {
                         key: Key::Char(c), ..
@@ -341,6 +365,13 @@ impl GuiApp {
                 egui::Event::Text(text) => {
                     if shared.find.is_some() {
                         self.find_text(shared, &text);
+                        continue;
+                    }
+                    // A shown aux pane owns composed text while it's
+                    // up (the find bar's focus rule) — nothing
+                    // reaches the PTY mid-pane.
+                    if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                        pane(id).text(shared, &text);
                         continue;
                     }
                     // A Meta chord still held while Text composes wants
@@ -370,6 +401,8 @@ impl GuiApp {
                 egui::Event::Paste(text) => {
                     if shared.find.is_some() {
                         self.find_text(shared, &text);
+                    } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                        pane(id).text(shared, &text);
                     } else {
                         self.paste(shared, &text);
                     }
@@ -429,6 +462,7 @@ impl GuiApp {
             // re-derives THIS tab's winsize through the GUI's
             // `session_size` (panels are per-tab).
             Resolution::Action(AppAction::AgentPanel) => {
+                let session_size = region_session_size(&shared.panes);
                 dispatch::toggle_agent_panel(&mut shared.tabs, session_size);
             }
             // `Alt+P` (Spec R07 §5.7): the shared switch — a second
@@ -548,6 +582,7 @@ impl GuiApp {
                 // nothing leaks to the PTY mid-pick.
                 if shared.picker.is_some() || shared.conversations.is_some() {
                     if let Some(key) = key {
+                        let session_size = region_session_size(&shared.panes);
                         dispatch::overlay_key(&key, &mut shared.key_ctx(), session_size);
                     }
                     return;
@@ -559,6 +594,16 @@ impl GuiApp {
                 if shared.find.is_some() {
                     if let Some(key) = key {
                         self.find_key(shared, key);
+                    }
+                    return;
+                }
+                // A shown aux pane owns unbound keys the same way
+                // (Spec R14 §5.13 — the find bar's focus rule): Esc
+                // returns focus to the grid, everything else routes
+                // to the pane; nothing reaches the PTY mid-pane.
+                if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                    if let Some(key) = key {
+                        self.pane_key(shared, id, key);
                     }
                     return;
                 }
@@ -743,6 +788,59 @@ impl GuiApp {
     }
 
     // -----------------------------------------------------------------
+    // Pane host (Spec R14 §5.13, R14-T1) — `Shared.panes` holds the
+    // app-global, ephemeral aux-pane selection; the region shows the
+    // agent panel while a tab's claim holds, else the selection.
+    // Selection changes resize EVERY tab (the open flag is global),
+    // claim changes resize one — [`PaneHost::region_open`] ORs them.
+
+    /// A pane chord's or switcher chip's toggle: the shown pane's
+    /// press deselects (the region falls back to the agent claim or
+    /// closes); any other press selects. An open agent panel yields
+    /// its claim to an explicit selection — `toggle_agent_panel`
+    /// walks its open→focus→close cycle until closed; the
+    /// conversation survives and `Alt+A` reopens it.
+    fn toggle_pane(&mut self, shared: &mut Shared, id: PaneId) {
+        let agent_open = shared
+            .tabs
+            .active()
+            .is_some_and(|tab| tab.agent_panel_open());
+        if shared.panes.showing(id, agent_open) {
+            shared.panes.clear();
+        } else {
+            shared.panes.select(id);
+            if let Some(tab) = shared.tabs.active_mut() {
+                while tab.agent_panel_open() {
+                    tab.toggle_agent_panel();
+                }
+            }
+        }
+        self.resize_for_panes(shared);
+    }
+
+    /// One unbound key while an aux pane shows: plain Esc returns
+    /// focus to the grid (the toggle chord is the other way out —
+    /// the find bar's own rule), everything else routes to the pane.
+    fn pane_key(&mut self, shared: &mut Shared, id: PaneId, key: KeyEvent) {
+        if key.key == Key::Escape && key.modifiers.is_empty() {
+            shared.panes.clear();
+            self.resize_for_panes(shared);
+            return;
+        }
+        pane(id).key(shared, key);
+    }
+
+    /// Re-derive EVERY tab's winsize after the aux selection moved —
+    /// region-open is `agent claim OR app-global selection`, so a
+    /// selection change is every tab's resize, not just the active
+    /// one's (a background tab must already be narrow when a switch
+    /// lands it under an open pane).
+    fn resize_for_panes(&mut self, shared: &mut Shared) {
+        let session_size = region_session_size(&shared.panes);
+        shared.tabs.resize_all(self.last_band, session_size);
+    }
+
+    // -----------------------------------------------------------------
     // Tab lifecycle — shared by the keymap actions above and the tab
     // bar's click targets below, so binding and button can never drift.
 
@@ -751,6 +849,16 @@ impl GuiApp {
     /// taking the window down (graceful degrade, like the TUI).
     fn open_tab(&mut self, shared: &mut Shared) {
         dispatch::new_tab(&mut shared.tabs, &mut shared.store, &mut shared.toast);
+        // The spawn sized the session for a closed region (the
+        // manager's stored band); an app-global aux selection holds
+        // the region open on the new tab too — re-derive now. A fresh
+        // tab has no agent claim, so `region_open(false)` IS the aux
+        // selection's `is_some`.
+        if shared.panes.region_open(false) {
+            shared
+                .tabs
+                .resize_active(|size, _agent_open| session_size(size, true));
+        }
     }
 
     /// `Alt+W` / a chip's "×": the shared close — store bookkeeping
@@ -993,6 +1101,103 @@ impl GuiApp {
         }
     }
 
+    /// The side region (Spec R14 §5.13): the pane host's frame — the
+    /// region background, the grid-side separator, and the switcher
+    /// strip that is the host's visible way to switch — then the one
+    /// pane `shown` names: the agent panel's body while its claim
+    /// holds, else the selected registry entry's own paint.
+    ///
+    /// The switcher shows one chip for the agent claim plus one per
+    /// registered pane, the shown chip reversed; clicks queue a
+    /// [`SidePane`] target applied after the pass (same queued-action
+    /// pattern as the gate card — the responses borrow `ui`, the
+    /// mutation borrows `shared`). Clicking the agent chip is
+    /// `Alt+A`'s mouse form; clicking a pane chip is its chord's.
+    fn paint_side_region(
+        &mut self,
+        ui: &mut egui::Ui,
+        shared: &mut Shared,
+        rect: Rect,
+        shown: SidePane,
+    ) {
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, PANEL_BG);
+        painter.line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
+        );
+        // The switcher strip across the region's top — the host's
+        // visible switch affordance.
+        let bar = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), PANE_BAR_H));
+        painter.line_segment(
+            [bar.left_bottom(), bar.right_bottom()],
+            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
+        );
+        let font = FontId::monospace(12.0);
+        let chips: Vec<(SidePane, &str)> = std::iter::once((SidePane::Agent, "agent"))
+            .chain(
+                PANES
+                    .iter()
+                    .map(|entry| (SidePane::Aux(entry.id()), entry.title())),
+            )
+            .collect();
+        let mut action = None;
+        let mut x = bar.left() + PANEL_PAD / 2.0;
+        for (index, (target, label)) in chips.iter().enumerate() {
+            let label_w = painter
+                .layout_no_wrap((*label).to_string(), font.clone(), Color32::WHITE)
+                .size()
+                .x;
+            let chip = Rect::from_min_size(
+                Pos2::new(x, bar.top() + 2.0),
+                Vec2::new(label_w + 12.0, bar.height() - 4.0),
+            );
+            if chip.right() > bar.right() {
+                break;
+            }
+            let hit = ui.interact(chip, egui::Id::unique(("pane-chip", index)), Sense::click());
+            let active = *target == shown;
+            let (bg, fg) = if active {
+                (self.theme.fg, PANEL_BG)
+            } else if hit.hovered() {
+                (Color32::from_rgb(0x2A, 0x2A, 0x2A), self.theme.fg)
+            } else {
+                (Color32::TRANSPARENT, Color32::from_rgb(0xAA, 0xAA, 0xAA))
+            };
+            painter.rect_filled(chip, 3.0, bg);
+            painter.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                *label,
+                font.clone(),
+                fg,
+            );
+            if hit.clicked() {
+                action = Some(*target);
+            }
+            x = chip.right() + 4.0;
+        }
+
+        // The body: everything under the switcher strip.
+        let body = Rect::from_min_max(Pos2::new(rect.left(), bar.bottom()), rect.right_bottom());
+        match shown {
+            SidePane::Agent => self.paint_panel(ui, shared, body),
+            SidePane::Aux(id) => pane(id).paint(ui, shared, body, self.theme),
+        }
+
+        if let Some(target) = action {
+            match target {
+                // The agent chip is `Alt+A`'s mouse form — the shared
+                // open→focus→close cycle, never a direct flip.
+                SidePane::Agent => {
+                    let session_size = region_session_size(&shared.panes);
+                    dispatch::toggle_agent_panel(&mut shared.tabs, session_size);
+                }
+                SidePane::Aux(id) => self.toggle_pane(shared, id),
+            }
+        }
+    }
+
     /// The side-panel region (Spec R13-T5): the agent conversation
     /// panel's egui paint over [`AgentPanel`]'s shared state — the
     /// same regions the TUI's `paint_agent_panel` carves: the title
@@ -1009,14 +1214,11 @@ impl GuiApp {
     /// the `a`/`t`/`d` keys reach through `agent_key`, and choice
     /// rows answer through `answer_choice` — the click and the
     /// keyboard can never disagree about what a gate does.
+    /// `rect` is the pane BODY — [`GuiApp::paint_side_region`] owns
+    /// the region's frame (background, separator, switcher strip).
     fn paint_panel(&mut self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect) {
         let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, PANEL_BG);
-        painter.line_segment(
-            [rect.left_top(), rect.left_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
-        );
         let font = FontId::monospace(13.0);
         let (line_h, cell_w) = ctx.fonts_mut(|fonts| {
             (
@@ -1665,6 +1867,7 @@ impl eframe::App for GuiApp {
                 Some((pending, since)) if pending == band => {
                     let elapsed = now.saturating_duration_since(since);
                     if elapsed >= RESIZE_SETTLE {
+                        let session_size = region_session_size(&shared.panes);
                         shared.tabs.resize_all(band, session_size);
                         self.last_band = band;
                         self.pending_band = None;
@@ -1684,21 +1887,26 @@ impl eframe::App for GuiApp {
             self.pending_band = None;
         }
 
-        // 3. The content split — the panel's share comes off the band
-        //    exactly like `session_size` told the PTY.
-        let panel_open = shared
-            .tabs
-            .active()
-            .is_some_and(|tab| tab.agent_panel_open());
-        let (grid_pane, panel_rect) = split_content(regions.content, panel_open, cell);
+        // 3. The content split — the pane host's share comes off the
+        //    band exactly like `session_size` told the PTY (the region
+        //    is open while the agent claims OR an aux pane is
+        //    selected).
+        let shown = shared.shown_pane();
+        let (grid_pane, region_rect) = split_content(regions.content, shown.is_some(), cell);
 
         self.paint_tab_bar(ui, &mut shared, regions.tab_bar);
         self.paint_grid_pane(&ctx, ui, &mut shared, grid_pane, cell, &font);
         // The wheel hit-test mirrors THIS frame's split — a stale
-        // rect would deaden the region the grid just reclaimed.
-        self.panel_pane = panel_rect;
-        if let Some(rect) = panel_rect {
-            self.paint_panel(ui, &mut shared, rect);
+        // rect would deaden the region the grid just reclaimed. Only
+        // the agent claim routes wheel to its conversation scroll;
+        // aux panes own their own wheel handling (T2/T3).
+        self.panel_pane = if shown == Some(SidePane::Agent) {
+            region_rect
+        } else {
+            None
+        };
+        if let (Some(rect), Some(shown)) = (region_rect, shown) {
+            self.paint_side_region(ui, &mut shared, rect, shown);
         }
         self.paint_status(ui, &shared, regions.status);
         self.paint_modals(ui, &shared, area);
@@ -1720,6 +1928,9 @@ impl eframe::App for GuiApp {
 /// keeps off the separator.
 const PANEL_BG: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1B);
 const PANEL_PAD: f32 = 8.0;
+/// The pane host's switcher strip height — fixed like the other
+/// chrome (never cell-tied) so zoom doesn't reflow it.
+const PANE_BAR_H: f32 = 22.0;
 /// How many choice rows a parked ask card shows before folding —
 /// the plan block's `… N more` idiom applied to the card.
 const ASK_CHOICES_MAX: usize = 6;
@@ -1837,6 +2048,18 @@ fn find_open_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
     modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)
 }
 
+/// The `session_size` the shared dispatch fns take under the pane
+/// host (Spec R14 §5.13): ORs the app-global aux selection into each
+/// tab's agent-open flag, so every session's winsize stays the GRID
+/// PANE's cells — never the window's — while the region hosts ANY
+/// pane. `resize_all`/`resize_active` read the claim per tab
+/// internally; the aux half is app-global, so it applies to every
+/// tab uniformly.
+fn region_session_size(panes: &PaneHost) -> impl Fn(Size, bool) -> Size {
+    let aux_open = panes.selected().is_some();
+    move |size, agent_open| session_size(size, agent_open || aux_open)
+}
+
 /// Scroll the view the minimum amount that puts `hit`'s row on screen:
 /// a visible match doesn't move the view, one above tops at its line
 /// (the block-nav rule `scroll_to_line` applies), one below lands on
@@ -1934,6 +2157,7 @@ mod tests {
                 suggester: CommandSuggester::with_secret_store(config::NoSecrets),
                 suggestion: SuggestionPin::new(),
                 find: None,
+                panes: PaneHost::default(),
             }));
             Self {
                 app: GuiApp {
@@ -1972,6 +2196,13 @@ mod tests {
         /// short-lived guards only, `pred`s lock per probe.
         fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
             self.shared.lock().unwrap()
+        }
+
+        /// `GuiApp::toggle_pane` under the same lock `press` takes —
+        /// the pane chord's and the switcher chip's dispatch seam.
+        fn toggle_pane(&mut self, id: PaneId) {
+            let mut shared = self.shared.lock().unwrap();
+            self.app.toggle_pane(&mut shared, id);
         }
     }
 
@@ -2529,5 +2760,179 @@ mod tests {
             wheel_lines(Unit::Line, 1.0, cell, 0, &mut rem),
             WHEEL_LINES as i32
         );
+    }
+
+    // ---- The pane host (Spec R14 §5.13, R14-T1) ----
+
+    /// Feed native `egui::Event`s through `dispatch_events` — the
+    /// seam `ui` runs each frame, so the chords' interception is
+    /// exercised at the same point it happens live.
+    fn feed(harness: &mut Harness, events: Vec<egui::Event>) {
+        harness.ctx.begin_pass(egui::RawInput {
+            events,
+            ..Default::default()
+        });
+        let mut shared = harness.shared.lock().unwrap();
+        harness.app.dispatch_events(&harness.ctx, &mut shared);
+    }
+
+    /// `Ctrl+Shift+E`/`Ctrl+Shift+B` toggle their slots through the
+    /// real event path — intercepted before `translate_key`, so the
+    /// keymap never sees them and the PTY stays silent throughout.
+    #[test]
+    fn pane_chords_toggle_through_the_native_event_path() {
+        let path = capture_path("panechords");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let press = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+
+        feed(&mut harness, vec![press(egui::Key::E)]);
+        assert_eq!(harness.shared().panes.selected(), Some(PaneId::Explorer));
+        feed(&mut harness, vec![press(egui::Key::B)]);
+        assert_eq!(harness.shared().panes.selected(), Some(PaneId::Browser));
+        feed(&mut harness, vec![press(egui::Key::B)]);
+        assert_eq!(harness.shared().panes.selected(), None);
+
+        // `head -c 1` is still blocked on its first byte — nothing
+        // leaked through three chord presses.
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The winsize invariant under the host: a pane toggle narrows
+    /// EVERY session to the grid-pane columns and the deselect
+    /// restores the band — the agent-open rule, unchanged for a new
+    /// claimant (R14 us-30).
+    #[test]
+    fn pane_toggle_resizes_every_session_to_the_grid_pane() {
+        let mut harness = Harness::new(sh_manager());
+        harness.toggle_pane(PaneId::Explorer);
+        {
+            let shared = harness.shared();
+            // The 40-column band's region share leaves 24 columns.
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
+        }
+        harness.toggle_pane(PaneId::Explorer);
+        let shared = harness.shared();
+        assert_eq!(shared.tabs.active().unwrap().session.size().columns, 40);
+        assert_eq!(shared.shown_pane(), None);
+    }
+
+    /// The agent panel claims the region while open — `Alt+A` still
+    /// runs its open→focus→close cycle — and an aux selection asks
+    /// the claim to yield: the panel closes (its conversation
+    /// survives) and the pane takes the region at the same winsize.
+    /// `Alt+A` brings the claim straight back over the selection.
+    #[test]
+    fn the_agent_claim_yields_only_to_an_explicit_selection() {
+        let mut harness = Harness::new(sh_manager());
+        harness.press(Key::Char('a'), Modifiers::ALT);
+        {
+            let shared = harness.shared();
+            assert!(shared.tabs.active().unwrap().agent_panel_open());
+            assert_eq!(shared.shown_pane(), Some(SidePane::Agent));
+        }
+        harness.toggle_pane(PaneId::Browser);
+        {
+            let shared = harness.shared();
+            assert!(
+                !shared.tabs.active().unwrap().agent_panel_open(),
+                "the claim yielded to the explicit selection"
+            );
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Browser)));
+            // The region never closed through the swap: same winsize.
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+        }
+        // `Alt+A` reopens — the claim returns over the still-live
+        // selection.
+        harness.press(Key::Char('a'), Modifiers::ALT);
+        let shared = harness.shared();
+        assert!(shared.tabs.active().unwrap().agent_panel_open());
+        assert_eq!(shared.shown_pane(), Some(SidePane::Agent));
+        assert_eq!(shared.panes.selected(), Some(PaneId::Browser));
+    }
+
+    /// While a pane shows it owns unbound input (the find bar's
+    /// focus rule): a plain char routes to the pane — the input
+    /// shadow stays empty, so nothing reached the PTY — and Esc
+    /// returns focus to the grid.
+    #[test]
+    fn a_shown_pane_owns_unbound_keys_and_esc_releases() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        harness.toggle_pane(PaneId::Explorer);
+
+        harness.press(Key::Char('x'), Modifiers::NONE);
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .shadow
+                .text()
+                .is_empty(),
+            "the pane swallowed the key — the shadow never saw it"
+        );
+
+        harness.press(Key::Escape, Modifiers::NONE);
+        assert_eq!(harness.shared().shown_pane(), None);
+
+        // Focus is back — the same char types into the line now.
+        harness.press(Key::Char('x'), Modifiers::NONE);
+        assert_eq!(harness.shared().tabs.active().unwrap().shadow.text(), "x");
+    }
+
+    /// The selection is app-global but the claim is per-tab: the
+    /// explorer on one tab and the agent panel on another hold the
+    /// region in turn as the active tab changes, and every session
+    /// already carries its grid-pane winsize (R14 us-4/30).
+    #[test]
+    fn the_selection_follows_the_active_tab() {
+        let mut harness = Harness::new(sh_manager());
+        // Tab 1 opens the agent panel; `Alt+T`'s new tab becomes
+        // active, then the explorer selection lands on it.
+        harness.press(Key::Char('a'), Modifiers::ALT);
+        harness.press(Key::Char('t'), Modifiers::ALT);
+        harness.toggle_pane(PaneId::Explorer);
+        {
+            let shared = harness.shared();
+            assert_eq!(shared.tabs.active_index(), 1);
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+        }
+
+        // Tab 1's claim fills the region — the selection waits
+        // underneath — and its session was resized ahead of the
+        // switch by the global `resize_all`.
+        harness.press(Key::Char('1'), Modifiers::ALT);
+        {
+            let shared = harness.shared();
+            assert_eq!(shared.shown_pane(), Some(SidePane::Agent));
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+        }
+
+        // Back to tab 2 — the same selection shows again.
+        harness.press(Key::Char('2'), Modifiers::ALT);
+        let shared = harness.shared();
+        assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
+        assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
     }
 }
