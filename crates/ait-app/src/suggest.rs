@@ -152,6 +152,22 @@ impl InputShadow {
         self.stale = true;
     }
 
+    /// Fold pasted text into the shadow — a clipboard paste IS user
+    /// input the shadow can replay (unlike `ait ctl send`, whose
+    /// bytes stay unverifiable — Spec R11 us-16): printable text
+    /// appends — the shell echoes it onto the line, so
+    /// [`verified_shadow`](Self::verified_shadow)'s echo-agreement
+    /// still gates — while any control byte (a newline submits, a
+    /// tab completes, an escape edits) is unreplayable and the
+    /// shadow falls back to stale.
+    pub fn update_pasted(&mut self, text: &str) {
+        if text.chars().any(|c| c.is_control()) {
+            self.mark_stale();
+        } else {
+            self.text.push_str(text);
+        }
+    }
+
     /// Clear the shadow back to the post-submission state — text and
     /// staleness both gone. The T5 Esc-cancel path wipes the input
     /// line with a `Ctrl+U` byte, which the shadow cannot replay as
@@ -917,6 +933,33 @@ mod tests {
         shadow.update(&KeyEvent::new(Key::Enter, Modifiers::NONE));
         assert!(!shadow.is_stale());
         assert_eq!(shadow.text(), "");
+    }
+
+    /// Clipboard text is replayable input: a printable pasted line
+    /// appends and fires the trigger exactly as if typed; a paste
+    /// carrying control bytes (newline submits, tab completes) falls
+    /// back to stale — the paste can never fake the echo.
+    #[test]
+    fn pasted_text_replays_or_stales() {
+        let mut shadow = InputShadow::new();
+        shadow.update_pasted("# list files");
+        assert_eq!(
+            shadow.request_text("user@box:~$ # list files"),
+            Some("list files".to_string())
+        );
+
+        // Typing continues onto a pasted prefix.
+        shadow.update(&char_key('s'));
+        assert_eq!(
+            shadow.request_text("user@box:~$ # list filess"),
+            Some("list filess".to_string())
+        );
+
+        for control in ["# a\nb", "# a\tb", "# a\x07"] {
+            let mut shadow = typed("# x");
+            shadow.update_pasted(control);
+            assert!(shadow.is_stale(), "{control:?} must stay stale");
+        }
     }
 
     /// The pure trigger check on (shadow, logical line): an agreeing

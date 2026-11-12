@@ -824,10 +824,11 @@ fn handle_event<W: Write>(
                                 if let Some(text) = state.copied_text.as_deref() {
                                     let bytes = encode_paste(text, tab.session.bracketed_paste());
                                     let _ = tab.session.send_bytes(&bytes);
-                                    // Pasted bytes are arbitrary input —
-                                    // newlines included — so the input
-                                    // shadow cannot replay them.
-                                    tab.shadow.mark_stale();
+                                    // Clipboard text replays into the
+                                    // shadow when it's printable — the
+                                    // shell's echo still verifies it
+                                    // (control bytes stay stale).
+                                    tab.shadow.update_pasted(text);
                                 }
                             }
                         }
@@ -1899,10 +1900,12 @@ mod tests {
         );
     }
 
-    /// `Shift+Insert` pastes arbitrary bytes — the shadow cannot
-    /// replay them, so it goes stale until the next submission.
+    /// `Shift+Insert` folds printable clipboard text into the shadow —
+    /// the shell echoes it, so verification still gates — while
+    /// control bytes stay unreplayable and stale the shadow until the
+    /// next submission.
     #[test]
-    fn paste_marks_the_shadow_stale() {
+    fn paste_replays_printable_and_stales_control() {
         let mut harness = Harness::new(sh_manager());
         for c in "# l".chars() {
             harness.handle(key(KeyCode::Char(c), KeyModifiers::NONE));
@@ -1912,7 +1915,17 @@ mod tests {
         harness.state.copied_text = Some("s".to_string());
         harness.handle(key(KeyCode::Insert, KeyModifiers::SHIFT));
 
-        assert!(harness.tabs.active().unwrap().shadow.is_stale());
+        let shadow = &harness.tabs.active().unwrap().shadow;
+        assert!(!shadow.is_stale(), "printable paste keeps the shadow");
+        assert_eq!(shadow.text(), "# ls");
+
+        harness.state.copied_text = Some("a\nb".to_string());
+        harness.handle(key(KeyCode::Insert, KeyModifiers::SHIFT));
+
+        assert!(
+            harness.tabs.active().unwrap().shadow.is_stale(),
+            "a newline in the paste is unreplayable"
+        );
     }
 
     /// The shadow tracks editing honestly through `handle_event`:

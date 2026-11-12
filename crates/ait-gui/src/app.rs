@@ -521,7 +521,7 @@ impl GuiApp {
                                 let bytes =
                                     selection::encode_paste(&text, tab.session.bracketed_paste());
                                 let _ = tab.session.send_bytes(&bytes);
-                                tab.shadow.mark_stale();
+                                tab.shadow.update_pasted(&text);
                             }
                         }
                     }
@@ -586,7 +586,7 @@ impl GuiApp {
         if tab.exit_status().is_none() && !text.is_empty() {
             let bytes = selection::encode_paste(text, tab.session.bracketed_paste());
             let _ = tab.session.send_bytes(&bytes);
-            tab.shadow.mark_stale();
+            tab.shadow.update_pasted(text);
         }
     }
 
@@ -1382,12 +1382,15 @@ impl GuiApp {
     }
 
     /// The status strip: `status_text` over the same `StatusLine` the
-    /// TUI composes (toast wins while live).
+    /// TUI composes (toast wins while live). A live suggestion adds a
+    /// `spinner · suggesting` segment — the gap between the trigger
+    /// and the first streamed Delta is otherwise silent.
     fn paint_status(&self, ui: &mut egui::Ui, shared: &Shared, rect: Rect) {
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(0x1E, 0x1E, 0x1E));
         let now = Instant::now();
-        let text = match shared.tabs.active() {
+        let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
+        let mut text = match shared.tabs.active() {
             Some(tab) => {
                 let model = shared.config.model(&shared.profile);
                 status_text(
@@ -1406,7 +1409,21 @@ impl GuiApp {
             }
             None => String::new(),
         };
-        let highlighted = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
+        if shared.suggestion.is_some() && !toast_live {
+            // Braille spinner — one frame per ~100 ms; the repaint is
+            // requested below so the glyph animates through the
+            // request's quiet model-call stretch, not just while
+            // Delta bytes land.
+            const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let millis = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as usize;
+            let frame = FRAMES[(millis / 100) % FRAMES.len()];
+            text = format!("{text} · {frame} suggesting");
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        let highlighted = toast_live;
         let color = if highlighted {
             Color32::BLACK
         } else {
