@@ -48,6 +48,39 @@ eframe = { version = "0.37", default-features = false, features = [
     "wgpu", "x11", "wayland", "default_fonts", "system_fonts",
     "clipboard", "accesskit",
 ] }
+# The browser pane's embedded webview (Spec R14 §5.13, R14-T3; optional —
+# the `web` feature): a `wry` child webview (`build_as_child`,
+# repositioned over the pane rect each frame) on macOS and Linux/X11.
+# wry 0.57.2 (2026-11-10) — `>= 0.55` pins past the macOS-26
+# `build_as_child` ObjC crash (wry#1705); its defaults keep `os-webview`
+# (webkit2gtk/soup3 on Linux) + `x11`. `dpi` is wry's own `Rect` unit
+# crate — `set_bounds`/`with_bounds` speak `dpi::Position`/`dpi::Size`
+# (dpi 0.1.2 (2025-05-02)). `raw-window-handle` names the
+# `RawWindowHandle::{Xlib,Wayland,AppKit}` variants the embed-support
+# decision matches on — the ^0.6 line wry and winit 0.30 share
+# (raw-window-handle 0.6.2 (2024-05-17)). All optional: feature-off
+# builds carry none of them and the pane degrades to external-open.
+wry = { version = "0.57.2", optional = true }
+dpi = { version = "0.1", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+
+# Linux-only webview runtime glue (Spec R14 §5.13, R14-T3): wry's
+# `build_as_child` panics unless `gtk::init` ran on the creating
+# thread, and the webview needs the glib main context pumped alongside
+# the frame loop. The `0.18` line is the one wry's `os-webview` feature
+# pulls itself, so the tree carries ONE gtk (gtk 0.18.2 (2024-12-09)).
+# macOS needs nothing — WKWebView is a system framework.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
+[features]
+# `web` (default): the browser pane embeds a `wry` child webview where
+# the platform supports it (Spec R14 §5.13). `--no-default-features`
+# drops the whole webkit stack — the pane then shows the
+# external-open surface only, and the build needs no webkit2gtk/gtk
+# system packages.
+default = ["web"]
+web = ["dep:wry", "dep:dpi", "dep:raw-window-handle", "dep:gtk"]
 
 [dev-dependencies]
 # Tempdirs for the pump tests' store database and settings-watcher
