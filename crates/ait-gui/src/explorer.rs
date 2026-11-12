@@ -308,7 +308,6 @@ impl ExplorerState {
     /// T4's Ctrl+click file entry point: browse to the file's parent
     /// (if it isn't already) then select+preview it. A directory
     /// target navigates instead.
-    #[allow(dead_code)] // T4's Ctrl+click routing calls it; tested at the seam today
     pub fn select_file(&mut self, path: &Path) {
         if self.remote {
             return;

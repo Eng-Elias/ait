@@ -13,6 +13,7 @@
 //! the resize detector diffs, the last grid-pane rect the wheel/selection
 //! hit-tests use, and the quit flag.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,7 +34,7 @@ use ait_app::selection::{self, GridPoint};
 use ait_app::skills::LiveSkills;
 use ait_app::status::{self, block_text, status_text, StatusLine, Toast};
 use ait_app::store::StoreHandle;
-use ait_app::suggest::SuggestionPin;
+use ait_app::suggest::{self, SuggestionPin};
 use ait_app::tabs::TabManager;
 use ait_config::Settings;
 use ait_term::{Key, KeyEvent, Modifiers, Size};
@@ -42,6 +43,7 @@ use eframe::egui::{
 };
 
 use crate::browser::BrowserState;
+use crate::detect;
 use crate::explorer::ExplorerState;
 use crate::grid::GridTheme;
 use crate::keys::{translate_key, translate_text};
@@ -49,7 +51,7 @@ use crate::layout::{
     chrome_regions, grid_point, grid_size, plan_block_chrome, session_size, split_content,
     tab_chips, BlockDivider, BlockLabel, CellMetrics, Chrome, GuiMetrics, CHIP_PAD, FIND_BAR_H,
 };
-use crate::paint::{paint_grid, FindOverlay, Overlays};
+use crate::paint::{paint_grid, DetectOverlay, FindOverlay, Overlays};
 use crate::pane::{pane, pane_chord, PaneHost, PaneId, SidePane, PANES};
 use crate::panel::{self, Gate, Tone};
 use crate::pump::Pump;
@@ -864,23 +866,17 @@ impl GuiApp {
         shared.tabs.resize_all(self.last_band, session_size);
     }
 
-    /// R14-T4's "open the browser pane at this URL" entry point —
-    /// the Ctrl+click-on-URL route and any other caller that names a
-    /// destination: queue the navigation (the address entry follows
-    /// it) and make the browser pane show — the same claim-yield and
-    /// resize a chord performs, minus the toggle-off arm (an explicit
-    /// open never closes the pane). Whether the page embeds or hands
-    /// to the system browser is the probe's verdict, not this
-    /// caller's concern.
-    #[allow(dead_code)] // R14-T4's Ctrl+click route is the caller; until it lands only the harness test exercises this
-    pub(crate) fn open_browser_at(&mut self, shared: &mut Shared, url: &str) {
-        shared.browser.navigate(url);
+    /// Make `id` the region's pane — the select + agent-claim yield +
+    /// every-tab resize the chord's open arm runs, minus its
+    /// toggle-off half (an explicit open never closes the pane).
+    /// `toggle_pane` keeps the on/off decision; this is just the show.
+    fn show_pane(&mut self, shared: &mut Shared, id: PaneId) {
         let agent_open = shared
             .tabs
             .active()
             .is_some_and(|tab| tab.agent_panel_open());
-        if !shared.panes.showing(PaneId::Browser, agent_open) {
-            shared.panes.select(PaneId::Browser);
+        if !shared.panes.showing(id, agent_open) {
+            shared.panes.select(id);
             if let Some(tab) = shared.tabs.active_mut() {
                 while tab.agent_panel_open() {
                     tab.toggle_agent_panel();
@@ -888,6 +884,40 @@ impl GuiApp {
             }
         }
         self.resize_for_panes(shared);
+    }
+
+    /// "Open the browser pane at this URL" — the Ctrl+click-on-URL
+    /// route (R14-T4) and any other caller that names a destination:
+    /// queue the navigation (the address entry follows it) and show
+    /// the browser pane. Whether the page embeds or hands to the
+    /// system browser is the probe's verdict, not this caller's
+    /// concern.
+    fn open_browser_at(&mut self, shared: &mut Shared, url: &str) {
+        shared.browser.navigate(url);
+        self.show_pane(shared, PaneId::Browser);
+    }
+
+    /// The Ctrl+click route (Spec R14 §5.13 us-25/26): a detected
+    /// token sends its target to the right pane — a URL navigates the
+    /// browser, a file path selects and previews in the explorer, a
+    /// directory navigates the explorer to it — each through
+    /// [`show_pane`], so a route carries the same claim-yield and
+    /// winsize a chord's open arm does and can never toggle one off.
+    /// Detection already gated remotes to URLs, so a `Path` target
+    /// always names a local entry `sync_explorer` can serve.
+    fn open_detection(&mut self, shared: &mut Shared, target: detect::Target) {
+        match target {
+            detect::Target::Url(url) => self.open_browser_at(shared, &url),
+            detect::Target::Path(path) => {
+                crate::explorer::sync_explorer(shared);
+                if path.is_dir() {
+                    shared.explorer.navigate_to_dir(&path);
+                } else {
+                    shared.explorer.select_file(&path);
+                }
+                self.show_pane(shared, PaneId::Explorer);
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1054,9 +1084,51 @@ impl GuiApp {
         };
         let response = ui.interact(pane, egui::Id::unique("grid"), Sense::click_and_drag());
         let scroll = tab.scroll_offset();
+        // Ctrl+hover detection (Spec R14 §5.13 us-24): while plain
+        // Ctrl is held and the pointer is over the grid, the token
+        // under it underlines and the pointer turns to the hand —
+        // Ctrl+click routes the same hit. Plain Ctrl only, so chords
+        // that add a modifier keep their other meanings and the
+        // affordance never fights them.
+        let ctrl = ctx.input(|input| {
+            let modifiers = input.modifiers;
+            modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
+        });
+        let link = if ctrl {
+            response.hover_pos().and_then(|pos| {
+                let (line, column) = grid_point(pos, pane, cell, scroll);
+                let remote = !tab.remote.is_empty();
+                let cwd = PathBuf::from(suggest::cwd_for(tab));
+                let home = std::env::home_dir().unwrap_or_default();
+                detect::detect_at(&tab.grid(), line, column, remote, &cwd, &home)
+                    .map(|hit| (line, hit))
+            })
+        } else {
+            None
+        };
+        if link.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let detect = link.as_ref().map(|(line, hit)| DetectOverlay {
+            line: *line,
+            column: hit.column,
+            cells: hit.cells,
+        });
+        // `clicked` is press AND release inside the pane with no drag
+        // — the affordance's release half; the route lands after the
+        // paint pass, once `tab`'s borrow ends.
+        let route = if response.clicked() && ctrl {
+            link.map(|(_, hit)| hit.target)
+        } else {
+            None
+        };
+        // A Ctrl+press is the affordance's, never a selection start —
+        // `extend_selection` no-ops without a `begin`, so the drag
+        // arm needs no gate of its own (us-27: ordinary click-drag
+        // selection is untouched).
         if let Some(pos) = response.interact_pointer_pos() {
             let (line, column) = grid_point(pos, pane, cell, scroll);
-            if response.drag_started() {
+            if response.drag_started() && !ctrl {
                 tab.begin_selection(GridPoint::new(line, column));
             } else if response.dragged() {
                 tab.extend_selection(GridPoint::new(line, column));
@@ -1124,6 +1196,7 @@ impl GuiApp {
                     current: find.current_index(),
                 }),
                 block_chips: Some(&chips),
+                detect,
             },
         );
         // Scrolled into scrollback: the jump-to-bottom affordance
@@ -1148,6 +1221,12 @@ impl GuiApp {
             if snap {
                 tab.snap_to_bottom();
             }
+        }
+        // The Ctrl+click route — applied last so `tab`'s borrow has
+        // ended: `open_detection` drives the pane host, the explorer
+        // model and the browser queue off the whole `Shared`.
+        if let Some(target) = route {
+            self.open_detection(shared, target);
         }
     }
 
@@ -3202,5 +3281,139 @@ mod tests {
         assert!(shared.browser.bad_entry());
         assert!(shared.browser.drain_nav().is_empty());
         assert_eq!(shared.browser.current(), None);
+    }
+
+    // ---- Ctrl+click detection & routing (Spec R14 §5.13, R14-T4) ----
+
+    /// `GuiApp::open_detection` under the shared lock — the route
+    /// `paint_grid_pane`'s Ctrl+click arm applies.
+    fn open_detection(harness: &mut Harness, target: detect::Target) {
+        let mut shared = harness.shared.lock().unwrap();
+        harness.app.open_detection(&mut shared, target);
+    }
+
+    /// The URL route: a detected URL navigates the browser pane open
+    /// — the claim yields, every session keeps the grid-pane winsize,
+    /// and the pending navigation waits for the frame's drain
+    /// (external-open under the harness's `Unknown` verdict).
+    #[test]
+    fn ctrl_click_on_a_url_opens_the_browser_pane_at_it() {
+        let mut harness = Harness::new(sh_manager());
+        harness.press(Key::Char('a'), Modifiers::ALT);
+        assert!(harness.shared().tabs.active().unwrap().agent_panel_open());
+
+        open_detection(
+            &mut harness,
+            detect::Target::Url("https://docs.rs/eframe".to_string()),
+        );
+
+        let mut shared = harness.shared();
+        assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Browser)));
+        assert!(
+            !shared.tabs.active().unwrap().agent_panel_open(),
+            "the claim yielded to the routed open"
+        );
+        assert_eq!(shared.browser.current(), Some("https://docs.rs/eframe"));
+        assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+        let _ = shared.browser.drain_nav();
+    }
+
+    /// The file route: a detected file selects it in the explorer —
+    /// the pane browses to its parent and the preview loads — a
+    /// directory navigates instead, and either way the explorer pane
+    /// shows.
+    #[test]
+    fn ctrl_click_on_a_path_opens_the_explorer_on_it() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("sub")).unwrap();
+        std::fs::write(fixture.path().join("file.txt"), "hello\n").unwrap();
+        let file = fixture.path().join("file.txt");
+        let dir = fixture.path().join("sub");
+        let mut harness = Harness::new(sh_manager());
+
+        open_detection(&mut harness, detect::Target::Path(file.clone()));
+        {
+            let shared = harness.shared();
+            assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
+            assert_eq!(shared.explorer.dir(), fixture.path());
+            assert_eq!(shared.explorer.selected_entry().unwrap().path, file);
+            assert!(
+                matches!(
+                    shared.explorer.preview(),
+                    Some(crate::explorer::Preview::Text { .. })
+                ),
+                "the routed file loads its preview"
+            );
+            assert_eq!(shared.tabs.active().unwrap().session.size().columns, 24);
+        }
+
+        open_detection(&mut harness, detect::Target::Path(dir.clone()));
+        let shared = harness.shared();
+        assert_eq!(shared.explorer.dir(), dir);
+        assert_eq!(shared.shown_pane(), Some(SidePane::Aux(PaneId::Explorer)));
+    }
+
+    /// `detect_at` over a real grid row: the shell's own echo is the
+    /// scanned text, the column under the pointer picks the token —
+    /// a relative filename resolves under the tab's reported cwd.
+    #[test]
+    fn detect_at_resolves_tokens_on_real_grid_rows() {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("file.txt"), "x\n").unwrap();
+        let harness = Harness::new(sh_manager());
+        report_cwd(&harness, fixture.path());
+        // 29 columns of output — under the harness's 40-wide grid so
+        // the whole row stays one line (no mid-token wrap).
+        run_line(&harness, "echo 'see https://a/b then file.txt'");
+        wait_until(&harness, |h| {
+            let shared = h.shared();
+            let tab = shared.tabs.active().unwrap();
+            let grid = tab.grid();
+            (-(grid.scrollback() as i32)..grid.lines() as i32).any(|line| {
+                grid.line(line)
+                    .is_some_and(|row| row.text().contains("see https://a/b then file.txt"))
+            })
+        });
+
+        let shared = harness.shared();
+        let tab = shared.tabs.active().unwrap();
+        let grid = tab.grid();
+        let (line, text) = (-(grid.scrollback() as i32)..grid.lines() as i32)
+            .find_map(|line| {
+                grid.line(line)
+                    .map(|row| (line, row.text()))
+                    .filter(|(_, text)| text.contains("see https://a/b then file.txt"))
+            })
+            .unwrap();
+        let home = fixture.path().to_path_buf();
+        let cwd = PathBuf::from(suggest::cwd_for(tab));
+        // The URL's column and the file's column both afford — the
+        // space between them never does.
+        let url_col = text.find("https").unwrap();
+        let hit = detect::detect_at(&grid, line, url_col, false, &cwd, &home)
+            .expect("the URL column affords");
+        assert_eq!(hit.target, detect::Target::Url("https://a/b".into()));
+        assert_eq!(hit.column, url_col);
+        assert_eq!(hit.cells, "https://a/b".chars().count());
+
+        let file_col = text.find("file.txt").unwrap();
+        let hit = detect::detect_at(&grid, line, file_col, false, &cwd, &home)
+            .expect("the real file's column affords");
+        assert_eq!(
+            hit.target,
+            detect::Target::Path(fixture.path().join("file.txt"))
+        );
+        assert!(
+            detect::detect_at(
+                &grid,
+                line,
+                text.find("then").unwrap() + "then".len(),
+                false,
+                &cwd,
+                &home
+            )
+            .is_none(),
+            "the space between tokens affords nothing"
+        );
     }
 }
