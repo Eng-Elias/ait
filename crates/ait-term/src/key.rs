@@ -39,6 +39,12 @@ impl Modifiers {
         self.0 & other.0 == other.0
     }
 
+    /// `self` with `other`'s bits set too — the const combination `|`
+    /// can't express in a `const` context (trait methods never are).
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
     /// The xterm modifier parameter: `1 + shift?1 + alt?2 + ctrl?4 + super?8`.
     fn xterm_param(self) -> u8 {
         self.0 + 1

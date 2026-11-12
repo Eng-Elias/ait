@@ -108,7 +108,10 @@ pub fn status_text(line: &StatusLine<'_>, toast: Option<&Toast>, now: Instant) -
 
 /// The block segment: `✓ <code>` when the command exited zero, `✗
 /// <code>` otherwise — then `· <dur>` (Spec R05's `✓ 0 · 1.2s`).
-fn block_text(status: BlockStatus) -> String {
+/// `pub` for the GUI's block chrome, which renders the same label on a
+/// block's boundary chip (CODING_STANDARDS.md §17 — one formatter,
+/// both consumers).
+pub fn block_text(status: BlockStatus) -> String {
     let mark = if status.exit == 0 { '✓' } else { '✗' };
     format!(
         "{mark} {} · {}",
@@ -119,8 +122,9 @@ fn block_text(status: BlockStatus) -> String {
 
 /// Sub-minute durations render tenths (`1.2s`, the spec's shape);
 /// minute-plus durations collapse to `Mm SSs` so a long build stays
-/// readable without a float tail.
-fn duration_text(duration: Duration) -> String {
+/// readable without a float tail. `pub` for the GUI's block chrome —
+/// same rule as [`block_text`].
+pub fn duration_text(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs < 60 {
         format!("{:.1}s", duration.as_secs_f64())
@@ -156,6 +160,16 @@ pub fn notification_text(source: Option<&str>, title: Option<&str>, message: &st
     }
     parts.push(message);
     parts.join(": ")
+}
+
+/// The launch-degradation toast both frontends build: every failed
+/// subsystem's message joined by ` · ` — `None` when the launch was
+/// clean. The config/store/ctl labels live beside their own loaders
+/// (`config::error_text`, `StoreHandle::unavailable_text`,
+/// `ctl::socket_error_text`); this is only the join (Spec R13 §5.12,
+/// CODING_STANDARDS §17).
+pub fn boot_toast(failures: Vec<String>, now: Instant) -> Option<Toast> {
+    (!failures.is_empty()).then(|| Toast::new(failures.join(" · "), now))
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ use crate::status::Toast;
 /// standard 17: a status line's text is defined once). The first
 /// error renders in full (`SkillError`'s Display is already
 /// toast-ready); the rest collapse to a count.
-pub(crate) fn skipped_text(errors: &[SkillError]) -> String {
+pub fn skipped_text(errors: &[SkillError]) -> String {
     match errors.split_first() {
         None => String::new(),
         Some((first, [])) => format!("skill skipped: {first}"),
@@ -105,9 +105,10 @@ impl LiveSkills {
     /// harnesses that drive `agent_key`/`AppState` without touching
     /// the filesystem: the desired watch set computes empty, so
     /// `ensure_watcher` never builds and snapshots rescan the empty
-    /// root into an empty catalog.
-    #[cfg(test)]
-    pub(crate) fn unwatched() -> Self {
+    /// root into an empty catalog. Frontends' dispatch tests use it
+    /// the same way this module's do.
+    #[doc(hidden)] // cross-crate test seam — not production surface
+    pub fn unwatched() -> Self {
         Self {
             user_root: PathBuf::new(),
             project_root: None,
@@ -258,6 +259,13 @@ impl LiveSkills {
         if self.watcher.is_some() {
             self.watched = desired;
         }
+    }
+}
+
+/// `new()` IS the default: the live catalog over the real roots.
+impl Default for LiveSkills {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

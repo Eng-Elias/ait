@@ -10,13 +10,21 @@
 //! The store reads, the panel rebuild and the paint are `app`'s
 //! seams (`store.rs`, `agent_panel.rs`, `render.rs` — standard 9).
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
+use ait_agent::TranscriptItem;
 use ait_store::ListedConversation;
+use ait_term::{Key, KeyEvent, Modifiers, Size};
+
+use crate::keymap;
+use crate::profile::ProfilePicker;
+use crate::status::Toast;
+use crate::store::StoreHandle;
+use crate::tabs::TabManager;
 
 /// One picker row — a stored conversation's display form.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConversationRow {
+pub struct ConversationRow {
     /// The `conversations` row id resume and delete address.
     pub id: i64,
     /// The row's title — the first task's text, truncated at write
@@ -30,13 +38,28 @@ pub(crate) struct ConversationRow {
     pub items: i64,
 }
 
+impl ConversationRow {
+    /// The picker's row text — `▸`-marked while highlighted, then
+    /// `title  age · N items`. Both frontends paint this verbatim
+    /// (Spec R13 §5.12, CODING_STANDARDS §17).
+    pub fn display_line(&self, selected: bool) -> String {
+        format!(
+            "{} {}  {} · {} items",
+            if selected { '▸' } else { ' ' },
+            self.title,
+            self.age,
+            self.items
+        )
+    }
+}
+
 /// The open picker (Spec R08 us-5): stored rows newest-first, the
 /// highlight wrapping on ↑/↓, and `Ctrl+D`'s one-key confirm — the
 /// first press arms the highlighted row, the second deletes it and
 /// any other key disarms (us-11: delete is one gesture but never an
 /// accident).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConversationPicker {
+pub struct ConversationPicker {
     /// The display rows, newest first.
     rows: Vec<ConversationRow>,
     /// The highlighted row's index into `rows`.
@@ -49,7 +72,7 @@ pub(crate) struct ConversationPicker {
 impl ConversationPicker {
     /// Rows for the store's listing: every conversation newest-first
     /// with its item count, the age bucketed against `now`.
-    pub(crate) fn new(listed: &[ListedConversation], now: SystemTime) -> Self {
+    pub fn new(listed: &[ListedConversation], now: SystemTime) -> Self {
         Self {
             rows: listed
                 .iter()
@@ -66,40 +89,40 @@ impl ConversationPicker {
     }
 
     /// The listed rows, newest first.
-    pub(crate) fn rows(&self) -> &[ConversationRow] {
+    pub fn rows(&self) -> &[ConversationRow] {
         &self.rows
     }
 
     /// The highlighted row's index.
-    pub(crate) fn selected(&self) -> usize {
+    pub fn selected(&self) -> usize {
         self.selected
     }
 
     /// The highlighted row — Enter's resume target, `Ctrl+D`'s
     /// delete target; `None` on an empty picker.
-    pub(crate) fn selected_row(&self) -> Option<&ConversationRow> {
+    pub fn selected_row(&self) -> Option<&ConversationRow> {
         self.rows.get(self.selected)
     }
 
     /// Whether `Ctrl+D` is armed on the highlighted row — the second
     /// press deletes, anything else disarms.
-    pub(crate) fn confirming(&self) -> bool {
+    pub fn confirming(&self) -> bool {
         self.confirming
     }
 
     /// Arm `Ctrl+D`'s one-key confirm on the highlighted row.
-    pub(crate) fn arm_delete(&mut self) {
+    pub fn arm_delete(&mut self) {
         self.confirming = true;
     }
 
     /// Drop the confirm arm — any key that isn't `Ctrl+D` does.
-    pub(crate) fn disarm_delete(&mut self) {
+    pub fn disarm_delete(&mut self) {
         self.confirming = false;
     }
 
     /// ↑ — the highlight wraps to the tail from the top (the ask
     /// card's/`Alt+P` picker's wrap rule).
-    pub(crate) fn prev(&mut self) {
+    pub fn prev(&mut self) {
         if self.rows.is_empty() {
             return;
         }
@@ -107,7 +130,7 @@ impl ConversationPicker {
     }
 
     /// ↓ — the highlight wraps back to the top.
-    pub(crate) fn next(&mut self) {
+    pub fn next(&mut self) {
         if self.rows.is_empty() {
             return;
         }
@@ -118,7 +141,7 @@ impl ConversationPicker {
     /// for the store call's aftermath; `None` on an empty picker.
     /// The highlight clamps to the new tail; the confirm arm is
     /// spent either way.
-    pub(crate) fn remove_selected(&mut self) -> Option<ConversationRow> {
+    pub fn remove_selected(&mut self) -> Option<ConversationRow> {
         self.confirming = false;
         if self.selected >= self.rows.len() {
             return None;
@@ -129,13 +152,206 @@ impl ConversationPicker {
         }
         Some(row)
     }
+
+    /// The picker's bottom hint row — the armed `Ctrl+D` swaps in the
+    /// one-key confirm. Empty on an empty picker.
+    pub fn hint_text(&self) -> String {
+        if self.confirming {
+            match self.selected_row() {
+                Some(row) => format!(" ctrl+d again deletes \"{}\"", row.title),
+                None => String::new(),
+            }
+        } else {
+            " enter: resume · ctrl+d: delete · esc: close".to_string()
+        }
+    }
+}
+
+/// `Alt+R`'s dispatch (Spec R08 us-5): a second press dismisses an
+/// open picker; opening drops the profile picker (one overlay at a
+/// time) and snapshots the store's rows — an empty store toasts
+/// instead of opening nothing.
+pub fn toggle(
+    picker: &mut Option<ConversationPicker>,
+    profile_picker: &mut Option<ProfilePicker>,
+    store: &StoreHandle,
+    toast: &mut Option<Toast>,
+    now: SystemTime,
+) {
+    if picker.take().is_some() {
+        return;
+    }
+    *profile_picker = None;
+    match store.conversations() {
+        Ok(listed) if listed.is_empty() => {
+            *toast = Some(Toast::new("no stored conversations", Instant::now()));
+        }
+        Ok(listed) => *picker = Some(ConversationPicker::new(&listed, now)),
+        Err(error) => {
+            *toast = Some(Toast::new(
+                format!("conversations list failed: {error}"),
+                Instant::now(),
+            ));
+        }
+    }
+}
+
+/// One key while the picker is open — the `Outcome` routing Spec
+/// R08-T6 names (us-5/11): `Ctrl+D` is the one-key confirm's whole
+/// vocabulary — the first press arms, the second deletes (the row's
+/// `detach` untangles every tab bound to it so they open a new row
+/// rather than append to a deleted one). Anything else first
+/// disarms, then does its usual thing — a stray key can never sneak
+/// a delete past the user. Enter resumes the highlighted row (either
+/// Enter — `keymap::normalize` folds the keypad's in), Esc (or an
+/// emptied list) closes, and every other key is swallowed.
+pub fn picker_key(
+    key: &KeyEvent,
+    picker: &mut Option<ConversationPicker>,
+    tabs: &mut TabManager,
+    store: &mut StoreHandle,
+    toast: &mut Option<Toast>,
+    session_size: impl Fn(Size, bool) -> Size,
+) {
+    enum Outcome {
+        /// Nothing happened — key consumed.
+        None,
+        /// Close the picker.
+        Close,
+        /// Resume `id` into the active tab's panel.
+        Resume(i64),
+        /// The armed confirm fired: delete `id`.
+        Delete(i64),
+    }
+    let outcome = {
+        let Some(p) = picker.as_mut() else {
+            return;
+        };
+        if key.key == Key::Char('d') && key.modifiers == Modifiers::CONTROL {
+            if p.confirming() {
+                match p.selected_row() {
+                    Some(row) => Outcome::Delete(row.id),
+                    None => Outcome::Close,
+                }
+            } else {
+                p.arm_delete();
+                Outcome::None
+            }
+        } else {
+            p.disarm_delete();
+            if keymap::normalize(key.key) == Key::Enter {
+                match p.selected_row() {
+                    Some(row) => Outcome::Resume(row.id),
+                    None => Outcome::Close,
+                }
+            } else {
+                match key.key {
+                    Key::Up => {
+                        p.prev();
+                        Outcome::None
+                    }
+                    Key::Down => {
+                        p.next();
+                        Outcome::None
+                    }
+                    Key::Escape if key.modifiers.is_empty() => Outcome::Close,
+                    _ => Outcome::None,
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::None => {}
+        Outcome::Close => *picker = None,
+        Outcome::Resume(id) => {
+            *picker = None;
+            resume(id, tabs, store, toast, session_size);
+        }
+        Outcome::Delete(id) => {
+            if store.delete_conversation(toast, id) {
+                // The row is gone — every tab bound to it must open
+                // a new row rather than append to a deleted one.
+                tabs.detach_conversation(id);
+                if let Some(p) = picker.as_mut() {
+                    p.remove_selected();
+                    if p.rows().is_empty() {
+                        *picker = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Enter` on a picker row (Spec R08-T6, us-6/10): load the
+/// conversation and swap the active tab's panel to it — transcript
+/// then latest plan, `reopen` on the store, a resize through the
+/// frontend's `session_size` like `Alt+A` does. A task in flight
+/// refuses the resume — a live run is never clobbered. The reads
+/// land BEFORE the swap so a failed load changes nothing.
+pub fn resume(
+    id: i64,
+    tabs: &mut TabManager,
+    store: &mut StoreHandle,
+    toast: &mut Option<Toast>,
+    session_size: impl Fn(Size, bool) -> Size,
+) {
+    let running = tabs
+        .active()
+        .and_then(|tab| tab.agent_panel())
+        .is_some_and(crate::agent_panel::AgentPanel::is_running);
+    if running {
+        *toast = Some(Toast::new(
+            "a task is still running — resume refused",
+            Instant::now(),
+        ));
+        return;
+    }
+    let items = match store.load_transcript(id) {
+        Ok(items) => items,
+        Err(error) => {
+            *toast = Some(Toast::new(
+                format!("transcript load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    // The latest plan snapshot restores the pinned block — the
+    // transcript's `plan` items already record it, so an absent row
+    // still yields the right conversation.
+    let plan = match store.load_plan(id) {
+        Ok(Some(TranscriptItem::Plan { todos })) => Some(todos),
+        Ok(_) => None,
+        Err(error) => {
+            *toast = Some(Toast::new(
+                format!("plan load failed: {error}"),
+                Instant::now(),
+            ));
+            return;
+        }
+    };
+    if let Some(tab) = tabs.active_mut() {
+        let previous = tab.conversation();
+        tab.resume_conversation(id, items, plan);
+        *toast = Some(Toast::new("conversation resumed", Instant::now()));
+        // `status` mirrors the binding: the resumed row re-opens, and
+        // the row this tab just swapped away from is unowned now.
+        store.conversation_reopened(toast, id);
+        if let Some(old) = previous.filter(|old| *old != id) {
+            store.conversation_closed(toast, old);
+        }
+    }
+    // The panel may have opened on a tab that never had one —
+    // re-derive its winsize through the same path `Alt+A` takes.
+    tabs.resize_active(session_size);
 }
 
 /// The age column's coarse bucketing: `"now"` under a minute,
 /// minutes under an hour, hours under two days, days after.
 /// `updated_at` is a wall clock, so a future skew renders `now`
 /// rather than a nonsense age.
-pub(crate) fn age_label(then: SystemTime, now: SystemTime) -> String {
+pub fn age_label(then: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(then).unwrap_or_default().as_secs();
     if secs < 60 {
         "now".to_string()

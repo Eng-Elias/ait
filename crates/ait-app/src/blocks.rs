@@ -70,14 +70,14 @@ const FNV_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// FNV-1a step over one hashed value — folds a row's fingerprint into
 /// a range fingerprint preserving order.
-pub(crate) fn hash_combine(hash: u64, value: u64) -> u64 {
+pub fn hash_combine(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x100_0000_01b3)
 }
 
 /// A scrollback row's fingerprint — FNV-1a over cell text plus the wrap
 /// flag, cheap enough to refresh per drained event. Used for the
 /// rotation anchor window and for block seal verification at resolve.
-pub(crate) fn row_hash(row: &Row<'_>) -> u64 {
+pub fn row_hash(row: &Row<'_>) -> u64 {
     let mut hash = FNV_INIT;
     for cell in row.cells() {
         hash = hash_combine(hash, cell.character as u64);
@@ -89,7 +89,7 @@ pub(crate) fn row_hash(row: &Row<'_>) -> u64 {
 /// `dropped`/`scrollback` translate to live grid indices; `None` when
 /// any row of the span is gone (nothing stable to seal against). The
 /// caller feeds the pair to [`BlockAssembler::observe_mark_row`].
-pub(crate) fn seal_fingerprint(
+pub fn seal_fingerprint(
     grid: &GridView<'_>,
     dropped: usize,
     scrollback: usize,
@@ -109,8 +109,8 @@ pub(crate) fn seal_fingerprint(
 }
 
 /// Row text for debug dumps — trimmed trailing blanks.
-#[allow(dead_code)]
-pub(crate) fn row_text(row: &Row<'_>) -> String {
+#[doc(hidden)] // test-side inspection — not production surface
+pub fn row_text(row: &Row<'_>) -> String {
     row.text().trim_end().to_string()
 }
 
@@ -231,7 +231,7 @@ impl BlockAssembler {
     /// open means its `D` never came — the open block closes
     /// best-effort, ending on the row above the new boundary. `C`/`D`
     /// with no open command are orphans and ignored.
-    #[allow(dead_code)] // the drain feeds `observe_mark_row`; tests use this
+    #[doc(hidden)] // the drain feeds `observe_mark_row`; tests use this
     pub fn observe_mark(&mut self, mark: &PromptMark, dropped: usize) {
         self.observe_mark_row(mark, dropped, None);
     }
@@ -507,12 +507,7 @@ impl BlockEntry {
     /// the command text (hook report, else the `B→C` echo slice read off
     /// `grid`), exit code and duration. `None` when the block's lines
     /// all left the grid.
-    pub(crate) fn resolve(
-        &self,
-        grid: &GridView<'_>,
-        dropped: usize,
-        extent: usize,
-    ) -> Option<Block> {
+    pub fn resolve(&self, grid: &GridView<'_>, dropped: usize, extent: usize) -> Option<Block> {
         // Content verification: the rows fingerprinted at seal time
         // must still sit at their recorded absolute positions. A range
         // that slid onto wrong-but-valid rows — rotation the caller
@@ -610,7 +605,7 @@ impl BlockEntry {
     /// `duration` and the wall-clock bounds come straight from the
     /// marks. `ended_at` stays `None` when no `D` reported. Metadata
     /// only — no output text, no cells.
-    pub(crate) fn persisted(
+    pub fn persisted(
         &self,
         grid: &GridView<'_>,
         dropped: usize,
@@ -637,7 +632,7 @@ impl BlockEntry {
 /// hands the store — metadata only, never output text or scrollback
 /// cells. Fields the hooks never reported stay `None`.
 #[derive(Debug)]
-pub(crate) struct PersistedBlock {
+pub struct PersistedBlock {
     /// The command text — `preexec` when the shell reported one, else
     /// the echo slice; `None` when nothing could be resolved (the
     /// `blocks.command` column is nullable: NULL is honest, `""`
@@ -667,7 +662,6 @@ pub(crate) struct PersistedBlock {
 // The full read-side surface stays: `range`/`end_column` are consumed
 // by the block nav/select/status paths; the rest serve the seams'
 // tests and the suggester's context assembly (Spec R05).
-#[allow(dead_code)]
 impl Block {
     /// The block's clamped live-coordinate line range (`B→D`), inclusive.
     pub fn range(&self) -> RangeInclusive<usize> {

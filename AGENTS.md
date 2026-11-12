@@ -29,7 +29,9 @@ AIT is a local-first, provider-agnostic AI terminal (TUI) written in Rust.
   `crates/ait-config` — exists (`settings.toml`, secrets, hot reload);
   `crates/ait-agent` — exists (NL→command, agent mode, execution profiles, transcripts);
   `crates/ait-shell` — exists (OSC 7700 hooks + blocks, shell snippets, ssh);
-  `crates/ait-store` — exists (§5.8 persistence — `rusqlite` facade; ADR-0011).
+  `crates/ait-store` — exists (§5.8 persistence — `rusqlite` facade; ADR-0011);
+  `crates/ait-app` — exists (frontend-agnostic session model both frontends render; ADR-0016);
+  `crates/ait-gui` — exists (eframe/egui-wgpu desktop frontend, §5.12; ADR-0017).
 
 ## Commands
 
@@ -84,10 +86,13 @@ it deliberately, one line per release.
 - Release (ADR-0015):
   - Checklist: promotion PR `dev`→`main` → CI green → flip the repo
     public → `dist plan --tag=vX.Y.Z` and `dist generate --check`
-    locally (the pre-tag sanity — the plan must list all five
-    targets + `ait-installer.sh`) → `git tag vX.Y.Z <main-sha>` →
-    `git push origin vX.Y.Z` → `release.yml` builds all five targets
-    → `verify-install` gate → announced release.
+    locally (the pre-tag sanity — the plan must list `ait` on all
+    five targets + `ait-installer.sh`, and `ait-gui` on the four
+    glibc/macOS targets + `ait-gui-installer.sh`; musl stays
+    ait-only) → `git tag vX.Y.Z <main-sha>` →
+    `git push origin vX.Y.Z` → `release.yml` builds `ait` on all five
+    targets and `ait-gui` on its four → `verify-install` gate →
+    announced release.
   - Version bump for later releases: bump `[workspace.package].version`
     in the root manifest, add the `## [x.y.z]` CHANGELOG entry, and
     update the literal `expect_text` in

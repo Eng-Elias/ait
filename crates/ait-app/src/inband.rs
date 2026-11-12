@@ -120,8 +120,8 @@ impl InBandExec {
     }
 
     /// Whether request `id` is still awaiting its response.
-    #[allow(dead_code)] // only tests read it today; Round 6's executor can
-                        // poll it for "still in flight" bookkeeping.
+    #[doc(hidden)] // only tests read it today; the executor can
+                   // poll it for "still in flight" bookkeeping.
     pub fn is_pending(&self, id: u64) -> bool {
         self.pending.contains_key(&id.to_string())
     }
@@ -146,15 +146,15 @@ pub struct RunRequest {
 
 impl RunRequest {
     /// The request's id — the `<id>` in `__ait_run <id> <hex>`.
-    #[allow(dead_code)] // tests assert id allocation; the bridge's reply
-                        // carries the receiver only.
+    #[doc(hidden)] // tests assert id allocation; the bridge's reply
+                   // carries the receiver only.
     pub fn id(&self) -> u64 {
         self.id
     }
 
     /// The channel the resolved [`RunResult`] arrives on: `recv` /
     /// `recv_timeout` per the caller's budget.
-    #[allow(dead_code)] // the executor awaits through `into_receiver`.
+    #[doc(hidden)] // the executor awaits through `into_receiver`.
     pub fn receiver(&self) -> &Receiver<RunResult> {
         &self.result
     }
@@ -168,8 +168,8 @@ impl RunRequest {
     }
 
     /// Block up to `timeout` for the response — the test-facing await.
-    #[allow(dead_code)] // the executor awaits through `into_receiver`;
-                        // tests keep the simpler handle.
+    #[doc(hidden)] // the executor awaits through `into_receiver`;
+                   // tests keep the simpler handle.
     pub fn wait(&self, timeout: Duration) -> Result<RunResult, RecvTimeoutError> {
         self.result.recv_timeout(timeout)
     }

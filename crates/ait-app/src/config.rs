@@ -6,11 +6,15 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
-use ait_config::{ModelRole, SecretStore, Settings, SettingsWatcher};
+use ait_config::{ConfigError, ModelRole, SecretStore, Settings, SettingsWatcher};
 use ait_term::LiveSessionOptions;
 
-use crate::tabs::SessionTemplate;
+use crate::profile::ProfilePicker;
+use crate::status::Toast;
+use crate::tabs::{SessionTemplate, TabManager};
 
 /// The model slot's text when no model resolves — Spec R02's `—`
 /// placeholder becomes story 24's "unset" rendering.
@@ -119,8 +123,64 @@ pub fn session_template(settings: &Settings) -> SessionTemplate {
 /// later drain site.
 ///
 /// [`ConfigError`]: ait_config::ConfigError
-pub(crate) fn mcp_error_text(error: &ait_config::ConfigError) -> String {
+pub fn mcp_error_text(error: &ait_config::ConfigError) -> String {
     format!("mcp.json failed to load: {}", error.message())
+}
+
+/// The toast text a `settings.toml` load/reload failure produces —
+/// "config error: <message>". The boot-degradation toast and the
+/// watcher drain both label it identically (Spec R13 §5.12,
+/// CODING_STANDARDS §17); `error.message()` already names the file.
+pub fn error_text(message: &str) -> String {
+    format!("config error: {message}")
+}
+
+/// One tick of settings-watcher events (Spec R03 us-10/11 + R07
+/// us-28) — the dispatch both frontends ran: a good reload adopts the
+/// new last-good and replaces the NEW-session template, an armed
+/// profile missing from the new file toasts instead of silently
+/// switching, and an open picker drops (its names belong to the old
+/// file). A broken save toasts and keeps last-good. The frontend's
+/// `watcher.receiver()` drives it. Returns the drained event count so
+/// a repaint-gated frontend (the GUI's pump) can flag the activity.
+pub fn drain_config_events(
+    receiver: &Receiver<Result<Settings, ConfigError>>,
+    config: &mut LiveSettings,
+    profile: &str,
+    picker: &mut Option<ProfilePicker>,
+    toast: &mut Option<Toast>,
+    tabs: &mut TabManager,
+) -> usize {
+    let mut drained = 0;
+    while let Ok(event) = receiver.try_recv() {
+        drained += 1;
+        match event {
+            Ok(settings) => {
+                tabs.set_session_template(session_template(&settings));
+                // The OLD declared names decide "deleted" vs
+                // "never declared" — an armed `default` deleted
+                // with the whole table toasts; one that never was
+                // stays silent (us-28). The profile stays armed
+                // either way: the R6 fail-safe asks on every tool
+                // call until the user picks a live name.
+                let vanished =
+                    crate::profile::active_missing(config.settings(), &settings, profile)
+                        .then(|| profile.to_string());
+                *config = LiveSettings::adopt(settings);
+                *picker = None;
+                if let Some(name) = vanished {
+                    *toast = Some(Toast::new(
+                        format!("execution profile \"{name}\" no longer declared"),
+                        Instant::now(),
+                    ));
+                }
+            }
+            Err(error) => {
+                *toast = Some(Toast::new(error_text(error.message()), Instant::now()));
+            }
+        }
+    }
+    drained
 }
 
 /// The status line's model slot (story 24): `profile`'s resolved

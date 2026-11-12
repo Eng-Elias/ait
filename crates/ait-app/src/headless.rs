@@ -84,7 +84,7 @@ static NEXT_HIDDEN_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 /// reach the thread's service queue. `Drop` stops the drain — the
 /// `Tab`'s own drop then kills the child, joins the session's
 /// reader/waiter threads and frees the snippet dir (us-30).
-pub(crate) struct HiddenSession {
+pub struct HiddenSession {
     /// The `ShellBridge` handle every consumer clones —
     /// `AgentRequest::bridge`'s `Box<dyn ShellBridge>` source.
     bridge: TabBridge,
@@ -106,7 +106,7 @@ impl HiddenSession {
     /// `None` injection plan or materialize failure still spawns the
     /// session — the bridge then reports `NotIntegrated`, the
     /// standard-1 degrade.
-    pub(crate) fn spawn(options: LiveSessionOptions, ssh: &SshSpawn) -> Result<Self, SpawnError> {
+    pub fn spawn(options: LiveSessionOptions, ssh: &SshSpawn) -> Result<Self, SpawnError> {
         let cwd = options
             .cwd
             .clone()
@@ -142,14 +142,14 @@ impl HiddenSession {
     /// into `AgentRequest::bridge` and `run_command`, `write_to_pty`
     /// (via `send_bytes`), `grid_lines`/`output_tail` and
     /// `remote_state` all answer against the hidden session.
-    pub(crate) fn bridge(&self) -> TabBridge {
+    pub fn bridge(&self) -> TabBridge {
         self.bridge.clone()
     }
 
     /// The `AIT_SESSION_ID` this session's spawn allocated — the
     /// identity its hooks echo (standard 14).
-    #[allow(dead_code)] // asserted by the tests; the driver needs no id.
-    pub(crate) fn session_id(&self) -> &str {
+    #[doc(hidden)] // asserted by the tests; the driver needs no id.
+    pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
@@ -158,7 +158,7 @@ impl HiddenSession {
     /// visible tab (Spec R11 us-30: the model sees its own commands'
     /// results the way it does in a tab). Answered on the drain like
     /// every bridge request; `Gone` once the session is dropped.
-    pub(crate) fn context(&self) -> Result<AgentContext, BridgeError> {
+    pub fn context(&self) -> Result<AgentContext, BridgeError> {
         self.bridge.context()
     }
 }
@@ -430,7 +430,7 @@ fn resolve_start(settings: &Settings, profile: Option<&str>) -> Result<String, S
 /// `ait --headless "<task>" [--profile <name>]` — the CLI arm: write
 /// every startup failure to stderr and every answer byte to stdout,
 /// exit by the task's terminal event (us-17/24/25/26/29).
-pub(crate) fn run(task: &str, profile: Option<&str>) -> ExitCode {
+pub fn run(task: &str, profile: Option<&str>) -> ExitCode {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     ExitCode::from(run_inner(task, profile, &mut out, &mut err))

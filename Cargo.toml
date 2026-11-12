@@ -20,9 +20,10 @@ version = "1.0.0"
 # curls this version's installer.
 cargo-dist-version = "0.34.0"
 ci = ["github"]
-# `ait` is the workspace's sole [[bin]] — the ait-llm `chat` example
-# and ait-testkit are never release artifacts.
-packages = ["ait"]
+# `ait` and `ait-gui` are the workspace's two [[bin]]s (Spec R13 §5.12)
+# — the ait-llm `chat` example and ait-testkit are never release
+# artifacts.
+packages = ["ait", "ait-gui"]
 # The shell installer is the only installer §5.11 ships — no
 # homebrew/npm/msi this round.
 installers = ["shell"]

@@ -59,6 +59,7 @@ tag=$1
 
 version=${tag#v}
 export AIT_EXPECTED_VERSION="ait $version"
+export AIT_EXPECTED_GUI_VERSION="ait-gui $version"
 export AIT_RELEASE_BASE_URL=${AIT_RELEASE_BASE_URL:-https://github.com/Eng-Elias/ait/releases/download/$tag}
 
 # The install + assert body shared by both legs. Written to a file so
@@ -90,6 +91,20 @@ if [ "$got" != "$AIT_EXPECTED_VERSION" ]; then
     exit 1
 fi
 echo "verify-install: $got — install verified ($install_dir/ait)"
+
+# R13 added ait-gui as a second released binary (Spec R13 us-25): the
+# same install+version assertion on the second installer.
+curl -fsSL "$AIT_RELEASE_BASE_URL/ait-gui-installer.sh" -o "$d/ait-gui-installer.sh"
+sh "$d/ait-gui-installer.sh"
+gui_got=$("$install_dir/ait-gui" --version) || {
+    echo "verify-install: '$install_dir/ait-gui --version' failed to run" >&2
+    exit 1
+}
+if [ "$gui_got" != "$AIT_EXPECTED_GUI_VERSION" ]; then
+    echo "verify-install: expected '$AIT_EXPECTED_GUI_VERSION', got '$gui_got'" >&2
+    exit 1
+fi
+echo "verify-install: $gui_got — install verified ($install_dir/ait-gui)"
 EOF
 
 if [ "$native" = 1 ]; then
@@ -123,7 +138,8 @@ fi
 # one flag covers both. Only set vars are forwarded into the container.
 set -- --rm -i --add-host host.docker.internal:host-gateway \
     -e "AIT_RELEASE_BASE_URL=$container_base" \
-    -e "AIT_EXPECTED_VERSION=$AIT_EXPECTED_VERSION"
+    -e "AIT_EXPECTED_VERSION=$AIT_EXPECTED_VERSION" \
+    -e "AIT_EXPECTED_GUI_VERSION=$AIT_EXPECTED_GUI_VERSION"
 for var in AIT_DOWNLOAD_URL AIT_INSTALL_DIR AIT_GITHUB_TOKEN \
     AIT_NO_MODIFY_PATH AIT_PRINT_VERBOSE AIT_PRINT_QUIET \
     INSTALLER_DOWNLOAD_URL INSTALLER_NO_MODIFY_PATH \

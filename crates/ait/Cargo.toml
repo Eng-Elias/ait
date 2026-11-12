@@ -10,6 +10,11 @@ repository = "https://github.com/Eng-Elias/ait"
 
 [dependencies]
 ait-term = { path = "../ait-term" }
+# Spec R13 §5.12: the frontend-agnostic session model — tabs, blocks,
+# the agent panel's state, pickers, ctl, the headless driver and the
+# keymap. `ait` keeps only the TUI loop, the crossterm→ait_term key
+# translation and the ratatui paint.
+ait-app = { path = "../ait-app" }
 # Settings.toml load/watch, the `--init` template, the `--print-schema`
 # schema and base_model resolution (Spec R03, user stories 1–14, 24).
 # `watch` adds hot reload (us-10–11) and `schema` the `--print-schema`
@@ -22,25 +27,9 @@ ait-config = { path = "../ait-config", features = ["schema", "watch"] }
 # the runtime landed in the library crates, not the `ait` binary the
 # original text reserved it for).
 ait-agent = { path = "../ait-agent" }
-# Spec R05 shell integration (§5.5): the injection planner consulted at
-# session spawn and the OSC 7700-series hook decode that drives each
-# tab's integration state (R05-T3).
-ait-shell = { path = "../ait-shell" }
-# Spec R08 persistence (§5.8): the binary owns the Store — one
-# `terminal_sessions` row per spawned tab, one `blocks` row per sealed
-# block, and every open/write failure degrades to a toast plus an
-# unpersisted run (user story 25).
-ait-store = { path = "../ait-store" }
 # Semver requirements per Spec R02; chosen releases are >=7 days old
 # (ADR-0002 supply-chain rule): ratatui 0.30.2 (2026-06-19),
-# crossterm 0.29.0 (2025-04-05); serde_json 1.0.154 (2026-10-11) —
-# TranscriptItem payloads serialize to the opaque JSON the store
-# keeps verbatim (Spec R08).
-serde_json = "1"
-# The ctl wire codec (Spec R11 §5.10.5): `Request`/`Response` derive
-# over single-line JSON — serde 1.0.229 (2026-07-18), already in the
-# tree via ait-config/ait-agent.
-serde = { version = "1", features = ["derive"] }
+# crossterm 0.29.0 (2025-04-05).
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm",
     "crossterm_0_29",
@@ -49,21 +38,27 @@ ratatui = { version = "0.30", default-features = false, features = [
 # clipboard writes (R02-T3). It does NOT touch child-app OSC 52, which
 # stays off in ait-term's `SessionOptions`.
 crossterm = { version = "0.29", features = ["osc52"] }
+# Spec R13 §5.12's binary shape: `ait gui`/`ait --gui` launches the GUI
+# frontend in-process — optional and OFF by default, so
+# `cargo build -p ait` carries zero GUI dependencies (us-23). Local
+# builds opt in with `--features gui`; the packaged GUI is the
+# `ait-gui` binary and release builds never enable this.
+ait-gui = { path = "../ait-gui", optional = true }
 
-[target.'cfg(unix)'.dependencies]
-# libc 0.2.191 (2026-10-16), already in the tree via `ait-term` —
-# `signal`/`raise` for `ait --headless`'s SIGINT→cancel wiring
-# (Spec R11 us-27) and `getuid` naming the ctl socket dir's per-user
-# `$TMPDIR` fallback (Spec R11, the same rule
-# `ait_shell::ssh_control_dir` uses).
-libc = "0.2"
+[features]
+# The `dep:` reference suppresses the implicit `ait-gui` feature —
+# `gui` is the only switch (Spec R13 §5.12: default off, never on in
+# dist builds).
+gui = ["dep:ait-gui"]
 
 [dev-dependencies]
 # Test-only e2e harness over ait-term's LiveSession (Spec E01) — never a
 # dependency of any product crate.
 ait-testkit = { path = "../ait-testkit" }
 # Semver requirement per Spec E01; the release is >=7 days old
-# (ADR-0002 supply-chain rule): insta 1.49.0 (2026-10-03).
+# (ADR-0002 supply-chain rule): insta 1.49.0 (2026-10-03);
+# serde_json 1.0.154 (2026-10-11) — the app tests serialize
+# `TranscriptItem`s into the stored payloads they stage.
 insta = "1.49"
 # Tempdirs for the CLI tests' XDG_CONFIG_HOME fixtures (Spec R03:
 # `ait --init` writes under a fresh config dir). Release >=7 days old
@@ -74,3 +69,14 @@ tempfile = "3"
 # the same harness ait-llm's contract tests and ait-agent's suggester
 # tests use.
 ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }
+# The app tests stage real store rows (conversations, transcript
+# items) through `ait_store::Store` — production reaches the store
+# only through `ait_app::store::StoreHandle`.
+ait-store = { path = "../ait-store" }
+serde_json = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
+# libc 0.2.191 (2026-10-16), already in the tree — the headless e2e
+# `kill(SIGINT)` the driver's cancel path is proven with (Spec R11
+# us-27); production signal handling lives in `ait_app::headless`.
+libc = "0.2"

@@ -5,36 +5,22 @@
 //! its JSON Schema (Spec R03, user stories 2–5). Everything the binary
 //! does is presentation + event routing (CODING_STANDARDS.md §9) — the
 //! terminal core lives in `ait-term`, the configuration model in
-//! `ait-config`.
+//! `ait-config`, and the frontend-agnostic session model in `ait-app`
+//! (Spec R13 §5.12): the modules here are only the TUI loop, the
+//! crossterm/ratatui paint and the host-terminal plumbing.
 
 mod agent_panel;
 mod app;
 mod backend;
-mod blocks;
-mod config;
-mod conversations;
 mod ctl;
-mod headless;
-mod inband;
-mod integration;
-mod keymap;
 mod keys;
-mod profile;
-mod remote;
 mod render;
-mod scroll;
-mod selection;
-mod shell_bridge;
-mod skills;
-mod status;
-mod store;
-mod suggest;
-mod tabs;
 mod terminal;
-mod transcript;
 
 use std::env;
 use std::process::ExitCode;
+
+use ait_app::headless;
 
 /// `--help`'s text and the tail of every usage error (Spec R12
 /// §5.11, us-13–16): man-page layout — NAME/SYNOPSIS/DESCRIPTION/
@@ -47,6 +33,7 @@ const USAGE: &str = "NAME
 
 SYNOPSIS
     ait
+    ait gui
     ait ctl open-tab
     ait ctl send [--tab <id>] [--no-enter] <text>
     ait ctl last-block [--tab <id>] [--command|--exit]
@@ -64,6 +51,11 @@ DESCRIPTION
     code is non-zero.
 
 OPTIONS
+    gui, --gui
+        Launch the GUI frontend (Spec R13 §5.12) in-process.
+        Only `--features gui` builds carry it — other builds
+        exit non-zero naming the gap (use `ait-gui` instead).
+
     ctl <verb>
         Drive a running instance over its control socket (unix
         only): $AIT_CTL_SOCKET when set, else the one live
@@ -118,6 +110,9 @@ OPTIONS
 enum Command {
     /// Bare `ait` — the TUI.
     Run,
+    /// `gui` / `--gui` — the GUI frontend in-process (Spec R13
+    /// §5.12), when the build opted into the `gui` feature.
+    Gui,
     /// `--version` / `-V`.
     Version,
     /// `--help` / `-h`.
@@ -156,6 +151,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         [arg] => match arg.as_str() {
             "--version" | "-V" => Ok(Command::Version),
             "--help" | "-h" => Ok(Command::Help),
+            "gui" | "--gui" => Ok(Command::Gui),
             "--init" => Ok(Command::Init { force: false }),
             "--print-schema" => Ok(Command::PrintSchema),
             "--headless" => Err("the --headless form needs a task".to_string()),
@@ -224,6 +220,12 @@ fn main() -> ExitCode {
         // socket, exchange one request, print the verb's answer —
         // `run_client` owns stdout/stderr and the exit code.
         Ok(Command::Ctl(verb)) => ctl::run_client(&verb),
+        // The GUI frontend (Spec R13 §5.12): `ait gui`/`--gui`
+        // reaches `ait_gui::run` in-process in builds that opted
+        // into the `gui` feature; every other build answers with a
+        // clear error — the parse is unconditional so the gap
+        // surfaces as a message, not an "unknown argument".
+        Ok(Command::Gui) => run_gui(),
         // The non-interactive agent run (Spec R11 §5.10.5) — the
         // driver owns settings load, the hidden shell and the
         // stdout/stderr/exit-code contract.
@@ -233,6 +235,32 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ait gui`/`--gui` with the `gui` feature: launch the GUI
+/// frontend in-process — the same [`ait_gui::run`] the `ait-gui`
+/// binary calls.
+#[cfg(feature = "gui")]
+fn run_gui() -> ExitCode {
+    match ait_gui::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ait: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ait gui`/`--gui` without the feature (the default and every
+/// release build): fail helpfully — the packaged GUI is the
+/// `ait-gui` binary.
+#[cfg(not(feature = "gui"))]
+fn run_gui() -> ExitCode {
+    eprintln!(
+        "ait: this build has no GUI frontend — `ait gui` requires a build \
+         with `--features gui`; the packaged GUI is the `ait-gui` binary"
+    );
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -267,6 +295,19 @@ mod tests {
             parse_args(&args(&["--print-schema"])),
             Ok(Command::PrintSchema)
         );
+    }
+
+    /// Spec R13 §5.12: `ait gui` and `ait --gui` both select the GUI
+    /// frontend — the parse is unconditional (a feature-less build
+    /// still parses it, then fails at dispatch naming the gap), and
+    /// trailing arguments stay usage errors.
+    #[test]
+    fn gui_forms_parse_to_the_gui_command() {
+        assert_eq!(parse_args(&args(&["gui"])), Ok(Command::Gui));
+        assert_eq!(parse_args(&args(&["--gui"])), Ok(Command::Gui));
+        for list in [&["gui", "extra"][..], &["--gui", "--verbose"][..]] {
+            assert!(parse_args(&args(list)).is_err(), "{list:?}");
+        }
     }
 
     /// Spec R11 §5.10.5: `--headless "<task>"` carries the task

@@ -53,7 +53,7 @@ cloud dependency, no vendor lock-in.
 |---|---|---|
 | Language | Rust (stable, edition 2021+) | Cargo workspace |
 | UI | `ratatui` + `crossterm` | TUI frontend |
-| GUI | TBD in Round 13 (Proposed: GPU-accelerated Rust stack, e.g. `wgpu`-based; fallbacks: `egui`, webview) | Release 2, §5.12; separate crate + binary |
+| GUI | `eframe`/`egui` on `wgpu` (ADR-0017) | Release 2, §5.12; separate crate + binary |
 | PTY | `portable-pty` | Own the master side; spawn `$SHELL` |
 | VT emulation | `alacritty_terminal` (grid + `vte` parser), exact-pinned | Do not hand-write a full emulator (ADR-0002) |
 | Async | `tokio` | Lives in the library crates that need it (`ait-llm` HTTP/SSE, `ait-agent` worker), each behind a synchronous facade — the `ait` binary stays tokio-free (ADR-0004, amended 2026-10-28). The PTY reader runs on `std::thread` inside `ait-term`; the core stays synchronous |
@@ -110,10 +110,12 @@ the TUI on the same core; both are thin frontends holding no business logic.
 | `ait-agent` | Tool registry, agent loop, permission engine, redaction |
 | `ait` | TUI binary (frontend only — no business logic) |
 | `ait-store` | SQLite store: conversations, transcript items, plans, terminal sessions, block metadata |
-| `ait-gui` | GUI frontend binary (Round 13, §5.12) — planned |
+| `ait-app` | Frontend-agnostic session model — tabs, blocks, agent-panel state, ctl, keymap (Round 13, ADR-0016) |
+| `ait-gui` | GUI frontend binary (Round 13, §5.12, ADR-0017) |
 
 The layout was confirmed in Round 1 (ADR-0003) and may grow (e.g. `ait-ssh`);
-`ait-store` landed in Round 8 (ADR-0011).
+`ait-store` landed in Round 8 (ADR-0011), `ait-app` and `ait-gui` in
+Round 13 (ADR-0016/0017).
 
 ---
 
@@ -409,20 +411,26 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 
 - An optional desktop frontend over the same core crates, shipped as a
   separate `ait-gui` binary. The TUI remains the default; nothing in the GUI
-  is required to use `ait`, and `ait` gains no GUI dependencies.
+  is required to use `ait`, and `ait` gains no GUI dependencies. An optional
+  `gui` cargo feature on `ait` (default off, never enabled in release
+  builds) launches the same GUI in-process as `ait gui`/`ait --gui`
+  (ADR-0016).
 - Reuses `ait-term`, `ait-shell`, `ait-agent`, `ait-config`, `ait-store` and
   `ait-llm` unchanged — the core stays frontend-agnostic (§1.1); the GUI
-  crate holds no business logic.
+  crate holds no business logic. The session model both frontends render
+  lives in `ait-app`, extracted from `ait` (ADR-0016).
 - Feature-parity target: tabs, scrollback with search/selection, blocks with
   exit status, the agent conversation panel, permission prompts, the plan
   view, and the status line — every frontend renders the same session model.
-- Toolkit: **Proposed** — a GPU-accelerated Rust stack rendering the
-  `ait-term` grid directly (e.g. `wgpu`-based); `egui` or a webview shell are
-  the fallbacks. Decided in the round's grilling and recorded as an ADR.
-  Heavyweight deps stay behind cargo features and out of the `ait` tree.
-- Distribution: `ait-gui` joins the §5.11 release artifacts for Linux and
-  macOS; Windows follows once §5.14 lands. GUI workspace panes (file
-  explorer, web browser) ship in the same binary — §5.13.
+- Toolkit: **Decided** (ADR-0017) — `eframe`/`egui` on the `wgpu` backend:
+  chrome is egui widgets, the `ait-term` grid is an `egui::Painter` pass
+  with a recorded `egui-wgpu` paint-callback escape hatch for the grid if
+  §6 perf misses. Heavyweight deps stay behind cargo features and out of
+  the `ait` tree.
+- Distribution: `ait-gui` joins the §5.11 release artifacts for glibc
+  Linux and macOS — musl stays `ait`-only (ADR-0015 amendment); Windows
+  follows once §5.14 lands. GUI workspace panes (file explorer, web
+  browser) ship in the same binary — §5.13.
 
 ### 5.13 GUI panels — file explorer & web browser (Round 14, Release 2)
 

@@ -34,7 +34,7 @@ const STATUS_CLOSED: &str = "closed";
 /// the store stays live for reads (user story 25's unpersisted-run
 /// contract is about persistence, not about blinding the picker —
 /// a transient write error must not empty `conversations()` forever).
-pub(crate) struct StoreHandle {
+pub struct StoreHandle {
     inner: Option<Store>,
     /// Whether writes still attempt — the first write error flips
     /// this off after one toast so a broken database can't toast-spam
@@ -52,6 +52,14 @@ impl StoreHandle {
         })
     }
 
+    /// The boot-degradation toast text an `open` failure produces —
+    /// "store unavailable: <error>". Both frontends' launches degrade
+    /// to [`disabled`](Self::disabled) under this message (Spec R13
+    /// §5.12, CODING_STANDARDS §17).
+    pub fn unavailable_text(error: impl std::fmt::Display) -> String {
+        format!("store unavailable: {error}")
+    }
+
     /// An explicitly unpersisted run — what an `open` failure (and the
     /// test `Harness`) degrades to.
     pub fn disabled() -> Self {
@@ -61,11 +69,11 @@ impl StoreHandle {
         }
     }
 
-    /// Wrap a caller-opened `Store` — the seam tests outside this
-    /// module inject a tempdir database through instead of touching
-    /// the real XDG path.
-    #[cfg(test)]
-    pub(crate) fn from_store(store: Store) -> Self {
+    /// Wrap a caller-opened `Store` — the seam a frontend's tests
+    /// inject a tempdir database through instead of touching the real
+    /// XDG path.
+    #[doc(hidden)] // cross-crate test seam — not production surface
+    pub fn from_store(store: Store) -> Self {
         Self {
             inner: Some(store),
             writes_enabled: true,

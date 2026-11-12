@@ -39,7 +39,7 @@ use crate::integration::IntegrationState;
 /// `AgentRequest` carries to the agent worker. `Clone` because a
 /// `Sender` clones — every clone reaches the same service queue.
 #[derive(Clone)]
-pub(crate) struct TabBridge {
+pub struct TabBridge {
     /// The service queue [`TabManager::drain_events`] answers.
     requests: Sender<BridgeRequest>,
 }
@@ -90,7 +90,7 @@ impl TabBridge {
     /// `ShellBridge` (the TUI reads its tab directly): the headless
     /// driver's surface for Spec R11 us-30 — the model sees the
     /// hidden shell's own commands' results the way it does in a tab.
-    pub(crate) fn context(&self) -> Result<AgentContext, BridgeError> {
+    pub fn context(&self) -> Result<AgentContext, BridgeError> {
         self.ask(BridgeRequest::Context)
     }
 
@@ -115,7 +115,7 @@ impl TabBridge {
 /// `Tab` state. Replies are plain channels: cheap, `Send`, and the
 /// answer's payload (up to and including a pending run's `Receiver`)
 /// moves straight to the worker.
-pub(crate) enum BridgeRequest {
+pub enum BridgeRequest {
     /// `integration_state` — answers with the tab's live state.
     State(Sender<ShellIntegration>),
     /// `send_bytes` — write to the session's PTY; `SessionExited`
@@ -171,7 +171,7 @@ pub(crate) enum BridgeRequest {
 /// The service side of a [`TabBridge`] — owned by its `Tab`, pumped
 /// by [`TabManager::drain_events`]. Holds the request queue plus the
 /// subscriber senders the drain forwards decoded events to.
-pub(crate) struct BridgeService {
+pub struct BridgeService {
     /// The queue `drain_events` answers on each tick.
     requests: Receiver<BridgeRequest>,
     /// Live `subscribe` senders — dead ones (a dropped receiver, a
@@ -184,7 +184,7 @@ pub(crate) struct BridgeService {
 
 /// The two ends of a fresh bridge: the [`ShellBridge`] clone factory
 /// the tab hands to `AgentRequest`s, and the service it drains.
-pub(crate) fn pair() -> (TabBridge, BridgeService) {
+pub fn pair() -> (TabBridge, BridgeService) {
     let (requests_tx, requests_rx) = channel();
     let handle = TabBridge {
         requests: requests_tx,
@@ -200,18 +200,18 @@ pub(crate) fn pair() -> (TabBridge, BridgeService) {
 impl BridgeService {
     /// A fresh [`ShellBridge`] handle for this service — every clone
     /// reaches the same queue.
-    pub(crate) fn handle(&self) -> TabBridge {
+    pub fn handle(&self) -> TabBridge {
         self.handle.clone()
     }
 
     /// The next queued request, if any — `drain_events`' pump.
-    pub(crate) fn try_recv(&self) -> Option<BridgeRequest> {
+    pub fn try_recv(&self) -> Option<BridgeRequest> {
         self.requests.try_recv().ok()
     }
 
     /// Install a subscription: a fresh channel whose sender the drain
     /// forwards decoded events to.
-    pub(crate) fn subscribe(&mut self) -> Receiver<BridgeEvent> {
+    pub fn subscribe(&mut self) -> Receiver<BridgeEvent> {
         let (tx, rx) = channel();
         self.subscribers.push(tx);
         rx
@@ -220,7 +220,7 @@ impl BridgeService {
     /// Forward one decoded observation to every live subscriber,
     /// pruning senders whose receivers went away (a finished
     /// subscription is the norm — tiers drop their receivers).
-    pub(crate) fn publish(&mut self, event: BridgeEvent) {
+    pub fn publish(&mut self, event: BridgeEvent) {
         self.subscribers
             .retain(|sender| sender.send(event.clone()).is_ok());
     }
@@ -256,7 +256,7 @@ impl From<InBandError> for BridgeError {
 /// `OSC 133` kind → the letter `BridgeEvent::PromptMark` carries —
 /// the mark vocabulary stays text so `ait-agent` never needs
 /// `ait-term` (the same rule that keeps `ait-shell` term-free).
-pub(crate) fn mark_letter(kind: PromptMarkKind) -> char {
+pub fn mark_letter(kind: PromptMarkKind) -> char {
     match kind {
         PromptMarkKind::PromptStart => 'A',
         PromptMarkKind::CommandStart => 'B',
