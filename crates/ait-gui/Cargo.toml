@@ -51,16 +51,19 @@ eframe = { version = "0.37", default-features = false, features = [
 # The browser pane's embedded webview (Spec R14 §5.13, R14-T3; optional —
 # the `web` feature): a `wry` child webview (`build_as_child`,
 # repositioned over the pane rect each frame) on macOS and Linux/X11.
-# wry 0.57.2 (2026-11-10) — `>= 0.55` pins past the macOS-26
-# `build_as_child` ObjC crash (wry#1705); its defaults keep `os-webview`
-# (webkit2gtk/soup3 on Linux) + `x11`. `dpi` is wry's own `Rect` unit
+# wry 0.57.1 (2026-10-23) — `>= 0.55` pins past the macOS-26
+# `build_as_child` ObjC crash (wry#1705); 0.57.2 (2026-11-10) is
+# excluded by ADR-0002's seven-day release-age rule at adoption
+# (2026-11-13), and 0.57.1 is the newest compliant release. Its
+# defaults keep `os-webview` (webkit2gtk/soup3 on Linux) + `x11`.
+# `dpi` is wry's own `Rect` unit
 # crate — `set_bounds`/`with_bounds` speak `dpi::Position`/`dpi::Size`
 # (dpi 0.1.2 (2025-05-02)). `raw-window-handle` names the
 # `RawWindowHandle::{Xlib,Wayland,AppKit}` variants the embed-support
 # decision matches on — the ^0.6 line wry and winit 0.30 share
 # (raw-window-handle 0.6.2 (2024-05-17)). All optional: feature-off
 # builds carry none of them and the pane degrades to external-open.
-wry = { version = "0.57.2", optional = true }
+wry = { version = "0.57.1", optional = true }
 dpi = { version = "0.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 

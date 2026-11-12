@@ -25,7 +25,7 @@ use ait_term::{Key, KeyEvent, Modifiers};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::app::Shared;
-use crate::grid::GridTheme;
+use crate::grid::{chrome, GridTheme};
 use crate::pane::{Pane, PaneId};
 
 /// What the pane's body hosts — the webview probe's verdict, written
@@ -445,14 +445,14 @@ impl Pane for BrowserPane {
         let ctx = ui.ctx().clone();
         let painter = ui.painter().with_clip_rect(rect);
         let font = FontId::monospace(13.0);
-        let dim = Color32::from_rgb(0x77, 0x77, 0x77);
-        let idle_fg = Color32::from_rgb(0xAA, 0xAA, 0xAA);
+        let dim = chrome::DIM;
+        let idle_fg = chrome::SUBTEXT;
 
         // The chrome row: nav buttons left, entry mid, external right.
         let bar = Rect::from_min_size(rect.left_top(), Vec2::new(rect.width(), CHROME_H));
         painter.line_segment(
             [bar.left_bottom(), bar.right_bottom()],
-            Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x33)),
+            Stroke::new(1.0, chrome::SEP),
         );
         // One chrome button at `x`: paints and hit-tests; `enabled`
         // dims and disarms it (the no-history back arrow). Returns
@@ -480,7 +480,7 @@ impl Pane for BrowserPane {
             let (bg, fg) = if !enabled {
                 (Color32::TRANSPARENT, dim)
             } else if hit.hovered() {
-                (Color32::from_rgb(0x2A, 0x2A, 0x2A), theme.fg)
+                (chrome::FIELD, theme.fg)
             } else {
                 (Color32::TRANSPARENT, idle_fg)
             };
@@ -530,7 +530,7 @@ impl Pane for BrowserPane {
             Pos2::new(x, bar.top() + 3.0),
             Pos2::new(bar.right() - ext_w - 10.0, bar.bottom() - 3.0),
         );
-        painter.rect_filled(entry_rect, 3.0, Color32::from_rgb(0x26, 0x26, 0x26));
+        painter.rect_filled(entry_rect, 3.0, chrome::ENTRY);
         let cell_w = ctx
             .fonts_mut(|fonts| fonts.glyph_width(&font, 'M'))
             .max(1.0);
@@ -542,7 +542,7 @@ impl Pane for BrowserPane {
             (
                 crate::panel::tail(entry, room).to_string(),
                 if browser.bad_entry() {
-                    Color32::from_rgb(0xE0, 0xC0, 0x40)
+                    chrome::WARN
                 } else {
                     theme.fg
                 },
@@ -607,7 +607,7 @@ impl Pane for BrowserPane {
                 let lines = 4;
                 let mut y = body.center().y - (lines as f32 * line_h) / 2.0;
                 for (text, color) in [
-                    (why.line(), Color32::from_rgb(0xE0, 0xC0, 0x40)),
+                    (why.line(), chrome::WARN),
                     (
                         "pages open in your system browser — type a URL and press Enter",
                         dim,

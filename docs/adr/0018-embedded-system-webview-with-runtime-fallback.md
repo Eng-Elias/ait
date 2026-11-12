@@ -43,13 +43,17 @@ the pane's actual payload — is the one thing a webview is for.
 
 ## Decision
 
-- **`wry` 0.57.2, a child webview over the pane's body rect.** The
+- **`wry` 0.57.1, a child webview over the pane's body rect.** The
   browser pane calls `wry::WebViewBuilder::build_as_child` on the
   eframe window's `RawWindowHandle` and repositions the child over
   the rect the pane stages each frame (`set_bounds` — the X11
   contract, where child webviews do not auto-resize; macOS takes
   the same call as an NSView placement). `>= 0.55` pins past the
-  macOS-26 `build_as_child` ObjC crash (wry#1705).
+  macOS-26 `build_as_child` ObjC crash (wry#1705). The pin is
+  0.57.1, not the newer 0.57.2 (2026-11-10): ADR-0002's seven-day
+  release-age rule excludes 0.57.2 at the 2026-11-13 adoption date,
+  and 0.57.1 (2026-10-23) is the newest compliant release with the
+  fix.
 - **The embed decision is a runtime matrix, not a compile-time
   one.** The frame's raw handle picks the arm — `Xlib`/`Xcb` and
   `AppKit` embed; `Wayland` and anything unlisted get the
@@ -106,9 +110,15 @@ the pane's actual payload — is the one thing a webview is for.
   deliberately-untested seam is the adapter, and everything
   decidable (the embed matrix, navigation queue, history) is pure
   in `browser.rs`.
-- The pump/repaint model is unregressed: the per-frame sync only
-  drains a queue and calls `set_bounds`; an idle window still
-  paints zero frames. A genuinely stalled webview would wedge the
+- The pump/repaint model is adjusted, deliberately: the per-frame
+  sync still only drains a queue, calls `set_bounds` and pumps
+  glib, but while a live webview has a staged surface it also
+  schedules a bounded `request_repaint_after` (~33 ms) — the X11
+  pump and wry's callbacks only advance while egui paints, and a
+  static-looking page can still run video or JS. With no host or
+  no staged surface nothing is scheduled, so an idle window with
+  the pane closed still paints zero frames. A genuinely stalled
+  webview would wedge the
   UI thread — accepted, manual-verified via the checklist's
   idle-frame/webview-stall item; there is no off-thread
   alternative in wry.

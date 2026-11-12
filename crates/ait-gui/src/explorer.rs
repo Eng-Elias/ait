@@ -26,11 +26,12 @@ use std::time::Instant;
 
 use ait_app::status::Toast;
 use ait_app::suggest;
+use ait_app::tabs::Tab;
 use ait_term::{Key, KeyEvent};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::app::Shared;
-use crate::grid::GridTheme;
+use crate::grid::{chrome, GridTheme};
 use crate::pane::{Pane, PaneId};
 
 /// How many bytes a file preview reads — the cap keeps a huge file
@@ -103,9 +104,11 @@ pub enum Activate {
 
 /// The explorer's mutable state on `Shared` — app-global like the
 /// pane selection, re-synced to the active tab every routed key and
-/// paint. `dir` is clamped at `root` upward (`..` never ascends past
-/// the session cwd — the spec's rooted-at-cwd rule) while descending
-/// is free; `root` only changes hands when the tab's cwd answer does.
+/// paint. `dir` is clamped to `root` on the way up (`..` never
+/// ascends past the session cwd — the spec's rooted-at-cwd rule —
+/// and a `..` from an out-of-root dir lands back on it) while
+/// descending is free; `root` only changes hands when the tab's cwd
+/// answer does.
 #[derive(Debug, Default)]
 pub struct ExplorerState {
     /// A live remote session gates the pane — while set, every
@@ -137,6 +140,15 @@ pub struct ExplorerState {
     /// The listing window's row count the last paint fit — the
     /// PageUp/PageDown distance (like `GuiApp::panel_rows`).
     page_rows: usize,
+    /// The `cwd_for` memo [`sync_explorer`] reads — the answer plus
+    /// the cheap key it's valid for (tab id, the tab's stored cwd,
+    /// the reported flag). `cwd_for` can readlink `/proc/<pid>/cwd`,
+    /// a per-frame syscall the §6 budget doesn't have; re-evaluating
+    /// only when the key moves keeps OSC-7 tracking live — a `cd` in
+    /// a shell that never reports (the /proc fallback's only cue)
+    /// keeps the stale answer until the tab switches, the accepted
+    /// trade for never readlinking per frame.
+    cwd_memo: Option<((u64, PathBuf, bool), PathBuf)>,
 }
 
 impl ExplorerState {
@@ -159,6 +171,10 @@ impl ExplorerState {
             return;
         }
         let Some(root) = root else {
+            // No session → no root: clear the stale one so the
+            // pane's "no session" arm is reachable again (a kept
+            // root would paint the last listing forever).
+            self.root = None;
             return;
         };
         if self.root.as_deref() != Some(root) {
@@ -183,6 +199,20 @@ impl ExplorerState {
     /// The synced session root, once one landed.
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// The tab's `suggest::cwd_for` answer, memoized on the cheap
+    /// key — see `cwd_memo`. `pub(crate)` for `sync_explorer`.
+    pub(crate) fn memoized_cwd(&mut self, tab: &Tab) -> PathBuf {
+        let key = (tab.id, tab.cwd().to_path_buf(), tab.cwd_reported());
+        match &self.cwd_memo {
+            Some((k, cwd)) if *k == key => cwd.clone(),
+            _ => {
+                let cwd = PathBuf::from(suggest::cwd_for(tab));
+                self.cwd_memo = Some((key, cwd.clone()));
+                cwd
+            }
+        }
     }
 
     /// The directory the listing describes — the row the header
@@ -335,9 +365,12 @@ impl ExplorerState {
 
     /// `..`/Left/Backspace — browse to `dir`'s parent and re-select
     /// the dir we left (the "up" affordance's return breadcrumb).
-    /// The session root is the ceiling: a `..` at `root` is a no-op,
-    /// so the listing never escapes the cwd the pane is rooted on
-    /// (us-7's "from the session root" bound).
+    /// The session root is the ceiling in BOTH directions: a `..` at
+    /// `root` is a no-op, and a `..` whose target isn't under root —
+    /// the browsed dir itself sits outside it, e.g. a Ctrl+click
+    /// detection navigated the pane to an absolute path elsewhere —
+    /// lands on `root` instead of climbing toward `/` (us-7's "from
+    /// the session root" bound).
     pub fn go_parent(&mut self) {
         if self.remote {
             return;
@@ -345,11 +378,19 @@ impl ExplorerState {
         if self.root.as_deref() == Some(self.dir.as_path()) {
             return;
         }
-        let Some(parent) = self.dir.parent().map(Path::to_path_buf) else {
-            return;
-        };
+        let parent = self.dir.parent().map(Path::to_path_buf);
         let came_from = self.dir.clone();
-        self.dir = parent;
+        self.dir = match (parent, self.root.clone()) {
+            // The parent is outside (or there is no parent) while a
+            // root exists — clamp to it rather than escaping.
+            (parent, Some(root)) => match parent {
+                Some(parent) if parent.starts_with(&root) => parent,
+                _ => root,
+            },
+            // No root recorded — keep the historical free walk.
+            (Some(parent), None) => parent,
+            (None, None) => return,
+        };
         self.selected = 0;
         self.scroll = 0;
         self.relist();
@@ -466,7 +507,11 @@ impl ExplorerState {
 pub fn list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+        // A vanished or unreadable entry must not abort the whole
+        // listing — skip it and list the rest.
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         // `metadata` follows symlinks — a link to a dir navigates.
@@ -562,30 +607,52 @@ pub fn resolve_editor(
     EditorResolution::Opener
 }
 
-/// The `Command` a resolution spawns — `Program` goes through `sh -c`
-/// so `editor = "code --goto"` splits its own arguments while the
-/// target path stays literal argv (never spliced into the evaluated
-/// string — no quoting bug can smuggle it); `Opener` delegates to the
-/// shared [`crate::platform_opener`] the browser pane's external
-/// surface also uses.
+/// The `Command` a resolution spawns — `Program` goes through the
+/// platform's eval shell ([`shell_eval`]) so `editor = "code --goto"`
+/// splits its own arguments; `Opener` delegates to the shared
+/// [`crate::platform_opener`] the browser pane's external surface
+/// also uses.
 pub fn editor_command(resolution: &EditorResolution, path: &Path) -> Command {
     match resolution {
-        EditorResolution::Program(program) => {
-            let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg(format!("{program} \"$@\""))
-                .arg("ait-explorer")
-                .arg(path);
-            command
-        }
+        EditorResolution::Program(program) => shell_eval(program, path),
         EditorResolution::Opener => crate::platform_opener(path.as_os_str()),
     }
 }
 
+/// The `Program` arm's shell on unix: `sh -c '{program} "$@"'` keeps
+/// the editor line evaluated (arguments split) while the target path
+/// stays literal argv — never spliced into the evaluated string, so
+/// no quoting bug can smuggle it.
+#[cfg(unix)]
+fn shell_eval(program: &str, path: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(format!("{program} \"$@\""))
+        .arg("ait-explorer")
+        .arg(path);
+    command
+}
+
+/// The `Program` arm's shell on Windows: `cmd /c` — the same eval
+/// idiom `platform_opener`'s `cmd /c start` already uses (§5.14's
+/// platform, not yet shipped). cmd has no argv-tail trick, so the
+/// path lands quoted inside the evaluated line — safe there because
+/// `"` is a forbidden character in Windows paths and can never
+/// break the quoting.
+#[cfg(windows)]
+fn shell_eval(program: &str, path: &Path) -> Command {
+    let mut command = Command::new("cmd");
+    command
+        .arg("/c")
+        .arg(format!("{program} \"{}\"", path.display()));
+    command
+}
+
 /// Spawn the editor detached: null stdio, its own process group on
-/// unix so it survives the terminal's lifecycle, and the `Child`
-/// dropped un-`wait`ed — the pane never blocks on the editor.
+/// unix so it survives the terminal's lifecycle. The `Child` is
+/// reaped on a helper thread — a spawned-and-dropped child leaves a
+/// zombie until exit — and the pane never blocks on the editor.
 /// Failure is the io error the caller toasts.
 pub fn spawn_detached(resolution: &EditorResolution, path: &Path) -> io::Result<()> {
     let mut command = editor_command(resolution, path);
@@ -598,7 +665,11 @@ pub fn spawn_detached(resolution: &EditorResolution, path: &Path) -> io::Result<
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command.spawn().map(|_| ())
+    command.spawn().map(|mut child| {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    })
 }
 
 /// The pane's tab→model sync: compute the remote gate and the
@@ -610,16 +681,20 @@ pub fn spawn_detached(resolution: &EditorResolution, path: &Path) -> io::Result<
 /// saying. `pub(crate)` so the app tests drive the same seam the
 /// pane's `key`/`paint` do.
 pub(crate) fn sync_explorer(shared: &mut Shared) {
-    let (remote, root) = shared
+    let remote = shared
         .tabs
         .active()
-        .map(|tab| {
-            (
-                !tab.remote.is_empty(),
-                Some(PathBuf::from(suggest::cwd_for(tab))),
-            )
-        })
-        .unwrap_or((false, None));
+        .is_some_and(|tab| !tab.remote.is_empty());
+    // The `cwd_for` answer rides the model's memo — an unchanged
+    // (tab, cwd, reported) key skips the /proc readlink entirely.
+    let root = if remote {
+        None
+    } else {
+        shared
+            .tabs
+            .active()
+            .map(|tab| shared.explorer.memoized_cwd(tab))
+    };
     let before = shared.explorer.error().map(str::to_owned);
     shared.explorer.sync(remote, root.as_deref());
     let after = shared.explorer.error().map(str::to_owned);
@@ -742,9 +817,9 @@ impl Pane for ExplorerPane {
         let font = FontId::monospace(13.0);
         let small = FontId::monospace(11.0);
         let row_h = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font)).max(1.0);
-        let dim = Color32::from_rgb(0x77, 0x77, 0x77);
-        let sep = Color32::from_rgb(0x33, 0x33, 0x33);
-        let hover = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+        let dim = chrome::DIM;
+        let sep = chrome::SEP;
+        let hover = chrome::FIELD;
 
         if shared.explorer.is_remote() {
             painter.text(
@@ -864,7 +939,7 @@ impl Pane for ExplorerPane {
                 Align2::LEFT_CENTER,
                 error.to_owned(),
                 small.clone(),
-                Color32::from_rgb(0xE0, 0x50, 0x50),
+                chrome::ERR,
             );
             y += row_h;
         }
@@ -976,7 +1051,7 @@ impl Pane for ExplorerPane {
                         Align2::CENTER_CENTER,
                         format!("cannot preview: {error}"),
                         small.clone(),
-                        Color32::from_rgb(0xE0, 0x50, 0x50),
+                        chrome::ERR,
                     );
                 }
             }
@@ -1009,6 +1084,7 @@ mod tests {
     //! PTY, no window, no real editor spawn.
 
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// The fixture dir every model test builds on:
@@ -1071,7 +1147,9 @@ mod tests {
 
     /// A symlink resolves through `metadata`: one to a dir navigates
     /// like the dir, a broken one stays `Other` — it lists but never
-    /// navigates or previews.
+    /// navigates or previews. `symlink` is a unix primitive — the
+    /// pane runs on Windows; this test doesn't.
+    #[cfg(unix)]
     #[test]
     fn symlinks_resolve_and_broken_ones_stay_other() {
         let dir = tempfile::tempdir().unwrap();
@@ -1105,16 +1183,20 @@ mod tests {
         // Where the fs honors permissions a `0o000` dir errors
         // identically (root reads through — the assert falls back to
         // the nonexistent path, which exercises the same code path).
-        let locked = dir.path().join("locked");
-        fs::create_dir(&locked).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(&locked).is_err() {
-            state.navigate_to_dir(&locked);
-            assert!(
-                state.error().is_some_and(|e| e.contains("locked")),
-                "locked dir must error: {:?}",
-                state.error()
-            );
+        // `from_mode` is unix-only; Windows has no mode bits to deny.
+        #[cfg(unix)]
+        {
+            let locked = dir.path().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read_dir(&locked).is_err() {
+                state.navigate_to_dir(&locked);
+                assert!(
+                    state.error().is_some_and(|e| e.contains("locked")),
+                    "locked dir must error: {:?}",
+                    state.error()
+                );
+            }
         }
     }
 
@@ -1200,6 +1282,52 @@ mod tests {
         assert_eq!(state.dir(), dir.path());
         state.go_parent();
         assert_eq!(state.dir(), dir.path());
+    }
+
+    /// The ceiling holds in BOTH directions: a `..` from a dir that
+    /// isn't under the synced root at all — a Ctrl+click detection
+    /// navigated the pane to an absolute path elsewhere — lands ON
+    /// the root rather than climbing toward `/` (the pane must never
+    /// escape upward, even when it's already outside).
+    #[test]
+    fn go_parent_from_an_out_of_root_dir_returns_to_root() {
+        let dir = fixture();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut state = ExplorerState::default();
+        state.sync(false, Some(dir.path()));
+
+        state.navigate_to_dir(elsewhere.path());
+        assert_eq!(state.dir(), elsewhere.path(), "outside root");
+        state.go_parent();
+        assert_eq!(
+            state.dir(),
+            dir.path(),
+            ".. from outside root clamps back to it"
+        );
+    }
+
+    /// `sync(false, None)` — no session — clears a stale root so the
+    /// pane's "no session" paint arm is reachable again (a kept root
+    /// would paint the last listing forever). A remote sync keeps it
+    /// instead: the `was_remote` restore path re-lists the browsed
+    /// dir under the same root when the session goes local again.
+    #[test]
+    fn sync_without_a_session_clears_the_root() {
+        let dir = fixture();
+        let mut state = ExplorerState::default();
+        state.sync(false, Some(dir.path()));
+        assert_eq!(state.root(), Some(dir.path()));
+
+        state.sync(false, None);
+        assert_eq!(state.root(), None, "no session → no root");
+
+        // Remote preserves the root for the post-remote restore.
+        state.sync(false, Some(dir.path()));
+        state.navigate_to_dir(&dir.path().join("adir"));
+        state.sync(true, None);
+        assert_eq!(state.root(), Some(dir.path()), "remote keeps it");
+        state.sync(false, Some(dir.path()));
+        assert_eq!(state.dir(), dir.path().join("adir"), "restored");
     }
 
     /// `activate` is the Enter/`o` read: a dir enters, a file opens,
@@ -1464,39 +1592,58 @@ mod tests {
         assert_eq!(resolve_editor(None, env(&[])), EditorResolution::Opener);
     }
 
-    /// The spawn construction: a named editor goes through `sh -c` —
-    /// so `editor = "code --goto"` splits its own args — with the
-    /// target path passed as literal argv, never spliced into the
-    /// evaluated string (a `;` in a path can't smuggle a command).
-    /// The opener execs the platform tool directly.
+    /// The spawn construction: on unix a named editor goes through
+    /// `sh -c` — so `editor = "code --goto"` splits its own args —
+    /// with the target path passed as literal argv, never spliced
+    /// into the evaluated string (a `;` in a path can't smuggle a
+    /// command). On Windows the same program goes through `cmd /c`,
+    /// the platform's own eval shell (matching `platform_opener`'s
+    /// `cmd /c start`). The opener execs the platform tool directly.
     #[test]
     fn editor_command_constructs_the_spawn() {
         let hostile = Path::new("/tmp/f; touch /tmp/pwned");
         let command = editor_command(&EditorResolution::Program("code --goto".into()), hostile);
-        assert_eq!(command.get_program(), "sh");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|arg| arg.to_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "code --goto \"$@\"");
-        assert!(
-            !args[1].contains("touch"),
-            "the path never enters the shell string: {args:?}"
-        );
-        assert_eq!(
-            args.last().unwrap(),
-            &hostile.to_string_lossy().into_owned()
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(command.get_program(), "sh");
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(args[0], "-c");
+            assert_eq!(args[1], "code --goto \"$@\"");
+            assert!(
+                !args[1].contains("touch"),
+                "the path never enters the shell string: {args:?}"
+            );
+            assert_eq!(
+                args.last().unwrap(),
+                &hostile.to_string_lossy().into_owned()
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(command.get_program(), "cmd");
+            let args: Vec<String> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(args[0], "/c");
+            assert!(args[1].starts_with("code --goto "), "{args:?}");
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = command;
 
         let command = editor_command(&EditorResolution::Opener, hostile);
-        let opener = if cfg!(target_os = "macos") {
+        let opener = if cfg!(target_os = "windows") {
+            "cmd"
+        } else if cfg!(target_os = "macos") {
             "open"
         } else {
             "xdg-open"
         };
         assert_eq!(command.get_program(), opener);
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, [hostile.as_os_str()]);
+        assert_eq!(args.last().copied(), Some(hostile.as_os_str()));
     }
 }
