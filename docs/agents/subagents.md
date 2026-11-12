@@ -100,7 +100,12 @@ pointers, restated per dispatch, not re-derived:
   tree on merge (`git diff <tip> <merge-result>` empty); gate only
   when the merge introduces new content (conflict resolution, a
   sibling merged in between). A skipped gate is reported as skipped,
-  not as a pass.
+  not as a pass. A clean git merge can still produce a broken tree:
+  when both sides add fields to the same struct literal — the
+  `Shared`/`GuiApp` fixtures are the recurring seam (R13) — git merges
+  both hunks silently and drops one side's field. Build before
+  declaring the merge clean; never trust the absence of conflict
+  markers on shared struct literals.
 - **Flake triage**: a gate failure in a test on
   `docs/agents/flaky-tests.md`'s list is probably load, not your
   change — rerun the named test alone before re-diagnosing; a pass

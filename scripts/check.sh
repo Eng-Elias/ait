@@ -13,7 +13,22 @@ if [ "$(df -Pk . | awk 'NR==2 {print $4}')" -lt 15728640 ]; then
 fi
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+# Known flakes (scripts/flaky-tests.txt — docs/agents/flaky-tests.md
+# owns the list): the parallel suite is the load that trips them, so
+# skip them in the sweep and run each one serially afterwards. A flake
+# that fails serially is a real failure — the gate still goes red.
+flaky_file="$(dirname "$0")/flaky-tests.txt"
+flaky_skips=""
+while read -r crate test_name _; do
+    case "$crate" in ''|'#'*) continue ;; esac
+    flaky_skips="$flaky_skips --skip $test_name"
+done < "$flaky_file"
+# shellcheck disable=SC2086
+cargo test --workspace -- $flaky_skips
+while read -r crate test_name _; do
+    case "$crate" in ''|'#'*) continue ;; esac
+    cargo test -p "$crate" "$test_name" -- --exact --test-threads=1
+done < "$flaky_file"
 python3 scripts/check-dep-comments.py
 scripts/check-src-hygiene.sh
 python3 scripts/check-e2e-sentinels.py
