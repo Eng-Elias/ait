@@ -54,10 +54,57 @@ impl Default for GridTheme {
             find_current: Color32::from_rgba_unmultiplied(0xFF, 0x88, 0x00, 0x90),
             block_edge: Color32::from_rgba_unmultiplied(0x88, 0x88, 0x88, 0x40),
             block_ok: Color32::from_rgb(0x4C, 0xAF, 0x50),
-            block_err: Color32::from_rgb(0xE0, 0x50, 0x50),
+            block_err: chrome::ERR,
             link: Color32::from_rgb(0x50, 0xC0, 0xC0),
         }
     }
+}
+
+/// The CHROME palette — every non-grid color the window furniture
+/// paints: tab/status strips, the pane switcher, cards and pickers,
+/// the find bar, and each aux pane's own chrome. Grid content still
+/// resolves through [`GridTheme`]; the furniture single-sources its
+/// values here so the literals the panes each used to carry can't
+/// drift — `from_rgb` is a `const fn`, so a named slot costs
+/// nothing.
+pub(crate) mod chrome {
+    use eframe::egui::Color32;
+
+    /// Interactive fills at rest — field surfaces and hover fills on
+    /// buttons, chips and list rows.
+    pub(crate) const FIELD: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+    /// `FIELD` one step lifted — the active tab chip, a button's
+    /// hovered-on-hover.
+    pub(crate) const FIELD_HI: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
+    /// Recessed surfaces — cards, the find bar, picker wells.
+    pub(crate) const WELL: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+    /// The permanent strips' fill — tab bar, status strip.
+    pub(crate) const STRIP: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
+    /// Hairlines — pane edges, strip separators, card strokes.
+    pub(crate) const SEP: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
+    /// Framing a step lifted off `SEP` — card and bar borders.
+    pub(crate) const EDGE: Color32 = Color32::from_rgb(0x55, 0x55, 0x55);
+    /// Selection behind a text row — pickers, the ask card's choice.
+    pub(crate) const SELECT: Color32 = Color32::from_rgb(0x33, 0x44, 0x66);
+    /// Dim text — placeholders, hints, disabled verbs.
+    pub(crate) const DIM: Color32 = Color32::from_rgb(0x77, 0x77, 0x77);
+    /// Idle interactive text — resting buttons, inactive labels.
+    pub(crate) const IDLE: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
+    /// Secondary content text — counts, timestamps, previews.
+    pub(crate) const SUBTEXT: Color32 = Color32::from_rgb(0xAA, 0xAA, 0xAA);
+    /// The browser entry's fill — a half-step under `FIELD` since the
+    /// entry sits inside its own chrome row, not on the grid's bg.
+    pub(crate) const ENTRY: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
+    /// Attention — `Tone::Alert`, the bad-entry flag, the external
+    /// surface's headline.
+    pub(crate) const WARN: Color32 = Color32::from_rgb(0xE0, 0xC0, 0x40);
+    /// Success — `Tone::Good` (the grid's `block_ok` keeps its own
+    /// xterm green — a chip and a tone are different reads).
+    pub(crate) const GOOD: Color32 = Color32::from_rgb(0x50, 0xC8, 0x50);
+    /// Failure — `Tone::Bad`, error rows and lines. [`super::GridTheme`]'s
+    /// `block_err` aliases this, so the chrome and grid failure reds
+    /// can't drift apart.
+    pub(crate) const ERR: Color32 = Color32::from_rgb(0xE0, 0x50, 0x50);
 }
 
 /// `ait_term` color → `egui::Color32`: `Default` resolves through the
