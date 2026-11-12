@@ -1,6 +1,6 @@
 # 18. Browser pane: embedded system webview with a runtime fallback
 
-Date: 2026-11-14
+Date: 2026-11-13
 
 ## Status
 

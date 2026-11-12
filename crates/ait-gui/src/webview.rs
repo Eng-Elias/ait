@@ -97,7 +97,15 @@ impl WebSlot {
             }
         }
 
-        self.pump_glib();
+        // The glib pump is only safe — and only needed — while a
+        // webview lives: `gtk::events_pending`/`main_iteration_do`
+        // assert `gtk::init` already ran, which happens inside
+        // `Host::new`. Pumping before a successful probe panics on
+        // Linux (R14-T5 manual-pass sighting: process died on the
+        // first frame before any pane was ever opened).
+        if self.host.is_some() {
+            self.pump_glib();
+        }
     }
 
     /// The one-shot embed attempt — the window handle picks the
@@ -126,8 +134,10 @@ impl WebSlot {
 
     /// Advance the glib main context the X11 child webview lives on —
     /// wry's documented idiom, run per frame so gtk's signals never
-    /// starve the event loop (unpumped, the webview wedges). Safe
-    /// before `gtk::init` — `events_pending` just reports empty.
+    /// starve the event loop (unpumped, the webview wedges). NOT safe
+    /// before `gtk::init` — `events_pending` asserts gtk is
+    /// initialized and panics, so `sync` calls this only while a live
+    /// host proves init succeeded.
     #[cfg(all(feature = "web", target_os = "linux"))]
     fn pump_glib(&self) {
         while gtk::events_pending() {
