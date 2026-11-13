@@ -153,6 +153,16 @@ for a repeatable version of the checklist; `import`/`scrot`/`xwd`
 capture the screenshots PR evidence uses. None is installed by
 default — keep it best-effort, not a gate.
 
+The automated slice of that idea is the **winit canary**
+(`crates/ait-gui/tests/winit_canary.rs`, Spec R15-T7): opt in with
+`AIT_GUI_E2E_XTEST=1` and, where `xdotool` and `Xvfb` are on `PATH`,
+it raises a private `Xvfb :N`, pins `ait-gui` to it, and sends a
+chord plus a pointer click *externally* over XTest — proving winit
+delivers real X input, the one layer the driver socket's injected
+events skip. It is a canary only: non-authoritative, never a gate
+for checklist behavior, and loud-skipping when the tools are absent
+rather than failing.
+
 The recipe that ran the checklist end to end (R14):
 
 ```bash

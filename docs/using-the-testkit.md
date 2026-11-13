@@ -39,6 +39,20 @@ the app's `PATH` — `expect_open = "<url substring>"` then waits on
 the stub's log, so `ext ↗`, external Enter navigations and editor
 spawns assert without real applications.
 
+A third display route exists for tests that own the X server
+themselves: `GuiSpawnConfig::display` pins the app to a named
+`DISPLAY` — no ambient display or `xvfb-run` needed — and
+`GuiE2e::pid()` hands back the spawned pid so `_NET_WM_PID` window
+lookup works. That is the winit canary's seam
+(`crates/ait-gui/tests/winit_canary.rs`, R15-T7): with
+`AIT_GUI_E2E_XTEST=1` and `xdotool`+`Xvfb` on `PATH` it raises a
+private `Xvfb :N` and injects a chord and a click *externally* over
+XTest, asserting through the dump that winit delivered them — the
+one layer socket injection skips. Canary only, non-authoritative:
+it loud-skips when the env flag or the tools are absent, and it
+never uses a shared display (a synthetic click would land on real
+windows). CI runs it on the promotion pipeline's `gui-e2e` job.
+
 Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
 app's own dispatch — `scroll` adds `target`/`x`/`y` aiming and
 `raw = true` for a real `MouseWheel` batch, the only delivery a
