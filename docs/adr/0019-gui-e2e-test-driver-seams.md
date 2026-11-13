@@ -102,10 +102,13 @@ and land here together:
   `ait-gui` binary under `xvfb-run` (or `AIT_GUI_E2E_HEADED=1` on
   the developer's display, or `GuiSpawnConfig::display` for tests
   that own the X server), connect the socket, verb methods, bounded
-  `wait_for_dump` polling, the stub opener
-  (`install_opener_stub`/`AIT_GUI_E2E_STUB_LOG`), and
-  `dump.json`+`stderr.txt`+`actions.log` evidence under
-  `target/e2e-failures/<test>/` on panic. It stays
+  `wait_for_dump` polling plus the `wait_dump` input barrier
+  (`input_done` catching `input_seq` — see Consequences), the
+  recording opener stubs (`install_opener_stubs` — every spawn's
+  `stub-bin/` shadows `xdg-open`/`open` and appends invocations to
+  `AIT_GUI_E2E_STUB_LOG`), and
+  `dump.json`+`stderr.txt`+`actions.log`+`screenshot.png` evidence
+  under `target/e2e-failures/<test>/` on panic. It stays
   dev-dependency-only; `ait-gui` adds `ait-testkit` beside
   `tempfile`/`ait-store` as a dev-dependency.
 - **The suite is a dual-binary matrix.** `cargo build -p ait-gui
@@ -146,6 +149,32 @@ and land here together:
   our own `load_url` echoes racing real in-page nav reports into
   history — T5 added the echo ledger to keep them distinct. A
   product bug the manual checklist never reached.
+- The review pass hardened the harness itself (Spec R15 follow-up):
+  the ctl socket's transport half — `Pending`'s buffered
+  request/flush lifecycle, `bind_socket`, `set_mode` — is exported
+  from `ait_app::ctl` and the test driver *uses the same code*, the
+  spec's "ctl's conventions exactly" made literal rather than a
+  twin implementation; hit-target names became lazy thunks so
+  release builds never pay the `format!`s the registry drops; the
+  `screenshot` verb landed end to end
+  (`Context::request_screenshot` → post-render PNG, staged via a
+  `.part` rename); the dual stub-opener mechanisms were unified on
+  `pinned_env`'s always-on `stub-bin`/`open.log`; the explorer
+  OSC-7 fixtures now run real integrated `/bin/bash` sessions (the
+  `ait-shell` snippet's precmd emits the report — no printf'd
+  stand-ins); and `scripts/check.sh` gained a
+  `--features test-driver` clippy leg since the default build never
+  lints `test_driver.rs`.
+- **`wait_dump` exists because `dump` alone is not a barrier.** The
+  pump answers the socket off the UI thread, so a `dump` can return
+  before the queued input's frame folded — the R15 review found a
+  300 ms sleep covering exactly that gap in a negative assertion.
+  `dispatch` bumps `Shared::input_seq` per request that queues
+  frame-folded input; `ui` sets `input_done` to it at frame end
+  once `injected` is drained AND the pointer plugin's queue
+  emptied. The dump carries both; `input_done >= input_seq` IS
+  "everything the socket accepted ran through a completed frame" —
+  the bounded barrier negative assertions now wait on.
 - Display pinning is env-scrubbing, not flag-setting: the harness
   `env_remove`s `WAYLAND_DISPLAY`/`DISPLAY` it doesn't own —
   setting `WINIT_UNIX_BACKEND=x11` is not enough.

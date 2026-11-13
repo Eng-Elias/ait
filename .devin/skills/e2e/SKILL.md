@@ -75,8 +75,9 @@ AIT_GUI_E2E_HEADED=1 cargo test -p ait-gui --features test-driver --test scenari
 - **Two binary legs**: `binary = "web"` (embedded webview) vs `"noweb"` (`--no-default-features` build, no webkit) — resolved via `AIT_GUI_E2E_BIN_WEB`/`_NOWEB`, else the cargo-built binary; unresolvable legs skip loudly.
 - **Assert the dump, not pixels**: `expect_text`/`expect_pane`/`expect_scroll`/`expect_explorer`/`expect_browser`/`expect_detect`/`expect_status`/`expect_toast`/`expect_tabs`/`expect_suggesting`/`expect_find`/`expect_gate`/`expect_selection`/`expect_hit`. `expect_hit` gates the hit registry — click targets register a frame after model state; use it before `click`.
 - **Click by name**: `click = "pill.scroll_bottom"` / `pointer = {event, target|x, y}` resolves the hit registry (`panes.button`, `gate.approve`, `explorer.entry.<name>`, `detect.url.<u>`); raw `x`/`y` is the escape hatch. `scroll` needs `raw = true` + a `target`/`x`/`y` hover for surfaces that own their paint (explorer listing).
-- **`agent = {event="approve", …}`** stages a real gate card; **`stub_opener = true`** records `xdg-open`/`open` for `expect_open` — `ext ↗` and editor spawns without real apps.
-- **Failures**: `target/e2e-failures/<test>/` holds `dump.json` + `stderr.txt` + `actions.log`.
+- **`agent = {event="approve", …}`** stages a real gate card; recording `xdg-open`/`open` stubs sit first on every spawned app's `PATH` (always on — `expect_open` reads their log) — `ext ↗` and editor spawns without real apps.
+- **`wait_dump = true`** is the input barrier: the dump's `input_done` catching `input_seq` proves every accepted request folded a completed frame — use it before *negative* assertions ("nothing opened/changed"), where a plain `dump` could answer pre-frame.
+- **Failures**: `target/e2e-failures/<test>/` holds `dump.json` + `stderr.txt` + `actions.log` + `screenshot.png` (real painted frame — evidence only, never a diff).
 - **Canary only**: `AIT_GUI_E2E_XTEST=1` runs the xdotool/Xvfb winit canary — non-authoritative, proves winit delivers real input, never a gate.
 - Needs `xvfb` (or `DISPLAY`), `mesa-vulkan-drivers` (lavapipe; pin `WGPU_ADAPTER_NAME=llvmpipe`+`WGPU_BACKEND=vulkan`), and the webkit2gtk-4.1 stack for the `web` leg.
 

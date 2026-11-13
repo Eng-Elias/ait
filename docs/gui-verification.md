@@ -13,7 +13,12 @@ TOML under `crates/ait-gui/tests/scenarios/` plus code-first tests in
 `cargo test -p ait-gui --features test-driver --test scenarios` — not
 manual legs; check them anyway when the scenario set can't reach the
 behavior (headed rendering, webview, real touchpads). Items marked
-*(manual — …)* name why no scenario carries them.
+*(manual — …)* name why no scenario carries them. A failing leg
+leaves `dump.json` + `stderr.txt` + `actions.log` + `screenshot.png`
+(the app's real painted frame — evidence only, never a diff) under
+`target/e2e-failures/<test>/`. Negative assertions ride `wait_dump`:
+the dump's `input_done` catching `input_seq` proves every accepted
+request folded through a completed frame — no guessed sleeps.
 
 ## Launch
 
@@ -26,17 +31,20 @@ xvfb-run -a ./target/debug/ait-gui   # headless smoke
 
 Work top to bottom; each item is cheap once the window is up.
 
-- **Chord leak** *(scenario: chord-leak, paste-inert)* — press `Alt+A`, `Alt+T`, `Alt+W`, `Alt+P`, `Alt+R`,
-  `Ctrl+Shift+F`, `Ctrl+W`, `Alt+Enter` one at a time, then type
-  `echo MARKER`: the command line must be clean. Some platforms emit a
-  `Text` twin for an Alt-chord — the leak shows as a stray char on the
-  line (Alt+A → `a`, R13).
-- **Touchpad scroll** *(scenario: wheel-scroll — sub-line pixel deltas;
-  manual — the physical flick feel is hardware)* — two-finger flick must scroll; wheel events
-  arrive as sub-line pixel (`MouseScrollDelta::PixelDelta`) deltas, and
-  truncating each event to whole lines drops them all (R13).
-- **Scroll-to-bottom** *(scenario: scroll-pill-click, wheel-scroll)* — scroll up; the `⤓` pill appears bottom-right;
-  clicking it snaps to live output.
+- **Chord leak** *(scenario: chord-leak, paste-inert)* — press
+  `Alt+A`, `Alt+T`, `Alt+W`, `Alt+P`, `Alt+R`, `Ctrl+Shift+F`,
+  `Ctrl+W`, `Alt+Enter` one at a time, then type `echo MARKER`: the
+  command line must be clean. Some platforms emit a `Text` twin for
+  an Alt-chord — the leak shows as a stray char on the line (Alt+A →
+  `a`, R13).
+- **Touchpad scroll** *(scenario: wheel-scroll — sub-line pixel
+  deltas; manual — the physical flick feel is hardware)* — two-finger
+  flick must scroll; wheel events arrive as sub-line pixel
+  (`MouseScrollDelta::PixelDelta`) deltas, and truncating each event
+  to whole lines drops them all (R13).
+- **Scroll-to-bottom** *(scenario: scroll-pill-click, wheel-scroll)* —
+  scroll up; the `⤓` pill appears bottom-right; clicking it snaps to
+  live output.
 - **Long scrollback** *(manual — responsiveness is a wall-clock
   judgment; the correctness leg rides wheel-scroll)* — `seq 1 5000`, then scroll: stays responsive
   (bounded scrollback + viewport-only paint; slowness is usually the
@@ -51,7 +59,8 @@ Work top to bottom; each item is cheap once the window is up.
   must register before the card's).
 - **Find chord** *(scenario: find-chord)* — `Ctrl+Shift+F` opens the find bar; `Ctrl+F` reaches
   the shell (readline forward-char — terminals never steal it).
-- **Pane chords** *(scenario: pane-chords-overlay, explorer)* — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle the
+- **Pane chords** *(scenario: pane-chords-overlay, explorer)* —
+  `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle the
   explorer and browser panes: the switcher strip atop the region
   reverses the shown chip, a second press of the shown pane's chord
   releases it, and plain `Esc` while a pane shows returns focus to
@@ -129,20 +138,24 @@ Work top to bottom; each item is cheap once the window is up.
   typing/grid output stays responsive while a
   heavy page loads — a stall there wedges input, which is the one
   risk wry leaves us no off-thread answer for.
-- **Ctrl+click affordance** *(scenario: detect-click, ctrl-drag-selection, detect-routes; test: ctrl_hover_ignores_missing_paths_chords_and_scrollback)* — hold Ctrl over an `https://`/`file://`
-  URL and an existing path in output: detected tokens underline and
-  the cursor turns to the pointer; non-tokens, nonexistent paths and
-  scrollback rows behave the same way. Ctrl+click on a URL opens the
-  browser pane at it (or hands it to the system browser on the
-  external surface), on a file previews it in the explorer, on a
-  directory navigates the explorer to it. Inside an `ssh()` session
-  only URLs afford — paths never resolve under a remote cwd. Ordinary
-  click-drag selection is untouched (a Ctrl+press never starts one).
-- **Pane/agent precedence** *(scenario: pane-agent-precedence)* — with the agent panel open, a pane chord
-  switches the region to that pane (the panel's conversation survives —
-  `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
-  over the live selection. Chord leak: type `echo MARKER` after each —
-  no stray chars on the line.
+- **Ctrl+click affordance** *(scenario: detect-click,
+  ctrl-drag-selection, detect-routes; test:
+  ctrl_hover_ignores_missing_paths_chords_and_scrollback)* — hold Ctrl
+  over an `https://`/`file://` URL and an existing path in output:
+  detected tokens underline and the cursor turns to the pointer;
+  non-tokens, nonexistent paths and scrollback rows behave the same
+  way. Ctrl+click on a URL opens the browser pane at it (or hands it
+  to the system browser on the external surface), on a file previews
+  it in the explorer, on a directory navigates the explorer to it.
+  Inside an `ssh()` session only URLs afford — paths never resolve
+  under a remote cwd. Ordinary click-drag selection is untouched (a
+  Ctrl+press never starts one).
+- **Pane/agent precedence** *(scenario: pane-agent-precedence)* — with
+  the agent panel open, a pane chord switches the region to that pane
+  (the panel's conversation survives — `Alt+A` brings it back); with a
+  pane showing, `Alt+A` opens the panel over the live selection.
+  Chord leak: type `echo MARKER` after each — no stray chars on the
+  line.
 - **Paste trigger** *(scenario: paste-inert — the control-byte half;
   test: ctl_and_driver_sockets_coexist — ctl's never-classified leg;
   manual — a clean `#`+Enter *paste* arming the suggestion has no
@@ -151,19 +164,21 @@ Work top to bottom; each item is cheap once the window is up.
   inert; `ait ctl send` is never classified (by design — the
   `ctl_and_driver_sockets_coexist` test's send leg lands verbatim on
   the grid).
-- **Suggestion loader** *(test: suggest_triggers_arm_then_clear_on_error)* — `# x` + Enter shows `⠋ suggesting` in the
-  status line while the model call is in flight; it clears on
-  complete/error/cancel.
+- **Suggestion loader** *(test:
+  suggest_triggers_arm_then_clear_on_error)* — `# x` + Enter shows
+  `⠋ suggesting` in the status line while the model call is in
+  flight; it clears on complete/error/cancel.
 - **ctl verbs** *(test: ctl_and_driver_sockets_coexist; manual — the
   `last-block` happy path: an interactive `sh` seals no blocks, so a
-  real readout needs a shell-integrated session)* — from another terminal: `ait ctl open-tab`,
-  `ait ctl send 'echo from-ctl'`, `ait ctl last-block` drive the window.
-  (The test's `last-block` leg only proves the round trip — an
-  interactive `sh` seals no blocks, so the happy-path readout stays
-  a manual leg.)
+  real readout needs a shell-integrated session)* — from another
+  terminal: `ait ctl open-tab`, `ait ctl send 'echo from-ctl'`,
+  `ait ctl last-block` drive the window. (The test's `last-block`
+  leg only proves the round trip — an interactive `sh` seals no
+  blocks, so the happy-path readout stays a manual leg.)
 - **Zoom** *(manual — no scenario yet; the dump's cell metrics make it
-  automatable whenever one lands)* — `Ctrl+±`/`Ctrl+0` change terminal text only (⌘ variants
-  on macOS); chrome stays put; zoom is ephemeral.
+  automatable whenever one lands)* — `Ctrl+±`/`Ctrl+0` change terminal
+  text only (⌘ variants on macOS); chrome stays put; zoom is
+  ephemeral.
 
 ## Scripted smoke (optional)
 

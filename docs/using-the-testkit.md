@@ -34,10 +34,11 @@ AIT_GUI_E2E_BIN_NOWEB=$PWD/target/gui-noweb/debug/ait-gui \
 (The env paths are absolute — the harness spawns each app in a
 throwaway cwd, where a relative path would dissolve.)
 
-`stub_opener = true` puts a recording `xdg-open`/`open` first on
-the app's `PATH` — `expect_open = "<url substring>"` then waits on
-the stub's log, so `ext ↗`, external Enter navigations and editor
-spawns assert without real applications.
+Every spawn gets recording `xdg-open`/`open` stubs first on the
+app's `PATH` (no flag — `pinned_env` always installs `stub-bin/`)
+— `expect_open = "<url substring>"` then waits on the stub's log,
+so `ext ↗`, external Enter navigations and editor spawns assert
+without real applications.
 
 A third display route exists for tests that own the X server
 themselves: `GuiSpawnConfig::display` pins the app to a named
@@ -66,7 +67,11 @@ registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
 `explorer.entry.<name>`, `explorer.row.<n>`),
 `agent = {event="approve", name, summary}` (stages a real gate
 card through `AgentPanel::apply`), plus waits/asserts
-`wait_text`/`expect_text`/`expect_pane`/`expect_find`/
+`wait_text`/`wait_dump` (the input barrier — the dump's
+`input_done` catching `input_seq` proves every accepted request
+folded through a completed frame; the sync point a negative
+assertion needs since the pump answers `dump` off the UI thread)/
+`expect_text`/`expect_pane`/`expect_find`/
 `expect_scroll`/`expect_suggesting`/`expect_gate`/
 `expect_selection`/`expect_hit` (the registry gate — use it when a
 model expectation like `expect_pane` can land a frame before the
@@ -81,7 +86,8 @@ suffixes, `entries`/`has`/`lacks` over the visible listing,
 `expect_detect` (the Ctrl-hover affordance — `"none"`,
 `"url:<u>"`/`"path:<p>"` or `{ctrl, token}`; pair `ctrl = true`
 with `token = "none"` to prove a non-affording hover frame was
-processed), `expect_open` (the stub-opener log),
+processed — combine with `wait_dump` first so the hover batch is
+provably folded), `expect_open` (the stub-opener log),
 `expect_pane_selected` (the selection *under* the agent claim —
 `expect_pane` asserts the shown region instead), `expect_status`
 (the status strip's composed text — toast while live, else the
@@ -212,10 +218,15 @@ AIT_GUI_E2E_HEADED=1 cargo test -p ait-gui --features test-driver \
 `pty-tail.bin`, `actions.log`; for the GUI suite `dump.json` (the
 last full `dump` — grid text, pane/browser/explorer state, the whole
 hit registry), `stderr.txt` (the app's stderr tail — wgpu adapter
-pick, webkit errors) and the same `actions.log` (one step per line,
-`screen=<hash>` marking drift between dumps). The `gui-e2e` CI job
-uploads the directory as an artifact on failure. A stuck terminal
-after a headed run: `reset`.
+pick, webkit errors), `screenshot.png` (the app's real painted
+frame — a `screenshot` request queues egui's
+`ViewportCommand::Screenshot`, the post-render callback encodes the
+`ColorImage` under a `.part` sibling and renames it into place;
+best-effort, evidence for humans only — never a pixel diff) and
+the same `actions.log` (one step per line, `screen=<hash>` marking
+drift between dumps). The `gui-e2e` CI job uploads the directory
+as an artifact on failure. A stuck terminal after a headed run:
+`reset`.
 
 ## Driving the agent panel and remote sessions
 
