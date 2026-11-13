@@ -1017,6 +1017,16 @@ impl Tab {
         self.agent.as_ref().is_some_and(AgentPanel::is_open)
     }
 
+    /// Close the panel outright — never toggle — for a caller that
+    /// must yield the region rather than run the open→focus→close
+    /// cycle (the GUI's pane host on an explicit aux selection, Spec
+    /// R14). The conversation survives; `Alt+A` reopens it.
+    pub fn close_agent_panel(&mut self) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.close();
+        }
+    }
+
     /// Whether keystrokes route to the panel's input line — the
     /// `suggestion_here`-style gate `app`'s pass-through arm checks
     /// before PTY input (Spec R06: focused keys never reach the PTY).
@@ -4002,6 +4012,34 @@ mod tests {
         // Closing THE owning tab drops the worker mid-task — Drop
         // cancels and joins; nothing to observe but the clean return.
         assert!(manager.close_active(), "the owning tab closes");
+    }
+
+    /// `close_agent_panel` is the GUI pane host's yield verb (Spec
+    /// R14): it closes outright from either open state — focused, or
+    /// open-but-Esc'd — never cycles the toggle, and stays closed on
+    /// a repeat call. The conversation survives every close.
+    #[test]
+    fn close_agent_panel_closes_outright_and_idempotently() {
+        let mut manager = manager(1, "/tmp");
+        let tab = manager.active_mut().unwrap();
+
+        // Open + focused: one call closes; a second never reopens.
+        tab.toggle_agent_panel();
+        assert!(tab.agent_panel_open());
+        tab.close_agent_panel();
+        assert!(!tab.agent_panel_open());
+        assert!(tab.agent.is_some(), "the conversation survives");
+        tab.close_agent_panel();
+        assert!(!tab.agent_panel_open());
+
+        // Open-but-unfocused (Esc'd back to the shell) closes in one
+        // step — the toggle cycle would have needed two presses.
+        tab.toggle_agent_panel();
+        tab.agent.as_mut().unwrap().escape();
+        assert!(tab.agent_panel_open());
+        assert!(!tab.agent_focused());
+        tab.close_agent_panel();
+        assert!(!tab.agent_panel_open());
     }
 
     /// The approve card's keys (Spec R06): while the gate is parked,

@@ -687,3 +687,31 @@ fn input_rejects_unknown_keys() {
         "the typo'd key must be named: {message:?}"
     );
 }
+
+// ---- Spec R14 §5.13: the [gui] section ----
+
+/// `[gui]` is the one GUI-only settings surface — the TUI parses the
+/// shared `settings.toml` but never reads it — and `editor` is the
+/// lone key: the explorer pane's system-editor override. Absent means
+/// the env chain resolves the editor instead.
+#[test]
+fn gui_section_parses_and_defaults_apply() {
+    for input in ["", "[gui]\n"] {
+        let settings = Settings::from_toml(input).unwrap();
+        assert_eq!(settings.gui.editor, None, "input {input:?}");
+    }
+    let settings = Settings::from_toml("[gui]\neditor = \"code --goto\"\n").unwrap();
+    assert_eq!(settings.gui.editor.as_deref(), Some("code --goto"));
+}
+
+/// `deny_unknown_fields` stands under `[gui]` too — a typo'd key is a
+/// load error naming it, same as every other table.
+#[test]
+fn gui_rejects_unknown_keys() {
+    let err = Settings::from_toml("[gui]\neditr = \"vim\"\n").unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("editr"),
+        "the typo'd key must be named: {message:?}"
+    );
+}

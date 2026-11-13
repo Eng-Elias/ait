@@ -16,6 +16,19 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   their grids, blocks, scroll/selection, the agent panel's
   entries/gates/plan, the pickers, the status line and the ctl
   surface (§5.12, ADR-0016).
+- **GUI pane** — one `ait-gui`-only auxiliary surface living in the side
+  region beside the grid: the agent panel, the file explorer or the web
+  browser (§5.13). Declared by the `Pane` trait + `PANES` registry in
+  `ait-gui`; `ait-app` knows nothing about panes.
+- **Pane host** — the `ait-gui` side region's ownership contract: it
+  shows exactly one GUI pane at a time, switched by pane chrome or the
+  `Ctrl+Shift+E`/`Ctrl+Shift+B` chords; the agent panel claims the
+  region while open, the `PaneHost` selection on `Shared` is
+  app-global, ephemeral and follows the active tab (§5.13).
+- **Aux pane** — a GUI pane that isn't the agent panel: a `Pane`
+  trait implementation registered in `ait-gui`'s `PANES` (the
+  explorer, the browser), the `SidePane::Aux` half of what the pane
+  host can show (§5.13).
 - **Grid** — the styled cell matrix plus scrollback for a session.
 - **Block** — one command, its output and exit code, delimited by shell hooks.
 - **Shell integration / rc snippet** — the script injected into a shell that

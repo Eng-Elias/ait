@@ -15,6 +15,20 @@
 //! - [`paint`] — the `Painter` pass over the planner's output.
 //! - [`panel`] — the agent panel's pure line planning (entries →
 //!   styled rows, the pinned plan block, the parked gate card).
+//! - [`pane`] — the side region's pane host (Spec R14 §5.13): the
+//!   `Pane` trait, the static registry, the app-global selection
+//!   state and the `Ctrl+Shift+E`/`Ctrl+Shift+B` chord interception.
+//! - [`explorer`] — the file-explorer pane (R14-T2): the read-only
+//!   `cwd_for`-rooted browser's model, its fs/editor seams and its
+//!   `Pane` impl.
+//! - [`browser`] — the web browser pane (R14-T3): entry/history/nav
+//!   model and the embed-vs-external fallback decision, all pure.
+//! - [`detect`] — the Ctrl+click affordance's detector (R14-T4):
+//!   line text + tab cwd + the filesystem → the URL/path token spans
+//!   the hover underline and the click route share.
+//! - [`webview`] — the `wry` adapter behind the `web` feature: the
+//!   child-webview handle, the gtk/glib plumbing and the platform
+//!   opener the external surface delegates to.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -30,12 +44,17 @@
 // internals (`app`'s `GuiApp`/`Shared`, the pump, the painters),
 // shared inside the crate and invisible outside it.
 pub(crate) mod app;
+pub(crate) mod browser;
+pub(crate) mod detect;
+pub(crate) mod explorer;
 pub(crate) mod grid;
 pub(crate) mod keys;
 pub(crate) mod layout;
 pub(crate) mod paint;
+pub(crate) mod pane;
 pub(crate) mod panel;
 pub(crate) mod pump;
+pub(crate) mod webview;
 
 use std::io::Write as _;
 
@@ -66,4 +85,40 @@ pub fn run() -> eframe::Result<()> {
 /// them outside `ait/src/main.rs`), but `io::stderr().write_all`.
 pub fn report_error(error: &eframe::Error) {
     let _ = writeln!(std::io::stderr(), "ait-gui: {error}");
+}
+
+/// The platform's "open this target" command — `open` on macOS,
+/// `xdg-open` on the freedesktop desktops, `cmd /c start` on Windows
+/// (§5.14, not yet shipped); the target is the single payload
+/// argument. Both OS-handoff surfaces share it: the explorer's
+/// platform-opener editor resolution (a file path) and the browser
+/// pane's external-open sink (a URL). Stdio is detached so the child
+/// never holds the terminal's pipes.
+pub(crate) fn platform_opener(target: &std::ffi::OsStr) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(target);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        // `start` reads its first quoted arg as a window title —
+        // the empty one keeps the target from being eaten as it.
+        command.args(["/c", "start", ""]);
+        command.arg(target);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(target);
+        command
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
 }
