@@ -30,6 +30,7 @@ mod chord;
 mod command;
 mod driver;
 mod evidence;
+pub mod gui;
 mod harness;
 mod mouse;
 mod probes;
@@ -74,6 +75,31 @@ macro_rules! ait_bin {
                 panic!(
                     "no `ait` binary to test: set AIT_E2E_BIN, or run under \
                      `cargo test -p ait` where cargo exports CARGO_BIN_EXE_ait"
+                )
+            }))
+        })
+    }};
+}
+
+/// Resolve the `ait-gui` binary under test (Spec R15): the
+/// `AIT_GUI_E2E_BIN` environment override first, else the
+/// `CARGO_BIN_EXE_ait-gui` cargo exports to the `ait-gui` package's
+/// own test targets — the [`ait_bin!`] convention, GUI-spelled.
+///
+/// ```
+/// # fn demo() {
+/// let bin = ait_testkit::ait_gui_bin!();
+/// # let _ = bin;
+/// # }
+/// ```
+#[macro_export]
+macro_rules! ait_gui_bin {
+    () => {{
+        ::std::env::var_os("AIT_GUI_E2E_BIN").unwrap_or_else(|| {
+            ::std::ffi::OsString::from(option_env!("CARGO_BIN_EXE_ait-gui").unwrap_or_else(|| {
+                panic!(
+                    "no `ait-gui` binary to test: set AIT_GUI_E2E_BIN, or run under \
+                         `cargo test -p ait-gui` where cargo exports CARGO_BIN_EXE_ait-gui"
                 )
             }))
         })

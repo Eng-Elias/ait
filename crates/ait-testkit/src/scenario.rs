@@ -257,7 +257,8 @@ pub struct ScenarioError {
 }
 
 impl ScenarioError {
-    fn file(file: &str, message: impl Into<String>) -> Self {
+    /// A file-level failure (also the `gui` module's constructor).
+    pub(crate) fn file(file: &str, message: impl Into<String>) -> Self {
         Self {
             file: file.to_string(),
             step: None,
@@ -265,7 +266,8 @@ impl ScenarioError {
         }
     }
 
-    fn step(file: &str, step: usize, message: impl Into<String>) -> Self {
+    /// A step-level failure (also the `gui` module's constructor).
+    pub(crate) fn step(file: &str, step: usize, message: impl Into<String>) -> Self {
         Self {
             file: file.to_string(),
             step: Some(step),
