@@ -35,6 +35,7 @@ investigate, don't retry-loop the gate hoping for green.
 | `ait-agent write_to_pty_first_write_asks_then_the_session_runs_free` | open — flake seen R14-T2 (the third captured request raced the shell's `READ-hello` echo under sweep load, twice; passes isolated twice), file untouched since R10 |
 | `ait-term the_output_mirror_receives_bytes_as_the_reader_reads_them` | open — flake seen R14-T5 (the reader's mirror tap lost the race to `early-mark`'s grid write under sweep load; passes isolated three times), file untouched since E01 |
 | `ait-agent demotion_never_replays_and_never_recovers` | open — flake seen r14-review-fixes (the ssh stub answered zero of the expected one failed run under sweep load; passes isolated twice and serially), file untouched since R09 |
+| `ait-agent control_master_runs_commands_over_the_socket` | open — flake seen R15-T1 (the `ssh-cm` stub spawn hit `ETXTBSY` (os error 26) under sweep load; passes isolated three times), file untouched since R09 |
 
 The underlying PTY races are tracked in the `Backlog: PTY-timing
 flakes under parallel test load` issue — the entries above leave the
