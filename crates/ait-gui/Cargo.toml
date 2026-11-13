@@ -73,6 +73,12 @@ raw-window-handle = { version = "0.6", optional = true }
 # 1.0.154 (2026-10-11).
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+# The `screenshot` verb's PNG encoder (Spec R15): `ViewportCommand::
+# Screenshot` hands back a `ColorImage` whose RGBA bytes `png` writes
+# to the harness's evidence dir — evidence for humans, never a
+# pixel-diff gate. Semver per ADR-0002: png 0.18.1 (2026-02-14),
+# already resolved in the tree via eframe's `image` dep.
+png = { version = "0.18", optional = true }
 
 # Linux-only webview runtime glue (Spec R14 §5.13, R14-T3): wry's
 # `build_as_child` panics unless `gtk::init` ran on the creating
@@ -95,7 +101,7 @@ web = ["dep:wry", "dep:dpi", "dep:raw-window-handle", "dep:gtk"]
 # dump socket beside ctl, bound only when AIT_TEST_DRIVER_SOCKET names
 # its path. Release artifacts never see it — cargo-dist builds default
 # features, and the code compiles out without it.
-test-driver = ["dep:serde", "dep:serde_json"]
+test-driver = ["dep:serde", "dep:serde_json", "dep:png"]
 
 [dev-dependencies]
 # Tempdirs for the pump tests' store database and settings-watcher

@@ -155,6 +155,20 @@ pub struct Shared {
     /// Feature-gated like `detect_hover`.
     #[cfg(feature = "test-driver")]
     pub cell_metrics: Option<(f32, f32)>,
+    /// The `wait_dump` barrier's queued half (Spec R15): `dispatch`
+    /// bumps this for every request that queues frame-folded input
+    /// — `dump`'s `input_seq` thus counts everything serviced before
+    /// it. Feature-gated like `injected`.
+    #[cfg(feature = "test-driver")]
+    pub input_seq: u64,
+    /// The `wait_dump` barrier's delivered half: `ui` sets this to
+    /// `input_seq` at a frame's end once `injected` is drained AND
+    /// the pointer plugin's queue emptied — `input_done >=
+    /// input_seq` in a dump IS "every accepted request folded
+    /// through a completed frame", the barrier negative assertions
+    /// wait on instead of a guessed sleep.
+    #[cfg(feature = "test-driver")]
+    pub input_done: u64,
 }
 
 /// The test-driver's hit-target registry (Spec R15-T3) — semantic
@@ -172,11 +186,13 @@ pub struct HitTargets {
 
 impl HitTargets {
     /// Register `name` at `rect` — the `interact` site owns both, so
-    /// a name's rect IS the hit-tested rect.
+    /// a name's rect IS the hit-tested rect. `name` is a thunk: only
+    /// `test-driver` builds have a map to fill, so release builds
+    /// never run the `format!`/clone the name costs.
     #[inline]
-    pub fn register(&mut self, name: impl Into<String>, rect: Rect) {
+    pub fn register(&mut self, name: impl FnOnce() -> String, rect: Rect) {
         #[cfg(feature = "test-driver")]
-        self.map.insert(name.into(), rect);
+        self.map.insert(name(), rect);
         #[cfg(not(feature = "test-driver"))]
         let _ = (name, rect);
     }
@@ -411,6 +427,10 @@ impl GuiApp {
             detect_hover: crate::test_driver::DetectHover::default(),
             #[cfg(feature = "test-driver")]
             cell_metrics: None,
+            #[cfg(feature = "test-driver")]
+            input_seq: 0,
+            #[cfg(feature = "test-driver")]
+            input_done: 0,
         }));
         // The pointer-injection plugin (Spec R15-T3): its `input_hook`
         // splices queued `pointer`/`click` batches into `RawInput` at
@@ -1226,10 +1246,10 @@ impl GuiApp {
             );
             // The registry names mirror the chip's role: the body
             // activates, the "×" closes (Spec R15-T3).
-            shared.hits.register(format!("tab.{index}"), chip.rect);
+            shared.hits.register(|| format!("tab.{index}"), chip.rect);
             shared
                 .hits
-                .register(format!("tab.{index}.close"), chip.close);
+                .register(|| format!("tab.{index}.close"), chip.close);
             let bg = if index == active {
                 chrome::FIELD_HI
             } else if chip_hit.hovered() || close_hit.hovered() {
@@ -1280,7 +1300,7 @@ impl GuiApp {
         }
         if let Some(new_rect) = bar.new_tab {
             let new_hit = ui.interact(new_rect, egui::Id::unique("tab-new"), Sense::click());
-            shared.hits.register("tab.new", new_rect);
+            shared.hits.register(|| "tab.new".to_owned(), new_rect);
             if new_hit.hovered() {
                 painter.rect_filled(new_rect, 4.0, chrome::FIELD);
             }
@@ -1307,7 +1327,9 @@ impl GuiApp {
         // chord makes, so click and chord can never disagree.
         if let Some(pane_rect) = bar.pane_button {
             let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
-            shared.hits.register("panes.button", pane_rect);
+            shared
+                .hits
+                .register(|| "panes.button".to_owned(), pane_rect);
             if pane_hit.hovered() {
                 painter.rect_filled(pane_rect, 4.0, chrome::FIELD);
             }
@@ -1344,7 +1366,7 @@ impl GuiApp {
     ) {
         self.grid_pane = Some(pane);
         // `grid` — the whole pane is the selection/click surface.
-        shared.hits.register("grid", pane);
+        shared.hits.register(|| "grid".to_owned(), pane);
         let Some(tab) = shared.tabs.active_mut() else {
             return;
         };
@@ -1524,7 +1546,9 @@ impl GuiApp {
                     pill_rect = response.rect;
                     snap = response.clicked();
                 });
-            shared.hits.register("pill.scroll_bottom", pill_rect);
+            shared
+                .hits
+                .register(|| "pill.scroll_bottom".to_owned(), pill_rect);
             if snap {
                 tab.snap_to_bottom();
             }
@@ -1631,7 +1655,7 @@ impl GuiApp {
         }
         if let Some(scan) = &self.detect_hits {
             for (name, rect) in &scan.out {
-                hits.register(name.clone(), *rect);
+                hits.register(|| name.clone(), *rect);
             }
         }
     }
@@ -1693,7 +1717,7 @@ impl GuiApp {
             let hit = ui.interact(chip, egui::Id::unique(("pane-chip", index)), Sense::click());
             // `panes.chip.<label>` — the name IS the chip's label
             // (`agent`/`explorer`/…), so a click reads like the UI.
-            shared.hits.register(format!("panes.chip.{label}"), chip);
+            shared.hits.register(|| format!("panes.chip.{label}"), chip);
             let active = *target == shown;
             let (bg, fg) = if active {
                 (self.theme.fg, PANEL_BG)
@@ -1773,7 +1797,7 @@ impl GuiApp {
         // every verdict/choice click.
         let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
         // `agent.focus` — the whole body is the focus affordance.
-        shared.hits.register("agent.focus", rect);
+        shared.hits.register(|| "agent.focus".to_owned(), rect);
         {
             let Some(panel) = shared.tabs.active().and_then(|tab| tab.agent_panel()) else {
                 return;
@@ -2013,7 +2037,7 @@ impl GuiApp {
                             Vec2::new(button_w, line_h),
                         );
                         let hit = ui.interact(button, id, Sense::click());
-                        hits.register(name, button);
+                        hits.register(|| name.to_owned(), button);
                         painter.rect_filled(
                             button,
                             3.0,
@@ -2065,7 +2089,7 @@ impl GuiApp {
                             egui::Id::unique(("agent-ask", index)),
                             Sense::click(),
                         );
-                        hits.register(format!("gate.ask.{index}"), row);
+                        hits.register(|| format!("gate.ask.{index}"), row);
                         let selected = index == ask.selected;
                         if selected || hit.hovered() {
                             painter.rect_filled(row, 2.0, chrome::SELECT);
@@ -2450,6 +2474,24 @@ impl eframe::App for GuiApp {
         // frames.
         let browser_shown = shown == Some(SidePane::Aux(PaneId::Browser));
         self.web.sync(&ctx, frame, &mut shared, browser_shown);
+
+        // The `wait_dump` barrier's delivered half (Spec R15): this
+        // frame folded the pointer plugin's batch at `begin_pass` and
+        // `dispatch_events` drained `injected` — with both queues
+        // empty at the frame's end, every request the socket accepted
+        // has run through a completed frame, so `input_done` catches
+        // up. A multi-batch gesture (press→release split across
+        // frames) only catches up after its LAST batch's frame.
+        #[cfg(feature = "test-driver")]
+        {
+            let plugin_drained =
+                ctx.with_plugin(|plugin: &mut crate::test_driver::DriverInputPlugin| {
+                    plugin.pending() == 0
+                });
+            if shared.injected.is_empty() && plugin_drained == Some(true) {
+                shared.input_done = shared.input_seq;
+            }
+        }
         drop(shared);
 
         if self.quit {
@@ -2777,6 +2819,10 @@ mod tests {
                 detect_hover: crate::test_driver::DetectHover::default(),
                 #[cfg(feature = "test-driver")]
                 cell_metrics: None,
+                #[cfg(feature = "test-driver")]
+                input_seq: 0,
+                #[cfg(feature = "test-driver")]
+                input_done: 0,
             }));
             Self {
                 app: GuiApp {

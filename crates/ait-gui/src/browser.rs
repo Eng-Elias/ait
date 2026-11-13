@@ -426,7 +426,14 @@ impl BrowserState {
         // policy decision rides IPC), so `webview_navigated`
         // consumes one outstanding entry per report: a `Navigate`
         // echoes its URL, a `Reload` the current page's. The cap
-        // bounds a load whose report never arrives.
+        // bounds a load whose report never arrives. Its edge: with
+        // >8 loads issued before their reports land, the oldest
+        // echo is evicted and its real report then reads as
+        // page-initiated — one spurious history entry + forward
+        // truncation, self-healing on the next navigation. The
+        // trade is deliberate: correctness within a plausible
+        // in-flight window (a webview can't meaningfully be 9 loads
+        // deep) over an unbounded ledger for a dropped webview.
         for command in &commands {
             let url = match command {
                 NavCommand::Navigate(url) => Some(url.clone()),
@@ -565,7 +572,7 @@ impl Pane for BrowserPane {
                 egui::Id::unique(("browser-btn", label)),
                 Sense::click(),
             );
-            hits.register(format!("browser.{name}"), hit_rect);
+            hits.register(|| format!("browser.{name}"), hit_rect);
             let (bg, fg) = if !enabled {
                 (Color32::TRANSPARENT, dim)
             } else if hit.hovered() {

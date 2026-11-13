@@ -336,11 +336,28 @@ pub fn ctl_dir(runtime_dir: Option<&OsStr>) -> PathBuf {
 }
 
 /// `path` at `mode` — the spec's permissions (dir `0700`, socket
-/// `0600`); same-uid is the trust boundary.
+/// `0600`); same-uid is the trust boundary. Public so the
+/// test-driver socket (`ait-gui`'s `test_driver` module, Spec R15)
+/// holds the same line.
 #[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// The listener bind every line socket shares: a stale file at the
+/// path is reclaimed (a crashed predecessor's), the socket gets its
+/// `0600`, and the listener is nonblocking so accept never stalls
+/// the drain loop.
+#[cfg(unix)]
+pub fn bind_socket(socket: &Path) -> io::Result<UnixListener> {
+    if socket.exists() {
+        std::fs::remove_file(socket)?;
+    }
+    let listener = UnixListener::bind(socket)?;
+    set_mode(socket, 0o600)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// What a serviced request leaves for the app to finish — the pieces
@@ -363,7 +380,7 @@ pub fn socket_error_text(error: impl std::fmt::Display) -> String {
 
 /// Whether a pending connection survives this service pass.
 #[cfg(unix)]
-enum Service {
+pub enum Service {
     /// Keep it for the next tick (request incomplete, reply stalled).
     Keep,
     /// Drop it — answered, expired, or the client went away.
@@ -371,9 +388,14 @@ enum Service {
 }
 
 /// One accepted connection buffered across ticks: request bytes until
-/// a full line exists, then the response flushing out.
+/// a full line exists, then the response flushing out. This is the
+/// transport half of the line-socket protocol — shared verbatim with
+/// `ait-gui`'s test-driver socket (Spec R15), which runs the same
+/// conventions against a different verb set: the caller supplies
+/// `answer`/`reject` so this never knows the server's [`Response`]
+/// shape.
 #[cfg(unix)]
-struct Pending {
+pub struct Pending {
     /// The accepted (nonblocking) stream.
     stream: UnixStream,
     /// Buffered request bytes — a complete request ends at `'\n'`.
@@ -397,68 +419,71 @@ impl Pending {
         }
     }
 
+    /// Accept every queued connection on `listener` into `pending` —
+    /// the drain's accept loop, shared by ctl and the test-driver
+    /// socket. An accept that can't go nonblocking is dropped: a
+    /// blocking conn in `pending` would wedge the tick.
+    pub fn accept(listener: &UnixListener, pending: &mut Vec<Pending>) {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if stream.set_nonblocking(true).is_ok() {
+                        pending.push(Pending::new(stream));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Service the connection once: flush a queued reply, else buffer
-    /// request bytes until a full line exists and dispatch it.
-    /// Returns the verdict plus the dispatch's app follow-up when the
-    /// answered request opened a tab.
-    fn service(&mut self, tabs: &mut TabManager) -> (Service, Option<FollowUp>) {
+    /// request bytes until a full line exists and hand it to
+    /// `answer` — the server's decode+dispatch+encode fold, whose
+    /// return is queued verbatim as the reply line (the `\n` is
+    /// appended here). `reject` produces the oversized-request
+    /// refusal's line. Each closure runs at most once, and `answer`
+    /// always runs synchronously — the caller's side effects (state
+    /// reads, queued side work) happen inside it.
+    pub fn service(
+        &mut self,
+        answer: impl FnOnce(&str) -> String,
+        reject: impl FnOnce() -> String,
+    ) -> Service {
         if self.at.elapsed() > PENDING_TTL {
-            return (Service::Close, None);
+            return Service::Close;
         }
         if self.reply.is_some() {
-            return (self.flush(), None);
+            return self.flush();
         }
         let mut chunk = [0u8; 8192];
         match self.stream.read(&mut chunk) {
             // EOF — the client went away mid-request.
-            Ok(0) => (Service::Close, None),
+            Ok(0) => Service::Close,
             Ok(n) => {
                 self.request.extend_from_slice(&chunk[..n]);
                 match self.request.iter().position(|b| *b == b'\n') {
                     // A line that only terminates past the cap is the
                     // same oversize request, not a valid line.
-                    Some(end) if end > REQUEST_CAP => (self.fail("request too large"), None),
+                    Some(end) if end > REQUEST_CAP => self.queue(reject()),
                     Some(end) => {
                         let line = String::from_utf8_lossy(&self.request[..end]).into_owned();
-                        self.answer(tabs, &line)
+                        self.queue(answer(&line))
                     }
-                    None if self.request.len() > REQUEST_CAP => {
-                        (self.fail("request too large"), None)
-                    }
-                    None => (Service::Keep, None),
+                    None if self.request.len() > REQUEST_CAP => self.queue(reject()),
+                    None => Service::Keep,
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (Service::Keep, None),
-            Err(_) => (Service::Close, None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Service::Keep,
+            Err(_) => Service::Close,
         }
     }
 
-    /// Decode + dispatch + queue the response — even a malformed line
-    /// earns a well-formed `{"ok":false}` before the close.
-    fn answer(&mut self, tabs: &mut TabManager, line: &str) -> (Service, Option<FollowUp>) {
-        let (response, follow) = match decode_request(line) {
-            Ok(request) => {
-                let response = dispatch(tabs, &request);
-                let follow = (matches!(request, Request::OpenTab) && response.ok)
-                    .then_some(FollowUp::OpenedTab);
-                (response, follow)
-            }
-            Err(error) => (Response::error(error), None),
-        };
-        (self.queue(response), follow)
-    }
-
-    /// Queue `response` as the reply line and start flushing it.
-    fn queue(&mut self, response: Response) -> Service {
-        let mut line = encode_response(&response);
+    /// Queue `line` as the reply and start flushing it.
+    fn queue(&mut self, mut line: String) -> Service {
         line.push('\n');
         self.reply = Some((line.into_bytes(), 0));
         self.flush()
-    }
-
-    /// `queue`'s string form — the oversized-request rejection.
-    fn fail(&mut self, message: &str) -> Service {
-        self.queue(Response::error(message.to_owned()))
     }
 
     /// Write out the queued reply — a full flush closes the
@@ -518,12 +543,7 @@ impl CtlServer {
         let socket = dir.join(format!("{}.sock", std::process::id()));
         // Re-bind over a stale file: the pid is this process's, so the
         // file can only be ours or a dead predecessor's.
-        if socket.exists() {
-            std::fs::remove_file(&socket)?;
-        }
-        let listener = UnixListener::bind(&socket)?;
-        set_mode(&socket, 0o600)?;
-        listener.set_nonblocking(true)?;
+        let listener = bind_socket(&socket)?;
         Ok(Self {
             listener,
             socket,
@@ -543,22 +563,27 @@ impl CtlServer {
     /// (us-42). The [`FollowUp`]s dispatches leave (a spawned tab
     /// needs its `terminal_sessions` row) are returned for the caller.
     pub fn drain(&mut self, tabs: &mut TabManager) -> Vec<FollowUp> {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // An accept that can't go nonblocking is dropped —
-                    // a blocking conn in `pending` would wedge the tick.
-                    if stream.set_nonblocking(true).is_ok() {
-                        self.pending.push(Pending::new(stream));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+        Pending::accept(&self.listener, &mut self.pending);
         let mut follows = Vec::new();
         for mut conn in std::mem::take(&mut self.pending) {
-            let (verdict, follow) = conn.service(tabs);
+            // `answer` is the decode+dispatch+encode fold — even a
+            // malformed line earns a well-formed `{"ok":false}`.
+            let mut follow = None;
+            let verdict = conn.service(
+                |line| {
+                    let response = match decode_request(line) {
+                        Ok(request) => {
+                            let response = dispatch(tabs, &request);
+                            follow = (matches!(request, Request::OpenTab) && response.ok)
+                                .then_some(FollowUp::OpenedTab);
+                            response
+                        }
+                        Err(error) => Response::error(error),
+                    };
+                    encode_response(&response)
+                },
+                || encode_response(&Response::error("request too large".to_owned())),
+            );
             follows.extend(follow);
             if let Service::Keep = verdict {
                 self.pending.push(conn);

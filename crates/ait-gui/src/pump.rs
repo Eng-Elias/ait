@@ -434,6 +434,10 @@ mod tests {
             detect_hover: crate::test_driver::DetectHover::default(),
             #[cfg(feature = "test-driver")]
             cell_metrics: None,
+            #[cfg(feature = "test-driver")]
+            input_seq: 0,
+            #[cfg(feature = "test-driver")]
+            input_done: 0,
         }))
     }
 

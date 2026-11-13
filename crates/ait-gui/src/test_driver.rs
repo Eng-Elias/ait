@@ -60,6 +60,12 @@
 //!   panel through `AgentPanel::apply` — the same fold
 //!   `drain_agent_events` feeds real worker events — so a staged
 //!   approve card IS the panel's real approval flow.
+//! - `{"verb":"screenshot","path":"…"}` — the app renders its next
+//!   painted frame into a PNG at `path` (a `ViewportCommand::
+//!   Screenshot` whose callback encodes the `ColorImage` under a
+//!   sibling `.part` then renames it into place — a poll for the file
+//!   never catches a half-flushed image). Evidence for humans; the
+//!   harness never diffs pixels.
 //! - `{"verb":"dump"}` — a versioned JSON snapshot of what the user
 //!   sees, sourced from the same [`Shared`] state `ui`'s paint pass
 //!   reads: the active tab's visible grid rows + cursor, cell
@@ -86,12 +92,12 @@
 //! socket is the only path to input injection.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use ait_app::ctl::REQUEST_CAP;
+use ait_app::ctl::{self, Pending, Service};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -111,10 +117,6 @@ pub const ENV_DRIVER_SOCKET: &str = "AIT_TEST_DRIVER_SOCKET";
 /// The dump's protocol version — clients gate field expectations on
 /// it; additive changes stay v1, shape changes bump it.
 pub const DUMP_VERSION: u32 = 1;
-
-/// A half-open connection's lifetime — same bound as ctl's: a client
-/// that connects but never completes a line is never serviced forever.
-const PENDING_TTL: Duration = Duration::from_secs(30);
 
 /// One request on the wire — internally tagged on `"verb"` like the
 /// ctl protocol, so an unknown verb fails decode naming the variant.
@@ -275,6 +277,14 @@ pub enum Request {
     },
     /// `dump` — answer with the versioned state snapshot.
     Dump,
+    /// `screenshot` — write the next painted frame to `path` as a
+    /// PNG. The request answers as soon as the
+    /// `ViewportCommand::Screenshot` is queued — the file lands
+    /// asynchronously with the frame, so the client polls for it.
+    Screenshot {
+        /// The PNG's destination — the harness's evidence dir.
+        path: String,
+    },
     /// `quit` — close the window the normal way.
     Quit,
 }
@@ -467,6 +477,15 @@ pub struct Dump {
     /// dump answers "what can I click" with the same data the verbs
     /// resolve from.
     pub hits: BTreeMap<String, RectDump>,
+    /// The `wait_dump` barrier's halves (Spec R15): `input_seq`
+    /// counts requests that queued frame-folded input before this
+    /// capture; `input_done` is the count a completed frame has
+    /// folded. `input_done >= input_seq` means every accepted
+    /// request landed — the sync point a negative assertion waits
+    /// on instead of a guessed settle sleep.
+    pub input_seq: u64,
+    /// See `input_seq`.
+    pub input_done: u64,
 }
 
 /// The toast slot — the status-line override's two halves: the text
@@ -919,6 +938,8 @@ impl Dump {
                 .entries()
                 .map(|(name, rect)| (name.clone(), RectDump::from(*rect)))
                 .collect(),
+            input_seq: shared.input_seq,
+            input_done: shared.input_done,
         }
     }
 }
@@ -1090,6 +1111,12 @@ impl DriverInputPlugin {
     pub fn held(&self) -> egui::Modifiers {
         self.held
     }
+
+    /// Batches still queued for a coming frame — the `wait_dump`
+    /// barrier's delivered half reads this at frame end.
+    pub fn pending(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 impl egui::Plugin for DriverInputPlugin {
@@ -1123,6 +1150,14 @@ pub fn socket_error_text(error: impl std::fmt::Display) -> String {
 /// `shared.injected` for the next frame's `dispatch_events`, `dump`
 /// answers from `shared` — the same state the paint pass reads.
 fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Response {
+    // The `wait_dump` barrier's queued half: every request that
+    // queues frame-folded input bumps the sequence first, so a
+    // `dump` serviced after it counts it — `dump` and `screenshot`
+    // themselves answer without a frame fold (screenshot's own
+    // barrier is the file), so they never enter the count.
+    if !matches!(request, Request::Dump | Request::Screenshot { .. }) {
+        shared.input_seq += 1;
+    }
     match request {
         Request::Key { chord, twin } => match parse_chord(chord) {
             Ok((key, modifiers)) => {
@@ -1366,6 +1401,23 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
             Response::ok()
         }
         Request::Dump => Response::dump(Dump::capture(ctx, shared)),
+        Request::Screenshot { path } => {
+            // `request_screenshot` queues a `ViewportCommand::
+            // Screenshot` and the callback fires after the next
+            // painted frame (the command itself requests the repaint
+            // — no `Injected` marker needed). The client polls for
+            // the file, so the response answers now; a write failure
+            // lands in a `<name>.error` sidecar the client can
+            // surface — the callback has no logger to reach for.
+            let path = PathBuf::from(path);
+            ctx.request_screenshot(move |image| {
+                if let Err(error) = write_png(&path, &image) {
+                    let sidecar = path.with_extension("error");
+                    let _ = std::fs::write(&sidecar, error.to_string());
+                }
+            });
+            Response::ok()
+        }
         Request::Quit => {
             shared.injected.push_back(Injected::Quit);
             Response::ok()
@@ -1718,127 +1770,12 @@ fn char_key(name: &str) -> Option<egui::Key> {
 }
 
 // ------------------------------------------------------------------
-// Server: the socket the pump drains — ctl's shape, cut to the four
-// verbs above.
+// Server: the socket the pump drains. The transport half —
+// `Pending`'s buffered request/flush lifecycle, the accept loop, the
+// listener bind — is [`ait_app::ctl`]'s own code (Spec R15's "ctl's
+// conventions exactly" decision made literal: same code, not a twin);
+// what lives here is the verb set it serves.
 // ------------------------------------------------------------------
-
-/// Whether a pending connection survives this service pass.
-enum Service {
-    /// Keep it for the next pass (request incomplete, reply stalled).
-    Keep,
-    /// Drop it — answered, expired, or the client went away.
-    Close,
-}
-
-/// One accepted connection buffered across passes: request bytes
-/// until a full line exists, then the response flushing out.
-struct Pending {
-    /// The accepted (nonblocking) stream.
-    stream: UnixStream,
-    /// Buffered request bytes — a complete request ends at `'\n'`.
-    request: Vec<u8>,
-    /// The response being flushed — `(bytes, written)`.
-    reply: Option<(Vec<u8>, usize)>,
-    /// When the connection was accepted — the [`PENDING_TTL`] bound.
-    at: Instant,
-}
-
-impl Pending {
-    /// A fresh accepted connection.
-    fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            request: Vec::new(),
-            reply: None,
-            at: Instant::now(),
-        }
-    }
-
-    /// Service the connection once: flush a queued reply, else buffer
-    /// request bytes until a full line exists and dispatch it.
-    /// Returns the verdict plus the injected-input count the pass
-    /// needs a frame for (`dump` answers without one — a poll that
-    /// repainted every 5 ms would idle-spin the window).
-    fn service(&mut self, ctx: &egui::Context, shared: &mut Shared) -> (Service, usize) {
-        if self.at.elapsed() > PENDING_TTL {
-            return (Service::Close, 0);
-        }
-        if self.reply.is_some() {
-            return (self.flush(), 0);
-        }
-        let mut chunk = [0u8; 8192];
-        match self.stream.read(&mut chunk) {
-            Ok(0) => (Service::Close, 0),
-            Ok(n) => {
-                self.request.extend_from_slice(&chunk[..n]);
-                match self.request.iter().position(|b| *b == b'\n') {
-                    Some(end) if end > REQUEST_CAP => (self.fail("request too large"), 0),
-                    Some(end) => {
-                        let line = String::from_utf8_lossy(&self.request[..end]).into_owned();
-                        self.answer(ctx, shared, &line)
-                    }
-                    None if self.request.len() > REQUEST_CAP => (self.fail("request too large"), 0),
-                    None => (Service::Keep, 0),
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (Service::Keep, 0),
-            Err(_) => (Service::Close, 0),
-        }
-    }
-
-    /// Decode + dispatch + queue the response — even a malformed line
-    /// earns a well-formed `{"ok":false}` before the close. The
-    /// returned count is the injected items the dispatch queued.
-    fn answer(&mut self, ctx: &egui::Context, shared: &mut Shared, line: &str) -> (Service, usize) {
-        let injected_before = shared.injected.len();
-        let response = match decode_request(line) {
-            Ok(request) => dispatch(ctx, shared, &request),
-            Err(error) => Response::error(error),
-        };
-        (
-            self.queue(response),
-            shared.injected.len() - injected_before,
-        )
-    }
-
-    /// Queue `response` as the reply line and start flushing it.
-    fn queue(&mut self, response: Response) -> Service {
-        let mut line = encode_response(&response);
-        line.push('\n');
-        self.reply = Some((line.into_bytes(), 0));
-        self.flush()
-    }
-
-    /// `queue`'s string form — the oversized-request rejection.
-    fn fail(&mut self, message: &str) -> Service {
-        self.queue(Response::error(message.to_owned()))
-    }
-
-    /// Write out the queued reply — a full flush closes the
-    /// connection (one request per invocation), a `WouldBlock` keeps
-    /// it for the next pass.
-    fn flush(&mut self) -> Service {
-        use std::net::Shutdown;
-        let Some((bytes, mut written)) = self.reply.take() else {
-            return Service::Close;
-        };
-        while written < bytes.len() {
-            match self.stream.write(&bytes[written..]) {
-                Ok(0) => break,
-                Ok(n) => written += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.reply = Some((bytes, written));
-                    return Service::Keep;
-                }
-                Err(_) => return Service::Close,
-            }
-        }
-        // Half-close so the client's read sees the line's end even
-        // before its own side closes.
-        let _ = self.stream.shutdown(Shutdown::Write);
-        Service::Close
-    }
-}
 
 /// Decode one request line — anything that isn't one [`Request`]
 /// line is an error naming the failure.
@@ -1846,16 +1783,34 @@ fn decode_request(line: &str) -> Result<Request, String> {
     serde_json::from_str(line.trim()).map_err(|e| format!("malformed request: {e}"))
 }
 
+/// Encode `image` (the RGBA `ColorImage` a `ViewportCommand::
+/// Screenshot` callback delivers) as a PNG at `path` — written to a
+/// sibling `.part` file and renamed into place, so a client polling
+/// for the file never sees a half-flushed image. The callback runs
+/// on the UI thread; the write is small (one frame's bytes) and off
+/// any hot path — only `screenshot` requests ever reach it.
+fn write_png(path: &Path, image: &egui::ColorImage) -> io::Result<()> {
+    let staging = path.with_extension("part");
+    let encode = || -> Result<(), png::EncodingError> {
+        let file = std::fs::File::create(&staging).map_err(png::EncodingError::IoError)?;
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            image.size[0] as u32,
+            image.size[1] as u32,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(image.as_raw())?;
+        Ok(())
+    };
+    encode().map_err(io::Error::other)?;
+    std::fs::rename(&staging, path)
+}
+
 /// Encode one response to its single-line JSON form.
 fn encode_response(response: &Response) -> String {
     serde_json::to_string(response).expect("Response serialization is infallible")
-}
-
-/// `path` at `mode` — the socket's `0600` (same-uid is the trust
-/// boundary), the parent dir's `0700`.
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// The test-driver socket: a nonblocking `UnixListener` at the path
@@ -1890,15 +1845,10 @@ impl TestDriver {
         if let Some(dir) = socket.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
-                set_mode(dir, 0o700)?;
+                ctl::set_mode(dir, 0o700)?;
             }
         }
-        if socket.exists() {
-            std::fs::remove_file(&socket)?;
-        }
-        let listener = UnixListener::bind(&socket)?;
-        set_mode(&socket, 0o600)?;
-        listener.set_nonblocking(true)?;
+        let listener = ctl::bind_socket(&socket)?;
         Ok(Self {
             listener,
             socket,
@@ -1919,23 +1869,24 @@ impl TestDriver {
     /// the count of injected items queued this pass — the repaint
     /// decision (a `dump`-only pass needs no frame).
     pub fn drain(&mut self, ctx: &egui::Context, shared: &mut Shared) -> usize {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // An accept that can't go nonblocking is dropped —
-                    // a blocking conn in `pending` would wedge the pass.
-                    if stream.set_nonblocking(true).is_ok() {
-                        self.pending.push(Pending::new(stream));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+        Pending::accept(&self.listener, &mut self.pending);
         let mut injected = 0;
         for mut conn in std::mem::take(&mut self.pending) {
-            let (verdict, count) = conn.service(ctx, shared);
-            injected += count;
+            // `answer` is the decode+dispatch+encode fold — the
+            // injected count is how much input the dispatch queued,
+            // which the pump turns into the repaint request.
+            let before = shared.injected.len();
+            let verdict = conn.service(
+                |line| {
+                    let response = match decode_request(line) {
+                        Ok(request) => dispatch(ctx, shared, &request),
+                        Err(error) => Response::error(error),
+                    };
+                    encode_response(&response)
+                },
+                || encode_response(&Response::error("request too large".to_owned())),
+            );
+            injected += shared.injected.len() - before;
             if let Service::Keep = verdict {
                 self.pending.push(conn);
             }
@@ -1972,7 +1923,9 @@ mod tests {
     use ait_term::Size;
     use eframe::egui::Plugin;
     use std::collections::VecDeque;
+    use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
 
     /// A `Shared` built like `GuiApp::new`'s minus the store, over a
     /// real interactive `/bin/sh` tab — the pump tests' shape.
@@ -2007,6 +1960,8 @@ mod tests {
             hits: crate::app::HitTargets::default(),
             detect_hover: DetectHover::default(),
             cell_metrics: None,
+            input_seq: 0,
+            input_done: 0,
         }
     }
 
@@ -2313,6 +2268,66 @@ mod tests {
         assert!(response.contains(r#""ok":false"#), "{response}");
     }
 
+    /// `screenshot` answers `ok` and queues a real
+    /// `ViewportCommand::Screenshot` — the command surfaces in the
+    /// frame output, where the integration's pixel readback picks it
+    /// up. No `Injected` marker: `request_screenshot` requests the
+    /// repaint itself.
+    #[test]
+    fn screenshot_queues_the_viewport_command() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Screenshot {
+                path: png.display().to_string(),
+            },
+        );
+        assert!(response.ok);
+        assert!(
+            shared.injected.is_empty(),
+            "screenshot queues no injected input"
+        );
+        let output = ctx.run_pass(egui::RawInput::default(), |_| {});
+        let found = output
+            .viewport_output
+            .values()
+            .flat_map(|viewport| viewport.commands.iter())
+            .any(|command| matches!(command, egui::ViewportCommand::Screenshot(_)));
+        output.drop_without_applying_deltas();
+        assert!(found, "the viewport queue holds the screenshot command");
+    }
+
+    /// `write_png` emits a decodable PNG — signature, dimensions and
+    /// color type what any evidence viewer accepts — and the `.part`
+    /// staging file never lingers.
+    #[test]
+    fn write_png_produces_a_decodable_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        let image = egui::ColorImage::filled([4, 2], egui::Color32::RED);
+        write_png(&png, &image).expect("encode the frame");
+
+        let bytes = std::fs::read(&png).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().expect("decode the header");
+        assert_eq!(
+            (reader.info().width, reader.info().height),
+            (4, 2),
+            "the encoded dimensions"
+        );
+        let mut buf = vec![0; reader.output_buffer_size().expect("a sized frame")];
+        reader.next_frame(&mut buf).expect("decode the image data");
+        assert!(
+            !png.with_extension("part").exists(),
+            "staging renamed into place"
+        );
+    }
+
     /// `"twin":true` queues press → `Text` → release — the order
     /// egui-winit emits the pair from one `KeyboardInput` — with the
     /// chord's own character as the payload; an explicit `twin` is
@@ -2483,7 +2498,7 @@ mod tests {
         ctx.add_plugin(DriverInputPlugin::default());
         let mut shared = shared();
         shared.hits.register(
-            "explorer.up",
+            || "explorer.up".to_owned(),
             egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(80.0, 18.0)),
         );
 
@@ -2628,7 +2643,7 @@ mod tests {
     fn pointer_positions_resolve_names_and_raw_pairs() {
         let mut shared = shared();
         shared.hits.register(
-            "grid",
+            || "grid".to_owned(),
             egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0)),
         );
         // The target's rect IS the answer — its center, plus offset.
@@ -2745,7 +2760,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut shared = shared();
         shared.hits.register(
-            "grid",
+            || "grid".to_owned(),
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 40.0)),
         );
 
@@ -2919,5 +2934,51 @@ mod tests {
         assert_eq!(grid.columns, 80);
         assert_eq!(grid.lines, 24);
         assert_eq!(grid.rows.len(), 24);
+    }
+
+    /// The `wait_dump` barrier (Spec R15): every request that queues
+    /// frame-folded input bumps `input_seq`, `dump`/`screenshot`
+    /// never do, and the dump carries both halves — the client's
+    /// `input_done >= input_seq` predicate reads exactly this.
+    #[test]
+    fn the_input_barrier_counts_queued_requests() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        // A `dump` answers without entering the count.
+        let r = dispatch(&ctx, &mut shared, &Request::Dump);
+        assert!(r.ok);
+        assert_eq!(shared.input_seq, 0, "dump never bumps the barrier");
+        // Two input verbs — two bumps, regardless of queue content.
+        dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Text {
+                text: "echo hi".to_owned(),
+            },
+        );
+        dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Key {
+                chord: "Enter".to_owned(),
+                twin: None,
+            },
+        );
+        assert_eq!(shared.input_seq, 2);
+        assert_eq!(shared.input_done, 0, "no frame folded yet");
+        // The dump reports both halves verbatim.
+        let dump = Dump::capture(&ctx, &shared);
+        assert_eq!(dump.input_seq, 2);
+        assert_eq!(dump.input_done, 0);
+        // A `screenshot` answers without entering the count either.
+        let r = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Screenshot {
+                path: "/tmp/x.png".to_owned(),
+            },
+        );
+        assert!(r.ok);
+        assert_eq!(shared.input_seq, 2, "screenshot never bumps the barrier");
     }
 }

@@ -235,6 +235,7 @@ dependencies = [
  "dpi",
  "eframe",
  "gtk",
+ "png",
  "raw-window-handle",
  "serde",
  "serde_json",

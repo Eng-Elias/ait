@@ -940,7 +940,7 @@ impl Pane for ExplorerPane {
             // `explorer.up` — the pinned `..` row's hit target, so a
             // scenario clicks the parent affordance by name (Spec
             // R15-T4).
-            shared.hits.register("explorer.up", up_row);
+            shared.hits.register(|| "explorer.up".to_owned(), up_row);
             if hit.hovered() {
                 painter.rect_filled(up_row, 0.0, hover);
             }
@@ -996,10 +996,10 @@ impl Pane for ExplorerPane {
             // listing (the same numbering `entries` filters to).
             shared
                 .hits
-                .register(format!("explorer.entry.{}", entry.name), row);
+                .register(|| format!("explorer.entry.{}", entry.name), row);
             shared
                 .hits
-                .register(format!("explorer.row.{position}"), row);
+                .register(|| format!("explorer.row.{position}"), row);
             let label = if entry.kind == EntryKind::Dir {
                 format!("{}/", entry.name)
             } else {
