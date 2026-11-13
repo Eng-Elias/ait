@@ -15,3 +15,6 @@ target/
 
 # Agent scratch space — never committed
 .scratch/
+
+# Python bytecode caches (script import side-effects)
+__pycache__/
