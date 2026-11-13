@@ -430,6 +430,10 @@ mod tests {
             #[cfg(feature = "test-driver")]
             injected: std::collections::VecDeque::new(),
             hits: crate::app::HitTargets::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hover: crate::test_driver::DetectHover::default(),
+            #[cfg(feature = "test-driver")]
+            cell_metrics: None,
         }))
     }
 
