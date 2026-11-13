@@ -376,7 +376,11 @@ impl GuiApp {
         // twice: some platforms emit BOTH `Key{A, alt}` and `Text("a")`
         // for `Alt+A`, which typed `a` into the PTY beside the panel
         // the chord opened. The Key event carries the whole chord to
-        // the resolver — a matching Text char is its twin, eaten here.
+        // the resolver — a matching Text char in the ADJACENT Text
+        // event is its twin, eaten there (winit emits the pair from
+        // one KeyboardInput, so nothing else can interleave); any
+        // other event closes the twin window, or a burst that types
+        // right behind a chord would lose real characters.
         let mut eaten: Vec<char> = Vec::new();
         // Spec R15: the pump's test-socket drain queued injected input
         // between frames — it lands AHEAD of the frame's native events
@@ -404,10 +408,9 @@ impl GuiApp {
                         crate::test_driver::ScrollTarget::Grid => {
                             self.grid_pane.map(|pane| pane.center())
                         }
-                        crate::test_driver::ScrollTarget::Panel => self
-                            .panel_pane
-                            .or(self.grid_pane)
-                            .map(|pane| pane.center()),
+                        crate::test_driver::ScrollTarget::Panel => {
+                            self.panel_pane.or(self.grid_pane).map(|pane| pane.center())
+                        }
                         crate::test_driver::ScrollTarget::At(pos) => Some(pos),
                     };
                     // Before the first painted pane the content rect
@@ -441,6 +444,15 @@ impl GuiApp {
         event: egui::Event,
         eaten: &mut Vec<char>,
     ) {
+        // Only a `Text` event consults the twin filter: winit emits
+        // `Key` + `Text` adjacently from one `KeyboardInput`, so any
+        // other event — the chord's own release, the next press, a
+        // paste, a wheel — closes the twin window. Without this a
+        // burst that types right behind a chord (injected input, a
+        // scripted macro) loses real characters to a stale `eaten`.
+        if !matches!(event, egui::Event::Text(_)) {
+            eaten.clear();
+        }
         match event {
             egui::Event::Key {
                 key,
@@ -3308,6 +3320,48 @@ mod tests {
         // `head -c 1` is still blocked — nothing leaked to the PTY.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The twin window is the ADJACENT Text only: a chord whose
+    /// press+release is followed by typed text in the SAME event
+    /// batch (injected input, a scripted macro — native streams
+    /// coalesce like this too) must not lose the typed char that
+    /// happens to share the chord's letter (R15-T2: `Alt+R` then
+    /// `printf` used to land `pintf`).
+    #[test]
+    fn a_chords_twin_window_closes_at_the_release() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        let modifiers = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        feed(
+            &mut harness,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text("printf".into()),
+            ],
+        );
+        // `Alt+R` on a disabled store toasts — and the whole typed
+        // line survived, 'r' included.
+        assert_eq!(
+            harness.shared().tabs.active().unwrap().shadow.text(),
+            "printf"
+        );
     }
 
     /// The winsize invariant under the host: a pane toggle narrows
