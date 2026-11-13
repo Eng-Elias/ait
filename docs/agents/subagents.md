@@ -31,6 +31,19 @@ subagents.
   dispatch then reports "gate unrun" and the parent runs
   `cargo fmt --all` and `scripts/check.sh` in that worktree
   itself; a ticket that never gated doesn't merge.
+- **ntfs3 target dirs**: the maintainer's dev box keeps worktrees
+  on an ntfs3 mount where `fallocate`/mmap-backed linker output
+  returns EINVAL — `cargo` fails writing binaries and some test
+  artifacts. Point the worktree's `target/` at ext4:
+  `ln -sfn ~/.cache/ait-targets/<ticket> target` (git-ignored);
+  if `rust-lld` still fails on a binary link, run that step with
+  `RUSTFLAGS="-C linker-features=-lld"` (GNU ld). R14 hit this in
+  three tickets independently before it was written down.
+- **PR screenshots**: evidence images go on a sibling
+  `rNN-pr-assets` branch — cut from `origin/dev`, one commit marked
+  "not for merge" — under `docs/pr-evidence/rNN/`; PR bodies embed
+  `github.com/<owner>/<repo>/blob/<sha>/<path>?raw=true`. The
+  assets branch is never merged.
 - **Dispatches are immutable** — a running background subagent
   can't be resumed or messaged mid-flight; front-load every
   pointer at dispatch. An update that lands mid-task rides the
@@ -91,7 +104,9 @@ pointers, restated per dispatch, not re-derived:
   re-explore for it), and the terse report format (what was built,
   tests, gate results, merge state, deviations from the ticket's
   acceptance criteria — required, write "none" — hand-off names for
-  later tickets).
+  later tickets). New surface grown in a crate the spec froze is a
+  deviation — name it in the report; shipping it silently turns it
+  into a review finding (R14's `close_agent_panel`).
 - **Merger/explorer** dispatches stay sparse: the explorer needs only
   the notes-dir path, the spec issue, and the topic list; the merger
   only the two branches and the gate command. The merger skips the
@@ -105,7 +120,9 @@ pointers, restated per dispatch, not re-derived:
   `Shared`/`GuiApp` fixtures are the recurring seam (R13) — git merges
   both hunks silently and drops one side's field. Build before
   declaring the merge clean; never trust the absence of conflict
-  markers on shared struct literals.
+  markers on shared struct literals. `cargo fmt --all --check`
+  the merge result too — union hunks merge clean but arrive
+  unformatted (R14's T3 merge).
 - **Flake triage**: a gate failure in a test on
   `docs/agents/flaky-tests.md`'s list is probably load, not your
   change — rerun the named test alone before re-diagnosing; a pass

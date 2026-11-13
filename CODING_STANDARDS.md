@@ -46,4 +46,11 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
     and URLs are exempt (a URL split across lines breaks copy-paste,
     a table row can't wrap). Reviewers cite this rule rather than
     re-adjudicating line-length nits per round (R12).
+20. No filesystem or environment syscalls on per-frame paths (paint,
+    dispatch, hover) without memoization — an `exists()` or a
+    `/proc/<pid>/cwd` readlink per token per frame stalls the UI
+    thread on slow filesystems. Cache keyed on the inputs that
+    invalidate the result (position + content + cwd), never
+    wall-clock. (R14: Ctrl+hover detection and the explorer's cwd
+    re-root both needed a memo pass after review.)
 
