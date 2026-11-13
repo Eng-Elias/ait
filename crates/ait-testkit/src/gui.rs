@@ -25,6 +25,18 @@
 //! tag, `env` pairs, ordered `[[steps]]` — run through a spawned
 //! [`GuiE2e`]. GUI verbs are the driver protocol's verbs plus the
 //! bounded dump assertions.
+//!
+//! The dual-binary matrix (R15-T5): a scenario's `binary = "web"` /
+//! `"noweb"` declares which `ait-gui` build it needs — the
+//! `web`+`test-driver` one (embedded webview) or the
+//! `--no-default-features`+`test-driver` one (external-open surface,
+//! no webkit packages). The test target resolves a leg through
+//! `AIT_GUI_E2E_BIN_WEB`/`AIT_GUI_E2E_BIN_NOWEB` first, else the
+//! cargo-built binary when its feature set matches; a scenario whose
+//! leg can't resolve skips loudly, never fails. `stub_opener = true`
+//! puts a recording `xdg-open`/`open` first on the app's `PATH`, so
+//! `expect_open` asserts the platform hand-off (`ext ↗`, an external
+//! Enter navigation, an editor spawn) without real applications.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -151,6 +163,27 @@ fn display(headed: bool) -> Option<Display> {
     choose_display(headed, have_display, xvfb_run())
 }
 
+/// Which `ait-gui` binary a scenario needs — the dual-binary matrix
+/// (Spec R15-T5): the same harness drives the `web`+`test-driver`
+/// build and the `--no-default-features`+`test-driver` one, and a
+/// scenario declares its surface rather than probing features at
+/// runtime. The test target resolves it — `AIT_GUI_E2E_BIN_WEB` /
+/// `AIT_GUI_E2E_BIN_NOWEB` name per-leg binaries, else the cargo-
+/// built binary answers the leg it was compiled for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuiBinary {
+    /// Whatever the harness's default resolution finds — the spawn
+    /// takes `AIT_GUI_E2E_BIN`/`CARGO_BIN_EXE_ait-gui` regardless of
+    /// its feature set (the default when `binary` is absent).
+    Any,
+    /// A `web`-feature binary — the embedded-webview surface.
+    Web,
+    /// A `--no-default-features` binary — the external-open surface
+    /// (and a build needing no webkit packages).
+    Noweb,
+}
+
 /// What [`GuiE2e::spawn`] launches — the `SpawnConfig` twin: program +
 /// argv, extra env applied after the pins, headed override.
 pub struct GuiSpawnConfig {
@@ -165,6 +198,11 @@ pub struct GuiSpawnConfig {
     /// Headed mode: drive the developer's `DISPLAY` instead of xvfb
     /// (debugging a scenario visually).
     pub headed: bool,
+    /// Stub the platform opener (Spec R15-T5): `<cwd>/opener-stub/`
+    /// gains a fake `xdg-open`/`open` earlier on `PATH` that appends
+    /// its argv to `<cwd>/opener.log`, so `ext ↗`, editor spawns and
+    /// external URL hand-offs assert without real applications.
+    pub stub_opener: bool,
 }
 
 impl GuiSpawnConfig {
@@ -176,8 +214,32 @@ impl GuiSpawnConfig {
             args: Vec::new(),
             env: Vec::new(),
             headed: false,
+            stub_opener: false,
         }
     }
+}
+
+/// The stub opener's install: `dir` gets an executable script per
+/// opener name (`xdg-open`, `open`) that appends its argv, one entry
+/// per line, to `log`. The caller puts `dir` first on `PATH` — the
+/// platform's real verb is never reached.
+fn install_opener_stub(dir: &Path, log: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    for name in ["xdg-open", "open"] {
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n# Harness stub — records the invocation's argv, one\n\
+                 # argument per line, and never opens anything.\nprintf '%s\\n' \
+                 \"$@\" >> \"{}\"\n",
+                log.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// One request on the driver wire — the server's enum, serialized
@@ -394,6 +456,10 @@ pub struct Dump {
     pub grid: Option<GridDump>,
     /// The side region's state.
     pub pane: PaneDump,
+    /// The browser pane's model — surface verdict, address entry,
+    /// history, load tally and staged webview rect (R15-T5).
+    #[serde(default)]
+    pub browser: BrowserDump,
     /// The find bar while it's open — `null` IS its closed state.
     #[serde(default)]
     pub find: Option<FindDump>,
@@ -489,6 +555,47 @@ pub struct PaneDump {
     pub shown: Option<String>,
     /// The app-global aux selection: `explorer`/`browser`/`null`.
     pub selected: Option<String>,
+}
+
+/// The browser pane's state (R15-T5) — the client's mirror of the
+/// server's `BrowserDump` (keep in lockstep). `Default` so an older
+/// binary's browser-less dump still decodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrowserDump {
+    /// The embed verdict — `unknown`/`embedded`/`external`.
+    #[serde(default)]
+    pub surface: String,
+    /// The external fallback's reason line — the body's first
+    /// painted line; `null` unless `surface` is `external`.
+    #[serde(default)]
+    pub external_reason: Option<String>,
+    /// The address entry's text.
+    #[serde(default)]
+    pub entry: String,
+    /// The `not a URL` hint flag — the amber entry's condition.
+    #[serde(default)]
+    pub bad_entry: bool,
+    /// The visited-history's depth.
+    #[serde(default)]
+    pub history: usize,
+    /// The current page's URL — `null` before any navigation.
+    #[serde(default)]
+    pub current: Option<String>,
+    /// `‹`'s enabled state.
+    #[serde(default)]
+    pub back: bool,
+    /// `›`'s enabled state.
+    #[serde(default)]
+    pub forward: bool,
+    /// Webview-bound loads issued — submits, history steps and
+    /// reloads count; external hand-offs and webview-reported
+    /// navigations never do.
+    #[serde(default)]
+    pub loads: usize,
+    /// The rect staged for the webview child — `Some` while the
+    /// pane shows an embedded body, `null` the hide signal.
+    #[serde(default)]
+    pub webview_rect: Option<RectDump>,
 }
 
 /// The find bar's state while it's open.
@@ -627,6 +734,15 @@ impl Dump {
             fnv(&mut h, &find.hits.to_le_bytes());
         }
         fnv(&mut h, &[self.suggesting as u8]);
+        fnv(&mut h, self.browser.surface.as_bytes());
+        fnv(&mut h, self.browser.entry.as_bytes());
+        fnv(&mut h, &[self.browser.bad_entry as u8]);
+        fnv(&mut h, &self.browser.history.to_le_bytes());
+        fnv(&mut h, &self.browser.loads.to_le_bytes());
+        if let Some(current) = &self.browser.current {
+            fnv(&mut h, current.as_bytes());
+        }
+        fnv(&mut h, &[self.browser.webview_rect.is_some() as u8]);
         if let Some(agent) = &self.agent {
             fnv(&mut h, &[agent.open as u8, agent.focused as u8]);
             match &agent.gate {
@@ -722,6 +838,28 @@ impl GuiE2e {
         let socket = cwd.path().join("driver.sock");
         let (mut env, runtime_dir) = pinned_env(cwd.path(), &socket)?;
         env.extend(config.env);
+        if config.stub_opener {
+            // The PATH-stub opener: the stub dir leads PATH so the
+            // app's `platform_opener` spawns the recorder, not the
+            // real `xdg-open`. A scenario-supplied PATH is honored as
+            // the base (the stub still leads it); absent that, the
+            // inherited one is.
+            let dir = cwd.path().join("opener-stub");
+            install_opener_stub(&dir, &cwd.path().join("opener.log"))?;
+            let base = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            let mut path = dir.into_os_string();
+            if !base.is_empty() {
+                path.push(":");
+                path.push(base);
+            }
+            env.push((OsString::from("PATH"), path));
+        }
 
         let mut command = match display {
             Display::Direct => {
@@ -1197,6 +1335,52 @@ impl GuiE2e {
         }
     }
 
+    /// The stub opener's recorded argv lines so far — every platform
+    /// hand-off the app spawned (`ext ↗`, external Enter navigation,
+    /// an editor spawn), one argument per line. Empty until the stub
+    /// first runs — and always empty when the spawn didn't set
+    /// [`GuiSpawnConfig::stub_opener`].
+    pub fn opened_urls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.cwd.path().join("opener.log"))
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// Bounded wait until the stub opener's log holds `needle` — the
+    /// [`wait_for_dump`](Self::wait_for_dump) twin for the opener
+    /// half of a scenario (`expect_open`). The failure message shows
+    /// the recorded argv plus the last dump.
+    ///
+    /// # Panics
+    /// On timeout or app exit, with the opener log in the message.
+    pub fn wait_for_open(&self, needle: &str) {
+        self.log_action(format!("wait_for_open({needle:?})"));
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            let urls = self.opened_urls();
+            if urls.iter().any(|line| line.contains(needle)) {
+                self.log_action(format!("wait_for_open({needle:?}) → satisfied"));
+                return;
+            }
+            if let Some(status) = self.exited() {
+                panic!(
+                    "waiting for opener log {needle:?}: ait-gui exited ({status:?})\n\
+                     --- opener log ---\n{}",
+                    urls.join("\n")
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {WAIT_TIMEOUT:?} waiting for the stub opener \
+                 to record {needle:?}\n--- opener log ---\n{}\n\
+                 --- last dump ---\n{}",
+                urls.join("\n"),
+                self.last_dump_text()
+            );
+            std::thread::sleep(WAIT_POLL);
+        }
+    }
+
     /// The app's exit status if it already exited — cached: `try_wait`
     /// is only consulted until it first yields `Some`.
     fn exited(&self) -> Option<ExitStatus> {
@@ -1312,6 +1496,8 @@ const GUI_VERBS: &[&str] = &[
     "expect_gate",
     "expect_selection",
     "expect_hit",
+    "expect_browser",
+    "expect_open",
     "expect_pane_selected",
     "expect_status",
     "expect_toast",
@@ -1325,6 +1511,10 @@ const GUI_VERBS: &[&str] = &[
 ///
 /// ```toml
 /// feature = "panes"
+/// binary = "web"                     # optional — the dual-binary leg:
+///                                    # "web" | "noweb" | any when absent
+/// stub_opener = true                 # optional — record platform-opener
+///                                    # invocations for `expect_open`
 ///
 /// [[steps]]
 /// key = "Ctrl+Shift+E"               # one chord through the app's dispatch
@@ -1337,6 +1527,9 @@ const GUI_VERBS: &[&str] = &[
 ///
 /// [[steps]]
 /// expect_pane = "explorer"           # bounded wait on pane.shown
+///
+/// [[steps]]
+/// expect_browser = { surface = "embedded" }   # bounded wait on browser state
 ///
 /// [[steps]]
 /// expect_text = "files"              # bounded wait on grid text
@@ -1352,6 +1545,11 @@ pub struct GuiScenario {
     pub env: Vec<(OsString, OsString)>,
     /// The ordered steps.
     pub steps: Vec<GuiStep>,
+    /// `binary = "web"|"noweb"` — the dual-binary leg the scenario
+    /// needs (Spec R15-T5); [`GuiBinary::Any`] when absent.
+    binary: GuiBinary,
+    /// `stub_opener = true` — record platform-opener invocations.
+    stub_opener: bool,
     /// `headed = true` — drive the developer's `DISPLAY`.
     headed: bool,
     /// The file stem — failure messages and dump dirs.
@@ -1486,6 +1684,15 @@ pub enum GuiStep {
     /// `click` after a state expectation needs this to resolve, or it
     /// can hit the `unknown hit target` refusal a frame early.
     ExpectHit(String),
+    /// `expect_browser` — bounded wait on the browser pane's dump
+    /// state (R15-T5): a table of assertions, every present key must
+    /// hold — `expect_browser = { surface = "embedded",
+    /// entry_contains = "example.com", loads = 1 }`.
+    ExpectBrowser(BrowserExpect),
+    /// `expect_open` — bounded wait until the stub opener's log
+    /// holds this string — the `ext ↗`/external-navigation hand-off
+    /// (`stub_opener = true` must name the spawn).
+    ExpectOpen(String),
     /// `expect_pane_selected` — assert the app-global aux selection
     /// (`pane.selected`): `explorer`/`browser`, or `none` for no
     /// selection — the state that survives UNDER the agent claim
@@ -1506,6 +1713,167 @@ pub enum GuiStep {
     ExpectTabs(usize),
     /// `quit` — the app's normal close.
     Quit,
+}
+
+/// `expect_browser`'s assertions — every present key must hold at
+/// once; absent keys assert nothing. Exact-match keys (`entry`,
+/// `current`, `history`, `loads`) compare `==`; `*_contains` and
+/// `reason` are substring checks; `history_min`/`loads_min` are `>=`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BrowserExpect {
+    /// `browser.surface` — `unknown`/`embedded`/`external`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    /// Substring of `browser.external_reason` — the fallback body's
+    /// first line (`"no webview runtime"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `browser.entry`, exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// Substring of `browser.entry`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_contains: Option<String>,
+    /// `browser.bad_entry` — the amber hint's flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_entry: Option<bool>,
+    /// `browser.history`, exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<usize>,
+    /// `browser.history >= n` — the tolerant form for reports the
+    /// webview may echo back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_min: Option<usize>,
+    /// `browser.current`, exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Substring of `browser.current`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_contains: Option<String>,
+    /// `browser.back` — `‹`'s enabled state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back: Option<bool>,
+    /// `browser.forward` — `›`'s enabled state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forward: Option<bool>,
+    /// `browser.loads`, exact — webview-bound fetches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loads: Option<usize>,
+    /// `browser.loads >= n`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loads_min: Option<usize>,
+    /// `browser.webview_rect` presence — `true` a rect is staged
+    /// (embedded body laid out), `false` the hide signal holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webview: Option<bool>,
+}
+
+impl BrowserExpect {
+    /// Whether at least one assertion is present — an empty table is
+    /// a scenario typo, not a pass.
+    fn any(&self) -> bool {
+        self.surface.is_some()
+            || self.reason.is_some()
+            || self.entry.is_some()
+            || self.entry_contains.is_some()
+            || self.bad_entry.is_some()
+            || self.history.is_some()
+            || self.history_min.is_some()
+            || self.current.is_some()
+            || self.current_contains.is_some()
+            || self.back.is_some()
+            || self.forward.is_some()
+            || self.loads.is_some()
+            || self.loads_min.is_some()
+            || self.webview.is_some()
+    }
+
+    /// Every present assertion against one dump.
+    fn matches(&self, browser: &BrowserDump) -> bool {
+        if let Some(surface) = &self.surface {
+            if browser.surface != *surface {
+                return false;
+            }
+        }
+        if let Some(reason) = &self.reason {
+            let Some(text) = &browser.external_reason else {
+                return false;
+            };
+            if !text.contains(reason.as_str()) {
+                return false;
+            }
+        }
+        if let Some(entry) = &self.entry {
+            if browser.entry != *entry {
+                return false;
+            }
+        }
+        if let Some(entry) = &self.entry_contains {
+            if !browser.entry.contains(entry.as_str()) {
+                return false;
+            }
+        }
+        if let Some(bad) = self.bad_entry {
+            if browser.bad_entry != bad {
+                return false;
+            }
+        }
+        if let Some(history) = self.history {
+            if browser.history != history {
+                return false;
+            }
+        }
+        if let Some(min) = self.history_min {
+            if browser.history < min {
+                return false;
+            }
+        }
+        if let Some(current) = &self.current {
+            if browser.current.as_deref() != Some(current.as_str()) {
+                return false;
+            }
+        }
+        if let Some(current) = &self.current_contains {
+            let Some(text) = &browser.current else {
+                return false;
+            };
+            if !text.contains(current.as_str()) {
+                return false;
+            }
+        }
+        if let Some(back) = self.back {
+            if browser.back != back {
+                return false;
+            }
+        }
+        if let Some(forward) = self.forward {
+            if browser.forward != forward {
+                return false;
+            }
+        }
+        if let Some(loads) = self.loads {
+            if browser.loads != loads {
+                return false;
+            }
+        }
+        if let Some(min) = self.loads_min {
+            if browser.loads < min {
+                return false;
+            }
+        }
+        if let Some(webview) = self.webview {
+            if browser.webview_rect.is_some() != webview {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A short listing of the present keys — the wait's description.
+    fn describe(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{…}".to_string())
+    }
 }
 
 /// `key`'s `twin` — how the platform text twin's payload resolves.
@@ -1572,6 +1940,8 @@ impl GuiStep {
             Self::ExpectGate(_) => "expect_gate",
             Self::ExpectSelection(_) => "expect_selection",
             Self::ExpectHit(_) => "expect_hit",
+            Self::ExpectBrowser(_) => "expect_browser",
+            Self::ExpectOpen(_) => "expect_open",
             Self::ExpectPaneSelected(_) => "expect_pane_selected",
             Self::ExpectStatus(_) => "expect_status",
             Self::ExpectToast(_) => "expect_toast",
@@ -1706,6 +2076,12 @@ impl GuiStep {
                     dump.hit(name).is_some()
                 });
             }
+            Self::ExpectBrowser(expect) => {
+                e2e.wait_for_dump(&format!("expect_browser {}", expect.describe()), |dump| {
+                    expect.matches(&dump.browser)
+                });
+            }
+            Self::ExpectOpen(needle) => e2e.wait_for_open(needle),
             Self::ExpectPaneSelected(pane) => {
                 e2e.wait_for_dump(&format!("expect_pane_selected {pane:?}"), |dump| match pane
                     .as_str()
@@ -1749,6 +2125,14 @@ struct RawGuiScenario {
     /// `env = { KEY = "value" }` applied after the pins.
     #[serde(default)]
     env: toml::Table,
+    /// `binary = "web"|"noweb"` — the dual-binary leg the scenario
+    /// needs (R15-T5); absent means any binary answers it.
+    #[serde(default)]
+    binary: Option<GuiBinary>,
+    /// `stub_opener = true` — the spawn installs the PATH-stub
+    /// opener so `expect_open` has a log to wait on.
+    #[serde(default)]
+    stub_opener: bool,
     /// `headed = true` — drive the developer's `DISPLAY`.
     #[serde(default)]
     headed: bool,
@@ -1797,18 +2181,31 @@ impl GuiScenario {
             feature: raw.feature,
             env,
             steps,
+            binary: raw.binary.unwrap_or(GuiBinary::Any),
+            stub_opener: raw.stub_opener,
             headed: raw.headed,
             name,
             source: source.to_string(),
         })
     }
 
-    /// A [`GuiSpawnConfig`] honoring the scenario's `env` and `headed`.
+    /// A [`GuiSpawnConfig`] honoring the scenario's `env`, `headed`
+    /// and `stub_opener` — the caller picked `program` per
+    /// [`binary`](Self::binary) already.
     pub fn spawn_config(&self, program: impl Into<OsString>) -> GuiSpawnConfig {
         let mut config = GuiSpawnConfig::new(program);
         config.env = self.env.clone();
         config.headed = self.headed;
+        config.stub_opener = self.stub_opener;
         config
+    }
+
+    /// The binary leg the scenario needs — `web` / `noweb` /
+    /// [`GuiBinary::Any`]. The runner resolves it to a binary path
+    /// (env override first, else the cargo-built binary when its
+    /// feature set matches) and skips loudly when it can't.
+    pub fn binary(&self) -> GuiBinary {
+        self.binary
     }
 
     /// Execute every step in order — a step's own panic is re-raised
@@ -2058,6 +2455,25 @@ fn parse_gui_step(
         )),
         "expect_hit" => Ok(GuiStep::ExpectHit(
             want(value, verb, "a hit-target name").map_err(fail)?,
+        )),
+        "expect_browser" => {
+            let expect: BrowserExpect = want(
+                value,
+                verb,
+                "a { surface?, reason?, entry?, entry_contains?, bad_entry?, \
+                 history?, history_min?, current?, current_contains?, back?, \
+                 forward?, loads?, loads_min?, webview? } table",
+            )
+            .map_err(fail)?;
+            if !expect.any() {
+                return Err(fail(
+                    "`expect_browser` needs at least one assertion key".to_string(),
+                ));
+            }
+            Ok(GuiStep::ExpectBrowser(expect))
+        }
+        "expect_open" => Ok(GuiStep::ExpectOpen(
+            want(value, verb, "a URL substring").map_err(fail)?,
         )),
         "expect_pane_selected" => Ok(GuiStep::ExpectPaneSelected(
             want(value, verb, "a pane name").map_err(fail)?,
@@ -2414,6 +2830,7 @@ mod tests {
                 shown: None,
                 selected: None,
             },
+            browser: BrowserDump::default(),
             find: None,
             suggesting: false,
             window: WindowDump {
@@ -2427,6 +2844,171 @@ mod tests {
             hits: BTreeMap::new(),
         };
         assert_eq!(dump.grid_text(), "a\n\nc");
+    }
+
+    /// The dump's `browser` object (R15-T5) decodes — verdict, entry,
+    /// history and the staged webview rect — and an older binary's
+    /// browser-less payload still reads (`#[serde(default)]`).
+    #[test]
+    fn dump_decodes_the_browser_state() {
+        let line = r#"{"ok":true,"dump":{"v":1,"grid":null,"pane":{"shown":"browser","selected":"browser"},"browser":{"surface":"embedded","external_reason":null,"entry":"https://example.com","bad_entry":false,"history":1,"current":"https://example.com","back":false,"forward":false,"loads":1,"webview_rect":{"x":10.0,"y":20.0,"w":300.0,"h":200.0}},"suggesting":false,"window":{"width":640.0,"height":480.0},"agent":null,"hits":{}}}"#;
+        let response: Response = serde_json::from_str(line).unwrap();
+        let dump = response.dump.unwrap();
+        let browser = &dump.browser;
+        assert_eq!(browser.surface, "embedded");
+        assert_eq!(browser.external_reason, None);
+        assert_eq!(browser.entry, "https://example.com");
+        assert_eq!(browser.history, 1);
+        assert_eq!(browser.current.as_deref(), Some("https://example.com"));
+        assert_eq!(browser.loads, 1);
+        assert!(browser.webview_rect.is_some());
+
+        // An external surface — the reason line survives verbatim.
+        let line = r#"{"ok":true,"dump":{"v":1,"grid":null,"pane":{"shown":"browser","selected":"browser"},"browser":{"surface":"external","external_reason":"this build has no webview runtime","entry":"","bad_entry":false,"history":0,"current":null,"back":false,"forward":false,"loads":0,"webview_rect":null},"suggesting":false,"window":{"width":640.0,"height":480.0},"agent":null,"hits":{}}}"#;
+        let response: Response = serde_json::from_str(line).unwrap();
+        let dump = response.dump.unwrap();
+        assert_eq!(dump.browser.surface, "external");
+        assert_eq!(
+            dump.browser.external_reason.as_deref(),
+            Some("this build has no webview runtime")
+        );
+
+        // A pre-T5 binary's dump — no `browser` key at all — still
+        // decodes; the field reads as the zero state.
+        let line = r#"{"ok":true,"dump":{"v":1,"grid":null,"pane":{"shown":null,"selected":null},"find":null,"suggesting":false,"window":{"width":1.0,"height":1.0},"agent":null,"hits":{}}}"#;
+        let response: Response = serde_json::from_str(line).unwrap();
+        assert_eq!(response.dump.unwrap().browser.surface, "");
+    }
+
+    /// `expect_browser` matches on its present keys only — exact,
+    /// substring and minimum forms side by side — and the parse
+    /// rejects an empty table and an unknown key.
+    #[test]
+    fn expect_browser_matches_present_keys() {
+        let browser = BrowserDump {
+            surface: "external".to_string(),
+            external_reason: Some("this build has no webview runtime".to_string()),
+            entry: "https://example.com".to_string(),
+            history: 2,
+            current: Some("https://example.com".to_string()),
+            loads: 3,
+            ..BrowserDump::default()
+        };
+        let expect: BrowserExpect = toml::from_str::<toml::Table>(
+            r#"surface = "external"
+               reason = "no webview runtime"
+               entry_contains = "example.com"
+               history_min = 1
+               current = "https://example.com"
+               loads = 3
+               webview = false"#,
+        )
+        .and_then(|table| BrowserExpect::deserialize(toml::Value::Table(table)))
+        .unwrap();
+        assert!(expect.any());
+        assert!(expect.matches(&browser));
+        // A failing key falses the whole match.
+        let expect: BrowserExpect = toml::from_str::<toml::Table>(r#"loads = 4"#)
+            .and_then(|table| BrowserExpect::deserialize(toml::Value::Table(table)))
+            .unwrap();
+        assert!(!expect.matches(&browser));
+        let expect: BrowserExpect = toml::from_str::<toml::Table>(r#"back = true"#)
+            .and_then(|table| BrowserExpect::deserialize(toml::Value::Table(table)))
+            .unwrap();
+        assert!(!expect.matches(&browser));
+
+        // The parse arms: unknown key, empty table, wrong shape.
+        let bad = GuiScenario::parse(
+            "t".to_string(),
+            "t.toml",
+            r#"feature = "x"
+               [[steps]]
+               expect_browser = { typo = 1 }"#,
+        );
+        assert!(bad.is_err(), "{bad:?}");
+        let bad = GuiScenario::parse(
+            "t".to_string(),
+            "t.toml",
+            r#"feature = "x"
+               [[steps]]
+               expect_browser = { }"#,
+        );
+        assert!(bad.is_err(), "{bad:?}");
+        let good = GuiScenario::parse(
+            "t".to_string(),
+            "t.toml",
+            r#"feature = "x"
+               [[steps]]
+               expect_browser = { surface = "embedded" }
+               [[steps]]
+               expect_open = "https://example.com""#,
+        )
+        .unwrap();
+        assert!(matches!(good.steps[0], GuiStep::ExpectBrowser(_)));
+        assert!(matches!(good.steps[1], GuiStep::ExpectOpen(_)));
+    }
+
+    /// The dual-binary key and the stub-opener flag parse — `binary`
+    /// defaults to `Any`, the opener to off.
+    #[test]
+    fn scenario_binary_and_stub_opener_parse() {
+        let scenario = GuiScenario::parse(
+            "t".to_string(),
+            "t.toml",
+            r#"feature = "x"
+               binary = "noweb"
+               stub_opener = true
+               [[steps]]
+               quit = true"#,
+        )
+        .unwrap();
+        assert_eq!(scenario.binary(), GuiBinary::Noweb);
+        assert!(scenario.spawn_config("bin").stub_opener);
+
+        let scenario = GuiScenario::parse(
+            "t".to_string(),
+            "t.toml",
+            r#"feature = "x"
+               [[steps]]
+               quit = true"#,
+        )
+        .unwrap();
+        assert_eq!(scenario.binary(), GuiBinary::Any);
+        assert!(!scenario.spawn_config("bin").stub_opener);
+
+        for bad_binary in ["weeb", "", "no_web"] {
+            let bad = GuiScenario::parse(
+                "t".to_string(),
+                "t.toml",
+                &format!("feature = \"x\"\nbinary = \"{bad_binary}\"\n[[steps]]\nquit = true"),
+            );
+            assert!(bad.is_err(), "{bad_binary:?}");
+        }
+    }
+
+    /// The stub opener install: executable scripts that append argv
+    /// to the log — the PATH-lead trick `spawn` wires.
+    #[test]
+    fn opener_stub_records_argv() {
+        let dir = TempDir::fresh().unwrap();
+        let stub = dir.path().join("bin");
+        let log = dir.path().join("opener.log");
+        install_opener_stub(&stub, &log).unwrap();
+        // `/bin/sh` absolutely — the child's PATH is only the stub
+        // dir, so a bare `sh` wouldn't resolve.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("xdg-open https://example.com 'a b'")
+            .env("PATH", &stub)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines, ["https://example.com", "a b"]);
     }
 
     /// Scenario parsing: verbs type-check, unknown keys and

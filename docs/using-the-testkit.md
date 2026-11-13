@@ -10,25 +10,65 @@ drive the real binary under Xvfb (or the developer's `DISPLAY` with
 `AIT_GUI_E2E_HEADED=1`) over a feature-gated socket. Build it with
 `cargo build -p ait-gui --features test-driver` and run
 `cargo test -p ait-gui --features test-driver --test scenarios`.
+
+The suite is a dual-binary matrix (R15-T5): the `web`+`test-driver`
+build covers the embedded-webview surface, the
+`--no-default-features`+`test-driver` build (no webkit packages
+needed) covers the external-open fallback. A scenario declares its
+leg with `binary = "web"` / `"noweb"` (absent = any binary). Each
+leg resolves through `AIT_GUI_E2E_BIN_WEB` / `AIT_GUI_E2E_BIN_NOWEB`
+first, else the cargo-built binary when its feature set matches —
+so `cargo test -p ait-gui --features test-driver` runs the `web`
+leg and skips `noweb` scenarios loudly, `--no-default-features
+--features test-driver` does the inverse, and setting the other
+leg's env var to a separately built binary runs both in one pass:
+
+```bash
+cargo build -p ait-gui --features test-driver                          # web leg
+cargo build -p ait-gui --no-default-features --features test-driver \
+  --target-dir target/gui-noweb                                      # noweb leg
+AIT_GUI_E2E_BIN_NOWEB=$PWD/target/gui-noweb/debug/ait-gui \
+  cargo test -p ait-gui --features test-driver --test scenarios
+```
+
+(The env paths are absolute — the harness spawns each app in a
+throwaway cwd, where a relative path would dissolve.)
+
+`stub_opener = true` puts a recording `xdg-open`/`open` first on
+the app's `PATH` — `expect_open = "<url substring>"` then waits on
+the stub's log, so `ext ↗`, external Enter navigations and editor
+spawns assert without real applications.
+
 Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
 app's own dispatch), `pointer = {event, target|x, y, …}` and
 `click = "hit.name"` (real egui pointer events aimed at the hit
 registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
-`pill.scroll_bottom`, `detect.url.<u>`, `detect.path.<p>`,
-`detect.<n>`), `agent = {event="approve", name, summary}` (stages a
-real gate card through `AgentPanel::apply`), plus waits/asserts
-`wait_text`/`expect_text`/`expect_pane`/`expect_find`/
-`expect_scroll`/`expect_suggesting`/`expect_gate`/`expect_selection`/
-`expect_hit` (the registry gate — use it when a model expectation
-like `expect_pane` can land a frame before the affordance's paint),
-`expect_pane_selected` (the selection *under* the agent claim —
-`expect_pane` asserts the shown region instead), `expect_status`
-(the status strip's composed text — toast while live, else the
-session summary plus a `suggesting` segment while a request is in
-flight), `expect_toast` (`true`/`false`/substring on a *live* toast)
-and `expect_tabs` (the tab strip's count), and `quit`. The dump also
-carries `agent`/`toast`/`status`/`tabs` objects for code-first legs —
-e.g. `ctl_and_driver_sockets_coexist` runs the real `ait ctl` client
+`pill.scroll_bottom`, `browser.back`/`browser.forward`/
+`browser.reload`/`browser.external`, `detect.url.<u>`,
+`detect.path.<p>`, `detect.<n>`), `agent = {event="approve", name,
+summary}` (stages a real gate card through `AgentPanel::apply`),
+plus waits/asserts `wait_text`/`expect_text`/`expect_pane`/
+`expect_find`/`expect_scroll`/`expect_suggesting`/`expect_gate`/
+`expect_selection`/`expect_hit` (the registry gate — use it when a
+model expectation like `expect_pane` can land a frame before the
+affordance's paint), `expect_browser = {surface, reason, entry,
+entry_contains, bad_entry, history, history_min, current,
+current_contains, back, forward, loads, loads_min, webview}`
+(every present key must hold — `loads` counts webview-bound
+fetches, so a reload or a rejected URL is provable),
+`expect_open` (the stub-opener log), `expect_pane_selected` (the
+selection *under* the agent claim — `expect_pane` asserts the shown
+region instead), `expect_status` (the status strip's composed text —
+toast while live, else the session summary plus a `suggesting`
+segment while a request is in flight), `expect_toast`
+(`true`/`false`/substring on a *live* toast) and `expect_tabs` (the
+tab strip's count), and `quit`. The dump's `browser` object carries
+the surface verdict (`unknown`/`embedded`/`external` + the external
+reason line), the address entry and its amber flag, history
+depth/position, the webview-bound load tally and the staged webview
+rect (`null` is the hide signal); it also carries
+`agent`/`toast`/`status`/`tabs` objects for code-first legs — e.g.
+`ctl_and_driver_sockets_coexist` runs the real `ait ctl` client
 against the spawned app's pinned `XDG_RUNTIME_DIR`
 (`GuiE2e::runtime_dir`) while the driver socket stays bound. The
 manual checklist stays in

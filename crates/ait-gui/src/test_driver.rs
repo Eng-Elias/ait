@@ -57,11 +57,12 @@
 //! - `{"verb":"dump"}` — a versioned JSON snapshot of what the user
 //!   sees, sourced from the same [`Shared`] state `ui`'s paint pass
 //!   reads: the active tab's visible grid rows + cursor, scroll
-//!   position and selection, the pane host's selection, the find
-//!   bar, the suggestion arm, the agent panel's open/focus/gate
-//!   state, the toast slot, the status strip's composed text, the
-//!   tab strip's titles + active index, the window's content size,
-//!   and the hit-target registry (`hits` — every interact site's
+//!   position and selection, the pane host's selection, the browser
+//!   pane's surface verdict/address entry/history, the find bar,
+//!   the suggestion arm, the agent panel's open/focus/gate state,
+//!   the toast slot, the status strip's composed text, the tab
+//!   strip's titles + active index, the window's content size, and
+//!   the hit-target registry (`hits` — every interact site's
 //!   name → rect).
 //! - `{"verb":"quit"}` — the app takes its normal close path
 //!   (`GuiApp::quit` → `ViewportCommand::Close`).
@@ -392,10 +393,9 @@ impl Response {
 }
 
 /// The versioned state snapshot a `dump` request answers — v1 carries
-/// the grid the paint pass draws, the pane the side region shows, and
-/// the window's size. Later tickets extend it (explorer/browser
-/// models, overlays, hit targets); field additions stay v1, shape
-/// changes bump [`DUMP_VERSION`].
+/// the grid the paint pass draws, the pane the side region shows, the
+/// browser pane's surface/entry/history, and the window's size.
+/// Field additions stay v1, shape changes bump [`DUMP_VERSION`].
 #[derive(Debug, Serialize)]
 pub struct Dump {
     /// Protocol version — [`DUMP_VERSION`].
@@ -404,6 +404,11 @@ pub struct Dump {
     pub grid: Option<GridDump>,
     /// The side region's state.
     pub pane: PaneDump,
+    /// The browser pane's model (R15-T5): the surface verdict the
+    /// webview probe reported, the address entry, the history and
+    /// the staged webview rect — the same `Shared::browser` state
+    /// the pane's paint reads.
+    pub browser: BrowserDump,
     /// The find bar while it's open — `Some` IS its visibility (the
     /// `Shared::find` rule the overlays and hit highlights share).
     pub find: Option<FindDump>,
@@ -501,6 +506,45 @@ pub struct PaneDump {
     /// The app-global aux selection — `explorer`/`browser`/`null`,
     /// independent of the agent claim.
     pub selected: Option<&'static str>,
+}
+
+/// The browser pane's visible state (Spec R15-T5) — the surface
+/// verdict (`embedded` vs the external fallback and its reason
+/// line), the address entry as typed/normalized, the `not a URL`
+/// hint flag the entry paints amber on, the history the ‹ › buttons
+/// and `Alt+←`/`Alt+→` walk, the webview-bound load tally, and the
+/// staged rect the webview child is positioned over (`null` is the
+/// hide signal: pane closed or a non-embedded verdict).
+#[derive(Debug, Serialize)]
+pub struct BrowserDump {
+    /// The embed verdict's name — `unknown` (the probe hasn't
+    /// reported), `embedded`, or `external`.
+    pub surface: &'static str,
+    /// The external fallback's reason line — the same
+    /// `WhyExternal::line` the body paints; `null` unless `surface`
+    /// is `external`.
+    pub external_reason: Option<&'static str>,
+    /// The address entry's text — the typed URL, or the normalized
+    /// (or webview-reported) page it syncs to on navigation.
+    pub entry: String,
+    /// The `not a URL` hint flag — the entry's amber paint condition.
+    pub bad_entry: bool,
+    /// The visited-history's depth — the entries ‹ › walk.
+    pub history: usize,
+    /// The current page's URL — `null` before any navigation.
+    pub current: Option<String>,
+    /// `‹`'s enabled state — a page sits behind the current one.
+    pub back: bool,
+    /// `›`'s enabled state — a truncated-forward entry remains.
+    pub forward: bool,
+    /// Webview-bound loads issued — a submit, a history step and a
+    /// reload each add one; external hand-offs and webview-reported
+    /// navigations never do (`BrowserState::loads`).
+    pub loads: usize,
+    /// The body rect staged for the webview child this frame —
+    /// `Some` while the pane shows an embedded body (what the child
+    /// is repositioned over on resize), `null` the hide signal.
+    pub webview_rect: Option<RectDump>,
 }
 
 /// The find bar's visible state while it's open — the same query,
@@ -649,6 +693,28 @@ impl Dump {
             pane: PaneDump {
                 shown: shared.shown_pane().map(side_pane_name),
                 selected: shared.panes.selected().map(pane_name),
+            },
+            browser: {
+                let browser = &shared.browser;
+                BrowserDump {
+                    surface: match browser.embed() {
+                        crate::browser::Embed::Unknown => "unknown",
+                        crate::browser::Embed::Embedded => "embedded",
+                        crate::browser::Embed::External(_) => "external",
+                    },
+                    external_reason: match browser.embed() {
+                        crate::browser::Embed::External(why) => Some(why.line()),
+                        _ => None,
+                    },
+                    entry: browser.entry().to_owned(),
+                    bad_entry: browser.bad_entry(),
+                    history: browser.history_depth(),
+                    current: browser.current().map(str::to_owned),
+                    back: browser.can_go_back(),
+                    forward: browser.can_go_forward(),
+                    loads: browser.loads(),
+                    webview_rect: browser.surface().map(RectDump::from),
+                }
             },
             find: shared.find.as_ref().map(|find| FindDump {
                 query: find.query().to_owned(),
@@ -1789,6 +1855,65 @@ mod tests {
         let line = encode_response(&response);
         assert!(line.contains(r#""ok":true"#), "{line}");
         assert!(line.contains(r#""v":1"#), "{line}");
+    }
+
+    /// The dump's `browser` object (R15-T5) reports the pane's model:
+    /// the probe verdict and its reason line, the entry, the history
+    /// and the webview-bound load tally — a feature-off `Shared`
+    /// reads like the external surface it paints.
+    #[test]
+    fn dump_carries_the_browser_state() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        let browser = &mut shared.browser;
+        // An external verdict (the no-`web` build's) — the reason
+        // string is the body's first line.
+        browser.set_embed(crate::browser::Embed::External(
+            crate::browser::WhyExternal::FeatureOff,
+        ));
+        browser.navigate("example.com");
+        let _ = browser.drain_nav();
+        let response = dispatch(&ctx, &mut shared, &Request::Dump);
+        let line = encode_response(&response);
+        let payload: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let browser = &payload["dump"]["browser"];
+        assert_eq!(browser["surface"], "external", "{browser}");
+        assert_eq!(
+            browser["external_reason"], "this build has no webview runtime",
+            "{browser}"
+        );
+        assert_eq!(browser["entry"], "https://example.com", "{browser}");
+        assert_eq!(browser["history"], 1, "{browser}");
+        assert_eq!(browser["current"], "https://example.com", "{browser}");
+        assert_eq!(browser["loads"], 0, "external drains never fetch");
+        assert_eq!(browser["webview_rect"], serde_json::Value::Null);
+        assert_eq!(browser["bad_entry"], false, "{browser}");
+
+        // An embedded verdict: no reason line, loads count the
+        // webview-bound commands.
+        let browser = &mut shared.browser;
+        browser.set_embed(crate::browser::Embed::Embedded);
+        browser.reload();
+        browser.set_surface(Some(egui::Rect::from_min_size(
+            egui::pos2(1.0, 2.0),
+            egui::vec2(30.0, 40.0),
+        )));
+        let _ = browser.drain_nav();
+        let response = dispatch(&ctx, &mut shared, &Request::Dump);
+        let payload: serde_json::Value = serde_json::from_str(&encode_response(&response)).unwrap();
+        let browser = &payload["dump"]["browser"];
+        assert_eq!(browser["surface"], "embedded", "{browser}");
+        assert_eq!(
+            browser["external_reason"],
+            serde_json::Value::Null,
+            "{browser}"
+        );
+        assert_eq!(browser["loads"], 1, "{browser}");
+        assert_eq!(
+            browser["webview_rect"],
+            serde_json::json!({"x": 1.0, "y": 2.0, "w": 30.0, "h": 40.0}),
+            "{browser}"
+        );
     }
 
     /// Chords resolve to their key and the SOURCE modifier bits —
