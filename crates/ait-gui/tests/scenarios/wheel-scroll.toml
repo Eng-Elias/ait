@@ -1,0 +1,67 @@
+# Spec R15-T2 — the wheel shapes: sub-line `pixel` deltas (winit's
+# `PixelDelta`, the touchpad shape) accumulate through the grid's
+# wheel remainder instead of truncating to zero — the R13 dead-zone.
+# `scroll_offset > 0` is also exactly the `⤓` pill's paint condition.
+feature = "scroll"
+
+[[steps]]
+wait_text = "$"
+
+# Fill scrollback — 200 rows well past the viewport.
+[[steps]]
+text = "seq 1 200"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "200"
+
+# Sub-line pixel deltas: each is far under a row, together they
+# scroll — a dead remainder would leave the offset at 0 forever.
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+[[steps]]
+scroll = { unit = "pixel", dy = 4.0 }
+
+# Scrolled back ≥1 row — and the `⤓` pill is painted (its condition
+# is `scroll_offset > 0`).
+[[steps]]
+expect_scroll = 1
+
+# A whole-line delta lands its WHEEL_LINES rows on top.
+[[steps]]
+scroll = { unit = "line", dy = 1.0 }
+
+[[steps]]
+expect_scroll = 3
+
+# Back down — the view snaps to the live bottom and the pill hides
+# (`expect_scroll = 0` asserts exactly zero).
+[[steps]]
+scroll = { unit = "line", dy = -2.0 }
+
+[[steps]]
+expect_scroll = 0
+
+[[steps]]
+quit = true

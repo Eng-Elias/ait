@@ -517,11 +517,7 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
             Err(error) => Response::error(error),
         },
         Request::Resize { width, height } => {
-            if !width.is_finite()
-                || !height.is_finite()
-                || *width <= 0.0
-                || *height <= 0.0
-            {
+            if !width.is_finite() || !height.is_finite() || *width <= 0.0 || *height <= 0.0 {
                 return Response::error(format!(
                     "resize needs finite positive points, got {width}x{height}"
                 ));
@@ -1103,14 +1099,14 @@ mod tests {
             "",
             "not json",
             r#"{"verb":"bogus"}"#,
-            r#"{"verb":"key"}"#,                        // missing chord
-            r#"{"verb":"key","chord":1}"#,              // wrong type
-            r#"{"verb":"key","chord":"a","twin":1}"#,   // twin is bool|string
-            r#"{"verb":"scroll","dy":3.0}"#,            // missing unit
-            r#"{"verb":"scroll","unit":"inch","dy":1}"#, // unknown unit
+            r#"{"verb":"key"}"#,                                // missing chord
+            r#"{"verb":"key","chord":1}"#,                      // wrong type
+            r#"{"verb":"key","chord":"a","twin":1}"#,           // twin is bool|string
+            r#"{"verb":"scroll","dy":3.0}"#,                    // missing unit
+            r#"{"verb":"scroll","unit":"inch","dy":1}"#,        // unknown unit
             r#"{"verb":"scroll","unit":"line","over":"moon"}"#, // unknown region
-            r#"{"verb":"resize","width":1100}"#,        // missing height
-            r#"{"verb":"send","text":"x"}"#,            // a ctl verb — NOT this socket
+            r#"{"verb":"resize","width":1100}"#,                // missing height
+            r#"{"verb":"send","text":"x"}"#,                    // a ctl verb — NOT this socket
         ] {
             assert!(decode_request(line).is_err(), "{line:?}");
         }
@@ -1385,11 +1381,7 @@ mod tests {
         }
 
         for (width, height) in [(0.0, 100.0), (100.0, -1.0), (f32::NAN, 100.0)] {
-            let response = dispatch(
-                &ctx,
-                &mut shared,
-                &Request::Resize { width, height },
-            );
+            let response = dispatch(&ctx, &mut shared, &Request::Resize { width, height });
             assert!(!response.ok, "{width}x{height}");
             assert!(shared.injected.is_empty());
         }

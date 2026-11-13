@@ -1,0 +1,60 @@
+# Spec R15-T2 — the paste verb and the inert-paste guard: an
+# `Event::Paste` delivers the clipboard payload to the PTY, but a
+# payload containing control bytes (newline, tab, escape) marks the
+# input shadow stale — the `# `-trigger can never verify, so the
+# suggestion path never fires.
+feature = "input"
+
+[[steps]]
+wait_text = "$"
+
+# A plain paste delivers and runs — the verb's baseline.
+[[steps]]
+paste = "printf 'PASTE-%s\\n' OK\n"
+
+[[steps]]
+expect_text = "PASTE-OK"
+
+# A `# ` paste with an embedded newline: the line echoes on the grid
+# (the paste landed), yet `suggesting` never arms — the control byte
+# made it inert by design.
+[[steps]]
+paste = "# list the files\n"
+
+[[steps]]
+expect_text = "# list the files"
+
+[[steps]]
+expect_suggesting = false
+
+# A tab byte in the payload is inert the same way.
+[[steps]]
+paste = "# a\tb\n"
+
+[[steps]]
+expect_text = "# a"
+
+[[steps]]
+expect_suggesting = false
+
+# An escape byte too — and the session is unharmed afterwards.
+[[steps]]
+paste = "# esc\u001bpe\n"
+
+[[steps]]
+expect_text = "# esc"
+
+[[steps]]
+expect_suggesting = false
+
+[[steps]]
+text = "printf 'ALIVE-%s\\n' 1"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "ALIVE-1"
+
+[[steps]]
+quit = true

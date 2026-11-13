@@ -1073,22 +1073,27 @@ impl GuiStep {
                 });
             }
             Self::ExpectFind(expect) => {
-                e2e.wait_for_dump(&format!("expect_find {expect:?}"), |dump| {
-                    match expect {
-                        FindExpect::Open => dump.find.is_some(),
-                        FindExpect::Closed => dump.find.is_none(),
-                        FindExpect::Query(query) => dump
-                            .find
-                            .as_ref()
-                            .is_some_and(|find| find.query.contains(query.as_str())),
-                    }
+                e2e.wait_for_dump(&format!("expect_find {expect:?}"), |dump| match expect {
+                    FindExpect::Open => dump.find.is_some(),
+                    FindExpect::Closed => dump.find.is_none(),
+                    FindExpect::Query(query) => dump
+                        .find
+                        .as_ref()
+                        .is_some_and(|find| find.query.contains(query.as_str())),
                 });
             }
             Self::ExpectScroll(lines) => {
                 e2e.wait_for_dump(&format!("expect_scroll {lines}"), |dump| {
-                    dump.grid
-                        .as_ref()
-                        .is_some_and(|grid| grid.scroll_offset >= *lines)
+                    let Some(grid) = &dump.grid else {
+                        return false;
+                    };
+                    if *lines == 0 {
+                        // `0` reads as "the live bottom" — exact, not
+                        // the trivially-true `>= 0`.
+                        grid.scroll_offset == 0
+                    } else {
+                        grid.scroll_offset >= *lines
+                    }
                 });
             }
             Self::ExpectSuggesting(want) => {
@@ -1267,8 +1272,7 @@ fn parse_gui_step(
             // text twin: `true` derives the chord's character, a
             // string is the payload.
             toml::Value::Table(_) => {
-                let table: KeyTable =
-                    want(value, verb, "a { chord, twin } table").map_err(fail)?;
+                let table: KeyTable = want(value, verb, "a { chord, twin } table").map_err(fail)?;
                 let twin = table.twin.and_then(|twin| match twin {
                     TwinToml::Flag(true) => Some(KeyTwin::Derived),
                     // `twin = false` spelled out means no twin.
@@ -1285,12 +1289,10 @@ fn parse_gui_step(
             ))),
         },
         "text" => Ok(GuiStep::Text(want(value, verb, "a string").map_err(fail)?)),
-        "paste" => Ok(GuiStep::Paste(
-            want(value, verb, "a string").map_err(fail)?,
-        )),
+        "paste" => Ok(GuiStep::Paste(want(value, verb, "a string").map_err(fail)?)),
         "scroll" => {
-            let table: ScrollTable = want(value, verb, "a { unit, dx?, dy?, x?, y?, over? } table")
-                .map_err(fail)?;
+            let table: ScrollTable =
+                want(value, verb, "a { unit, dx?, dy?, x?, y?, over? } table").map_err(fail)?;
             if table.x.is_some() != table.y.is_some() {
                 return Err(fail(
                     "`scroll`'s `x` and `y` travel together or not at all".to_string(),
@@ -1306,8 +1308,8 @@ fn parse_gui_step(
             })
         }
         "resize" => {
-            let table: ResizeTable = want(value, verb, "a { width, height } table")
-                .map_err(fail)?;
+            let table: ResizeTable =
+                want(value, verb, "a { width, height } table").map_err(fail)?;
             Ok(GuiStep::Resize {
                 width: table.width,
                 height: table.height,
@@ -1328,9 +1330,7 @@ fn parse_gui_step(
             } else {
                 FindExpect::Closed
             })),
-            toml::Value::String(query) => {
-                Ok(GuiStep::ExpectFind(FindExpect::Query(query.clone())))
-            }
+            toml::Value::String(query) => Ok(GuiStep::ExpectFind(FindExpect::Query(query.clone()))),
             _ => Err(fail(format!(
                 "`expect_find` must be `true`, `false` or a query string, got {value}"
             ))),
@@ -1572,7 +1572,10 @@ quit = true
             ("[[steps]]\nkey = 1", "typed values"),
             ("[[steps]]\nkey = { chord = \"a\", twin = 1 }", "typed twin"),
             ("[[steps]]\nscroll = { dy = 1 }", "scroll wants a unit"),
-            ("[[steps]]\nscroll = { unit = \"line\", x = 1 }", "x wants y"),
+            (
+                "[[steps]]\nscroll = { unit = \"line\", x = 1 }",
+                "x wants y",
+            ),
             ("[[steps]]\nexpect_find = 1", "typed find"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),

@@ -1,0 +1,41 @@
+# Spec R15-T2 — the find chord: `Ctrl+Shift+F` opens the bar and Esc
+# closes it, while bare `Ctrl+F` stays readline's forward-char and
+# reaches the shell — the bar must never open on it. The `Ctrl+F`
+# proof is the probe: if the bar had opened it would swallow the
+# Enter that runs the marker, and the marker would never land.
+feature = "input"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+key = "Ctrl+Shift+F"
+
+[[steps]]
+expect_find = true
+
+[[steps]]
+key = "Escape"
+
+[[steps]]
+expect_find = false
+
+# Bare Ctrl+F mid-line — it reaches the PTY (the forward-char byte),
+# the Enter still submits, and the bar stays closed throughout.
+[[steps]]
+text = "printf 'FIND-%s\\n' OK"
+
+[[steps]]
+key = "Ctrl+F"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "FIND-OK"
+
+[[steps]]
+expect_find = false
+
+[[steps]]
+quit = true
