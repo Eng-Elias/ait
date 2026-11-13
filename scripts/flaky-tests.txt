@@ -10,3 +10,4 @@ ait-agent write_to_pty_first_write_asks_then_the_session_runs_free
 ait-term the_output_mirror_receives_bytes_as_the_reader_reads_them
 ait-agent demotion_never_replays_and_never_recovers
 ait-agent control_master_runs_commands_over_the_socket
+ait scenarios
