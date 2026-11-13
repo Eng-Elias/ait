@@ -429,6 +429,7 @@ mod tests {
             browser: crate::browser::BrowserState::default(),
             #[cfg(feature = "test-driver")]
             injected: std::collections::VecDeque::new(),
+            hits: crate::app::HitTargets::default(),
         }))
     }
 
