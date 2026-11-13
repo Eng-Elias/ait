@@ -61,14 +61,17 @@ Work top to bottom; each item is cheap once the window is up.
   is closed opens it, a click while that pane shows toggles it off.
   `..` in the explorer stops at the session root — it never climbs
   to `/`.
-- **Explorer cwd tracking** — `Ctrl+Shift+E` opens the explorer rooted
+- **Explorer cwd tracking** *(scenario: explorer-browse; test:
+  explorer_reroots_on_tab_switch)* — `Ctrl+Shift+E` opens the explorer rooted
   at the shell's cwd: `cd elsewhere` (an OSC-7-reporting shell)
   re-roots the listing, and switching tabs re-roots to that tab's cwd.
-- **Explorer browsing** — `↓`/`↑` move the highlight, `Enter`/`→`
+- **Explorer browsing** *(scenario: explorer-browse; test:
+  explorer_editor_stub_and_refresh)* — `↓`/`↑` move the highlight, `Enter`/`→`
   descend into a dir, `←`/`⌫` walk back up (the dir you left stays
   selected), `..` is the same walk by mouse, double-click descends,
   `.` toggles dotfiles, `r` refreshes, the wheel scrolls.
-- **Explorer preview** — selecting a text file previews its head in
+- **Explorer preview** *(scenario: explorer-browse, detect-routes; test:
+  explorer_editor_stub_and_refresh)* — selecting a text file previews its head in
   the bottom split; a file past the cap flags `…`; a binary file shows
   `binary file — no preview`; `o`/`Enter` on a file spawns the system
   editor detached (`[gui].editor` → `$VISUAL` → `$EDITOR` →
@@ -114,7 +117,7 @@ Work top to bottom; each item is cheap once the window is up.
   typing/grid output stays responsive while a
   heavy page loads — a stall there wedges input, which is the one
   risk wry leaves us no off-thread answer for.
-- **Ctrl+click affordance** *(scenario: detect-click, ctrl-drag-selection)* — hold Ctrl over an `https://`/`file://`
+- **Ctrl+click affordance** *(scenario: detect-click, ctrl-drag-selection, detect-routes; test: ctrl_hover_ignores_missing_paths_chords_and_scrollback)* — hold Ctrl over an `https://`/`file://`
   URL and an existing path in output: detected tokens underline and
   the cursor turns to the pointer; non-tokens, nonexistent paths and
   scrollback rows behave the same way. Ctrl+click on a URL opens the

@@ -231,6 +231,14 @@ impl ExplorerState {
         self.show_hidden
     }
 
+    /// The full listing — hidden rows flagged, never filtered; the
+    /// test-driver's dump mirrors this plus `show_hidden` so a
+    /// client recomputes `visible()` exactly.
+    #[cfg(feature = "test-driver")]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
     /// The entries the listing renders, paired with their `entries`
     /// index — the pair a mouse click needs to `select` the right
     /// row. Empty while remote.
@@ -761,9 +769,11 @@ impl Pane for ExplorerPane {
     /// The explorer's keys while it owns unbound input (the find
     /// bar's focus rule): arrows/Home/End/Page move the highlight,
     /// `Enter`/`→` descend, `Enter` on a file opens it in the editor,
-    /// `←`/`⌫` go up, `.` toggles dotfiles, `r` refreshes, `o` opens
-    /// the selection in the system editor. Modified keys fall
-    /// through untouched — nothing reaches the PTY either way.
+    /// `←`/`⌫` go up. Modified keys fall through untouched — nothing
+    /// reaches the PTY either way. The letter verbs (`.`/`r`/`o`)
+    /// live in [`Pane::text`]: a bare letter press arrives as
+    /// composed text — `translate_key` reserves `Key::Char` for
+    /// chorded keys — so this match would never see them here.
     fn key(&self, shared: &mut Shared, key: KeyEvent) {
         sync_explorer(shared);
         if shared.explorer.is_remote() || !key.modifiers.is_empty() {
@@ -787,24 +797,38 @@ impl Pane for ExplorerPane {
                 }
             }
             Key::Left | Key::Backspace => shared.explorer.go_parent(),
-            Key::Char('.') => shared.explorer.toggle_hidden(),
-            Key::Char('r') => shared.explorer.refresh(),
-            Key::Char('o') => {
-                let path = match shared.explorer.activate() {
-                    Activate::EnterDir(path) | Activate::OpenFile(path) => Some(path),
-                    Activate::Nothing => None,
-                };
-                if let Some(path) = path {
-                    open_in_editor(shared, &path);
-                }
-            }
             _ => {}
         }
     }
 
-    /// No text input — composed text and pastes are swallowed while
-    /// the pane shows (the focus rule); nothing reaches the PTY.
-    fn text(&self, _shared: &mut Shared, _text: &str) {}
+    /// The letter verbs — `.` toggles dotfiles, `r` refreshes, `o`
+    /// opens the selection in the system editor. A real `.`/`r`/`o`
+    /// press reaches the pane as composed text (the `Key` half
+    /// translates to `None` un-chorded), so the verbs live here, one
+    /// character at a time; every other character is still swallowed
+    /// — nothing reaches the PTY while the pane shows.
+    fn text(&self, shared: &mut Shared, text: &str) {
+        sync_explorer(shared);
+        if shared.explorer.is_remote() {
+            return;
+        }
+        for c in text.chars() {
+            match c {
+                '.' => shared.explorer.toggle_hidden(),
+                'r' => shared.explorer.refresh(),
+                'o' => {
+                    let path = match shared.explorer.activate() {
+                        Activate::EnterDir(path) | Activate::OpenFile(path) => Some(path),
+                        Activate::Nothing => None,
+                    };
+                    if let Some(path) = path {
+                        open_in_editor(shared, &path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     /// The pane body under the switcher strip: a header naming the
     /// browsed dir, a pinned `..` row, the windowed listing
@@ -913,6 +937,10 @@ impl Pane for ExplorerPane {
         );
         if up_row.bottom() <= list_rect.bottom() {
             let hit = ui.interact(up_row, egui::Id::unique(("explorer", "up")), Sense::click());
+            // `explorer.up` — the pinned `..` row's hit target, so a
+            // scenario clicks the parent affordance by name (Spec
+            // R15-T4).
+            shared.hits.register("explorer.up", up_row);
             if hit.hovered() {
                 painter.rect_filled(up_row, 0.0, hover);
             }
@@ -953,7 +981,7 @@ impl Pane for ExplorerPane {
             .map(|(index, entry)| (index, entry.clone()))
             .collect();
         let selected = shared.explorer.selected();
-        for &(index, ref entry) in rows.iter().skip(scroll).take(window) {
+        for (position, &(index, ref entry)) in rows.iter().enumerate().skip(scroll).take(window) {
             let row = Rect::from_min_size(
                 Pos2::new(list_rect.left(), y),
                 Vec2::new(list_rect.width(), row_h),
@@ -962,6 +990,16 @@ impl Pane for ExplorerPane {
                 break;
             }
             let hit = ui.interact(row, egui::Id::unique(("explorer", index)), Sense::click());
+            // The row's hit targets (Spec R15-T4): content-keyed
+            // `explorer.entry.<name>` like `detect.*`'s aliases,
+            // `explorer.row.<n>` the ordinal over the visible
+            // listing (the same numbering `entries` filters to).
+            shared
+                .hits
+                .register(format!("explorer.entry.{}", entry.name), row);
+            shared
+                .hits
+                .register(format!("explorer.row.{position}"), row);
             let label = if entry.kind == EntryKind::Dir {
                 format!("{}/", entry.name)
             } else {

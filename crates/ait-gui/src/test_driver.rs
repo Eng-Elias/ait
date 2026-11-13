@@ -30,7 +30,13 @@
 //!   gesture: `unit` is `line`, `pixel` (sub-line touchpad deltas —
 //!   winit's `PixelDelta`) or `page`; `dx`/`dy` are in the unit.
 //!   `over` (`grid`/`panel`) picks the hover region — `grid` is the
-//!   default — and `x`/`y` give an explicit position in points.
+//!   default — `x`/`y` give an explicit position in points and
+//!   `target` resolves a hit-registry name to its rect's center.
+//!   `"raw":true` skips the app-side wheel route entirely and
+//!   delivers a real `Event::MouseWheel` through the pointer batch
+//!   (a `PointerMoved` first when `target`/`x`/`y` names the hover)
+//!   — the only delivery panes whose scroll lives in their own
+//!   paint, like the explorer listing, ever see.
 //! - `{"verb":"resize","width":…,"height":…}` — a viewport resize
 //!   request in points, sent as a real `ViewportCommand::InnerSize`
 //!   so the winsize settle path runs end to end.
@@ -56,14 +62,16 @@
 //!   approve card IS the panel's real approval flow.
 //! - `{"verb":"dump"}` — a versioned JSON snapshot of what the user
 //!   sees, sourced from the same [`Shared`] state `ui`'s paint pass
-//!   reads: the active tab's visible grid rows + cursor, scroll
-//!   position and selection, the pane host's selection, the browser
-//!   pane's surface verdict/address entry/history, the find bar,
-//!   the suggestion arm, the agent panel's open/focus/gate state,
-//!   the toast slot, the status strip's composed text, the tab
-//!   strip's titles + active index, the window's content size, and
-//!   the hit-target registry (`hits` — every interact site's
-//!   name → rect).
+//!   reads: the active tab's visible grid rows + cursor, cell
+//!   metrics, scroll position and selection, the pane host's
+//!   selection, the browser pane's surface verdict/address
+//!   entry/history, the find bar, the suggestion arm, the agent
+//!   panel's open/focus/gate state, the explorer's listing/
+//!   selection/preview, the Ctrl-hover affordance's resolved token
+//!   (`detect`), the toast slot, the status strip's composed text,
+//!   the tab strip's titles + active index, the window's content
+//!   size, and the hit-target registry (`hits` — every interact
+//!   site's name → rect).
 //! - `{"verb":"quit"}` — the app takes its normal close path
 //!   (`GuiApp::quit` → `ViewportCommand::Close`).
 //!
@@ -164,6 +172,20 @@ pub enum Request {
         /// `panel` (the agent conversation's region).
         #[serde(default)]
         over: Option<ScrollRegion>,
+        /// A hit-registry name the scroll hovers — resolves to its
+        /// rect's center the way `pointer`'s `target` does.
+        #[serde(default)]
+        target: Option<String>,
+        /// Deliver the wheel as a real `Event::MouseWheel` through
+        /// the pointer batch (a `PointerMoved` first when
+        /// `target`/`x`/`y` names the hover) — the only delivery
+        /// panes whose scroll lives in their own paint (the
+        /// explorer listing) ever see, since egui routes wheel
+        /// events on `pointer.hover_pos`. Absent keeps the app-side
+        /// `wheel` route, which only knows the grid and the agent
+        /// conversation.
+        #[serde(default)]
+        raw: bool,
     },
     /// `resize` — a viewport resize request in points, sent as a real
     /// `ViewportCommand::InnerSize` so the window manager round trip
@@ -420,6 +442,14 @@ pub struct Dump {
     /// The active tab's agent panel — `null` while no tab has ever
     /// opened one (the `tab.agent` Option mirrors through).
     pub agent: Option<AgentDump>,
+    /// The file explorer's model — the listing, selection, preview
+    /// and navigation state `ExplorerPane::paint` draws from (Spec
+    /// R14 §5.13, R15-T4).
+    pub explorer: ExplorerDump,
+    /// The Ctrl-hover affordance's resolved state — the token the
+    /// last painted frame found under the pointer while plain Ctrl
+    /// was held (Spec R14 §5.13 us-24, R15-T4).
+    pub detect: DetectDump,
     /// The toast slot — `Some` while a toast exists, `live` whether
     /// it still overrides the status line.
     pub toast: Option<ToastDump>,
@@ -483,6 +513,19 @@ pub struct GridDump {
     /// The drag-selection's normalized range — during and after a
     /// drag (the highlight's lifetime), `null` when none.
     pub selection: Option<SelectionDump>,
+    /// The cell metrics the last painted frame laid out — the
+    /// `(row, column) → point` map a scenario needs to point at
+    /// output no hit name covers (`null` before the first paint).
+    pub cell: Option<CellDump>,
+}
+
+/// One terminal cell's pixel size on the last painted frame.
+#[derive(Debug, Serialize)]
+pub struct CellDump {
+    /// One grid column in points.
+    pub width: f32,
+    /// One grid row in points.
+    pub height: f32,
 }
 
 /// The cursor's viewport position and shape.
@@ -650,6 +693,118 @@ pub enum GateDump {
     },
 }
 
+/// The file explorer's model (Spec R14 §5.13, R15-T4) — the
+/// listing, selection, preview and navigation state
+/// `ExplorerPane::paint` draws from. `entries` is the FULL listing:
+/// the dotfile toggle is a view change, so `hidden` flags the rows
+/// `show_hidden` suppresses and the painted listing is exactly the
+/// entries where `show_hidden || !hidden` holds.
+#[derive(Debug, Serialize)]
+pub struct ExplorerDump {
+    /// The remote-session gate — the pane paints `remote session —
+    /// browsing unavailable` while set and the model never lists.
+    pub remote: bool,
+    /// The session root `..` clamps at — `null` until a local
+    /// session's cwd answer lands (and always while `remote`).
+    pub root: Option<String>,
+    /// The directory the listing describes.
+    pub dir: String,
+    /// The `.` toggle — whether dotfiles join the visible rows.
+    pub show_hidden: bool,
+    /// `dir`'s entries, sorted the way `list_dir` ships them — dirs
+    /// first, each class case-insensitive.
+    pub entries: Vec<ExplorerEntryDump>,
+    /// The highlighted row — `null` on an empty listing.
+    pub selected: Option<ExplorerEntryDump>,
+    /// The selected file's preview — `null` on dirs, `other`s, a
+    /// remote session or an empty listing.
+    pub preview: Option<PreviewDump>,
+    /// The listing's io error row — `null` on a clean read.
+    pub error: Option<String>,
+    /// The listing's scroll offset in visible rows.
+    pub scroll: usize,
+}
+
+/// One listing row.
+#[derive(Debug, Serialize)]
+pub struct ExplorerEntryDump {
+    /// The file name — the pane draws dirs with a `/` suffix.
+    pub name: String,
+    /// `dir` / `file` / `other`.
+    pub kind: &'static str,
+    /// A dotfile — suppressed from the painted rows while
+    /// `show_hidden` is off.
+    pub hidden: bool,
+}
+
+/// The selected file's preview — tagged on `kind` like `GateDump`.
+/// `text` is capped at [`PREVIEW_DUMP_BYTES`] for the wire;
+/// `truncated` is the model's over-cap flag — the `…` the pane
+/// paints under a too-big head.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreviewDump {
+    /// A text file's preview head.
+    Text {
+        /// The head, capped for the wire.
+        text: String,
+        /// The file continues past the preview cap.
+        truncated: bool,
+    },
+    /// The `binary file — no preview` placeholder.
+    Binary,
+    /// The read error's text.
+    Unreadable {
+        /// What the failed read reported.
+        error: String,
+    },
+}
+
+/// The preview `text` field's wire cap — the scenario asserts on
+/// the head, never the whole 64 KiB.
+const PREVIEW_DUMP_BYTES: usize = 4 * 1024;
+
+/// The Ctrl-hover affordance's resolved state (Spec R14 §5.13
+/// us-24, R15-T4): `ctrl` is the plain-Ctrl-over-the-grid gate;
+/// `token` is the underline's span and the route a Ctrl+click
+/// takes — `null` when the affordance doesn't fire (no Ctrl, a
+/// non-token, a path that doesn't exist, or — on scrollback rows,
+/// which the affordance treats the same way — a non-token there).
+/// The underline and the hand cursor paint on exactly `token`
+/// being `Some`, so this IS the affordance's state.
+#[derive(Debug, Serialize)]
+pub struct DetectDump {
+    /// Plain Ctrl held while the pointer hovered the grid.
+    pub ctrl: bool,
+    /// The detected token under the pointer.
+    pub token: Option<DetectTokenDump>,
+}
+
+/// A detected token — the underline's span plus the route.
+#[derive(Debug, Serialize)]
+pub struct DetectTokenDump {
+    /// The token's grid line — absolute (scrollback rows are
+    /// negative).
+    pub line: i32,
+    /// Its starting cell column.
+    pub column: usize,
+    /// Its cell span.
+    pub cells: usize,
+    /// The route a Ctrl+click takes — `url:<u>` or `path:<p>`.
+    pub target: String,
+}
+
+/// The last painted frame's Ctrl-hover resolution — written by
+/// `paint_grid_pane`, read by `dump`. Frontend-local like
+/// `GuiApp::detect_cache`: only the UI thread touches it.
+#[derive(Debug, Default)]
+pub struct DetectHover {
+    /// Plain Ctrl held while the pointer hovered the grid.
+    pub ctrl: bool,
+    /// The detected token — `(line, detection)`.
+    pub token: Option<(i32, crate::detect::Detection)>,
+}
+
 impl Dump {
     /// Snapshot `shared` — the state `ui`'s paint pass reads — plus
     /// the window's current content rect and the hit registry the
@@ -684,6 +839,9 @@ impl Dump {
                         column: range.end.column,
                     },
                 }),
+                cell: shared
+                    .cell_metrics
+                    .map(|(width, height)| CellDump { width, height }),
             }
         });
         let area = ctx.content_rect();
@@ -754,6 +912,8 @@ impl Dump {
                         },
                     }),
                 }),
+            explorer: explorer_dump(&shared.explorer),
+            detect: detect_dump(&shared.detect_hover),
             hits: shared
                 .hits
                 .entries()
@@ -787,6 +947,67 @@ fn pane_name(id: PaneId) -> &'static str {
     match id {
         PaneId::Explorer => "explorer",
         PaneId::Browser => "browser",
+    }
+}
+
+/// `Shared::explorer` → its dump shape — the full listing (`hidden`
+/// is the toggle's view state, so the visible rows recompute
+/// client-side) plus the selection and preview.
+fn explorer_dump(state: &crate::explorer::ExplorerState) -> ExplorerDump {
+    ExplorerDump {
+        remote: state.is_remote(),
+        root: state.root().map(|path| path.display().to_string()),
+        dir: state.dir().display().to_string(),
+        show_hidden: state.show_hidden(),
+        entries: state.entries().iter().map(entry_dump).collect(),
+        selected: state.selected_entry().map(entry_dump),
+        preview: state.preview().map(preview_dump),
+        error: state.error().map(str::to_owned),
+        scroll: state.scroll(),
+    }
+}
+
+/// An explorer `Entry` → its dump shape.
+fn entry_dump(entry: &crate::explorer::Entry) -> ExplorerEntryDump {
+    ExplorerEntryDump {
+        name: entry.name.clone(),
+        kind: match entry.kind {
+            crate::explorer::EntryKind::Dir => "dir",
+            crate::explorer::EntryKind::File => "file",
+            crate::explorer::EntryKind::Other => "other",
+        },
+        hidden: entry.hidden,
+    }
+}
+
+/// An explorer `Preview` → its dump shape — the text head bounded
+/// for the wire, the model's `truncated` flag carried through.
+fn preview_dump(preview: &crate::explorer::Preview) -> PreviewDump {
+    match preview {
+        crate::explorer::Preview::Text { text, truncated } => PreviewDump::Text {
+            text: text.chars().take(PREVIEW_DUMP_BYTES).collect(),
+            truncated: *truncated,
+        },
+        crate::explorer::Preview::Binary => PreviewDump::Binary,
+        crate::explorer::Preview::Unreadable(error) => PreviewDump::Unreadable {
+            error: error.clone(),
+        },
+    }
+}
+
+/// The recorded Ctrl-hover resolution → its dump shape.
+fn detect_dump(hover: &DetectHover) -> DetectDump {
+    DetectDump {
+        ctrl: hover.ctrl,
+        token: hover.token.as_ref().map(|(line, hit)| DetectTokenDump {
+            line: *line,
+            column: hit.column,
+            cells: hit.cells,
+            target: match &hit.target {
+                crate::detect::Target::Url(url) => format!("url:{url}"),
+                crate::detect::Target::Path(path) => format!("path:{}", path.display()),
+            },
+        }),
     }
 }
 
@@ -956,17 +1177,61 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
             x,
             y,
             over,
-        } => match scroll_target(*x, *y, *over) {
-            Ok(target) => {
-                shared.injected.push_back(Injected::Wheel {
-                    unit: wheel_unit(*unit),
-                    delta: egui::Vec2::new(*dx, *dy),
-                    target,
+            target,
+            raw,
+        } => {
+            if *raw {
+                // The pointer gesture's path: a real `MouseWheel`
+                // folds into `InputState` at `begin_pass`, so panes
+                // whose scroll lives in their paint (the explorer
+                // listing) see it — the app-side `wheel` route only
+                // knows the grid and the agent conversation.
+                if over.is_some() {
+                    return Response::error(
+                        "raw scroll rides the pointer's hover — `over` doesn't apply".to_owned(),
+                    );
+                }
+                let pos = match (target.is_some(), x.is_some(), y.is_some()) {
+                    (false, false, false) => None,
+                    _ => match pointer_pos(shared, target.as_deref(), *x, *y, 0.0, 0.0) {
+                        Ok(pos) => Some(pos),
+                        Err(error) => return Response::error(error),
+                    },
+                };
+                let pushed = ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+                    let mut batch = Vec::with_capacity(2);
+                    if let Some(pos) = pos {
+                        batch.push(egui::Event::PointerMoved(pos));
+                    }
+                    batch.push(egui::Event::MouseWheel {
+                        unit: wheel_unit(*unit),
+                        delta: egui::Vec2::new(*dx, *dy),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: plugin.held(),
+                    });
+                    plugin.push(batch);
                 });
-                Response::ok()
+                return match pushed {
+                    Some(()) => {
+                        shared.injected.push_back(Injected::Repaint);
+                        Response::ok()
+                    }
+                    None => Response::error("the pointer plugin is not registered".to_owned()),
+                };
             }
-            Err(error) => Response::error(error),
-        },
+            match scroll_target(shared, target.as_deref(), *x, *y, *over) {
+                Ok(target) => {
+                    shared.injected.push_back(Injected::Wheel {
+                        unit: wheel_unit(*unit),
+                        delta: egui::Vec2::new(*dx, *dy),
+                        target,
+                    });
+                    Response::ok()
+                }
+                Err(error) => Response::error(error),
+            }
+        }
         Request::Resize { width, height } => {
             if !width.is_finite() || !height.is_finite() || *width <= 0.0 || *height <= 0.0 {
                 return Response::error(format!(
@@ -1250,13 +1515,26 @@ fn twin_text(
     }
 }
 
-/// A `scroll` request's target: explicit `x`/`y` wins and must travel
-/// as a pair; else the named region; else the grid.
+/// A `scroll` request's target: `target` resolves a registry name
+/// to its rect's center, explicit `x`/`y` wins and must travel as a
+/// pair; else the named region; else the grid.
 fn scroll_target(
+    shared: &Shared,
+    target: Option<&str>,
     x: Option<f32>,
     y: Option<f32>,
     over: Option<ScrollRegion>,
 ) -> Result<ScrollTarget, String> {
+    if let Some(name) = target {
+        if x.is_some() || y.is_some() || over.is_some() {
+            return Err("scroll's `target` stands alone — no `x`/`y`/`over`".to_owned());
+        }
+        return shared
+            .hits
+            .get(name)
+            .map(|rect| ScrollTarget::At(rect.center()))
+            .ok_or_else(|| unknown_target(shared, name));
+    }
     match (x, y) {
         (Some(x), Some(y)) => Ok(ScrollTarget::At(egui::Pos2::new(x, y))),
         (None, None) => Ok(match over {
@@ -1727,6 +2005,8 @@ mod tests {
             browser: crate::browser::BrowserState::default(),
             injected: VecDeque::new(),
             hits: crate::app::HitTargets::default(),
+            detect_hover: DetectHover::default(),
+            cell_metrics: None,
         }
     }
 
@@ -1776,6 +2056,20 @@ mod tests {
                 over: Some(ScrollRegion::Panel),
                 ..
             })
+        ));
+        // R15-T4's additions: `target` names a hit-registry rect and
+        // `raw` switches delivery to the real `MouseWheel` path.
+        assert!(matches!(
+            decode_request(
+                r#"{"verb":"scroll","unit":"line","dy":-3.0,"target":"explorer.up","raw":true}"#
+            ),
+            Ok(Request::Scroll {
+                unit: ScrollUnit::Line,
+                dy,
+                target: Some(_),
+                raw: true,
+                ..
+            }) if dy == -3.0
         ));
         assert!(matches!(
             decode_request(r#"{"verb":"resize","width":1100,"height":700}"#),
@@ -2122,6 +2416,8 @@ mod tests {
                 x: None,
                 y: None,
                 over: None,
+                target: None,
+                raw: false,
             },
         );
         assert!(response.ok);
@@ -2149,6 +2445,8 @@ mod tests {
                 x: Some(4.0),
                 y: None,
                 over: None,
+                target: None,
+                raw: false,
             },
         );
         assert!(!response.ok);
@@ -2173,6 +2471,132 @@ mod tests {
             assert!(!response.ok, "{width}x{height}");
             assert!(shared.injected.is_empty());
         }
+    }
+
+    /// `raw` scroll builds a real `MouseWheel` batch — a
+    /// `PointerMoved` first when a hover is named — plus the
+    /// `Repaint` wake, while `over` stays an error (the raw path
+    /// has no named regions).
+    #[test]
+    fn raw_scroll_delivers_a_real_wheel_batch() {
+        let ctx = egui::Context::default();
+        ctx.add_plugin(DriverInputPlugin::default());
+        let mut shared = shared();
+        shared.hits.register(
+            "explorer.up",
+            egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(80.0, 18.0)),
+        );
+
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Scroll {
+                unit: ScrollUnit::Line,
+                dx: 0.0,
+                dy: -3.0,
+                x: None,
+                y: None,
+                over: None,
+                target: Some("explorer.up".to_owned()),
+                raw: true,
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        // No `Injected::Wheel` — only the frame wake.
+        assert!(matches!(
+            shared.injected.pop_front().unwrap(),
+            Injected::Repaint
+        ));
+        assert!(shared.injected.is_empty());
+        let pushed = ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            let batch = plugin.queue.pop_front().expect("the wheel batch");
+            assert!(matches!(batch[0], egui::Event::PointerMoved(_)));
+            match &batch[1] {
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    assert_eq!(*unit, egui::MouseWheelUnit::Line);
+                    assert_eq!(*delta, egui::Vec2::new(0.0, -3.0));
+                }
+                other => panic!("expected a MouseWheel, got {other:?}"),
+            }
+        });
+        assert!(pushed.is_some());
+
+        // `over` names a region — the raw path has none.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Scroll {
+                unit: ScrollUnit::Line,
+                dx: 0.0,
+                dy: 1.0,
+                x: None,
+                y: None,
+                over: Some(ScrollRegion::Grid),
+                target: None,
+                raw: true,
+            },
+        );
+        assert!(!response.ok);
+        // And `target` still resolves through the registry — an
+        // unknown name names the miss.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Scroll {
+                unit: ScrollUnit::Line,
+                dx: 0.0,
+                dy: 1.0,
+                x: None,
+                y: None,
+                over: None,
+                target: Some("bogus".to_owned()),
+                raw: true,
+            },
+        );
+        assert!(!response.ok, "{response:?}");
+    }
+
+    /// The dump's explorer block mirrors `Shared::explorer` — root,
+    /// listing + hidden flags, the selected row and the preview's
+    /// over-cap/binary flags — and `detect` answers the recorded
+    /// hover (here: nothing resolved yet).
+    #[test]
+    fn the_dump_reports_the_explorer_and_detect_models() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("subdir")).unwrap();
+        std::fs::write(fixture.path().join("a.txt"), b"hello\n").unwrap();
+        std::fs::write(fixture.path().join(".dot"), b"secret\n").unwrap();
+        shared.explorer.sync(false, Some(fixture.path()));
+
+        let response = dispatch(&ctx, &mut shared, &Request::Dump);
+        let line = encode_response(&response);
+        assert!(line.contains(r#""explorer""#), "{line}");
+        assert!(line.contains(r#""name":"subdir""#), "{line}");
+        assert!(
+            line.contains(r#""name":".dot","kind":"file","hidden":true"#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#""detect":{"ctrl":false,"token":null}"#),
+            "{line}"
+        );
+
+        // A Ctrl-hover record surfaces as the token's span + route.
+        shared.detect_hover.ctrl = true;
+        shared.detect_hover.token = Some((
+            3,
+            crate::detect::Detection {
+                column: 4,
+                cells: 12,
+                target: crate::detect::Target::Url("https://a/b".to_owned()),
+            },
+        ));
+        let response = dispatch(&ctx, &mut shared, &Request::Dump);
+        let line = encode_response(&response);
+        assert!(line.contains(r#""ctrl":true"#), "{line}");
+        assert!(line.contains(r#""target":"url:https://a/b""#), "{line}");
     }
 
     /// `pointer`'s `modifiers` strings → the held set: modifier-only

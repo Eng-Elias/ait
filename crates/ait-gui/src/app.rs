@@ -142,6 +142,19 @@ pub struct Shared {
     /// unconditional — the map inside only exists (and only fills)
     /// in `test-driver` builds.
     pub hits: HitTargets,
+    /// The Ctrl-hover affordance's last-painted resolution (Spec
+    /// R15-T4): `paint_grid_pane` records the plain-Ctrl gate and
+    /// the detected token so `dump` answers "what would Ctrl+click
+    /// do" without driving one. Feature-gated like `injected` — a
+    /// release build has no socket to read it.
+    #[cfg(feature = "test-driver")]
+    pub detect_hover: crate::test_driver::DetectHover,
+    /// The cell metrics `paint_grid_pane` last laid out (Spec
+    /// R15-T4) — the dump's `grid.cell`, so a scenario turns a
+    /// `(row, column)` into a pointer position without guessing.
+    /// Feature-gated like `detect_hover`.
+    #[cfg(feature = "test-driver")]
+    pub cell_metrics: Option<(f32, f32)>,
 }
 
 /// The test-driver's hit-target registry (Spec R15-T3) — semantic
@@ -394,6 +407,10 @@ impl GuiApp {
             #[cfg(feature = "test-driver")]
             injected: std::collections::VecDeque::new(),
             hits: HitTargets::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hover: crate::test_driver::DetectHover::default(),
+            #[cfg(feature = "test-driver")]
+            cell_metrics: None,
         }));
         // The pointer-injection plugin (Spec R15-T3): its `input_hook`
         // splices queued `pointer`/`click` batches into `RawInput` at
@@ -1350,6 +1367,14 @@ impl GuiApp {
         let link = if ctrl {
             response.hover_pos().and_then(|pos| {
                 let (line, column) = grid_point(pos, pane, cell, scroll);
+                // Scrollback rows don't afford (Spec R15-T4): a
+                // scrollback path was written under whatever cwd the
+                // session held then — resolving it against today's
+                // cwd can afford a wrong or since-deleted file, so
+                // only the live viewport's tokens resolve.
+                if line < 0 {
+                    return None;
+                }
                 let remote = !tab.remote.is_empty();
                 let (text, cols) = tab
                     .grid()
@@ -1385,6 +1410,16 @@ impl GuiApp {
             column: hit.column,
             cells: hit.cells,
         });
+        // The dump's Ctrl-hover + cell-metric probes (Spec R15-T4):
+        // record what the affordance resolved — `ctrl` only counts
+        // over the grid — and this frame's cell geometry, so a dump
+        // answers "what Ctrl+click would route" without driving one.
+        #[cfg(feature = "test-driver")]
+        {
+            shared.cell_metrics = Some((cell.width, cell.height));
+            shared.detect_hover.ctrl = ctrl && response.hover_pos().is_some();
+            shared.detect_hover.token = link.clone();
+        }
         // `clicked` is press AND release inside the pane with no drag
         // — the affordance's release half; the route lands after the
         // paint pass, once `tab`'s borrow ends.
@@ -2738,6 +2773,10 @@ mod tests {
                 #[cfg(feature = "test-driver")]
                 injected: std::collections::VecDeque::new(),
                 hits: HitTargets::default(),
+                #[cfg(feature = "test-driver")]
+                detect_hover: crate::test_driver::DetectHover::default(),
+                #[cfg(feature = "test-driver")]
+                cell_metrics: None,
             }));
             Self {
                 app: GuiApp {

@@ -40,15 +40,20 @@ the stub's log, so `ext ↗`, external Enter navigations and editor
 spawns assert without real applications.
 
 Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
-app's own dispatch), `pointer = {event, target|x, y, …}` and
+app's own dispatch — `scroll` adds `target`/`x`/`y` aiming and
+`raw = true` for a real `MouseWheel` batch, the only delivery a
+pane-own-paint surface like the explorer's listing answers),
+`pointer = {event, target|x, y, …, modifiers?}` and
 `click = "hit.name"` (real egui pointer events aimed at the hit
 registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
 `pill.scroll_bottom`, `browser.back`/`browser.forward`/
 `browser.reload`/`browser.external`, `detect.url.<u>`,
-`detect.path.<p>`, `detect.<n>`), `agent = {event="approve", name,
-summary}` (stages a real gate card through `AgentPanel::apply`),
-plus waits/asserts `wait_text`/`expect_text`/`expect_pane`/
-`expect_find`/`expect_scroll`/`expect_suggesting`/`expect_gate`/
+`detect.path.<p>`, `detect.<n>`, `explorer.up`,
+`explorer.entry.<name>`, `explorer.row.<n>`),
+`agent = {event="approve", name, summary}` (stages a real gate
+card through `AgentPanel::apply`), plus waits/asserts
+`wait_text`/`expect_text`/`expect_pane`/`expect_find`/
+`expect_scroll`/`expect_suggesting`/`expect_gate`/
 `expect_selection`/`expect_hit` (the registry gate — use it when a
 model expectation like `expect_pane` can land a frame before the
 affordance's paint), `expect_browser = {surface, reason, entry,
@@ -56,23 +61,33 @@ entry_contains, bad_entry, history, history_min, current,
 current_contains, back, forward, loads, loads_min, webview}`
 (every present key must hold — `loads` counts webview-bound
 fetches, so a reload or a rejected URL is provable),
-`expect_open` (the stub-opener log), `expect_pane_selected` (the
-selection *under* the agent claim — `expect_pane` asserts the shown
-region instead), `expect_status` (the status strip's composed text —
-toast while live, else the session summary plus a `suggesting`
-segment while a request is in flight), `expect_toast`
-(`true`/`false`/substring on a *live* toast) and `expect_tabs` (the
-tab strip's count), and `quit`. The dump's `browser` object carries
-the surface verdict (`unknown`/`embedded`/`external` + the external
-reason line), the address entry and its amber flag, history
-depth/position, the webview-bound load tally and the staged webview
-rect (`null` is the hide signal); it also carries
-`agent`/`toast`/`status`/`tabs` objects for code-first legs — e.g.
-`ctl_and_driver_sockets_coexist` runs the real `ait ctl` client
-against the spawned app's pinned `XDG_RUNTIME_DIR`
-(`GuiE2e::runtime_dir`) while the driver socket stays bound. The
-manual checklist stays in
-[gui-verification.md](gui-verification.md).
+`expect_explorer` (the explorer model — `dir`/`root` as path
+suffixes, `entries`/`has`/`lacks` over the visible listing,
+`selected`, `hidden`, `scroll`, `preview` kind/head/`truncated`),
+`expect_detect` (the Ctrl-hover affordance — `"none"`,
+`"url:<u>"`/`"path:<p>"` or `{ctrl, token}`; pair `ctrl = true`
+with `token = "none"` to prove a non-affording hover frame was
+processed), `expect_open` (the stub-opener log),
+`expect_pane_selected` (the selection *under* the agent claim —
+`expect_pane` asserts the shown region instead), `expect_status`
+(the status strip's composed text — toast while live, else the
+session summary plus a `suggesting` segment while a request is in
+flight), `expect_toast` (`true`/`false`/substring on a *live*
+toast) and `expect_tabs` (the tab strip's count), and `quit`. The
+dump's `browser` object carries the surface verdict
+(`unknown`/`embedded`/`external` + the external reason line), the
+address entry and its amber flag, history depth/position, the
+webview-bound load tally and the staged webview rect (`null` is
+the hide signal); it also carries
+`explorer`/`detect`/`agent`/`toast`/`status`/`tabs` objects for
+code-first legs — e.g. `ctl_and_driver_sockets_coexist` runs the
+real `ait ctl` client against the spawned app's pinned
+`XDG_RUNTIME_DIR` (`GuiE2e::runtime_dir`) while the driver socket
+stays bound. `env = {K = "v"}` layers extra variables after the
+harness pins; `stub-bin/` shadows `xdg-open`/`open` first on
+`PATH` and records spawns to `$AIT_GUI_E2E_STUB_LOG`
+(`GuiE2e::stub_log()` in code-first tests). The manual checklist
+stays in [gui-verification.md](gui-verification.md).
 
 ## Run
 
