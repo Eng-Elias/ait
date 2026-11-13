@@ -132,6 +132,36 @@ Work top to bottom; each item is cheap once the window is up.
 ## Scripted smoke (optional)
 
 `xdotool`/`ydotool` can inject keys and pointer motion under `xvfb-run`
-for a repeatable version of the checklist; `import`/`scrot` capture the
-screenshots PR evidence uses. Neither is installed by default — keep it
-best-effort, not a gate.
+for a repeatable version of the checklist; `import`/`scrot`/`xwd`
+capture the screenshots PR evidence uses. None is installed by
+default — keep it best-effort, not a gate.
+
+The recipe that ran the checklist end to end (R14):
+
+```bash
+# Scrub the real session's display vars — an inherited
+# WAYLAND_DISPLAY opens the window on your actual desktop.
+env -u WAYLAND_DISPLAY -u DISPLAY Xvfb :99 -screen 0 1400x900x24 &
+DISPLAY=:99 ./target/debug/ait-gui &
+
+# Inject input over XTest (xdotool, or a tiny XTest helper for
+# chords xdotool spells awkwardly).
+DISPLAY=:99 xdotool key ctrl+shift+e            # explorer pane
+DISPLAY=:99 xdotool type 'cd docs' Return key Return
+DISPLAY=:99 xdotool key ctrl+shift+b            # browser pane
+
+# Grab the framebuffer for evidence.
+DISPLAY=:99 xwd -root -silent | convert xwd:- shot.png
+# or: DISPLAY=:99 import -window root shot.png
+```
+
+Notes from that run:
+
+- The embedded webview spawns real `WebKitWebProcess` /
+  `WebKitNetworkProcess` children — confirm with `ps` that the page
+  embedded rather than silently falling back.
+- A missing `libwebkit2gtk-4.1.so.0` kills the binary at exec
+  (DT_NEEDED), not at init — build `--no-default-features` for the
+  missing-runtime leg.
+- First WebKit init under llvmpipe can wedge input for ~20 s; it
+  resolves — don't mistake it for a deadlock.
