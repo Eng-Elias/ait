@@ -632,12 +632,10 @@ impl Dump {
                     open: panel.is_open(),
                     focused: panel.is_focused(),
                     gate: crate::panel::gate(panel).map(|gate| match gate {
-                        crate::panel::Gate::Approve { name, denying } => {
-                            GateDump::Approve {
-                                name: name.to_owned(),
-                                denying,
-                            }
-                        }
+                        crate::panel::Gate::Approve { name, denying } => GateDump::Approve {
+                            name: name.to_owned(),
+                            denying,
+                        },
                         crate::panel::Gate::Ask(card) => GateDump::Ask {
                             question: card.question.clone(),
                             choices: card.choices.clone(),
@@ -771,9 +769,11 @@ impl egui::Plugin for DriverInputPlugin {
         let Some(batch) = self.queue.pop_front() else {
             return;
         };
-        // Front of the queue — the injected events fold ahead of any
-        // natively produced ones for the frame.
-        input.events.splice(0..0, batch);
+        // The batch folds AFTER the pass's native events — the last
+        // position wins `interact_pos`, and `hits` is computed once
+        // per pass at it, so a real cursor's `PointerMoved` landing in
+        // the same pass must not retarget the press's hit-test.
+        input.events.extend(batch);
         // A delivered batch changes pointer state — the next frame
         // paints it (and delivers any queued follow-up batch).
         ctx.request_repaint();
@@ -877,11 +877,7 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
             button,
             modifiers,
         } => {
-            let parsed = match modifiers
-                .as_deref()
-                .map(parse_modifiers)
-                .transpose()
-            {
+            let parsed = match modifiers.as_deref().map(parse_modifiers).transpose() {
                 Ok(mods) => mods,
                 Err(error) => return Response::error(error),
             };
@@ -909,9 +905,7 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
                     shared.injected.push_back(Injected::Repaint);
                     Response::ok()
                 }
-                None => Response::error(
-                    "the pointer plugin is not registered".to_owned(),
-                ),
+                None => Response::error("the pointer plugin is not registered".to_owned()),
             }
         }
         Request::Click {
@@ -927,17 +921,11 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
                 Ok(pos) => pos,
                 Err(error) => return Response::error(error),
             };
-            let parsed = match modifiers
-                .as_deref()
-                .map(parse_modifiers)
-                .transpose()
-            {
+            let parsed = match modifiers.as_deref().map(parse_modifiers).transpose() {
                 Ok(mods) => mods,
                 Err(error) => return Response::error(error),
             };
-            let button = egui::PointerButton::from(button.unwrap_or(
-                PointerButtonKind::Primary,
-            ));
+            let button = egui::PointerButton::from(button.unwrap_or(PointerButtonKind::Primary));
             let pushed = ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
                 let mods = parsed.unwrap_or_else(|| plugin.held());
                 let mut batch = Vec::with_capacity(4);
@@ -970,9 +958,7 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
                     shared.injected.push_back(Injected::Repaint);
                     Response::ok()
                 }
-                None => Response::error(
-                    "the pointer plugin is not registered".to_owned(),
-                ),
+                None => Response::error("the pointer plugin is not registered".to_owned()),
             }
         }
         Request::Agent {
@@ -1058,12 +1044,8 @@ fn pointer_pos(
             .map(|rect| rect.center() + offset)
             .ok_or_else(|| unknown_target(shared, name)),
         (None, Some(x), Some(y)) => Ok(egui::pos2(x, y) + offset),
-        (None, None, None) => {
-            Err("pointer needs a `target` name or an `x`/`y` pair".to_owned())
-        }
-        (Some(_), _, _) => Err(
-            "`target` and `x`/`y` are alternatives, not partners".to_owned(),
-        ),
+        (None, None, None) => Err("pointer needs a `target` name or an `x`/`y` pair".to_owned()),
+        (Some(_), _, _) => Err("`target` and `x`/`y` are alternatives, not partners".to_owned()),
         _ => Err("`x` and `y` travel together".to_owned()),
     }
 }
@@ -1079,7 +1061,10 @@ fn unknown_target(shared: &Shared, name: &str) -> String {
         .collect();
     match names.is_empty() {
         true => format!("unknown hit target {name:?} — nothing registered"),
-        false => format!("unknown hit target {name:?} — registered: {}", names.join(", ")),
+        false => format!(
+            "unknown hit target {name:?} — registered: {}",
+            names.join(", ")
+        ),
     }
 }
 
@@ -2078,7 +2063,10 @@ mod tests {
     /// `pointer_batch` builds the modifier-first batch per piece —
     /// real input's order — and `pointer`/`click` deliveries ride the
     /// plugin's `input_hook` into `RawInput` one batch per frame,
-    /// ahead of the frame's native events.
+    /// appended behind the frame's native events so the last
+    /// `interact_pos` is the gesture's (egui hit-tests once per pass
+    /// at it — a real cursor's `PointerMoved` landing first must not
+    /// retarget the press).
     #[test]
     fn pointer_batches_splice_into_raw_input() {
         // A press under a named set: `ModifiersChanged` leads, the
@@ -2132,8 +2120,10 @@ mod tests {
             egui::Event::ModifiersChanged(m) if m == egui::Modifiers::NONE
         ));
 
-        // The plugin: one batch per `input_hook` call, spliced ahead
-        // of native events; `held` tracks the queued stream's sets.
+        // The plugin: one batch per `input_hook` call, appended after
+        // the pass's native events — the last `interact_pos` is the
+        // gesture's, which is what `hits` resolves against; `held`
+        // tracks the queued stream's sets.
         let mut plugin = DriverInputPlugin::default();
         plugin.push(vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL)]);
         plugin.push(vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]);
@@ -2144,11 +2134,8 @@ mod tests {
             ..Default::default()
         };
         plugin.input_hook(&ctx, &mut input);
-        assert!(matches!(
-            input.events[0],
-            egui::Event::ModifiersChanged(_)
-        ));
-        assert!(matches!(input.events[1], egui::Event::Text(_)));
+        assert!(matches!(input.events[0], egui::Event::Text(_)));
+        assert!(matches!(input.events[1], egui::Event::ModifiersChanged(_)));
         let mut next = egui::RawInput::default();
         plugin.input_hook(&ctx, &mut next);
         assert_eq!(next.events.len(), 1);
