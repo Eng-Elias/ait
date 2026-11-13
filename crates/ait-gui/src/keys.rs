@@ -117,7 +117,9 @@ fn named_key(key: egui::Key) -> Option<Key> {
 /// Letters case-fold on `shift` (egui's `Key::A` is caseless); egui's
 /// logical punctuation variants (`Colon`, `Questionmark`, …) already
 /// carry the shift resolution, so they map to their own character.
-fn char_key(key: egui::Key, shift: bool) -> Option<char> {
+/// `pub(crate)` so the test driver's `twin` derives the same
+/// character the translator would.
+pub(crate) fn char_key(key: egui::Key, shift: bool) -> Option<char> {
     let c = match key {
         egui::Key::Space => ' ',
         egui::Key::Num0 => '0',
