@@ -36,10 +36,11 @@
 //! no webkit packages). The test target resolves a leg through
 //! `AIT_GUI_E2E_BIN_WEB`/`AIT_GUI_E2E_BIN_NOWEB` first, else the
 //! cargo-built binary when its feature set matches; a scenario whose
-//! leg can't resolve skips loudly, never fails. `stub_opener = true`
-//! puts a recording `xdg-open`/`open` first on the app's `PATH`, so
-//! `expect_open` asserts the platform hand-off (`ext ↗`, an external
-//! Enter navigation, an editor spawn) without real applications.
+//! leg can't resolve skips loudly, never fails. Every spawn puts the
+//! `stub-bin` recording `xdg-open`/`open` first on the app's `PATH`,
+//! so `expect_open` asserts the platform hand-off (`ext ↗`, an
+//! external Enter navigation, an editor spawn) without real
+//! applications.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -153,7 +154,7 @@ fn install_opener_stubs(dir: &Path) -> io::Result<()> {
         std::fs::write(
             &path,
             "#!/bin/sh\n\
-             printf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" \
+             printf '%s %s\\n' \"${0##*/}\" \"$*\" \
              >> \"${AIT_GUI_E2E_STUB_LOG:-$HOME/open.log}\"\n",
         )?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
@@ -170,8 +171,10 @@ enum Display {
     Xvfb(PathBuf),
 }
 
-/// The headed flag's truthiness — `AIT_GUI_E2E_HEADED` / config.
-fn env_flag(name: &str) -> bool {
+/// The env flag's truthiness — `AIT_GUI_E2E_HEADED`/`AIT_GUI_E2E_XTEST`
+/// and friends: unset, empty, `0` and `false` (any case) are false;
+/// anything else opts in. Public — GUI e2e test files share the rule.
+pub fn env_flag(name: &str) -> bool {
     match std::env::var(name) {
         Ok(value) => !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"),
         Err(_) => false,
@@ -255,11 +258,6 @@ pub struct GuiSpawnConfig {
     /// external input — a synthetic click lands on whatever window
     /// sits under the coordinates.
     pub display: Option<OsString>,
-    /// Stub the platform opener (Spec R15-T5): `<cwd>/opener-stub/`
-    /// gains a fake `xdg-open`/`open` earlier on `PATH` that appends
-    /// its argv to `<cwd>/opener.log`, so `ext ↗`, editor spawns and
-    /// external URL hand-offs assert without real applications.
-    pub stub_opener: bool,
 }
 
 impl GuiSpawnConfig {
@@ -272,32 +270,8 @@ impl GuiSpawnConfig {
             env: Vec::new(),
             headed: false,
             display: None,
-            stub_opener: false,
         }
     }
-}
-
-/// The stub opener's install: `dir` gets an executable script per
-/// opener name (`xdg-open`, `open`) that appends its argv, one entry
-/// per line, to `log`. The caller puts `dir` first on `PATH` — the
-/// platform's real verb is never reached.
-fn install_opener_stub(dir: &Path, log: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(dir)?;
-    for name in ["xdg-open", "open"] {
-        let script = dir.join(name);
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n# Harness stub — records the invocation's argv, one\n\
-                 # argument per line, and never opens anything.\nprintf '%s\\n' \
-                 \"$@\" >> \"{}\"\n",
-                log.display()
-            ),
-        )?;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
 }
 
 /// One request on the driver wire — the server's enum, serialized
@@ -422,6 +396,13 @@ enum Request<'a> {
     },
     /// `dump` — the versioned snapshot.
     Dump,
+    /// `screenshot` — the app's next painted frame as a PNG at
+    /// `path`; the response precedes the file (the client polls for
+    /// it).
+    Screenshot {
+        /// The PNG's destination path.
+        path: &'a str,
+    },
     /// `quit` — the app's normal close.
     Quit,
 }
@@ -453,6 +434,27 @@ pub enum PointerButtonKind {
     Secondary,
     /// The middle button.
     Middle,
+}
+
+/// `pointer`'s wire fields beside `event` — one bundle for
+/// [`GuiE2e`]'s pointer conveniences so the request builders read
+/// like the table form (the `Request::Pointer` payload verbatim).
+#[derive(Debug, Default)]
+pub struct PointerArgs<'a> {
+    /// A hit-registry name — resolves to its rect's center.
+    pub target: Option<&'a str>,
+    /// A raw position in points — `x`/`y` travel together.
+    pub x: Option<f32>,
+    /// See `x`.
+    pub y: Option<f32>,
+    /// Points added to the resolved position.
+    pub dx: f32,
+    /// See `dx`.
+    pub dy: f32,
+    /// The button for `press`/`release` — default `primary`.
+    pub button: Option<PointerButtonKind>,
+    /// The held modifier set for the event (`"Ctrl"`, `""` to lift).
+    pub modifiers: Option<&'a str>,
 }
 
 /// `agent`'s `event` — the stageable `AgentEvent` vocabulary.
@@ -573,6 +575,17 @@ pub struct Dump {
     /// `target` names resolve against exactly this map.
     #[serde(default)]
     pub hits: BTreeMap<String, RectDump>,
+    /// The `wait_dump` barrier's halves: requests that queued
+    /// frame-folded input before this capture, and the count a
+    /// completed frame has folded. `input_done >= input_seq` IS
+    /// "everything the driver accepted landed" — the predicate
+    /// [`GuiE2e::wait_settled`] polls (both `0` pre-R15-review
+    /// servers, which had no barrier).
+    #[serde(default)]
+    pub input_seq: u64,
+    /// See `input_seq`.
+    #[serde(default)]
+    pub input_done: u64,
 }
 
 /// The toast slot — the status-line override's two halves: the text
@@ -1072,28 +1085,6 @@ impl GuiE2e {
             ));
         }
         env.extend(config.env);
-        if config.stub_opener {
-            // The PATH-stub opener: the stub dir leads PATH so the
-            // app's `platform_opener` spawns the recorder, not the
-            // real `xdg-open`. A scenario-supplied PATH is honored as
-            // the base (the stub still leads it); absent that, the
-            // inherited one is.
-            let dir = cwd.path().join("opener-stub");
-            install_opener_stub(&dir, &cwd.path().join("opener.log"))?;
-            let base = env
-                .iter()
-                .rev()
-                .find(|(key, _)| key == "PATH")
-                .map(|(_, value)| value.clone())
-                .or_else(|| std::env::var_os("PATH"))
-                .unwrap_or_default();
-            let mut path = dir.into_os_string();
-            if !base.is_empty() {
-                path.push(":");
-                path.push(base);
-            }
-            env.push((OsString::from("PATH"), path));
-        }
 
         let mut command = match display {
             Display::Direct => {
@@ -1217,23 +1208,21 @@ impl GuiE2e {
     /// response line (the server half-closes after its reply, which
     /// terminates the read).
     fn request(&self, request: &Request<'_>) -> Result<Response, String> {
-        let fail = |message: String| message;
         let mut conn = UnixStream::connect(&self.socket)
-            .map_err(|e| fail(format!("connect {}: {e}", self.socket.display())))?;
+            .map_err(|e| format!("connect {}: {e}", self.socket.display()))?;
         conn.set_read_timeout(Some(REQUEST_TIMEOUT))
-            .map_err(|e| fail(format!("read timeout: {e}")))?;
+            .map_err(|e| format!("read timeout: {e}"))?;
         let mut line =
-            serde_json::to_string(request).map_err(|e| fail(format!("encode request: {e}")))?;
+            serde_json::to_string(request).map_err(|e| format!("encode request: {e}"))?;
         line.push('\n');
         conn.write_all(line.as_bytes())
-            .map_err(|e| fail(format!("write request: {e}")))?;
+            .map_err(|e| format!("write request: {e}"))?;
         // Signal request-complete — the server answers after the line.
         let _ = conn.shutdown(Shutdown::Write);
         let mut reply = String::new();
         conn.read_to_string(&mut reply)
-            .map_err(|e| fail(format!("read response: {e}")))?;
-        serde_json::from_str(reply.trim())
-            .map_err(|e| fail(format!("malformed response {e}: {reply:?}")))
+            .map_err(|e| format!("read response: {e}"))?;
+        serde_json::from_str(reply.trim()).map_err(|e| format!("malformed response {e}: {reply:?}"))
     }
 
     /// `request` + the `ok` contract — a driver-side failure (bad
@@ -1271,6 +1260,42 @@ impl GuiE2e {
         match self.try_dump() {
             Ok(dump) => dump,
             Err(error) => panic!("dump failed: {error}"),
+        }
+    }
+
+    /// `screenshot` — the app renders its next painted frame into a
+    /// PNG at `path`; this sends the verb and polls for the file
+    /// (bounded — one painted frame is all the app needs). Returns
+    /// `false` when the request was refused, the app died, or the
+    /// bound passed. Evidence for humans only — never an assertion
+    /// (Spec R15: screenshots are evidence, never a pixel diff).
+    pub fn screenshot(&self, path: &Path) -> bool {
+        self.log_action(format!("screenshot({})", path.display()));
+        let path = path.to_path_buf();
+        let path_text = path.to_string_lossy().into_owned();
+        let accepted = matches!(
+            self.request(&Request::Screenshot { path: &path_text }),
+            Ok(Response { ok: true, .. })
+        );
+        if !accepted {
+            return false;
+        }
+        // The server encodes under a `.part` sibling and renames it
+        // into place, so an existing file is always a complete PNG.
+        // A `<name>.error` sidecar means the write failed server-side.
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            if path.is_file() {
+                return true;
+            }
+            if let Ok(error) = std::fs::read_to_string(path.with_extension("error")) {
+                self.log_action(format!("screenshot server error: {error}"));
+                return false;
+            }
+            if self.exited().is_some() || Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(WAIT_POLL);
         }
     }
 
@@ -1439,37 +1464,24 @@ impl GuiE2e {
         self.act(&Request::Resize { width, height });
     }
 
-    /// `pointer` — one gesture piece's full wire shape: `event` at
-    /// `target`'s rect center plus `dx`/`dy`, or at raw `x`/`y`;
-    /// `button` travels with `press`/`release`, `modifiers`
-    /// (`"Ctrl"`) sets the held set for the event. Delivered through
-    /// the app's input plugin so egui's own pointer fold runs the
-    /// production hit-test.
-    #[allow(clippy::too_many_arguments)]
-    fn pointer_request(
-        &self,
-        event: PointerEventKind,
-        target: Option<&str>,
-        x: Option<f32>,
-        y: Option<f32>,
-        dx: f32,
-        dy: f32,
-        button: Option<PointerButtonKind>,
-        modifiers: Option<&str>,
-    ) {
+    /// `pointer` — one gesture piece's full wire shape, delivered
+    /// through the app's input plugin so egui's own pointer fold
+    /// runs the production hit-test.
+    fn pointer_request(&self, event: PointerEventKind, args: PointerArgs<'_>) {
         self.log_action(format!(
-            "pointer({event:?}, target={target:?}, at={x:?},{y:?}, \
-             dx={dx}, dy={dy}, button={button:?}, modifiers={modifiers:?})"
+            "pointer({event:?}, target={:?}, at={:?},{:?}, \
+             dx={}, dy={}, button={:?}, modifiers={:?})",
+            args.target, args.x, args.y, args.dx, args.dy, args.button, args.modifiers
         ));
         self.act(&Request::Pointer {
             event,
-            target,
-            x,
-            y,
-            dx,
-            dy,
-            button,
-            modifiers,
+            target: args.target,
+            x: args.x,
+            y: args.y,
+            dx: args.dx,
+            dy: args.dy,
+            button: args.button,
+            modifiers: args.modifiers,
         });
     }
 
@@ -1478,7 +1490,14 @@ impl GuiE2e {
     /// plugin so egui's own pointer fold runs the production
     /// hit-test.
     pub fn pointer_at(&self, event: PointerEventKind, x: f32, y: f32) {
-        self.pointer_request(event, None, Some(x), Some(y), 0.0, 0.0, None, None);
+        self.pointer_request(
+            event,
+            PointerArgs {
+                x: Some(x),
+                y: Some(y),
+                ..PointerArgs::default()
+            },
+        );
     }
 
     /// `pointer` — one gesture piece on a named hit target: the
@@ -1494,7 +1513,16 @@ impl GuiE2e {
         dy: f32,
         modifiers: Option<&str>,
     ) {
-        self.pointer_request(event, Some(target), None, None, dx, dy, None, modifiers);
+        self.pointer_request(
+            event,
+            PointerArgs {
+                target: Some(target),
+                dx,
+                dy,
+                modifiers,
+                ..PointerArgs::default()
+            },
+        );
     }
 
     /// `pointer` — a bare held-set change (`"Ctrl"` holds, `""`
@@ -1502,13 +1530,10 @@ impl GuiE2e {
     pub fn pointer_modifiers(&self, modifiers: &str) {
         self.pointer_request(
             PointerEventKind::Modifiers,
-            None,
-            None,
-            None,
-            0.0,
-            0.0,
-            None,
-            Some(modifiers),
+            PointerArgs {
+                modifiers: Some(modifiers),
+                ..PointerArgs::default()
+            },
         );
     }
 
@@ -1621,6 +1646,19 @@ impl GuiE2e {
         }
     }
 
+    /// The `wait_dump` barrier — a bounded wait until the dump's
+    /// `input_done` catches its `input_seq`: every request the
+    /// socket accepted has folded through a completed frame. This is
+    /// the servicing barrier a negative assertion needs (a plain
+    /// `dump` can answer before the queued input's frame ran — the
+    /// pump services the socket off the UI thread); it asserts
+    /// nothing about the state itself.
+    pub fn wait_settled(&self) {
+        self.wait_for_dump("the input barrier", |dump| {
+            dump.input_done >= dump.input_seq
+        });
+    }
+
     /// Wait for the app to exit (bounded) — after [`quit`](Self::quit).
     ///
     /// # Panics
@@ -1639,13 +1677,13 @@ impl GuiE2e {
         }
     }
 
-    /// The stub opener's recorded argv lines so far — every platform
+    /// The stub opener's recorded invocations so far — every platform
     /// hand-off the app spawned (`ext ↗`, external Enter navigation,
-    /// an editor spawn), one argument per line. Empty until the stub
-    /// first runs — and always empty when the spawn didn't set
-    /// [`GuiSpawnConfig::stub_opener`].
+    /// an editor spawn) as a `name args…` line in
+    /// [`stub_log`](Self::stub_log). Empty until the first hand-off —
+    /// the `stub-bin` shadows are installed for every spawn.
     pub fn opened_urls(&self) -> Vec<String> {
-        std::fs::read_to_string(self.cwd.path().join("opener.log"))
+        std::fs::read_to_string(self.stub_log())
             .map(|text| text.lines().map(str::to_owned).collect())
             .unwrap_or_default()
     }
@@ -1744,15 +1782,20 @@ impl GuiE2e {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// Write `dump.json` + `actions.log` + `stderr.txt` under
-    /// `target/e2e-failures/<test_name>/` — the GUI evidence set.
+    /// Write `dump.json` + `actions.log` + `stderr.txt` +
+    /// `screenshot.png` under `target/e2e-failures/<test_name>/` —
+    /// the GUI evidence set (Spec R15's "dump JSON, screenshot,
+    /// action log"). The screenshot is best-effort: a wedged app
+    /// still gets its three text files.
     pub fn dump_evidence(&self, test_name: &str) -> io::Result<PathBuf> {
-        evidence::write_gui_dump(
+        let dir = evidence::write_gui_dump(
             test_name,
             &self.last_dump_text(),
             &self.stderr_tail(),
             &self.log.borrow(),
-        )
+        )?;
+        let _ = self.screenshot(&dir.join("screenshot.png"));
+        Ok(dir)
     }
 }
 
@@ -1798,6 +1841,7 @@ const GUI_VERBS: &[&str] = &[
     "pointer",
     "click",
     "agent",
+    "wait_dump",
     "wait_text",
     "expect_text",
     "expect_pane",
@@ -1826,8 +1870,6 @@ const GUI_VERBS: &[&str] = &[
 /// feature = "panes"
 /// binary = "web"                     # optional — the dual-binary leg:
 ///                                    # "web" | "noweb" | any when absent
-/// stub_opener = true                 # optional — record platform-opener
-///                                    # invocations for `expect_open`
 ///
 /// [[steps]]
 /// key = "Ctrl+Shift+E"               # one chord through the app's dispatch
@@ -1861,8 +1903,6 @@ pub struct GuiScenario {
     /// `binary = "web"|"noweb"` — the dual-binary leg the scenario
     /// needs (Spec R15-T5); [`GuiBinary::Any`] when absent.
     binary: GuiBinary,
-    /// `stub_opener = true` — record platform-opener invocations.
-    stub_opener: bool,
     /// `headed = true` — drive the developer's `DISPLAY`.
     headed: bool,
     /// The file stem — failure messages and dump dirs.
@@ -1972,6 +2012,14 @@ pub enum GuiStep {
         /// The renderable argument summary the card shows.
         summary: String,
     },
+    /// `wait_dump` — the input barrier (Spec R15's `wait_dump`): a
+    /// bounded wait until the dump's `input_done` catches its
+    /// `input_seq` — every request the socket accepted has folded
+    /// through a completed frame. The sync point before a negative
+    /// assertion (its "nothing changed" claim then knows the input
+    /// landed); `expect_*` verbs stay the field-predicate waits and
+    /// `wait_dump` asserts nothing about the state itself.
+    WaitDump,
     /// `wait_text` — gate until the grid text contains it.
     WaitText(String),
     /// `expect_text` — assert the grid text contains it.
@@ -2027,7 +2075,7 @@ pub enum GuiStep {
     ExpectBrowser(BrowserExpect),
     /// `expect_open` — bounded wait until the stub opener's log
     /// holds this string — the `ext ↗`/external-navigation hand-off
-    /// (`stub_opener = true` must name the spawn).
+    /// (the `stub-bin` shadows are installed for every spawn).
     ExpectOpen(String),
     /// `expect_pane_selected` — assert the app-global aux selection
     /// (`pane.selected`): `explorer`/`browser`, or `none` for no
@@ -2506,6 +2554,7 @@ impl GuiStep {
             Self::Pointer { .. } => "pointer",
             Self::Click { .. } => "click",
             Self::Agent { .. } => "agent",
+            Self::WaitDump => "wait_dump",
             Self::WaitText(_) => "wait_text",
             Self::ExpectText(_) => "expect_text",
             Self::ExpectPane(_) => "expect_pane",
@@ -2570,13 +2619,15 @@ impl GuiStep {
                 modifiers,
             } => e2e.pointer_request(
                 *event,
-                target.as_deref(),
-                *x,
-                *y,
-                *dx,
-                *dy,
-                *button,
-                modifiers.as_deref(),
+                PointerArgs {
+                    target: target.as_deref(),
+                    x: *x,
+                    y: *y,
+                    dx: *dx,
+                    dy: *dy,
+                    button: *button,
+                    modifiers: modifiers.as_deref(),
+                },
             ),
             Self::Click {
                 target,
@@ -2593,6 +2644,7 @@ impl GuiStep {
             } => match event {
                 AgentEventKind::Approve => e2e.agent_approve(name, summary),
             },
+            Self::WaitDump => e2e.wait_settled(),
             Self::WaitText(text) => {
                 e2e.wait_for_dump(&format!("wait_text {text:?}"), |dump| {
                     dump.grid_text().contains(text.as_str())
@@ -2727,10 +2779,6 @@ struct RawGuiScenario {
     /// needs (R15-T5); absent means any binary answers it.
     #[serde(default)]
     binary: Option<GuiBinary>,
-    /// `stub_opener = true` — the spawn installs the PATH-stub
-    /// opener so `expect_open` has a log to wait on.
-    #[serde(default)]
-    stub_opener: bool,
     /// `headed = true` — drive the developer's `DISPLAY`.
     #[serde(default)]
     headed: bool,
@@ -2780,21 +2828,19 @@ impl GuiScenario {
             env,
             steps,
             binary: raw.binary.unwrap_or(GuiBinary::Any),
-            stub_opener: raw.stub_opener,
             headed: raw.headed,
             name,
             source: source.to_string(),
         })
     }
 
-    /// A [`GuiSpawnConfig`] honoring the scenario's `env`, `headed`
-    /// and `stub_opener` — the caller picked `program` per
+    /// A [`GuiSpawnConfig`] honoring the scenario's `env` and
+    /// `headed` — the caller picked `program` per
     /// [`binary`](Self::binary) already.
     pub fn spawn_config(&self, program: impl Into<OsString>) -> GuiSpawnConfig {
         let mut config = GuiSpawnConfig::new(program);
         config.env = self.env.clone();
         config.headed = self.headed;
-        config.stub_opener = self.stub_opener;
         config
     }
 
@@ -3034,6 +3080,13 @@ fn parse_gui_step(
                 name: table.name,
                 summary: table.summary.unwrap_or_default(),
             })
+        }
+        "wait_dump" => {
+            let flag: bool = want(value, verb, "`true`").map_err(fail)?;
+            if !flag {
+                return Err(fail("`wait_dump` must be `true`".to_string()));
+            }
+            Ok(GuiStep::WaitDump)
         }
         "wait_text" => Ok(GuiStep::WaitText(
             want(value, verb, "a string").map_err(fail)?,
@@ -3553,6 +3606,8 @@ mod tests {
             status: String::new(),
             tabs: TabsDump::default(),
             hits: BTreeMap::new(),
+            input_seq: 0,
+            input_done: 0,
         };
         assert_eq!(dump.grid_text(), "a\n\nc");
     }
@@ -3659,22 +3714,19 @@ mod tests {
         assert!(matches!(good.steps[1], GuiStep::ExpectOpen(_)));
     }
 
-    /// The dual-binary key and the stub-opener flag parse — `binary`
-    /// defaults to `Any`, the opener to off.
+    /// The dual-binary key parses — `binary` defaults to `Any`.
     #[test]
-    fn scenario_binary_and_stub_opener_parse() {
+    fn scenario_binary_parses() {
         let scenario = GuiScenario::parse(
             "t".to_string(),
             "t.toml",
             r#"feature = "x"
                binary = "noweb"
-               stub_opener = true
                [[steps]]
                quit = true"#,
         )
         .unwrap();
         assert_eq!(scenario.binary(), GuiBinary::Noweb);
-        assert!(scenario.spawn_config("bin").stub_opener);
 
         let scenario = GuiScenario::parse(
             "t".to_string(),
@@ -3685,7 +3737,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scenario.binary(), GuiBinary::Any);
-        assert!(!scenario.spawn_config("bin").stub_opener);
 
         for bad_binary in ["weeb", "", "no_web"] {
             let bad = GuiScenario::parse(
@@ -3697,20 +3748,22 @@ mod tests {
         }
     }
 
-    /// The stub opener install: executable scripts that append argv
-    /// to the log — the PATH-lead trick `spawn` wires.
+    /// The stub opener install: executable scripts that record the
+    /// `name args…` invocation to [`STUB_LOG_ENV`]'s file — the
+    /// PATH-lead trick `pinned_env` wires for every spawn.
     #[test]
-    fn opener_stub_records_argv() {
+    fn opener_stub_records_invocations() {
         let dir = TempDir::fresh().unwrap();
         let stub = dir.path().join("bin");
-        let log = dir.path().join("opener.log");
-        install_opener_stub(&stub, &log).unwrap();
+        let log = dir.path().join("open.log");
+        install_opener_stubs(&stub).unwrap();
         // `/bin/sh` absolutely — the child's PATH is only the stub
         // dir, so a bare `sh` wouldn't resolve.
         let status = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("xdg-open https://example.com 'a b'")
             .env("PATH", &stub)
+            .env(STUB_LOG_ENV, &log)
             .status()
             .unwrap();
         assert!(status.success());
@@ -3719,7 +3772,7 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect();
-        assert_eq!(lines, ["https://example.com", "a b"]);
+        assert_eq!(lines, ["xdg-open https://example.com a b"]);
     }
 
     /// Scenario parsing: verbs type-check, unknown keys and
@@ -3787,12 +3840,14 @@ expect_toast = false
 [[steps]]
 expect_tabs = 2
 [[steps]]
+wait_dump = true
+[[steps]]
 quit = true
 "#,
         )
         .unwrap();
         assert_eq!(scenario.feature, "panes");
-        assert_eq!(scenario.steps.len(), 28);
+        assert_eq!(scenario.steps.len(), 29);
 
         for (text, want) in [
             (r#"feature = "x""#, "missing steps is fine"),
@@ -3832,6 +3887,8 @@ quit = true
             ("[[steps]]\nexpect_detect = 1", "typed detect"),
             ("[[steps]]\nexpect_toast = 1", "typed toast"),
             ("[[steps]]\nexpect_tabs = \"x\"", "typed tabs"),
+            ("[[steps]]\nwait_dump = 1", "typed wait_dump"),
+            ("[[steps]]\nwait_dump = false", "wait_dump must be true"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),
         ] {
