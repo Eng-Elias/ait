@@ -59,8 +59,10 @@
 //!   reads: the active tab's visible grid rows + cursor, scroll
 //!   position and selection, the pane host's selection, the find
 //!   bar, the suggestion arm, the agent panel's open/focus/gate
-//!   state, the window's content size, and the hit-target registry
-//!   (`hits` — every interact site's name → rect).
+//!   state, the toast slot, the status strip's composed text, the
+//!   tab strip's titles + active index, the window's content size,
+//!   and the hit-target registry (`hits` — every interact site's
+//!   name → rect).
 //! - `{"verb":"quit"}` — the app takes its normal close path
 //!   (`GuiApp::quit` → `ViewportCommand::Close`).
 //!
@@ -413,12 +415,45 @@ pub struct Dump {
     /// The active tab's agent panel — `null` while no tab has ever
     /// opened one (the `tab.agent` Option mirrors through).
     pub agent: Option<AgentDump>,
+    /// The toast slot — `Some` while a toast exists, `live` whether
+    /// it still overrides the status line.
+    pub toast: Option<ToastDump>,
+    /// The status strip's text — the same composed string
+    /// `paint_status` draws: a live toast's text while one lives, the
+    /// session summary otherwise, the `· <spinner> suggesting`
+    /// segment while a request is in flight (Spec R15-T6).
+    pub status: String,
+    /// The tab strip — titles in order plus the active index; `ait
+    /// ctl open-tab`/`send` move exactly this state.
+    pub tabs: TabsDump,
     /// The hit-target registry — name → rect for every interactive
     /// surface the last painted frame registered. `pointer`'s and
     /// `click`'s `target` resolve against exactly this map, so the
     /// dump answers "what can I click" with the same data the verbs
     /// resolve from.
     pub hits: BTreeMap<String, RectDump>,
+}
+
+/// The toast slot — the status-line override's two halves: the text
+/// it carries, and whether it still paints (`is_live` at capture —
+/// an expired toast lingers in the slot until the next one
+/// replaces it, but shows nothing).
+#[derive(Debug, Serialize)]
+pub struct ToastDump {
+    /// The toast's text.
+    pub text: String,
+    /// Whether the status line shows it at capture time.
+    pub live: bool,
+}
+
+/// The tab strip — `TabManager::titles()` plus the active index the
+/// chips highlight (and ctl's `open_tab` activates).
+#[derive(Debug, Serialize)]
+pub struct TabsDump {
+    /// Tab titles in strip order.
+    pub titles: Vec<String>,
+    /// The active tab's index into `titles`.
+    pub active: usize,
 }
 
 /// The active tab's visible grid — the same `visible_rows` the paint
@@ -576,6 +611,7 @@ impl Dump {
     /// the window's current content rect and the hit registry the
     /// last painted frame produced.
     fn capture(ctx: &egui::Context, shared: &Shared) -> Self {
+        let now = Instant::now();
         let grid = shared.tabs.active().map(|tab| {
             let cursor = tab.cursor();
             let size = tab.session.size();
@@ -620,6 +656,15 @@ impl Dump {
                 position: find.position(),
             }),
             suggesting: shared.suggestion.is_some(),
+            toast: shared.toast.as_ref().map(|toast| ToastDump {
+                text: toast.text().to_owned(),
+                live: toast.is_live(now),
+            }),
+            status: crate::app::status_line_text(shared, now),
+            tabs: TabsDump {
+                titles: shared.tabs.titles(),
+                active: shared.tabs.active_index(),
+            },
             window: WindowDump {
                 width: area.width(),
                 height: area.height(),

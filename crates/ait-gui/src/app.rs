@@ -2104,37 +2104,11 @@ impl GuiApp {
         painter.rect_filled(rect, 0.0, chrome::STRIP);
         let now = Instant::now();
         let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
-        let mut text = match shared.tabs.active() {
-            Some(tab) => {
-                let model = shared.config.model(&shared.profile);
-                status_text(
-                    &StatusLine {
-                        cwd: tab.cwd(),
-                        shell: tab.title(),
-                        model: &model,
-                        profile: profile::status_slot(&shared.profile),
-                        block: tab.last_block_status(),
-                        remote: tab.remote_target(),
-                        exit: tab.exit_status(),
-                    },
-                    shared.toast.as_ref(),
-                    now,
-                )
-            }
-            None => String::new(),
-        };
+        let text = status_line_text(shared, now);
         if shared.suggestion.is_some() && !toast_live {
-            // Braille spinner — one frame per ~100 ms; the repaint is
-            // requested below so the glyph animates through the
-            // request's quiet model-call stretch, not just while
-            // Delta bytes land.
-            const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let millis = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as usize;
-            let frame = FRAMES[(millis / 100) % FRAMES.len()];
-            text = format!("{text} · {frame} suggesting");
+            // The spinner animates one frame per ~100 ms — the repaint
+            // keeps the glyph turning through the request's quiet
+            // model-call stretch, not just while Delta bytes land.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let highlighted = toast_live;
@@ -2606,6 +2580,47 @@ fn find_open_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
         return false;
     }
     modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)
+}
+
+/// The status strip's text at `now` — the same composition
+/// `paint_status` draws: a live toast wins outright, else the
+/// `StatusLine` session summary, and a live suggestion appends a
+/// `· <spinner> suggesting` segment (Spec R04; the repaint cadence
+/// stays the painter's concern). Factored so the test-driver `dump`
+/// ships the exact string the user reads (Spec R15-T6) instead of a
+/// re-derived near-copy.
+pub(crate) fn status_line_text(shared: &Shared, now: Instant) -> String {
+    let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
+    let mut text = match shared.tabs.active() {
+        Some(tab) => {
+            let model = shared.config.model(&shared.profile);
+            status_text(
+                &StatusLine {
+                    cwd: tab.cwd(),
+                    shell: tab.title(),
+                    model: &model,
+                    profile: profile::status_slot(&shared.profile),
+                    block: tab.last_block_status(),
+                    remote: tab.remote_target(),
+                    exit: tab.exit_status(),
+                },
+                shared.toast.as_ref(),
+                now,
+            )
+        }
+        None => String::new(),
+    };
+    if shared.suggestion.is_some() && !toast_live {
+        // Braille spinner — one frame per ~100 ms.
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as usize;
+        let frame = FRAMES[(millis / 100) % FRAMES.len()];
+        text = format!("{text} · {frame} suggesting");
+    }
+    text
 }
 
 /// The `session_size` the shared dispatch fns take under the pane
