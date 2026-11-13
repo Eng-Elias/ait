@@ -37,6 +37,7 @@ investigate, don't retry-loop the gate hoping for green.
 | `ait-agent demotion_never_replays_and_never_recovers` | open — flake seen r14-review-fixes (the ssh stub answered zero of the expected one failed run under sweep load; passes isolated twice and serially), file untouched since R09 |
 | `ait-agent control_master_runs_commands_over_the_socket` | open — flake seen R15-T1 (the `ssh-cm` stub spawn hit `ETXTBSY` (os error 26) under sweep load; passes isolated three times), file untouched since R09 |
 | `ait scenarios` (the whole TOML runner — name granularity skips the suite, the serial leg re-runs it) | open — flake seen R15-T6 (`agent-tab`'s recorded `act "open a new tab"` drifted: the second tab's spawn lagged the agent step's 500 ms settle under sweep load; passes isolated twice), file untouched since E01-T4 |
+| `ait-gui scenarios` (the whole GUI TOML runner — name granularity skips the suite, the serial leg re-runs it) | open — flake seen R15-T5 (`scroll-pill-click`: a cold `noweb` run timed out with `scroll_offset` stuck at 9 under first-boot wgpu/Xvfb load; passed every re-run), file added in R15 |
 
 The underlying PTY races are tracked in the `Backlog: PTY-timing
 flakes under parallel test load` issue — the entries above leave the
