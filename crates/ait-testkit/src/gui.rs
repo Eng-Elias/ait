@@ -18,7 +18,10 @@
 //! display — the suite never steals desktop focus) and falls back to
 //! `DISPLAY` when xvfb is unavailable. With neither, [`GuiE2e::spawn`]
 //! returns `None` — the skip convention the GUI suite codes on, never
-//! a failure.
+//! a failure. A third route exists for tests that own the X server
+//! themselves: [`GuiSpawnConfig::display`] pins the app to a named
+//! `DISPLAY` (the winit canary's private `Xvfb`, which `xdotool`
+//! drives too — Spec R15-T7) and needs no ambient display at all.
 //!
 //! The scenario layer mirrors [`crate::Scenario`]: a [`GuiScenario`]
 //! is a TOML file under `crates/ait-gui/tests/scenarios/` — `feature`
@@ -241,6 +244,17 @@ pub struct GuiSpawnConfig {
     /// Headed mode: drive the developer's `DISPLAY` instead of xvfb
     /// (debugging a scenario visually).
     pub headed: bool,
+    /// Pin the app to this `DISPLAY` — a caller-owned X server (the
+    /// R15-T7 canary's private `Xvfb :N`, which external tooling
+    /// drives too). Bypasses the xvfb-run/ambient-DISPLAY policy:
+    /// the spawn needs no `DISPLAY` of its own, the value reaches
+    /// the app as `DISPLAY`, and the Wayland vars are scrubbed the
+    /// same way the xvfb-run branch scrubs them (a leaked
+    /// `WAYLAND_DISPLAY` would put the window on the wrong server).
+    /// Never point this at a shared display when the test injects
+    /// external input — a synthetic click lands on whatever window
+    /// sits under the coordinates.
+    pub display: Option<OsString>,
     /// Stub the platform opener (Spec R15-T5): `<cwd>/opener-stub/`
     /// gains a fake `xdg-open`/`open` earlier on `PATH` that appends
     /// its argv to `<cwd>/opener.log`, so `ext ↗`, editor spawns and
@@ -257,6 +271,7 @@ impl GuiSpawnConfig {
             args: Vec::new(),
             env: Vec::new(),
             headed: false,
+            display: None,
             stub_opener: false,
         }
     }
@@ -1039,12 +1054,23 @@ impl GuiE2e {
     /// tail in the message), or an app that exits during boot.
     pub fn spawn(config: GuiSpawnConfig) -> io::Result<Option<Self>> {
         let headed = config.headed || env_flag(HEADED_ENV);
-        let Some(display) = display(headed) else {
+        // A pinned `DISPLAY` is the caller's own server — the policy
+        // question (xvfb-run vs ambient) never arises.
+        let Some(display) = (match &config.display {
+            Some(_) => Some(Display::Direct),
+            None => display(headed),
+        }) else {
             return Ok(None);
         };
         let cwd = TempDir::fresh()?;
         let socket = cwd.path().join("driver.sock");
         let (mut env, runtime_dir) = pinned_env(cwd.path(), &socket)?;
+        if let Some(display_name) = &config.display {
+            env.push((
+                OsString::from("DISPLAY"),
+                display_name.as_os_str().to_os_string(),
+            ));
+        }
         env.extend(config.env);
         if config.stub_opener {
             // The PATH-stub opener: the stub dir leads PATH so the
@@ -1073,6 +1099,13 @@ impl GuiE2e {
             Display::Direct => {
                 let mut command = std::process::Command::new(&config.program);
                 command.args(&config.args);
+                if config.display.is_some() {
+                    // Same Wayland scrub the xvfb-run branch applies —
+                    // a pinned X display must actually host the window.
+                    command
+                        .env_remove("WAYLAND_DISPLAY")
+                        .env_remove("WAYLAND_SOCKET");
+                }
                 command
             }
             Display::Xvfb(xvfb) => {
@@ -1247,6 +1280,14 @@ impl GuiE2e {
     /// leg).
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
+    }
+
+    /// The spawned process's pid — the `ait-gui` pid under a direct or
+    /// pinned-display spawn, the `xvfb-run` wrapper's pid under the
+    /// headless policy (external tools looking up the app's window
+    /// by `_NET_WM_PID` need the former, e.g. Spec R15-T7's canary).
+    pub fn pid(&self) -> u32 {
+        self.child.borrow().id()
     }
 
     /// `key "Ctrl+Shift+E"` — one press+release through the app's own
