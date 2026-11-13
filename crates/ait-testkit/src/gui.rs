@@ -86,13 +86,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// `HOME` and `XDG_RUNTIME_DIR` inside the throwaway dir, so a spawned
 /// app reads no host config, loads no host dotfiles into its tab
 /// shells, and places its ctl/runtime sockets under a dir the harness
-/// owns.
-fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<Vec<(OsString, OsString)>> {
+/// owns. The runtime dir comes back too — [`GuiE2e::runtime_dir`]
+/// hands it to `ait ctl` clients so they scan exactly the socket dir
+/// the spawn pinned (Spec R15-T6's coexistence leg).
+fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)>, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     let runtime = cwd.join("xdg-runtime");
     std::fs::create_dir(&runtime)?;
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
-    Ok(vec![
+    let env = vec![
         (OsString::from("SHELL"), OsString::from("/bin/sh")),
         (OsString::from("PS1"), OsString::from("$ ")),
         (OsString::from("HOME"), cwd.as_os_str().to_os_string()),
@@ -100,13 +102,17 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<Vec<(OsString, OsString)>
             OsString::from("XDG_CONFIG_HOME"),
             cwd.join("xdg-config").into_os_string(),
         ),
-        (OsString::from("XDG_RUNTIME_DIR"), runtime.into_os_string()),
+        (
+            OsString::from("XDG_RUNTIME_DIR"),
+            runtime.as_os_str().to_os_string(),
+        ),
         (OsString::from("skip_global_compinit"), OsString::from("1")),
         (
             OsString::from(ENV_DRIVER_SOCKET),
             socket.as_os_str().to_os_string(),
         ),
-    ])
+    ];
+    Ok((env, runtime))
 }
 
 /// How the spawned binary reaches a display.
@@ -467,11 +473,44 @@ pub struct Dump {
     /// opened one.
     #[serde(default)]
     pub agent: Option<AgentDump>,
+    /// The toast slot — `Some` while a toast exists, `live` whether
+    /// it still overrides the status line (Spec R15-T6).
+    #[serde(default)]
+    pub toast: Option<ToastDump>,
+    /// The status strip's composed text — the string the paint pass
+    /// draws (a live toast's text, else the session summary, with a
+    /// `suggesting` segment while a request is in flight).
+    #[serde(default)]
+    pub status: String,
+    /// The tab strip — titles in order plus the active index.
+    #[serde(default)]
+    pub tabs: TabsDump,
     /// The hit-target registry — name → rect for every interactive
     /// surface the last painted frame registered. `click`/`pointer`
     /// `target` names resolve against exactly this map.
     #[serde(default)]
     pub hits: BTreeMap<String, RectDump>,
+}
+
+/// The toast slot — the status-line override's two halves: the text
+/// it carries, and whether it still paints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToastDump {
+    /// The toast's text.
+    pub text: String,
+    /// Whether the status line shows it at capture time.
+    pub live: bool,
+}
+
+/// The tab strip — the chips' titles plus the active index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TabsDump {
+    /// Tab titles in strip order.
+    #[serde(default)]
+    pub titles: Vec<String>,
+    /// The active tab's index into `titles`.
+    #[serde(default)]
+    pub active: usize,
 }
 
 /// The active tab's visible grid.
@@ -727,6 +766,16 @@ impl Dump {
                 fnv(&mut h, &selection.end.column.to_le_bytes());
             }
         }
+        if let Some(toast) = &self.toast {
+            fnv(&mut h, toast.text.as_bytes());
+            fnv(&mut h, &[toast.live as u8]);
+        }
+        fnv(&mut h, self.status.as_bytes());
+        fnv(&mut h, &self.tabs.active.to_le_bytes());
+        for title in &self.tabs.titles {
+            fnv(&mut h, title.as_bytes());
+            fnv(&mut h, b"\n");
+        }
         for name in self.hits.keys() {
             fnv(&mut h, name.as_bytes());
         }
@@ -752,6 +801,9 @@ pub struct GuiE2e {
     child: RefCell<Child>,
     /// The driver socket path ([`ENV_DRIVER_SOCKET`] at spawn).
     socket: PathBuf,
+    /// The pinned `XDG_RUNTIME_DIR` — where the app's ctl socket
+    /// lands; `ait ctl` clients need exactly this env to find it.
+    runtime_dir: PathBuf,
     /// The throwaway cwd/`HOME` — removed on drop.
     cwd: TempDir,
     /// Spawn instant — action-log timestamps.
@@ -784,7 +836,7 @@ impl GuiE2e {
         };
         let cwd = TempDir::fresh()?;
         let socket = cwd.path().join("driver.sock");
-        let mut env = pinned_env(cwd.path(), &socket)?;
+        let (mut env, runtime_dir) = pinned_env(cwd.path(), &socket)?;
         env.extend(config.env);
         if config.stub_opener {
             // The PATH-stub opener: the stub dir leads PATH so the
@@ -880,6 +932,7 @@ impl GuiE2e {
         let e2e = Self {
             child: RefCell::new(child),
             socket,
+            runtime_dir,
             cwd,
             started: Instant::now(),
             log: RefCell::new(Vec::new()),
@@ -978,6 +1031,14 @@ impl GuiE2e {
             Ok(dump) => dump,
             Err(error) => panic!("dump failed: {error}"),
         }
+    }
+
+    /// The pinned `XDG_RUNTIME_DIR` — pass it to an `ait ctl` client's
+    /// env so the socket scan finds the running app's control socket
+    /// beside this harness's driver socket (Spec R15-T6's coexistence
+    /// leg).
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
     }
 
     /// `key "Ctrl+Shift+E"` — one press+release through the app's own
@@ -1437,6 +1498,10 @@ const GUI_VERBS: &[&str] = &[
     "expect_hit",
     "expect_browser",
     "expect_open",
+    "expect_pane_selected",
+    "expect_status",
+    "expect_toast",
+    "expect_tabs",
     "quit",
 ];
 
@@ -1628,6 +1693,24 @@ pub enum GuiStep {
     /// holds this string — the `ext ↗`/external-navigation hand-off
     /// (`stub_opener = true` must name the spawn).
     ExpectOpen(String),
+    /// `expect_pane_selected` — assert the app-global aux selection
+    /// (`pane.selected`): `explorer`/`browser`, or `none` for no
+    /// selection — the state that survives UNDER the agent claim
+    /// (`expect_pane` asserts the shown region instead; a selection
+    /// hidden behind the panel is the precedence scenario's whole
+    /// point).
+    ExpectPaneSelected(String),
+    /// `expect_status` — assert the status strip's composed text
+    /// contains this — the `suggesting` segment while a request is
+    /// in flight, a live toast's text, the session summary.
+    ExpectStatus(String),
+    /// `expect_toast` — `true`/`false` asserts a live toast is or
+    /// isn't showing; a string asserts a live toast's text contains
+    /// it (an expired toast fails all three — it paints nothing).
+    ExpectToast(ToastExpect),
+    /// `expect_tabs` — assert the tab strip's count (`tabs.titles`'s
+    /// length — an `ait ctl open-tab` adds one).
+    ExpectTabs(usize),
     /// `quit` — the app's normal close.
     Quit,
 }
@@ -1813,6 +1896,17 @@ pub enum FindExpect {
     Query(String),
 }
 
+/// What `expect_toast` asserts about the toast slot.
+#[derive(Debug)]
+pub enum ToastExpect {
+    /// `expect_toast = true` — a live toast is showing.
+    Live,
+    /// `expect_toast = false` — no live toast (absent or expired).
+    Gone,
+    /// `expect_toast = "…"` — a live toast's text contains this.
+    Contains(String),
+}
+
 /// What `expect_gate` asserts about the parked gate card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1848,6 +1942,10 @@ impl GuiStep {
             Self::ExpectHit(_) => "expect_hit",
             Self::ExpectBrowser(_) => "expect_browser",
             Self::ExpectOpen(_) => "expect_open",
+            Self::ExpectPaneSelected(_) => "expect_pane_selected",
+            Self::ExpectStatus(_) => "expect_status",
+            Self::ExpectToast(_) => "expect_toast",
+            Self::ExpectTabs(_) => "expect_tabs",
             Self::Quit => "quit",
         }
     }
@@ -1984,6 +2082,35 @@ impl GuiStep {
                 });
             }
             Self::ExpectOpen(needle) => e2e.wait_for_open(needle),
+            Self::ExpectPaneSelected(pane) => {
+                e2e.wait_for_dump(&format!("expect_pane_selected {pane:?}"), |dump| match pane
+                    .as_str()
+                {
+                    "none" => dump.pane.selected.is_none(),
+                    name => dump.pane.selected.as_deref() == Some(name),
+                });
+            }
+            Self::ExpectStatus(text) => {
+                e2e.wait_for_dump(&format!("expect_status {text:?}"), |dump| {
+                    dump.status.contains(text.as_str())
+                });
+            }
+            Self::ExpectToast(expect) => {
+                e2e.wait_for_dump(&format!("expect_toast {expect:?}"), |dump| {
+                    let toast = dump.toast.as_ref();
+                    match expect {
+                        ToastExpect::Live => toast.is_some_and(|toast| toast.live),
+                        ToastExpect::Gone => !toast.is_some_and(|toast| toast.live),
+                        ToastExpect::Contains(text) => toast
+                            .is_some_and(|toast| toast.live && toast.text.contains(text.as_str())),
+                    }
+                });
+            }
+            Self::ExpectTabs(count) => {
+                e2e.wait_for_dump(&format!("expect_tabs {count}"), |dump| {
+                    dump.tabs.titles.len() == *count
+                });
+            }
             Self::Quit => e2e.quit(),
         }
     }
@@ -2348,6 +2475,28 @@ fn parse_gui_step(
         "expect_open" => Ok(GuiStep::ExpectOpen(
             want(value, verb, "a URL substring").map_err(fail)?,
         )),
+        "expect_pane_selected" => Ok(GuiStep::ExpectPaneSelected(
+            want(value, verb, "a pane name").map_err(fail)?,
+        )),
+        "expect_status" => Ok(GuiStep::ExpectStatus(
+            want(value, verb, "a status text").map_err(fail)?,
+        )),
+        "expect_toast" => match value {
+            toml::Value::Boolean(want) => Ok(GuiStep::ExpectToast(if *want {
+                ToastExpect::Live
+            } else {
+                ToastExpect::Gone
+            })),
+            toml::Value::String(text) => {
+                Ok(GuiStep::ExpectToast(ToastExpect::Contains(text.clone())))
+            }
+            _ => Err(fail(format!(
+                "`expect_toast` must be `true`, `false` or a substring, got {value}"
+            ))),
+        },
+        "expect_tabs" => Ok(GuiStep::ExpectTabs(
+            want(value, verb, "a tab count").map_err(fail)?,
+        )),
         "quit" => {
             let flag: bool = want(value, verb, "`true`").map_err(fail)?;
             if !flag {
@@ -2689,6 +2838,9 @@ mod tests {
                 height: 0.0,
             },
             agent: None,
+            toast: None,
+            status: String::new(),
+            tabs: TabsDump::default(),
             hits: BTreeMap::new(),
         };
         assert_eq!(dump.grid_text(), "a\n\nc");
@@ -2906,12 +3058,22 @@ expect_scroll = 1
 [[steps]]
 expect_suggesting = false
 [[steps]]
+expect_pane_selected = "explorer"
+[[steps]]
+expect_status = "suggesting"
+[[steps]]
+expect_toast = "config error"
+[[steps]]
+expect_toast = false
+[[steps]]
+expect_tabs = 2
+[[steps]]
 quit = true
 "#,
         )
         .unwrap();
         assert_eq!(scenario.feature, "panes");
-        assert_eq!(scenario.steps.len(), 19);
+        assert_eq!(scenario.steps.len(), 24);
 
         for (text, want) in [
             (r#"feature = "x""#, "missing steps is fine"),
@@ -2936,6 +3098,8 @@ quit = true
             ),
             ("[[steps]]\nexpect_gate = \"maybe\"", "typed gate"),
             ("[[steps]]\nexpect_find = 1", "typed find"),
+            ("[[steps]]\nexpect_toast = 1", "typed toast"),
+            ("[[steps]]\nexpect_tabs = \"x\"", "typed tabs"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),
         ] {

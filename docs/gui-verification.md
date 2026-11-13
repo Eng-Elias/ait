@@ -123,19 +123,23 @@ Work top to bottom; each item is cheap once the window is up.
   directory navigates the explorer to it. Inside an `ssh()` session
   only URLs afford — paths never resolve under a remote cwd. Ordinary
   click-drag selection is untouched (a Ctrl+press never starts one).
-- **Pane/agent precedence** — with the agent panel open, a pane chord
+- **Pane/agent precedence** *(scenario: pane-agent-precedence)* — with the agent panel open, a pane chord
   switches the region to that pane (the panel's conversation survives —
   `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
   over the live selection. Chord leak: type `echo MARKER` after each —
   no stray chars on the line.
 - **Paste trigger** — OS-paste `# list files here` + Enter fires the
   suggestion path; a paste containing newline/tab/escape bytes stays
-  inert; `ait ctl send` is never classified (by design).
-- **Suggestion loader** — `# x` + Enter shows `⠋ suggesting` in the
+  inert; `ait ctl send` is never classified (by design — the
+  `ctl_coexistence` test's send leg lands verbatim on the grid).
+- **Suggestion loader** *(scenario: suggest_triggers test)* — `# x` + Enter shows `⠋ suggesting` in the
   status line while the model call is in flight; it clears on
   complete/error/cancel.
-- **ctl verbs** — from another terminal: `ait ctl open-tab`,
+- **ctl verbs** *(scenario: ctl_coexistence test)* — from another terminal: `ait ctl open-tab`,
   `ait ctl send 'echo from-ctl'`, `ait ctl last-block` drive the window.
+  (The test's `last-block` leg only proves the round trip — an
+  interactive `sh` seals no blocks, so the happy-path readout stays
+  a manual leg.)
 - **Zoom** — `Ctrl+±`/`Ctrl+0` change terminal text only (⌘ variants
   on macOS); chrome stays put; zoom is ephemeral.
 

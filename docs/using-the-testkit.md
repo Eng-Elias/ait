@@ -56,12 +56,22 @@ entry_contains, bad_entry, history, history_min, current,
 current_contains, back, forward, loads, loads_min, webview}`
 (every present key must hold — `loads` counts webview-bound
 fetches, so a reload or a rejected URL is provable),
-`expect_open` (the stub-opener log) and `quit`. The dump's
-`browser` object carries the surface verdict (`unknown`/
-`embedded`/`external` + the external reason line), the address
-entry and its amber flag, history depth/position, the webview-bound
-load tally and the staged webview rect (`null` is the hide
-signal). The manual checklist stays in
+`expect_open` (the stub-opener log), `expect_pane_selected` (the
+selection *under* the agent claim — `expect_pane` asserts the shown
+region instead), `expect_status` (the status strip's composed text —
+toast while live, else the session summary plus a `suggesting`
+segment while a request is in flight), `expect_toast`
+(`true`/`false`/substring on a *live* toast) and `expect_tabs` (the
+tab strip's count), and `quit`. The dump's `browser` object carries
+the surface verdict (`unknown`/`embedded`/`external` + the external
+reason line), the address entry and its amber flag, history
+depth/position, the webview-bound load tally and the staged webview
+rect (`null` is the hide signal); it also carries
+`agent`/`toast`/`status`/`tabs` objects for code-first legs — e.g.
+`ctl_and_driver_sockets_coexist` runs the real `ait ctl` client
+against the spawned app's pinned `XDG_RUNTIME_DIR`
+(`GuiE2e::runtime_dir`) while the driver socket stays bound. The
+manual checklist stays in
 [gui-verification.md](gui-verification.md).
 
 ## Run
