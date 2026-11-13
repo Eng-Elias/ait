@@ -20,8 +20,18 @@ real gate card through `AgentPanel::apply`), plus waits/asserts
 `wait_text`/`expect_text`/`expect_pane`/`expect_find`/
 `expect_scroll`/`expect_suggesting`/`expect_gate`/`expect_selection`/
 `expect_hit` (the registry gate — use it when a model expectation
-like `expect_pane` can land a frame before the affordance's paint)
-and `quit`. The manual checklist stays in
+like `expect_pane` can land a frame before the affordance's paint),
+`expect_pane_selected` (the selection *under* the agent claim —
+`expect_pane` asserts the shown region instead), `expect_status`
+(the status strip's composed text — toast while live, else the
+session summary plus a `suggesting` segment while a request is in
+flight), `expect_toast` (`true`/`false`/substring on a *live* toast)
+and `expect_tabs` (the tab strip's count), and `quit`. The dump also
+carries `agent`/`toast`/`status`/`tabs` objects for code-first legs —
+e.g. `ctl_and_driver_sockets_coexist` runs the real `ait ctl` client
+against the spawned app's pinned `XDG_RUNTIME_DIR`
+(`GuiE2e::runtime_dir`) while the driver socket stays bound. The
+manual checklist stays in
 [gui-verification.md](gui-verification.md).
 
 ## Run
