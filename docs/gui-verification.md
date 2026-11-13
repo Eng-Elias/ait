@@ -79,7 +79,10 @@ Work top to bottom; each item is cheap once the window is up.
 - **Explorer remote gate** — inside an `ssh()` session the pane shows
   `remote session — browsing unavailable` and never lists the local
   disk under the remote path.
-- **Browser webview** — on X11 or macOS, `Ctrl+Shift+B` embeds a
+- **Browser webview** *(scenario: browser-embed, browser-invalid,
+  browser-history; tests: browser_in_page_nav_syncs_address,
+  browser_webview_tracks_resize_and_hides)* — on X11 or macOS,
+  `Ctrl+Shift+B` embeds a
   `wry` child over the pane body: typing `example.com` + Enter loads
   it in place (a bare `not a url` turns amber and fetches nothing),
   `‹`/`›` or `Alt+←`/`Alt+→` walk history, `⟳`/`Ctrl+R` reloads,
@@ -89,7 +92,8 @@ Work top to bottom; each item is cheap once the window is up.
   history (the wry navigation handler's report), so `‹`/`Alt+←`
   returns to the pre-click page rather than the last typed URL —
   mid-load redirect hops can lag the entry one step on webkit.
-- **Browser external surface** — where the embed verdict isn't
+- **Browser external surface** *(scenario: browser-noweb)* — where
+  the embed verdict isn't
   `Embedded` (Wayland, a `web`-less build, a failed init) the body
   names the reason (`embedded webviews aren't supported on
   Wayland`, `this build has no webview runtime`, `the webview
@@ -122,19 +126,23 @@ Work top to bottom; each item is cheap once the window is up.
   directory navigates the explorer to it. Inside an `ssh()` session
   only URLs afford — paths never resolve under a remote cwd. Ordinary
   click-drag selection is untouched (a Ctrl+press never starts one).
-- **Pane/agent precedence** — with the agent panel open, a pane chord
+- **Pane/agent precedence** *(scenario: pane-agent-precedence)* — with the agent panel open, a pane chord
   switches the region to that pane (the panel's conversation survives —
   `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
   over the live selection. Chord leak: type `echo MARKER` after each —
   no stray chars on the line.
 - **Paste trigger** — OS-paste `# list files here` + Enter fires the
   suggestion path; a paste containing newline/tab/escape bytes stays
-  inert; `ait ctl send` is never classified (by design).
-- **Suggestion loader** — `# x` + Enter shows `⠋ suggesting` in the
+  inert; `ait ctl send` is never classified (by design — the
+  `ctl_coexistence` test's send leg lands verbatim on the grid).
+- **Suggestion loader** *(scenario: suggest_triggers test)* — `# x` + Enter shows `⠋ suggesting` in the
   status line while the model call is in flight; it clears on
   complete/error/cancel.
-- **ctl verbs** — from another terminal: `ait ctl open-tab`,
+- **ctl verbs** *(scenario: ctl_coexistence test)* — from another terminal: `ait ctl open-tab`,
   `ait ctl send 'echo from-ctl'`, `ait ctl last-block` drive the window.
+  (The test's `last-block` leg only proves the round trip — an
+  interactive `sh` seals no blocks, so the happy-path readout stays
+  a manual leg.)
 - **Zoom** — `Ctrl+±`/`Ctrl+0` change terminal text only (⌘ variants
   on macOS); chrome stays put; zoom is ephemeral.
 

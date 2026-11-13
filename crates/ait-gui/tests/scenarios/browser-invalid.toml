@@ -1,0 +1,52 @@
+# Spec R15-T5 — the `not a url` rejection (Spec R14 §5.13): an
+# entry the normalizer can't read turns amber (`bad_entry` — the
+# flag the entry's WARN paint reads) and fetches NOTHING — `loads`
+# and `history` stay flat. `Ctrl+U` clears the entry and the hint,
+# and a real URL then loads: a `file://` page keeps the assert
+# deterministic and offline.
+feature = "browser"
+binary = "web"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+key = "Ctrl+Shift+B"
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+expect_browser = { surface = "embedded" }
+
+# "not a url" has a space — the normalizer rejects it, the entry
+# turns amber, and no fetch ever queues.
+[[steps]]
+text = "not a url"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_browser = { bad_entry = true, loads = 0, history = 0 }
+
+# `Ctrl+U` clears the entry wholesale — the hint lifts with the edit.
+[[steps]]
+key = "Ctrl+U"
+
+[[steps]]
+expect_browser = { bad_entry = false, entry = "" }
+
+# A navigable URL then loads for real — a `file://` page, exact and
+# offline-deterministic.
+[[steps]]
+text = "file:///etc/hostname"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_browser = { entry = "file:///etc/hostname", current = "file:///etc/hostname", history = 1, loads = 1, bad_entry = false }
+
+[[steps]]
+quit = true
