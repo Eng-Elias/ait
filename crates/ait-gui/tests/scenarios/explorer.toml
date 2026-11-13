@@ -10,15 +10,17 @@ feature = "panes"
 wait_text = "$"
 
 # Type + run a marker command while the terminal owns focus — the
-# dump's grid rows then carry user-visible text to assert on.
+# dump's grid rows then carry user-visible text to assert on. The
+# probe is output-only (std.15): `EXPLORER-MARKER` exists only in
+# printf's output, never in the typed line's echo.
 [[steps]]
-text = "echo explorer-marker"
+text = "printf 'EXPLORER-%s\\n' MARKER"
 
 [[steps]]
 key = "Enter"
 
 [[steps]]
-expect_text = "explorer-marker"
+expect_text = "EXPLORER-MARKER"
 
 # The chord: a `key` verb through the test-driver socket — injected at
 # frame start, resolved by the production pane-chord arm.
@@ -31,7 +33,7 @@ expect_pane = "explorer"
 
 # The grid still shows the session text under the open pane.
 [[steps]]
-expect_text = "explorer-marker"
+expect_text = "EXPLORER-MARKER"
 
 [[steps]]
 quit = true
