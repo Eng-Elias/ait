@@ -7,15 +7,16 @@ feature = "scroll"
 [[steps]]
 wait_text = "$"
 
-# Fill scrollback — 200 rows well past the viewport.
+# Fill scrollback — 200 rows well past the viewport, prefixed so the
+# probe can't be satisfied by the command's own echo (std.15).
 [[steps]]
-text = "seq 1 200"
+text = "seq 1 200 | sed 's/^/X/'"
 
 [[steps]]
 key = "Enter"
 
 [[steps]]
-wait_text = "200"
+wait_text = "X200"
 
 # Sub-line pixel deltas: each is far under a row, together they
 # scroll — a dead remainder would leave the offset at 0 forever.
