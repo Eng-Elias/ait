@@ -76,7 +76,10 @@ Work top to bottom; each item is cheap once the window is up.
 - **Explorer remote gate** — inside an `ssh()` session the pane shows
   `remote session — browsing unavailable` and never lists the local
   disk under the remote path.
-- **Browser webview** — on X11 or macOS, `Ctrl+Shift+B` embeds a
+- **Browser webview** *(scenario: browser-embed, browser-invalid,
+  browser-history; tests: browser_in_page_nav_syncs_address,
+  browser_webview_tracks_resize_and_hides)* — on X11 or macOS,
+  `Ctrl+Shift+B` embeds a
   `wry` child over the pane body: typing `example.com` + Enter loads
   it in place (a bare `not a url` turns amber and fetches nothing),
   `‹`/`›` or `Alt+←`/`Alt+→` walk history, `⟳`/`Ctrl+R` reloads,
@@ -86,7 +89,8 @@ Work top to bottom; each item is cheap once the window is up.
   history (the wry navigation handler's report), so `‹`/`Alt+←`
   returns to the pre-click page rather than the last typed URL —
   mid-load redirect hops can lag the entry one step on webkit.
-- **Browser external surface** — where the embed verdict isn't
+- **Browser external surface** *(scenario: browser-noweb)* — where
+  the embed verdict isn't
   `Embedded` (Wayland, a `web`-less build, a failed init) the body
   names the reason (`embedded webviews aren't supported on
   Wayland`, `this build has no webview runtime`, `the webview
