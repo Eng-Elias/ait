@@ -103,6 +103,40 @@ harness pins; `stub-bin/` shadows `xdg-open`/`open` first on
 (`GuiE2e::stub_log()` in code-first tests). The manual checklist
 stays in [gui-verification.md](gui-verification.md).
 
+A GUI scenario is the same TOML shape with the driver's verbs —
+drop a file in `crates/ait-gui/tests/scenarios/`:
+
+```toml
+feature = "scroll"                # required tag; `binary = "noweb"` pins a leg
+
+[[steps]]
+wait_text = "$"                   # gate progress on the grid, not a sleep
+
+[[steps]]
+text = "seq 1 200 | sed 's/^/X/'"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+scroll = { unit = "line", dy = 3.0 }    # injects egui::Event::MouseWheel
+
+[[steps]]
+expect_scroll = 3                 # dump assert: the model's scroll offset
+
+[[steps]]
+expect_hit = "pill.scroll_bottom" # the registry gate — the pill painted
+
+[[steps]]
+click = "pill.scroll_bottom"      # a real egui click on the named rect
+
+[[steps]]
+expect_scroll = 0
+
+[[steps]]
+quit = true
+```
+
 ## Run
 
 ```bash
@@ -166,12 +200,22 @@ uid-0 shells whose PS1 `\$` renders `#`), `terminal_half` /
 AIT_E2E_HEADED=1 AIT_E2E_SLOWMO=400 \
   cargo test -p ait --test scenarios -- --test-threads=1
 cargo run -p ait-testkit --example drive   # interactive manual driving
+
+# GUI headed mode — spawns on your real DISPLAY instead of xvfb:
+AIT_GUI_E2E_HEADED=1 cargo test -p ait-gui --features test-driver \
+  --test scenarios scroll-pill-click
 ```
 
 ## When it fails
 
-`target/e2e-failures/<test>/` → `screen.txt`, `pty-tail.bin`,
-`actions.log`. A stuck terminal after a headed run: `reset`.
+`target/e2e-failures/<test>/` → for the PTY suite `screen.txt`,
+`pty-tail.bin`, `actions.log`; for the GUI suite `dump.json` (the
+last full `dump` — grid text, pane/browser/explorer state, the whole
+hit registry), `stderr.txt` (the app's stderr tail — wgpu adapter
+pick, webkit errors) and the same `actions.log` (one step per line,
+`screen=<hash>` marking drift between dumps). The `gui-e2e` CI job
+uploads the directory as an artifact on failure. A stuck terminal
+after a headed run: `reset`.
 
 ## Driving the agent panel and remote sessions
 

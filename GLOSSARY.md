@@ -163,6 +163,14 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   tick and carrying one single-line JSON request/response per
   connection. `ait ctl <verb>` is its client; `AIT_CTL_SOCKET` —
   exported into every spawned session — names it (§5.10.5).
+- **Test-driver socket** — `ait-gui`'s second, test-only Unix socket
+  beside the control socket (Spec R15, ADR-0019), compiled only under
+  the off-by-default `test-driver` cargo feature and bound only when
+  `AIT_TEST_DRIVER_SOCKET` names a path. Same wire shape as ctl (one
+  single-line JSON request/response per connection); its verbs inject
+  real `egui::Event`s/`RawInput` and answer a versioned JSON **dump**
+  of the state paint draws — grid, panes, browser, explorer, status
+  and the hit-target registry.
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.

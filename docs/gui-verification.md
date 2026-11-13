@@ -7,11 +7,13 @@ resize jank; every one was caught by hands, not by the gate). Run this
 checklist on any round that touches `crates/ait-gui`, `ait-app`'s
 dispatch/input paths, or the keymap.
 
-Items marked *(scenario)* are executable coverage — TOML under
-`crates/ait-gui/tests/scenarios/`, run with
+Items marked *(scenario: …)* or *(test: …)* are executable coverage —
+TOML under `crates/ait-gui/tests/scenarios/` plus code-first tests in
+`crates/ait-gui/tests/scenarios.rs`, run with
 `cargo test -p ait-gui --features test-driver --test scenarios` — not
 manual legs; check them anyway when the scenario set can't reach the
-behavior (headed rendering, webview, real touchpads).
+behavior (headed rendering, webview, real touchpads). Items marked
+*(manual — …)* name why no scenario carries them.
 
 ## Launch
 
@@ -29,15 +31,18 @@ Work top to bottom; each item is cheap once the window is up.
   `echo MARKER`: the command line must be clean. Some platforms emit a
   `Text` twin for an Alt-chord — the leak shows as a stray char on the
   line (Alt+A → `a`, R13).
-- **Touchpad scroll** — two-finger flick must scroll; wheel events
+- **Touchpad scroll** *(scenario: wheel-scroll — sub-line pixel deltas;
+  manual — the physical flick feel is hardware)* — two-finger flick must scroll; wheel events
   arrive as sub-line pixel (`MouseScrollDelta::PixelDelta`) deltas, and
   truncating each event to whole lines drops them all (R13).
 - **Scroll-to-bottom** *(scenario: scroll-pill-click, wheel-scroll)* — scroll up; the `⤓` pill appears bottom-right;
   clicking it snaps to live output.
-- **Long scrollback** — `seq 1 5000`, then scroll: stays responsive
+- **Long scrollback** *(manual — responsiveness is a wall-clock
+  judgment; the correctness leg rides wheel-scroll)* — `seq 1 5000`, then scroll: stays responsive
   (bounded scrollback + viewport-only paint; slowness is usually the
   scroll-delta path, not rendering).
-- **Resize** *(scenario: resize_settle test)* — drag a window edge: the grid tracks during the drag and
+- **Resize** *(test: resize_settle_reflows_on_settle_not_per_frame;
+  manual — live-drag jank is feel)* — drag a window edge: the grid tracks during the drag and
   the winsize reflow fires on settle, not per frame.
 - **Gate cards by mouse** *(scenario: gate-card-click)* — under an `ask` profile, trigger a
   permission card and *click* a verdict button; click a choice row on
@@ -76,7 +81,9 @@ Work top to bottom; each item is cheap once the window is up.
   `binary file — no preview`; `o`/`Enter` on a file spawns the system
   editor detached (`[gui].editor` → `$VISUAL` → `$EDITOR` →
   `open`/`xdg-open`), and a failure toasts.
-- **Explorer remote gate** — inside an `ssh()` session the pane shows
+- **Explorer remote gate** *(manual — needs a live `ssh()` session; the
+  docker-sshd rig is §5.9's TUI surface and no remote GUI fixture
+  exists yet)* — inside an `ssh()` session the pane shows
   `remote session — browsing unavailable` and never lists the local
   disk under the remote path.
 - **Browser webview** *(scenario: browser-embed, browser-invalid,
@@ -100,14 +107,19 @@ Work top to bottom; each item is cheap once the window is up.
   runtime failed to initialize`) and keeps the whole chrome: Enter
   on a URL still navigates — via the system browser — and the
   surface is never a blank rect.
-- **Missing-webkit degradation** — `libwebkit2gtk-4.1.so.0` is a
+- **Missing-webkit degradation** *(manual — a build/packaging check,
+  not a GUI scenario: `ldd` on each binary leg at release)*
+  — `libwebkit2gtk-4.1.so.0` is a
   hard `DT_NEEDED` (ADR-0018): `ldd` on a `web`-feature binary
   lists it, and a webkit-less system kills that binary in the ELF
   loader, before the fallback can run. The mitigation is
   `cargo build -p ait-gui --no-default-features`: that build needs
   no webkit/gtk packages and the pane reports `this build has no
   webview runtime`.
-- **Webview frame discipline** — the webview shares the UI thread
+- **Webview frame discipline** *(manual — video/animation playback and
+  heavy-page responsiveness are real-rendering judgments llvmpipe
+  under Xvfb can't proxy; no dump counter for idle frames exists)*
+  — the webview shares the UI thread
   (§6): while a live webview is staged the sync schedules a bounded
   ~33 ms repaint so the glib pump and page animation keep
   progressing between egui frames — an embedded page visibly plays
@@ -131,19 +143,26 @@ Work top to bottom; each item is cheap once the window is up.
   `Alt+A` brings it back); with a pane showing, `Alt+A` opens the panel
   over the live selection. Chord leak: type `echo MARKER` after each —
   no stray chars on the line.
-- **Paste trigger** — OS-paste `# list files here` + Enter fires the
+- **Paste trigger** *(scenario: paste-inert — the control-byte half;
+  test: ctl_and_driver_sockets_coexist — ctl's never-classified leg;
+  manual — a clean `#`+Enter *paste* arming the suggestion has no
+  scenario yet)* — OS-paste `# list files here` + Enter fires the
   suggestion path; a paste containing newline/tab/escape bytes stays
   inert; `ait ctl send` is never classified (by design — the
-  `ctl_coexistence` test's send leg lands verbatim on the grid).
-- **Suggestion loader** *(scenario: suggest_triggers test)* — `# x` + Enter shows `⠋ suggesting` in the
+  `ctl_and_driver_sockets_coexist` test's send leg lands verbatim on
+  the grid).
+- **Suggestion loader** *(test: suggest_triggers_arm_then_clear_on_error)* — `# x` + Enter shows `⠋ suggesting` in the
   status line while the model call is in flight; it clears on
   complete/error/cancel.
-- **ctl verbs** *(scenario: ctl_coexistence test)* — from another terminal: `ait ctl open-tab`,
+- **ctl verbs** *(test: ctl_and_driver_sockets_coexist; manual — the
+  `last-block` happy path: an interactive `sh` seals no blocks, so a
+  real readout needs a shell-integrated session)* — from another terminal: `ait ctl open-tab`,
   `ait ctl send 'echo from-ctl'`, `ait ctl last-block` drive the window.
   (The test's `last-block` leg only proves the round trip — an
   interactive `sh` seals no blocks, so the happy-path readout stays
   a manual leg.)
-- **Zoom** — `Ctrl+±`/`Ctrl+0` change terminal text only (⌘ variants
+- **Zoom** *(manual — no scenario yet; the dump's cell metrics make it
+  automatable whenever one lands)* — `Ctrl+±`/`Ctrl+0` change terminal text only (⌘ variants
   on macOS); chrome stays put; zoom is ephemeral.
 
 ## Scripted smoke (optional)
