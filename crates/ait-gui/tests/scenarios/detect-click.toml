@@ -1,0 +1,44 @@
+# Spec R15-T3 — detected-token spans as click targets: every visible
+# URL/path token registers `detect.url.<u>`/`detect.path.<p>` (plus a
+# `detect.<n>` ordinal alias) over its cell rect, so a scenario
+# Ctrl+clicks the token's NAME — through the grid's own hit-test —
+# and the detection route lands: a URL opens the browser pane, a
+# path the explorer (Spec R14 §5.13 us-25/26).
+feature = "detect"
+
+[[steps]]
+wait_text = "$"
+
+# Real tokens in real output — `printf` keeps the probes in sed's
+# stream, not the typed command's own echo (std.15). `/tmp` exists
+# on every host, so the path alias is deterministic.
+[[steps]]
+text = "printf 'https://example.com/docs /tmp\n'"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_hit = "detect.url.https://example.com/docs"
+
+[[steps]]
+expect_hit = "detect.path./tmp"
+
+# Ctrl+click the URL token — the pointer batch carries the held set,
+# `clicked && ctrl` routes it, and the browser pane shows.
+[[steps]]
+click = { target = "detect.url.https://example.com/docs", modifiers = "Ctrl" }
+
+[[steps]]
+expect_pane = "browser"
+
+# The region stole columns, so the row re-registers against the new
+# pane rect — the path alias still resolves.
+[[steps]]
+click = { target = "detect.path./tmp", modifiers = "Ctrl" }
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+quit = true

@@ -1,0 +1,59 @@
+# Spec R15-T3 — a Ctrl+press starts no selection drag (us-27: the
+# detected-token affordance owns Ctrl+press; `extend_selection`
+# no-ops without a `begin`), while an ordinary click-drag still
+# selects — pointer pieces driven as separate frame batches the way
+# real input arrives.
+feature = "selection"
+
+[[steps]]
+wait_text = "$"
+
+# Marker rows to drag over — output-only (std.15): `SEL-` exists
+# only in sed's output, never in the typed line's echo.
+[[steps]]
+text = "seq 1 20 | sed 's/^/SEL-/'"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "SEL-20"
+
+# Hold Ctrl, press on the grid, drag, release — the gesture under
+# the held set. No selection may begin: `begin_selection`'s gate is
+# `drag_started && !ctrl`, and the drag arm can't run without it.
+[[steps]]
+expect_hit = "grid"
+
+[[steps]]
+pointer = { event = "press", target = "grid", modifiers = "Ctrl" }
+
+[[steps]]
+pointer = { event = "move", target = "grid", dx = 120.0, dy = 32.0 }
+
+[[steps]]
+pointer = { event = "release", target = "grid", dx = 120.0, dy = 32.0 }
+
+[[steps]]
+expect_selection = false
+
+# Lift the held set — the `modifiers` piece with no set.
+[[steps]]
+pointer = { event = "modifiers" }
+
+# The ordinary drag DOES select — the affordance leaves plain
+# click-drag selection untouched.
+[[steps]]
+pointer = { event = "press", target = "grid" }
+
+[[steps]]
+pointer = { event = "move", target = "grid", dx = -120.0, dy = -32.0 }
+
+[[steps]]
+pointer = { event = "release", target = "grid", dx = -120.0, dy = -32.0 }
+
+[[steps]]
+expect_selection = true
+
+[[steps]]
+quit = true

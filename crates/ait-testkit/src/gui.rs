@@ -1250,6 +1250,7 @@ const GUI_VERBS: &[&str] = &[
     "expect_suggesting",
     "expect_gate",
     "expect_selection",
+    "expect_hit",
     "quit",
 ];
 
@@ -1411,6 +1412,15 @@ pub enum GuiStep {
     /// `expect_selection` — `true`/`false` asserts a drag-selection
     /// exists (`grid.selection` non-null / null).
     ExpectSelection(bool),
+    /// `expect_hit` — bounded wait until the last painted frame
+    /// registered this hit-target name (`"panes.chip.explorer"`,
+    /// `"gate.approve"`, `"pill.scroll_bottom"`). The registry tracks
+    /// the paint pass, which can sit one frame behind a model-flag
+    /// expectation (`expect_pane` sees `panes` state before the frame
+    /// that paints — and registers — the host's chips runs): a named
+    /// `click` after a state expectation needs this to resolve, or it
+    /// can hit the `unknown hit target` refusal a frame early.
+    ExpectHit(String),
     /// `quit` — the app's normal close.
     Quit,
 }
@@ -1467,6 +1477,7 @@ impl GuiStep {
             Self::ExpectSuggesting(_) => "expect_suggesting",
             Self::ExpectGate(_) => "expect_gate",
             Self::ExpectSelection(_) => "expect_selection",
+            Self::ExpectHit(_) => "expect_hit",
             Self::Quit => "quit",
         }
     }
@@ -1520,14 +1531,7 @@ impl GuiStep {
                 dx,
                 dy,
                 modifiers,
-            } => e2e.click_request(
-                target.as_deref(),
-                *x,
-                *y,
-                *dx,
-                *dy,
-                modifiers.as_deref(),
-            ),
+            } => e2e.click_request(target.as_deref(), *x, *y, *dx, *dy, modifiers.as_deref()),
             Self::Agent {
                 event,
                 name,
@@ -1597,6 +1601,11 @@ impl GuiStep {
                     dump.grid
                         .as_ref()
                         .is_some_and(|grid| grid.selection.is_some() == *want)
+                });
+            }
+            Self::ExpectHit(name) => {
+                e2e.wait_for_dump(&format!("expect_hit {name:?}"), |dump| {
+                    dump.hit(name).is_some()
                 });
             }
             Self::Quit => e2e.quit(),
@@ -1827,7 +1836,8 @@ fn parse_gui_step(
             {
                 return Err(fail(
                     "`pointer` needs a `target` name or an `x`/`y` pair — \
-                     only the `modifiers` piece takes neither".to_string(),
+                     only the `modifiers` piece takes neither"
+                        .to_string(),
                 ));
             }
             Ok(GuiStep::Pointer {
@@ -1918,6 +1928,9 @@ fn parse_gui_step(
         )),
         "expect_selection" => Ok(GuiStep::ExpectSelection(
             want(value, verb, "`true` or `false`").map_err(fail)?,
+        )),
+        "expect_hit" => Ok(GuiStep::ExpectHit(
+            want(value, verb, "a hit-target name").map_err(fail)?,
         )),
         "quit" => {
             let flag: bool = want(value, verb, "`true`").map_err(fail)?;
@@ -2055,9 +2068,9 @@ fn pointer_like(
 ) -> Result<(), String> {
     match (target, x, y) {
         (Some(_), None, None) | (None, Some(_), Some(_)) | (None, None, None) => Ok(()),
-        (None, Some(_), None) | (None, None, Some(_)) => {
-            Err(format!("`{verb}`'s `x` and `y` travel together or not at all"))
-        }
+        (None, Some(_), None) | (None, None, Some(_)) => Err(format!(
+            "`{verb}`'s `x` and `y` travel together or not at all"
+        )),
         (Some(_), _, _) => Err(format!(
             "`{verb}`'s `target` and `x`/`y` are alternatives, not partners"
         )),
@@ -2331,8 +2344,14 @@ quit = true
                 "[[steps]]\nclick = { target = \"grid\", x = 1, y = 2 }",
                 "target wants no x/y",
             ),
-            ("[[steps]]\npointer = { target = \"grid\" }", "pointer wants an event"),
-            ("[[steps]]\nagent = { event = \"approve\" }", "agent wants a name"),
+            (
+                "[[steps]]\npointer = { target = \"grid\" }",
+                "pointer wants an event",
+            ),
+            (
+                "[[steps]]\nagent = { event = \"approve\" }",
+                "agent wants a name",
+            ),
             ("[[steps]]\nexpect_gate = \"maybe\"", "typed gate"),
             ("[[steps]]\nexpect_find = 1", "typed find"),
             ("[[steps]]\nbogus = 1", "unknown verb"),

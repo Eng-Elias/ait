@@ -500,10 +500,7 @@ impl GuiApp {
                 // events through, so the parked gate card is the
                 // panel's real approval state.
                 crate::test_driver::Injected::AgentEvent(event) => {
-                    if let Some(panel) = shared
-                        .tabs
-                        .active_mut()
-                        .and_then(|tab| tab.agent.as_mut())
+                    if let Some(panel) = shared.tabs.active_mut().and_then(|tab| tab.agent.as_mut())
                     {
                         panel.apply(event);
                     }
@@ -1213,7 +1210,9 @@ impl GuiApp {
             // The registry names mirror the chip's role: the body
             // activates, the "×" closes (Spec R15-T3).
             shared.hits.register(format!("tab.{index}"), chip.rect);
-            shared.hits.register(format!("tab.{index}.close"), chip.close);
+            shared
+                .hits
+                .register(format!("tab.{index}.close"), chip.close);
             let bg = if index == active {
                 chrome::FIELD_HI
             } else if chip_hit.hovered() || close_hit.hovered() {
@@ -1486,9 +1485,7 @@ impl GuiApp {
                     let button = egui::Button::new(egui::RichText::new("⤓").monospace())
                         .fill(Color32::from_rgba_premultiplied(0x2A, 0x2A, 0x2A, 0xDC))
                         .stroke(Stroke::new(1.0, chrome::EDGE));
-                    let response = ui
-                        .add(button)
-                        .on_hover_text("jump to the live output");
+                    let response = ui.add(button).on_hover_text("jump to the live output");
                     pill_rect = response.rect;
                     snap = response.clicked();
                 });
@@ -1560,10 +1557,9 @@ impl GuiApp {
                     detect::tokens(text, cwd, home)
                 };
                 for token in tokens {
-                    let (Some(&first), Some(&last)) = (
-                        cols.get(token.start),
-                        cols.get(token.end.saturating_sub(1)),
-                    ) else {
+                    let (Some(&first), Some(&last)) =
+                        (cols.get(token.start), cols.get(token.end.saturating_sub(1)))
+                    else {
                         continue;
                     };
                     let rect = Rect::from_min_max(
