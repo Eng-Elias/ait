@@ -1,0 +1,58 @@
+# Spec R15-T3 — the pane host's mouse affordance end to end: the
+# `panes` button opens the host and the switcher chips toggle/switch —
+# every click a real pointer batch through egui's own hit-test, aimed
+# by hit-registry name, never pixels (Spec R14 §5.13 us-1: "a chord
+# AND a clickable affordance").
+feature = "panes"
+
+[[steps]]
+wait_text = "$"
+
+# The `panes` button — the mouse path onto the host — opens the last
+# selection, explorer by default.
+[[steps]]
+click = "panes.button"
+
+[[steps]]
+expect_pane = "explorer"
+
+# `pane.shown` flips in the same pass that owns the toggle, but the
+# switcher chips register on the NEXT pass's paint — the named click
+# needs the registry, so gate on it.
+[[steps]]
+expect_hit = "panes.chip.explorer"
+
+# The shown pane's own chip toggles the region off — the affordance's
+# close, not just its open.
+[[steps]]
+click = "panes.chip.explorer"
+
+[[steps]]
+expect_pane = "none"
+
+# Reopen by mouse, then a different chip switches the shown pane —
+# the strip's switcher role.
+[[steps]]
+click = "panes.button"
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+expect_hit = "panes.chip.browser"
+
+[[steps]]
+click = "panes.chip.browser"
+
+[[steps]]
+expect_pane = "browser"
+
+# …and the active chip closes it again.
+[[steps]]
+click = "panes.chip.browser"
+
+[[steps]]
+expect_pane = "none"
+
+[[steps]]
+quit = true

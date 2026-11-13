@@ -34,20 +34,47 @@
 //! - `{"verb":"resize","width":…,"height":…}` — a viewport resize
 //!   request in points, sent as a real `ViewportCommand::InnerSize`
 //!   so the winsize settle path runs end to end.
+//! - `{"verb":"pointer","event":"…","x":…,"y":…}` — one pointer
+//!   gesture piece (`move`/`press`/`release`/`modifiers`) delivered
+//!   as a real `RawInput` event through [`DriverInputPlugin`]'s
+//!   `input_hook` — the only seam upstream of egui's `PointerState`
+//!   fold, so hover, press, click and drag state update exactly as
+//!   they do for winit-delivered input. `target` names a hit
+//!   registry entry (its rect's center, plus `dx`/`dy`); `x`/`y` is
+//!   the raw escape hatch; `button` defaults `primary`; `modifiers`
+//!   sets the held modifier set for the event (a `ModifiersChanged`
+//!   lands first, real input's order).
+//! - `{"verb":"click","target":"…"}` — one complete click (move +
+//!   press + release in a single frame batch) on a hit-registry
+//!   `target`, or on raw `x`/`y`. Unknown names answer `ok:false`
+//!   with the registered names. `modifiers` holds the set for the
+//!   click only — the held state restores on the next frame.
+//! - `{"verb":"agent","event":"approve","name":"…","summary":"…"}` —
+//!   stage an `AgentEvent::ApprovalRequest` on the active tab's
+//!   panel through `AgentPanel::apply` — the same fold
+//!   `drain_agent_events` feeds real worker events — so a staged
+//!   approve card IS the panel's real approval flow.
 //! - `{"verb":"dump"}` — a versioned JSON snapshot of what the user
 //!   sees, sourced from the same [`Shared`] state `ui`'s paint pass
-//!   reads: the active tab's visible grid rows + cursor and scroll
-//!   position, the pane host's selection, the find bar, the
-//!   suggestion arm, and the window's content size.
+//!   reads: the active tab's visible grid rows + cursor, scroll
+//!   position and selection, the pane host's selection, the find
+//!   bar, the suggestion arm, the agent panel's open/focus/gate
+//!   state, the window's content size, and the hit-target registry
+//!   (`hits` — every interact site's name → rect).
 //! - `{"verb":"quit"}` — the app takes its normal close path
 //!   (`GuiApp::quit` → `ViewportCommand::Close`).
 //!
 //! Injected input joins the `dispatch_events` stream at frame start
-//! via [`Shared::injected`]; the socket is drained in the pump loop
-//! beside ctl (`drain_pass`), where a `dump` answers from post-drain
-//! state. The control socket's request enum and `ait ctl` are
-//! untouched — this socket is the only path to input injection.
+//! via [`Shared::injected`]; pointer input rides
+//! [`DriverInputPlugin`] instead — `dispatch_events` runs mid-pass,
+//! after `InputState::begin_pass` already folded the frame's events
+//! into `PointerState`, so only `RawInput` injection reaches the
+//! hit-test. The socket is drained in the pump loop beside ctl
+//! (`drain_pass`), where a `dump` answers from post-drain state. The
+//! control socket's request enum and `ait ctl` are untouched — this
+//! socket is the only path to input injection.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -144,10 +171,124 @@ pub enum Request {
         /// The requested inner height.
         height: f32,
     },
+    /// `pointer` — one pointer gesture piece delivered as real
+    /// `RawInput` events through [`DriverInputPlugin`]: egui's own
+    /// `PointerState` folds them at `begin_pass`, so hover, press,
+    /// click and drag all run the production hit-test path (the
+    /// `Shared::injected` stream can't — `dispatch_events` runs
+    /// mid-pass, after the fold).
+    Pointer {
+        /// The gesture piece — `move`, `press`, `release` or
+        /// `modifiers` (a bare modifier-set change).
+        event: PointerEventKind,
+        /// A hit-registry name — resolves to its rect's center.
+        /// `x`/`y` and `target` are alternatives.
+        #[serde(default)]
+        target: Option<String>,
+        /// A raw position in points — the escape hatch. `x` and `y`
+        /// travel together.
+        #[serde(default)]
+        x: Option<f32>,
+        /// See `x`.
+        #[serde(default)]
+        y: Option<f32>,
+        /// Points added to the resolved position — drags step away
+        /// from a named target without knowing its pixels.
+        #[serde(default)]
+        dx: f32,
+        /// See `dx`.
+        #[serde(default)]
+        dy: f32,
+        /// The button for `press`/`release` — default `primary`.
+        #[serde(default)]
+        button: Option<PointerButtonKind>,
+        /// The held modifier set for this event (`"Ctrl"`,
+        /// `"Ctrl+Shift"`, `""` for none) — emitted as a
+        /// `ModifiersChanged` first, real input's order. Absent means
+        /// "whatever the batch stream left held".
+        #[serde(default)]
+        modifiers: Option<String>,
+    },
+    /// `click` — a complete click on a registry `target` (or raw
+    /// `x`/`y`): one frame batch carrying the pointer move and the
+    /// press+release pair, so egui's own click detection fires.
+    Click {
+        /// The hit-registry name — fails `ok:false` when unregistered.
+        #[serde(default)]
+        target: Option<String>,
+        /// A raw position in points — `x`/`y` travel together.
+        #[serde(default)]
+        x: Option<f32>,
+        /// See `x`.
+        #[serde(default)]
+        y: Option<f32>,
+        /// Points added to the resolved position.
+        #[serde(default)]
+        dx: f32,
+        /// See `dx`.
+        #[serde(default)]
+        dy: f32,
+        /// The button — default `primary`.
+        #[serde(default)]
+        button: Option<PointerButtonKind>,
+        /// The modifier set held for the click only — the held state
+        /// restores on the next frame.
+        #[serde(default)]
+        modifiers: Option<String>,
+    },
+    /// `agent` — stage one `AgentEvent` on the active tab's panel
+    /// through `AgentPanel::apply` — the real approval flow's fold.
+    Agent {
+        /// The staged event — `approve` parks an `ApprovalRequest`'s
+        /// gate card.
+        event: AgentEventKind,
+        /// The tool's registry name — the card's title.
+        name: String,
+        /// The renderable argument summary the card shows.
+        #[serde(default)]
+        summary: String,
+    },
     /// `dump` — answer with the versioned state snapshot.
     Dump,
     /// `quit` — close the window the normal way.
     Quit,
+}
+
+/// `pointer`'s `event` — one gesture piece per request (each lands
+/// in its own frame batch, the way real input arrives).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerEventKind {
+    /// `Event::PointerMoved`.
+    Move,
+    /// `Event::PointerButton{pressed: true}`.
+    Press,
+    /// `Event::PointerButton{pressed: false}`.
+    Release,
+    /// `Event::ModifiersChanged` alone — set (`"Ctrl"`) or lift
+    /// (`""`/absent) the held set.
+    Modifiers,
+}
+
+/// The pointer button names the wire speaks — egui's
+/// `PointerButton` minus the exotic extras.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButtonKind {
+    /// The primary (usually left) button.
+    Primary,
+    /// The secondary (usually right) button.
+    Secondary,
+    /// The middle button.
+    Middle,
+}
+
+/// `agent`'s `event` — the stageable `AgentEvent` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventKind {
+    /// `AgentEvent::ApprovalRequest` — the approve gate card.
+    Approve,
 }
 
 /// `key`'s `twin` — the `Event::Text` payload twin-emitting platforms
@@ -269,6 +410,15 @@ pub struct Dump {
     pub suggesting: bool,
     /// The window's content area in points.
     pub window: WindowDump,
+    /// The active tab's agent panel — `null` while no tab has ever
+    /// opened one (the `tab.agent` Option mirrors through).
+    pub agent: Option<AgentDump>,
+    /// The hit-target registry — name → rect for every interactive
+    /// surface the last painted frame registered. `pointer`'s and
+    /// `click`'s `target` resolve against exactly this map, so the
+    /// dump answers "what can I click" with the same data the verbs
+    /// resolve from.
+    pub hits: BTreeMap<String, RectDump>,
 }
 
 /// The active tab's visible grid — the same `visible_rows` the paint
@@ -290,6 +440,9 @@ pub struct GridDump {
     pub rows: Vec<String>,
     /// The renderable cursor.
     pub cursor: CursorDump,
+    /// The drag-selection's normalized range — during and after a
+    /// drag (the highlight's lifetime), `null` when none.
+    pub selection: Option<SelectionDump>,
 }
 
 /// The cursor's viewport position and shape.
@@ -338,9 +491,90 @@ pub struct WindowDump {
     pub height: f32,
 }
 
+/// A rectangle in points — the hit-target registry's value shape and
+/// the shape every future rect dump reuses.
+#[derive(Debug, Serialize)]
+pub struct RectDump {
+    /// The left edge.
+    pub x: f32,
+    /// The top edge.
+    pub y: f32,
+    /// The width.
+    pub w: f32,
+    /// The height.
+    pub h: f32,
+}
+
+impl From<egui::Rect> for RectDump {
+    fn from(rect: egui::Rect) -> Self {
+        Self {
+            x: rect.min.x,
+            y: rect.min.y,
+            w: rect.width(),
+            h: rect.height(),
+        }
+    }
+}
+
+/// A grid position — `line` is absolute (scrollback rows are
+/// negative), `column` a cell column.
+#[derive(Debug, Serialize)]
+pub struct PointDump {
+    /// The absolute line.
+    pub line: i32,
+    /// The cell column.
+    pub column: usize,
+}
+
+/// The drag-selection's normalized range — `start` ≤ `end` in
+/// reading order.
+#[derive(Debug, Serialize)]
+pub struct SelectionDump {
+    /// The earlier endpoint.
+    pub start: PointDump,
+    /// The later endpoint.
+    pub end: PointDump,
+}
+
+/// The active tab's agent panel — the open/focus split a `click`
+/// scenario drives the pane affordances through, plus the gate card.
+#[derive(Debug, Serialize)]
+pub struct AgentDump {
+    /// `AgentPanel::is_open` — the region claim.
+    pub open: bool,
+    /// `AgentPanel::is_focused` — key routing.
+    pub focused: bool,
+    /// The gate card while one parks — `approve`/`ask`/`null` (the
+    /// same `panel::gate` the painter draws).
+    pub gate: Option<GateDump>,
+}
+
+/// The gate card — tagged on `kind` like the ctl protocol's verbs.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GateDump {
+    /// `Gate::Approve` — an approve card, possibly mid-deny-prompt.
+    Approve {
+        /// The tool's registry name.
+        name: String,
+        /// `denying` — the deny reason prompt replaced the buttons.
+        denying: bool,
+    },
+    /// `Gate::Ask` — a multiple-choice card.
+    Ask {
+        /// The question the card asks.
+        question: String,
+        /// The answer choices the card shows.
+        choices: Vec<String>,
+        /// The highlighted row.
+        selected: usize,
+    },
+}
+
 impl Dump {
     /// Snapshot `shared` — the state `ui`'s paint pass reads — plus
-    /// the window's current content rect.
+    /// the window's current content rect and the hit registry the
+    /// last painted frame produced.
     fn capture(ctx: &egui::Context, shared: &Shared) -> Self {
         let grid = shared.tabs.active().map(|tab| {
             let cursor = tab.cursor();
@@ -360,6 +594,16 @@ impl Dump {
                     column: cursor.column,
                     shape: shape_name(cursor.shape),
                 },
+                selection: tab.selection.range().map(|range| SelectionDump {
+                    start: PointDump {
+                        line: range.start.line,
+                        column: range.start.column,
+                    },
+                    end: PointDump {
+                        line: range.end.line,
+                        column: range.end.column,
+                    },
+                }),
             }
         });
         let area = ctx.content_rect();
@@ -380,6 +624,30 @@ impl Dump {
                 width: area.width(),
                 height: area.height(),
             },
+            agent: shared
+                .tabs
+                .active()
+                .and_then(|tab| tab.agent_panel())
+                .map(|panel| AgentDump {
+                    open: panel.is_open(),
+                    focused: panel.is_focused(),
+                    gate: crate::panel::gate(panel).map(|gate| match gate {
+                        crate::panel::Gate::Approve { name, denying } => GateDump::Approve {
+                            name: name.to_owned(),
+                            denying,
+                        },
+                        crate::panel::Gate::Ask(card) => GateDump::Ask {
+                            question: card.question.clone(),
+                            choices: card.choices.clone(),
+                            selected: card.selected,
+                        },
+                    }),
+                }),
+            hits: shared
+                .hits
+                .entries()
+                .map(|(name, rect)| (name.clone(), RectDump::from(*rect)))
+                .collect(),
         }
     }
 }
@@ -436,8 +704,80 @@ pub enum Injected {
     /// `ViewportCommand::InnerSize`, so the winsize settle path the
     /// scenario asserts is the production one end to end.
     Resize(egui::Vec2),
+    /// A staged `AgentEvent` — `AgentPanel::apply` runs it in
+    /// `dispatch_events`, the same fold `drain_agent_events` feeds
+    /// real worker events through, so a staged approve card IS the
+    /// panel's real approval flow.
+    AgentEvent(ait_agent::AgentEvent),
+    /// A marker that wakes one frame — `pointer`/`click` batches queue
+    /// on [`DriverInputPlugin`] (their events must fold into
+    /// `RawInput` at `begin_pass`, upstream of everything
+    /// `dispatch_events` can reach), so the verb pushes this marker
+    /// to earn the frame that delivers them.
+    Repaint,
     /// Close the window — `GuiApp::quit`'s flag path.
     Quit,
+}
+
+/// The egui plugin that injects pointer batches into `RawInput` at
+/// `begin_pass` — the only seam where injected events update
+/// `InputState`/`PointerState` (hover, press, click, drag) like
+/// winit-delivered input. `dispatch_events`' `Shared::injected`
+/// stream runs mid-pass, after the fold already happened, which is
+/// why wheel went through the app-side `wheel` route — pointer
+/// gestures need the real thing.
+#[derive(Debug, Default)]
+pub struct DriverInputPlugin {
+    /// One `pointer`/`click` request's events per entry — each
+    /// `input_hook` delivers exactly one batch so multi-batch
+    /// gestures (a click's trailing modifier restore, a
+    /// press→drag→release) unfold across frames the way real input
+    /// arrives.
+    queue: VecDeque<Vec<egui::Event>>,
+    /// The modifier set the queued batch stream leaves held —
+    /// tracked at push time (not hook time) so a `PointerButton`
+    /// event's `modifiers` field can reflect the stream's own
+    /// `ModifiersChanged` events even before they deliver.
+    held: egui::Modifiers,
+}
+
+impl DriverInputPlugin {
+    /// Queue `batch` for delivery on a coming frame; folds its
+    /// `ModifiersChanged` events into `held`.
+    pub fn push(&mut self, batch: Vec<egui::Event>) {
+        for event in &batch {
+            if let egui::Event::ModifiersChanged(mods) = event {
+                self.held = *mods;
+            }
+        }
+        self.queue.push_back(batch);
+    }
+
+    /// The modifier set the queue's batches leave held — a pointer
+    /// event's `modifiers` when its request doesn't name a set.
+    pub fn held(&self) -> egui::Modifiers {
+        self.held
+    }
+}
+
+impl egui::Plugin for DriverInputPlugin {
+    fn debug_name(&self) -> &'static str {
+        "ait-test-driver"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let Some(batch) = self.queue.pop_front() else {
+            return;
+        };
+        // The batch folds AFTER the pass's native events — the last
+        // position wins `interact_pos`, and `hits` is computed once
+        // per pass at it, so a real cursor's `PointerMoved` landing in
+        // the same pass must not retarget the press's hit-test.
+        input.events.extend(batch);
+        // A delivered batch changes pointer state — the next frame
+        // paints it (and delivers any queued follow-up batch).
+        ctx.request_repaint();
+    }
 }
 
 /// The boot-degradation text a bind failure produces — mirrors
@@ -527,10 +867,251 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
                 .push_back(Injected::Resize(egui::Vec2::new(*width, *height)));
             Response::ok()
         }
+        Request::Pointer {
+            event,
+            target,
+            x,
+            y,
+            dx,
+            dy,
+            button,
+            modifiers,
+        } => {
+            let parsed = match modifiers.as_deref().map(parse_modifiers).transpose() {
+                Ok(mods) => mods,
+                Err(error) => return Response::error(error),
+            };
+            // A bare `modifiers` gesture needs no position.
+            let pos = if matches!(event, PointerEventKind::Modifiers) {
+                None
+            } else {
+                match pointer_pos(shared, target.as_deref(), *x, *y, *dx, *dy) {
+                    Ok(pos) => Some(pos),
+                    Err(error) => return Response::error(error),
+                }
+            };
+            let pushed = ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+                let batch = pointer_batch(
+                    *event,
+                    pos,
+                    button.unwrap_or(PointerButtonKind::Primary),
+                    parsed,
+                    plugin.held(),
+                );
+                plugin.push(batch);
+            });
+            match pushed {
+                Some(()) => {
+                    shared.injected.push_back(Injected::Repaint);
+                    Response::ok()
+                }
+                None => Response::error("the pointer plugin is not registered".to_owned()),
+            }
+        }
+        Request::Click {
+            target,
+            x,
+            y,
+            dx,
+            dy,
+            button,
+            modifiers,
+        } => {
+            let pos = match pointer_pos(shared, target.as_deref(), *x, *y, *dx, *dy) {
+                Ok(pos) => pos,
+                Err(error) => return Response::error(error),
+            };
+            let parsed = match modifiers.as_deref().map(parse_modifiers).transpose() {
+                Ok(mods) => mods,
+                Err(error) => return Response::error(error),
+            };
+            let button = egui::PointerButton::from(button.unwrap_or(PointerButtonKind::Primary));
+            let pushed = ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+                let mods = parsed.unwrap_or_else(|| plugin.held());
+                let mut batch = Vec::with_capacity(4);
+                if parsed.is_some() {
+                    batch.push(egui::Event::ModifiersChanged(mods));
+                }
+                batch.push(egui::Event::PointerMoved(pos));
+                batch.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers: mods,
+                });
+                batch.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers: mods,
+                });
+                let before = plugin.held();
+                plugin.push(batch);
+                if parsed.is_some() {
+                    // The click's set is a gesture, not a hold — the
+                    // next frame restores whatever was held before it.
+                    plugin.push(vec![egui::Event::ModifiersChanged(before)]);
+                }
+            });
+            match pushed {
+                Some(()) => {
+                    shared.injected.push_back(Injected::Repaint);
+                    Response::ok()
+                }
+                None => Response::error("the pointer plugin is not registered".to_owned()),
+            }
+        }
+        Request::Agent {
+            event,
+            name,
+            summary,
+        } => {
+            if !shared
+                .tabs
+                .active()
+                .and_then(|tab| tab.agent_panel())
+                .is_some_and(|panel| panel.is_open())
+            {
+                return Response::error(
+                    "`agent` needs the panel open — send `key \"Alt+A\"` first".to_owned(),
+                );
+            }
+            let staged = match event {
+                AgentEventKind::Approve => ait_agent::AgentEvent::ApprovalRequest {
+                    call: ait_agent::ToolCall {
+                        id: format!("test-driver.{name}"),
+                        name: name.clone(),
+                        arguments: "{}".to_owned(),
+                    },
+                    summary: summary.clone(),
+                },
+            };
+            shared.injected.push_back(Injected::AgentEvent(staged));
+            Response::ok()
+        }
         Request::Dump => Response::dump(Dump::capture(ctx, shared)),
         Request::Quit => {
             shared.injected.push_back(Injected::Quit);
             Response::ok()
+        }
+    }
+}
+
+/// `pointer`'s `modifiers` field → the held `egui::Modifiers` set.
+/// Modifier-only names only (`alt`/`ctrl`/`shift`/`super`) joined by
+/// `+`; `""` or `none` is the empty set. Unlike `parse_chord` there
+/// is no key to name — a chord is the wrong shape for a held set.
+fn parse_modifiers(text: &str) -> Result<egui::Modifiers, String> {
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return Ok(egui::Modifiers::NONE);
+    }
+    let mut mods = egui::Modifiers::NONE;
+    for name in text.split('+').filter(|part| !part.is_empty()) {
+        match name.to_ascii_lowercase().as_str() {
+            "alt" => mods.alt = true,
+            "ctrl" | "control" => mods.ctrl = true,
+            "shift" => mods.shift = true,
+            "super" | "meta" | "cmd" => mods.mac_cmd = true,
+            _ => {
+                return Err(format!(
+                    "modifier set {text:?} names no modifier at {name:?} — \
+                     the held set is alt/ctrl/shift/super joined by `+`"
+                ))
+            }
+        }
+    }
+    mods.command = mods.ctrl || mods.mac_cmd;
+    Ok(mods)
+}
+
+/// A `pointer`/`click` request's position: `target` resolves a hit
+/// registry name to its rect's center, `x`/`y` is the raw escape
+/// hatch — plus the `dx`/`dy` offset. The name lookup answers the
+/// registry's contents in the error so a bad name names the truth.
+fn pointer_pos(
+    shared: &Shared,
+    target: Option<&str>,
+    x: Option<f32>,
+    y: Option<f32>,
+    dx: f32,
+    dy: f32,
+) -> Result<egui::Pos2, String> {
+    let offset = egui::vec2(dx, dy);
+    match (target, x, y) {
+        (Some(name), None, None) => shared
+            .hits
+            .get(name)
+            .map(|rect| rect.center() + offset)
+            .ok_or_else(|| unknown_target(shared, name)),
+        (None, Some(x), Some(y)) => Ok(egui::pos2(x, y) + offset),
+        (None, None, None) => Err("pointer needs a `target` name or an `x`/`y` pair".to_owned()),
+        (Some(_), _, _) => Err("`target` and `x`/`y` are alternatives, not partners".to_owned()),
+        _ => Err("`x` and `y` travel together".to_owned()),
+    }
+}
+
+/// The `unknown target` error — names the miss and lists what the
+/// last painted frame registered, so a typo'd target fails naming
+/// the real vocabulary.
+fn unknown_target(shared: &Shared, name: &str) -> String {
+    let names: Vec<&str> = shared
+        .hits
+        .entries()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    match names.is_empty() {
+        true => format!("unknown hit target {name:?} — nothing registered"),
+        false => format!(
+            "unknown hit target {name:?} — registered: {}",
+            names.join(", ")
+        ),
+    }
+}
+
+/// One `pointer` request's batch: the `ModifiersChanged` first (real
+/// input's order — the modifier lands, then the gesture under it),
+/// then the pointer event. `modifiers` names the whole held set;
+/// absent, the event carries the stream's `held` state.
+fn pointer_batch(
+    event: PointerEventKind,
+    pos: Option<egui::Pos2>,
+    button: PointerButtonKind,
+    modifiers: Option<egui::Modifiers>,
+    held: egui::Modifiers,
+) -> Vec<egui::Event> {
+    let mut batch = Vec::new();
+    if let Some(mods) = modifiers {
+        batch.push(egui::Event::ModifiersChanged(mods));
+    }
+    match event {
+        PointerEventKind::Move => batch.push(egui::Event::PointerMoved(
+            pos.expect("move resolves a position"),
+        )),
+        PointerEventKind::Press | PointerEventKind::Release => {
+            batch.push(egui::Event::PointerButton {
+                pos: pos.expect("a button event resolves a position"),
+                button: egui::PointerButton::from(button),
+                pressed: matches!(event, PointerEventKind::Press),
+                modifiers: modifiers.unwrap_or(held),
+            });
+        }
+        PointerEventKind::Modifiers => {
+            if modifiers.is_none() {
+                // `{"event":"modifiers"}` with no set lifts all.
+                batch.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            }
+        }
+    }
+    batch
+}
+
+/// `PointerButtonKind` → `egui::PointerButton`.
+impl From<PointerButtonKind> for egui::PointerButton {
+    fn from(kind: PointerButtonKind) -> Self {
+        match kind {
+            PointerButtonKind::Primary => Self::Primary,
+            PointerButtonKind::Secondary => Self::Secondary,
+            PointerButtonKind::Middle => Self::Middle,
         }
     }
 }
@@ -1000,6 +1581,7 @@ mod tests {
     use ait_app::tabs::{SessionTemplate, TabManager};
     use ait_config::Settings;
     use ait_term::Size;
+    use eframe::egui::Plugin;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1033,6 +1615,7 @@ mod tests {
             explorer: crate::explorer::ExplorerState::default(),
             browser: crate::browser::BrowserState::default(),
             injected: VecDeque::new(),
+            hits: crate::app::HitTargets::default(),
         }
     }
 
@@ -1088,6 +1671,36 @@ mod tests {
             Ok(Request::Resize { .. })
         ));
         assert!(matches!(
+            decode_request(
+                r#"{"verb":"pointer","event":"press","target":"grid","modifiers":"Ctrl"}"#
+            ),
+            Ok(Request::Pointer {
+                event: PointerEventKind::Press,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"pointer","event":"move","x":10,"y":20,"dx":1}"#),
+            Ok(Request::Pointer {
+                event: PointerEventKind::Move,
+                x: Some(10.0),
+                y: Some(20.0),
+                dx: 1.0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"click","target":"gate.approve"}"#),
+            Ok(Request::Click { .. })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"agent","event":"approve","name":"run"}"#),
+            Ok(Request::Agent {
+                event: AgentEventKind::Approve,
+                ..
+            })
+        ));
+        assert!(matches!(
             decode_request(r#"{"verb":"dump"}"#),
             Ok(Request::Dump)
         ));
@@ -1106,6 +1719,11 @@ mod tests {
             r#"{"verb":"scroll","unit":"inch","dy":1}"#,        // unknown unit
             r#"{"verb":"scroll","unit":"line","over":"moon"}"#, // unknown region
             r#"{"verb":"resize","width":1100}"#,                // missing height
+            r#"{"verb":"pointer"}"#,                            // missing event
+            r#"{"verb":"pointer","event":"blink"}"#,            // unknown piece
+            r#"{"verb":"pointer","event":"press","button":"extra"}"#, // unknown button
+            r#"{"verb":"agent","event":"refuse","name":"x"}"#,  // unknown stageable
+            r#"{"verb":"agent","event":"approve"}"#,            // missing name
             r#"{"verb":"send","text":"x"}"#,                    // a ctl verb — NOT this socket
         ] {
             assert!(decode_request(line).is_err(), "{line:?}");
@@ -1384,6 +2002,299 @@ mod tests {
             let response = dispatch(&ctx, &mut shared, &Request::Resize { width, height });
             assert!(!response.ok, "{width}x{height}");
             assert!(shared.injected.is_empty());
+        }
+    }
+
+    /// `pointer`'s `modifiers` strings → the held set: modifier-only
+    /// names joined by `+`, `""`/`none` lifts, anything else errors.
+    #[test]
+    fn modifier_sets_parse_or_fail_loudly() {
+        let mods = parse_modifiers("Ctrl").unwrap();
+        assert!(mods.ctrl && !mods.alt && !mods.shift);
+        assert!(mods.command, "ctrl derives command off macOS");
+        let mods = parse_modifiers("ctrl+shift").unwrap();
+        assert!(mods.ctrl && mods.shift && !mods.alt);
+        let mods = parse_modifiers("Alt+Super").unwrap();
+        assert!(mods.alt && mods.mac_cmd);
+        for empty in ["", "none"] {
+            assert_eq!(parse_modifiers(empty).unwrap(), egui::Modifiers::NONE);
+        }
+        // Empty join parts skip — `ctrl++alt` is `ctrl+alt`.
+        let mods = parse_modifiers("ctrl++alt").unwrap();
+        assert!(mods.ctrl && mods.alt);
+        for bad in ["Ctrl+E", "bogus", "ctrl "] {
+            assert!(parse_modifiers(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `pointer`/`click` positions: `target` resolves to its rect's
+    /// center plus `dx`/`dy`, `x`/`y` is the raw pair — and an
+    /// unknown name fails naming the registry's real vocabulary.
+    #[test]
+    fn pointer_positions_resolve_names_and_raw_pairs() {
+        let mut shared = shared();
+        shared.hits.register(
+            "grid",
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0)),
+        );
+        // The target's rect IS the answer — its center, plus offset.
+        let pos = pointer_pos(&shared, Some("grid"), None, None, 0.0, 0.0).unwrap();
+        assert_eq!(pos, egui::pos2(60.0, 45.0));
+        let pos = pointer_pos(&shared, Some("grid"), None, None, 5.0, -5.0).unwrap();
+        assert_eq!(pos, egui::pos2(65.0, 40.0));
+        // The raw escape hatch.
+        let pos = pointer_pos(&shared, None, Some(1.0), Some(2.0), 1.0, 1.0).unwrap();
+        assert_eq!(pos, egui::pos2(2.0, 3.0));
+        // An unknown name names the miss AND the registry.
+        let error = pointer_pos(&shared, Some("bogus"), None, None, 0.0, 0.0).unwrap_err();
+        assert!(error.contains("bogus"), "{error}");
+        assert!(error.contains("grid"), "{error}");
+        // The shape mismatches: neither, half a pair, or both forms.
+        for (target, x, y) in [
+            (None, None, None),
+            (None, Some(1.0), None),
+            (None, None, Some(2.0)),
+            (Some("grid"), Some(1.0), Some(2.0)),
+        ] {
+            assert!(pointer_pos(&shared, target, x, y, 0.0, 0.0).is_err());
+        }
+    }
+
+    /// `pointer_batch` builds the modifier-first batch per piece —
+    /// real input's order — and `pointer`/`click` deliveries ride the
+    /// plugin's `input_hook` into `RawInput` one batch per frame,
+    /// appended behind the frame's native events so the last
+    /// `interact_pos` is the gesture's (egui hit-tests once per pass
+    /// at it — a real cursor's `PointerMoved` landing first must not
+    /// retarget the press).
+    #[test]
+    fn pointer_batches_splice_into_raw_input() {
+        // A press under a named set: `ModifiersChanged` leads, the
+        // button event carries the set.
+        let batch = pointer_batch(
+            PointerEventKind::Press,
+            Some(egui::pos2(3.0, 4.0)),
+            PointerButtonKind::Primary,
+            Some(egui::Modifiers::CTRL),
+            egui::Modifiers::NONE,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::ModifiersChanged(m) if m.ctrl
+        ));
+        assert!(matches!(
+            batch[1],
+            egui::Event::PointerButton {
+                pos,
+                pressed: true,
+                modifiers,
+                ..
+            } if pos == egui::pos2(3.0, 4.0) && modifiers.ctrl
+        ));
+        // No set named → the event carries the stream's held state.
+        let batch = pointer_batch(
+            PointerEventKind::Release,
+            Some(egui::pos2(3.0, 4.0)),
+            PointerButtonKind::Primary,
+            None,
+            egui::Modifiers::CTRL,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::PointerButton {
+                pressed: false,
+                modifiers,
+                ..
+            } if modifiers.ctrl
+        ));
+        // The bare `modifiers` piece with no set lifts all.
+        let batch = pointer_batch(
+            PointerEventKind::Modifiers,
+            None,
+            PointerButtonKind::Primary,
+            None,
+            egui::Modifiers::CTRL,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::ModifiersChanged(m) if m == egui::Modifiers::NONE
+        ));
+
+        // The plugin: one batch per `input_hook` call, appended after
+        // the pass's native events — the last `interact_pos` is the
+        // gesture's, which is what `hits` resolves against; `held`
+        // tracks the queued stream's sets.
+        let mut plugin = DriverInputPlugin::default();
+        plugin.push(vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL)]);
+        plugin.push(vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]);
+        assert_eq!(plugin.held(), egui::Modifiers::CTRL);
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::Text("native".to_owned())],
+            ..Default::default()
+        };
+        plugin.input_hook(&ctx, &mut input);
+        assert!(matches!(input.events[0], egui::Event::Text(_)));
+        assert!(matches!(input.events[1], egui::Event::ModifiersChanged(_)));
+        let mut next = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut next);
+        assert_eq!(next.events.len(), 1);
+        assert!(matches!(next.events[0], egui::Event::PointerMoved(_)));
+    }
+
+    /// `click`/`pointer` queue their batches on the plugin and earn a
+    /// frame through the `Repaint` marker; an `agent` stage needs the
+    /// panel open and lands an `Injected::AgentEvent` for
+    /// `dispatch_events`' `apply` fold.
+    #[test]
+    fn pointer_click_agent_dispatch_their_shapes() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        shared.hits.register(
+            "grid",
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 40.0)),
+        );
+
+        // No plugin registered → a clean `ok:false`, nothing queued.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(shared.injected.is_empty());
+
+        ctx.add_plugin(DriverInputPlugin::default());
+        // `click` on a name → the move+press+release batch queued on
+        // the plugin, the frame earned through `Injected::Repaint`.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(response.ok);
+        assert!(matches!(
+            shared.injected.pop_front(),
+            Some(Injected::Repaint)
+        ));
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 1);
+            let batch = &plugin.queue[0];
+            assert!(matches!(batch[0], egui::Event::PointerMoved(_)));
+            assert!(matches!(
+                batch[1],
+                egui::Event::PointerButton {
+                    pos,
+                    pressed: true,
+                    ..
+                } if pos == egui::pos2(40.0, 20.0)
+            ));
+            assert!(matches!(
+                batch[2],
+                egui::Event::PointerButton { pressed: false, .. }
+            ));
+        });
+
+        // An unknown name fails loudly and queues nothing.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("bogus".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(shared.injected.is_empty());
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 1, "nothing new queued");
+        });
+
+        // A `click` naming a modifier set appends the restore batch —
+        // the held state survives the gesture.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: Some("Ctrl".to_owned()),
+            },
+        );
+        assert!(response.ok);
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 3, "click batch + restore");
+            assert!(matches!(
+                plugin.queue[1][0],
+                egui::Event::ModifiersChanged(m) if m.ctrl
+            ));
+            assert!(matches!(
+                plugin.queue[2][0],
+                egui::Event::ModifiersChanged(m) if m == egui::Modifiers::NONE
+            ));
+        });
+        shared.injected.clear();
+
+        // `agent` without an open panel refuses; with one it stages
+        // the approval through the same `apply` fold real events take.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Agent {
+                event: AgentEventKind::Approve,
+                name: "run".to_owned(),
+                summary: "rm -rf /".to_owned(),
+            },
+        );
+        assert!(!response.ok, "no panel open yet");
+        shared
+            .tabs
+            .active_mut()
+            .expect("a tab is active")
+            .toggle_agent_panel();
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Agent {
+                event: AgentEventKind::Approve,
+                name: "run".to_owned(),
+                summary: "rm -rf /".to_owned(),
+            },
+        );
+        assert!(response.ok);
+        match shared.injected.pop_front().unwrap() {
+            Injected::AgentEvent(ait_agent::AgentEvent::ApprovalRequest {
+                call, summary, ..
+            }) => {
+                assert_eq!(call.name, "run");
+                assert_eq!(summary, "rm -rf /");
+            }
+            other => panic!("expected the staged approval, got {other:?}"),
         }
     }
 

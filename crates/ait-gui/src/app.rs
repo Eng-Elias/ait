@@ -136,6 +136,59 @@ pub struct Shared {
     /// path.
     #[cfg(feature = "test-driver")]
     pub injected: std::collections::VecDeque<crate::test_driver::Injected>,
+    /// The hit-target registry (Spec R15-T3): the paint pass's
+    /// name → rect map a `pointer`/`click` `target` resolves against
+    /// and the `dump` reports. Always present so the paint sites stay
+    /// unconditional — the map inside only exists (and only fills)
+    /// in `test-driver` builds.
+    pub hits: HitTargets,
+}
+
+/// The test-driver's hit-target registry (Spec R15-T3) — semantic
+/// name → the rect its `interact` owned on the last painted frame.
+/// `register`/`clear` are inline no-ops outside `test-driver` builds
+/// (no map exists to populate), so a production build pays nothing
+/// for the names the paint pass carries anyway.
+#[derive(Debug, Default)]
+pub struct HitTargets {
+    /// The names registered so far this frame — the dump's `hits`
+    /// and `target` resolution read exactly this.
+    #[cfg(feature = "test-driver")]
+    map: std::collections::BTreeMap<String, Rect>,
+}
+
+impl HitTargets {
+    /// Register `name` at `rect` — the `interact` site owns both, so
+    /// a name's rect IS the hit-tested rect.
+    #[inline]
+    pub fn register(&mut self, name: impl Into<String>, rect: Rect) {
+        #[cfg(feature = "test-driver")]
+        self.map.insert(name.into(), rect);
+        #[cfg(not(feature = "test-driver"))]
+        let _ = (name, rect);
+    }
+
+    /// Forget the last frame's targets — `ui` clears at paint start
+    /// so `hits` is always exactly one frame's registration.
+    #[inline]
+    pub fn clear(&mut self) {
+        #[cfg(feature = "test-driver")]
+        self.map.clear();
+    }
+
+    /// `name` → its last-painted rect — the `target` resolution seam
+    /// (test-driver only).
+    #[cfg(feature = "test-driver")]
+    pub fn get(&self, name: &str) -> Option<Rect> {
+        self.map.get(name).copied()
+    }
+
+    /// The registry's entries — the dump's `hits` field (test-driver
+    /// only).
+    #[cfg(feature = "test-driver")]
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Rect)> {
+        self.map.iter()
+    }
 }
 
 impl Shared {
@@ -223,6 +276,14 @@ pub struct GuiApp {
     /// `exists()` checks run once per hover position+content, not
     /// once per frame while Ctrl is held (§6).
     detect_cache: detect::DetectCache,
+    /// The test-driver's memoized detection-token scan (Spec R15-T3)
+    /// — the `detect.*` hit names → cell rects. Keyed on the whole
+    /// input (tab, scroll, pane, cell, remote flag, every visible
+    /// row's text) so the fs probes inside `detect::tokens` run only
+    /// on a real change — the same §6 guard `detect_cache` applies
+    /// to the Ctrl+hover, applied to the scan.
+    #[cfg(feature = "test-driver")]
+    detect_hits: Option<DetectHitScan>,
     /// The browser pane's webview slot (Spec R14 §5.13, R14-T3): the
     /// `!Send` wry child once the probe embeds it — frontend-local
     /// like the galley cache, since `Shared` is touched by the pump's
@@ -332,7 +393,14 @@ impl GuiApp {
             browser: BrowserState::default(),
             #[cfg(feature = "test-driver")]
             injected: std::collections::VecDeque::new(),
+            hits: HitTargets::default(),
         }));
+        // The pointer-injection plugin (Spec R15-T3): its `input_hook`
+        // splices queued `pointer`/`click` batches into `RawInput` at
+        // `begin_pass` — the only seam upstream of egui's PointerState
+        // fold, so clicks hit-test like real input.
+        #[cfg(feature = "test-driver")]
+        ctx.add_plugin(crate::test_driver::DriverInputPlugin::default());
         let watcher = config::watcher();
         let pump = Pump::start(
             ctx.clone(),
@@ -358,6 +426,8 @@ impl GuiApp {
             pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
             detect_cache: detect::DetectCache::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hits: None,
             web: WebSlot::new(),
             quit: false,
         })
@@ -425,6 +495,20 @@ impl GuiApp {
                 crate::test_driver::Injected::Resize(size) => {
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 }
+                // A staged `AgentEvent` — the same `apply` fold the
+                // pump's `drain_agent_events` feeds real worker
+                // events through, so the parked gate card is the
+                // panel's real approval state.
+                crate::test_driver::Injected::AgentEvent(event) => {
+                    if let Some(panel) = shared.tabs.active_mut().and_then(|tab| tab.agent.as_mut())
+                    {
+                        panel.apply(event);
+                    }
+                }
+                // The pointer verbs' frame wake — the batch already
+                // sits on the plugin; the marker only earns the
+                // frame that delivers it.
+                crate::test_driver::Injected::Repaint => {}
                 crate::test_driver::Injected::Quit => self.quit = true,
             }
         }
@@ -1123,6 +1207,12 @@ impl GuiApp {
                 egui::Id::unique(("tab-close", index)),
                 Sense::click(),
             );
+            // The registry names mirror the chip's role: the body
+            // activates, the "×" closes (Spec R15-T3).
+            shared.hits.register(format!("tab.{index}"), chip.rect);
+            shared
+                .hits
+                .register(format!("tab.{index}.close"), chip.close);
             let bg = if index == active {
                 chrome::FIELD_HI
             } else if chip_hit.hovered() || close_hit.hovered() {
@@ -1173,6 +1263,7 @@ impl GuiApp {
         }
         if let Some(new_rect) = bar.new_tab {
             let new_hit = ui.interact(new_rect, egui::Id::unique("tab-new"), Sense::click());
+            shared.hits.register("tab.new", new_rect);
             if new_hit.hovered() {
                 painter.rect_filled(new_rect, 4.0, chrome::FIELD);
             }
@@ -1199,6 +1290,7 @@ impl GuiApp {
         // chord makes, so click and chord can never disagree.
         if let Some(pane_rect) = bar.pane_button {
             let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
+            shared.hits.register("panes.button", pane_rect);
             if pane_hit.hovered() {
                 painter.rect_filled(pane_rect, 4.0, chrome::FIELD);
             }
@@ -1234,6 +1326,8 @@ impl GuiApp {
         font: &FontId,
     ) {
         self.grid_pane = Some(pane);
+        // `grid` — the whole pane is the selection/click surface.
+        shared.hits.register("grid", pane);
         let Some(tab) = shared.tabs.active_mut() else {
             return;
         };
@@ -1382,6 +1476,7 @@ impl GuiApp {
         // offers a no-op when the view is already live.
         if scroll > 0 {
             let mut snap = false;
+            let mut pill_rect = Rect::NOTHING;
             egui::Area::new(egui::Id::unique("scroll-bottom"))
                 .order(egui::Order::Foreground)
                 .pivot(Align2::RIGHT_BOTTOM)
@@ -1390,20 +1485,119 @@ impl GuiApp {
                     let button = egui::Button::new(egui::RichText::new("⤓").monospace())
                         .fill(Color32::from_rgba_premultiplied(0x2A, 0x2A, 0x2A, 0xDC))
                         .stroke(Stroke::new(1.0, chrome::EDGE));
-                    snap = ui
-                        .add(button)
-                        .on_hover_text("jump to the live output")
-                        .clicked();
+                    let response = ui.add(button).on_hover_text("jump to the live output");
+                    pill_rect = response.rect;
+                    snap = response.clicked();
                 });
+            shared.hits.register("pill.scroll_bottom", pill_rect);
             if snap {
                 tab.snap_to_bottom();
             }
         }
+        // The detection-token targets (Spec R15-T3): every
+        // `detect.*` name maps the span's cell rect, so a scenario
+        // clicks a URL like a user would — through the grid's own
+        // hit-test, not a bypass.
+        #[cfg(feature = "test-driver")]
+        self.register_detect_targets(&mut shared.hits, tab, pane, cell, scroll);
         // The Ctrl+click route — applied last so `tab`'s borrow has
         // ended: `open_detection` drives the pane host, the explorer
         // model and the browser queue off the whole `Shared`.
         if let Some(target) = route {
             self.open_detection(shared, target);
+        }
+    }
+
+    /// Register the visible rows' detected URL/path tokens as
+    /// `detect.{n}` hit targets (scan order) plus content-keyed
+    /// `detect.url.<u>`/`detect.path.<p>` aliases — so a scenario
+    /// clicks a link by name through the grid's own hit-test. The
+    /// scan rides `detect_hits`' memo: `line_cells` is the cheap
+    /// half (it rebuilds for the hover every frame), the token
+    /// scan's filesystem probes are the expensive one and re-run
+    /// only when the key — tab, scroll, pane, cell, remote flag, the
+    /// rows' text — moved.
+    #[cfg(feature = "test-driver")]
+    fn register_detect_targets(
+        &mut self,
+        hits: &mut HitTargets,
+        tab: &ait_app::tabs::Tab,
+        pane: Rect,
+        cell: CellMetrics,
+        scroll: usize,
+    ) {
+        let remote = !tab.remote.is_empty();
+        let lines: Vec<(String, Vec<usize>)> = tab
+            .grid()
+            .visible_rows()
+            .map(|row| detect::line_cells(&row))
+            .collect();
+        let texts: Vec<String> = lines.iter().map(|(text, _)| text.clone()).collect();
+        let fresh = self.detect_hits.as_ref().is_none_or(|scan| {
+            scan.tab != tab.id
+                || scan.scroll != scroll
+                || scan.remote != remote
+                || scan.pane != pane
+                || scan.cell != cell
+                || scan.rows != texts
+        });
+        if fresh {
+            let mut out: Vec<(String, Rect)> = Vec::new();
+            // `cwd_for`/`home_dir` resolve once per scan, not per
+            // row — the same laziness `DetectCache`'s `env` closure
+            // buys the hover probe.
+            let mut env: Option<(PathBuf, PathBuf)> = None;
+            let mut ordinal = 0usize;
+            for (row_index, (text, cols)) in lines.iter().enumerate() {
+                let (cwd, home) =
+                    env.get_or_insert_with(|| (PathBuf::from(suggest::cwd_for(tab)), home_dir()));
+                let tokens = if remote {
+                    detect::url_tokens(text)
+                } else {
+                    detect::tokens(text, cwd, home)
+                };
+                for token in tokens {
+                    let (Some(&first), Some(&last)) =
+                        (cols.get(token.start), cols.get(token.end.saturating_sub(1)))
+                    else {
+                        continue;
+                    };
+                    let rect = Rect::from_min_max(
+                        Pos2::new(
+                            pane.left() + first as f32 * cell.width,
+                            pane.top() + row_index as f32 * cell.height,
+                        ),
+                        Pos2::new(
+                            pane.left() + (last + 1) as f32 * cell.width,
+                            pane.top() + (row_index + 1) as f32 * cell.height,
+                        ),
+                    );
+                    match &token.target {
+                        detect::Target::Url(url) => {
+                            out.push((format!("detect.url.{url}"), rect));
+                        }
+                        detect::Target::Path(path) => {
+                            out.push((format!("detect.path.{}", path.display()), rect));
+                        }
+                    }
+                    out.push((format!("detect.{ordinal}"), rect));
+                    ordinal += 1;
+                }
+            }
+            self.detect_hits = Some(DetectHitScan {
+                tab: tab.id,
+                scroll,
+                remote,
+                pane,
+                cell,
+                rows: texts,
+                out,
+            });
+        }
+        if let Some(scan) = &self.detect_hits {
+            for (name, rect) in &scan.out {
+                hits.register(name.clone(), *rect);
+            }
         }
     }
 
@@ -1462,6 +1656,9 @@ impl GuiApp {
                 break;
             }
             let hit = ui.interact(chip, egui::Id::unique(("pane-chip", index)), Sense::click());
+            // `panes.chip.<label>` — the name IS the chip's label
+            // (`agent`/`explorer`/…), so a click reads like the UI.
+            shared.hits.register(format!("panes.chip.{label}"), chip);
             let active = *target == shown;
             let (bg, fg) = if active {
                 (self.theme.fg, PANEL_BG)
@@ -1540,6 +1737,8 @@ impl GuiApp {
         // topmost) — registered after, this rect would swallow
         // every verdict/choice click.
         let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
+        // `agent.focus` — the whole body is the focus affordance.
+        shared.hits.register("agent.focus", rect);
         {
             let Some(panel) = shared.tabs.active().and_then(|tab| tab.agent_panel()) else {
                 return;
@@ -1578,6 +1777,7 @@ impl GuiApp {
                 ui,
                 &painter,
                 panel,
+                &mut shared.hits,
                 &GateCardLayout {
                     font: &font,
                     line_h,
@@ -1688,6 +1888,7 @@ impl GuiApp {
         ui: &mut egui::Ui,
         painter: &egui::Painter,
         panel: &AgentPanel,
+        hits: &mut HitTargets,
         layout: &GateCardLayout<'_>,
         action: &mut Option<PanelAction>,
     ) -> f32 {
@@ -1754,26 +1955,30 @@ impl GuiApp {
                         (
                             "a: once",
                             egui::Id::unique("agent-allow-once"),
+                            "gate.approve",
                             PanelAction::Verdict(ApprovalVerdict::AllowOnce),
                         ),
                         (
                             "t: task",
                             egui::Id::unique("agent-allow-task"),
+                            "gate.approve_task",
                             PanelAction::Verdict(ApprovalVerdict::AllowForTask),
                         ),
                         (
                             "d: deny",
                             egui::Id::unique("agent-deny"),
+                            "gate.deny",
                             PanelAction::BeginDenyReason,
                         ),
                     ];
                     let button_w = (card.width() - 16.0 - 8.0 * 2.0) / 3.0;
-                    for (index, (label, id, verdict)) in buttons.into_iter().enumerate() {
+                    for (index, (label, id, name, verdict)) in buttons.into_iter().enumerate() {
                         let button = Rect::from_min_size(
                             Pos2::new(card.left() + 8.0 + index as f32 * (button_w + 8.0), y),
                             Vec2::new(button_w, line_h),
                         );
                         let hit = ui.interact(button, id, Sense::click());
+                        hits.register(name, button);
                         painter.rect_filled(
                             button,
                             3.0,
@@ -1825,6 +2030,7 @@ impl GuiApp {
                             egui::Id::unique(("agent-ask", index)),
                             Sense::click(),
                         );
+                        hits.register(format!("gate.ask.{index}"), row);
                         let selected = index == ask.selected;
                         if selected || hit.hovered() {
                             painter.rect_filled(row, 2.0, chrome::SELECT);
@@ -2156,6 +2362,12 @@ impl eframe::App for GuiApp {
         // 1. Input first — the frame below paints post-input state.
         self.dispatch_events(&ctx, &mut shared);
 
+        // The hit registry repaints with the frame (Spec R15-T3):
+        // cleared at the top, every `interact` site re-registers its
+        // name → rect below — the dump's `hits` is always exactly the
+        // last painted frame, never a stale union of them.
+        shared.hits.clear();
+
         // 2. Regions + cell metrics (zoom included), then the band→
         //    winsize resize — settled, not per-frame: a reflow walks
         //    each session's scrollback, so mid-drag reflows are the
@@ -2303,6 +2515,26 @@ fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
 
 /// The creation-time cell estimate — fonts don't exist until the
 /// first `Context::run`, so `GuiApp::new` can't read the glyph table.
+/// One detection-token scan's cache key and result — see
+/// [`GuiApp::detect_hits`].
+#[cfg(feature = "test-driver")]
+struct DetectHitScan {
+    /// The tab the rows were scanned on.
+    tab: u64,
+    /// The scroll offset they were read at.
+    scroll: usize,
+    /// Remote sessions scan URLs only (no local fs probes).
+    remote: bool,
+    /// The pane the rects were computed against.
+    pane: Rect,
+    /// The cell metrics the rects were computed against.
+    cell: CellMetrics,
+    /// Every visible row's text — the scan's input.
+    rows: Vec<String>,
+    /// The `(name, rect)` pairs in scan order.
+    out: Vec<(String, Rect)>,
+}
+
 /// Typical monospace ratios (advance ~0.6×em, line ~1.2×em) seed the
 /// first tab's winsize; the first frame's real `cell_metrics` +
 /// `resize_all` correct it before anything paints.
@@ -2490,6 +2722,7 @@ mod tests {
                 browser: BrowserState::default(),
                 #[cfg(feature = "test-driver")]
                 injected: std::collections::VecDeque::new(),
+                hits: HitTargets::default(),
             }));
             Self {
                 app: GuiApp {
@@ -2510,6 +2743,8 @@ mod tests {
                     pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
                     detect_cache: detect::DetectCache::default(),
+                    #[cfg(feature = "test-driver")]
+                    detect_hits: None,
                     web: WebSlot::new(),
                     quit: false,
                 },

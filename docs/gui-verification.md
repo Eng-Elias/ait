@@ -1,11 +1,17 @@
 # GUI manual verification
 
-`ait-gui` has no input-injection harness — its correctness surface is
-winit/egui event behavior, which tests and code review have both missed
-(R13 shipped a dead gate-card click layer, a touchpad scroll dead-zone,
-an Alt-chord text leak, and resize jank; every one was caught by hands,
-not by the gate). Run this checklist on any round that touches
-`crates/ait-gui`, `ait-app`'s dispatch/input paths, or the keymap.
+`ait-gui`'s correctness surface is winit/egui event behavior, which
+tests and code review have both missed (R13 shipped a dead gate-card
+click layer, a touchpad scroll dead-zone, an Alt-chord text leak, and
+resize jank; every one was caught by hands, not by the gate). Run this
+checklist on any round that touches `crates/ait-gui`, `ait-app`'s
+dispatch/input paths, or the keymap.
+
+Items marked *(scenario)* are executable coverage — TOML under
+`crates/ait-gui/tests/scenarios/`, run with
+`cargo test -p ait-gui --features test-driver --test scenarios` — not
+manual legs; check them anyway when the scenario set can't reach the
+behavior (headed rendering, webview, real touchpads).
 
 ## Launch
 
@@ -18,7 +24,7 @@ xvfb-run -a ./target/debug/ait-gui   # headless smoke
 
 Work top to bottom; each item is cheap once the window is up.
 
-- **Chord leak** — press `Alt+A`, `Alt+T`, `Alt+W`, `Alt+P`, `Alt+R`,
+- **Chord leak** *(scenario: chord-leak, paste-inert)* — press `Alt+A`, `Alt+T`, `Alt+W`, `Alt+P`, `Alt+R`,
   `Ctrl+Shift+F`, `Ctrl+W`, `Alt+Enter` one at a time, then type
   `echo MARKER`: the command line must be clean. Some platforms emit a
   `Text` twin for an Alt-chord — the leak shows as a stray char on the
@@ -26,21 +32,21 @@ Work top to bottom; each item is cheap once the window is up.
 - **Touchpad scroll** — two-finger flick must scroll; wheel events
   arrive as sub-line pixel (`MouseScrollDelta::PixelDelta`) deltas, and
   truncating each event to whole lines drops them all (R13).
-- **Scroll-to-bottom** — scroll up; the `⤓` pill appears bottom-right;
+- **Scroll-to-bottom** *(scenario: scroll-pill-click, wheel-scroll)* — scroll up; the `⤓` pill appears bottom-right;
   clicking it snaps to live output.
 - **Long scrollback** — `seq 1 5000`, then scroll: stays responsive
   (bounded scrollback + viewport-only paint; slowness is usually the
   scroll-delta path, not rendering).
-- **Resize** — drag a window edge: the grid tracks during the drag and
+- **Resize** *(scenario: resize_settle test)* — drag a window edge: the grid tracks during the drag and
   the winsize reflow fires on settle, not per frame.
-- **Gate cards by mouse** — under an `ask` profile, trigger a
+- **Gate cards by mouse** *(scenario: gate-card-click)* — under an `ask` profile, trigger a
   permission card and *click* a verdict button; click a choice row on
   an `ask_user_question` card. Buttons painted but mouse-inert shipped
   once already (egui hit-test ordering — the panel-level `interact`
   must register before the card's).
-- **Find chord** — `Ctrl+Shift+F` opens the find bar; `Ctrl+F` reaches
+- **Find chord** *(scenario: find-chord)* — `Ctrl+Shift+F` opens the find bar; `Ctrl+F` reaches
   the shell (readline forward-char — terminals never steal it).
-- **Pane chords** — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle the
+- **Pane chords** *(scenario: pane-chords-overlay, explorer)* — `Ctrl+Shift+E` and `Ctrl+Shift+B` toggle the
   explorer and browser panes: the switcher strip atop the region
   reverses the shown chip, a second press of the shown pane's chord
   releases it, and plain `Esc` while a pane shows returns focus to
@@ -49,7 +55,7 @@ Work top to bottom; each item is cheap once the window is up.
   no stray chars on the line. While the find bar or a picker is up,
   the chords hold — a `Ctrl+Shift+E` mid-search or mid-pick is
   swallowed, never toggles the region out from under the overlay.
-- **Pane click affordance** — the `panes` button anchored at the tab
+- **Pane click affordance** *(scenario: panes-click)* — the `panes` button anchored at the tab
   bar's right edge opens the host with the mouse (explorer on a
   fresh window, the last selection after): a click while the region
   is closed opens it, a click while that pane shows toggles it off.
@@ -104,7 +110,7 @@ Work top to bottom; each item is cheap once the window is up.
   typing/grid output stays responsive while a
   heavy page loads — a stall there wedges input, which is the one
   risk wry leaves us no off-thread answer for.
-- **Ctrl+click affordance** — hold Ctrl over an `https://`/`file://`
+- **Ctrl+click affordance** *(scenario: detect-click, ctrl-drag-selection)* — hold Ctrl over an `https://`/`file://`
   URL and an existing path in output: detected tokens underline and
   the cursor turns to the pointer; non-tokens, nonexistent paths and
   scrollback rows behave the same way. Ctrl+click on a URL opens the

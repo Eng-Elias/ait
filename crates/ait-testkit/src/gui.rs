@@ -27,6 +27,7 @@
 //! bounded dump assertions.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write as _};
@@ -222,10 +223,108 @@ enum Request<'a> {
         /// The requested height.
         height: f32,
     },
+    /// `pointer` — one pointer gesture piece (`move`/`press`/
+    /// `release`/`modifiers`) delivered as real `RawInput` events
+    /// through the app's input plugin, so egui's own `PointerState`
+    /// folds them — the production hit-test path.
+    Pointer {
+        /// The gesture piece.
+        event: PointerEventKind,
+        /// A hit-registry name — resolves to its rect's center.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<&'a str>,
+        /// A raw position in points — `x`/`y` travel together.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        /// See `x`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        y: Option<f32>,
+        /// Points added to the resolved position.
+        dx: f32,
+        /// See `dx`.
+        dy: f32,
+        /// The button for `press`/`release` — default `primary`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        button: Option<PointerButtonKind>,
+        /// The held modifier set for this event (`"Ctrl"`, `""` to
+        /// lift) — emitted as a `ModifiersChanged` first.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modifiers: Option<&'a str>,
+    },
+    /// `click` — a complete click (move + press + release in one
+    /// frame batch) on a hit-registry `target` or raw `x`/`y`.
+    Click {
+        /// The hit-registry name — unknown names fail loudly.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<&'a str>,
+        /// A raw position in points — `x`/`y` travel together.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        /// See `x`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        y: Option<f32>,
+        /// Points added to the resolved position.
+        dx: f32,
+        /// See `dx`.
+        dy: f32,
+        /// The button — default `primary`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        button: Option<PointerButtonKind>,
+        /// The modifier set held for the click only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        modifiers: Option<&'a str>,
+    },
+    /// `agent` — stage one `AgentEvent` on the active tab's panel
+    /// through `AgentPanel::apply` — the real approval flow's fold.
+    Agent {
+        /// The staged event — `approve` parks a gate card.
+        event: AgentEventKind,
+        /// The tool's registry name — the card's title.
+        name: &'a str,
+        /// The renderable argument summary the card shows.
+        summary: &'a str,
+    },
     /// `dump` — the versioned snapshot.
     Dump,
     /// `quit` — the app's normal close.
     Quit,
+}
+
+/// `pointer`'s `event` — one gesture piece per request (each lands
+/// in its own frame batch, the way real input arrives). The client
+/// and server spell it identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerEventKind {
+    /// `Event::PointerMoved`.
+    Move,
+    /// `Event::PointerButton{pressed: true}`.
+    Press,
+    /// `Event::PointerButton{pressed: false}`.
+    Release,
+    /// `Event::ModifiersChanged` alone — set or lift the held set.
+    Modifiers,
+}
+
+/// The pointer button names the wire speaks — egui's `PointerButton`
+/// minus the exotic extras.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButtonKind {
+    /// The primary (usually left) button.
+    Primary,
+    /// The secondary (usually right) button.
+    Secondary,
+    /// The middle button.
+    Middle,
+}
+
+/// `agent`'s `event` — the stageable `AgentEvent` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventKind {
+    /// `AgentEvent::ApprovalRequest` — the approve gate card.
+    Approve,
 }
 
 /// `key`'s `twin` on the wire — `true` (derive the chord's character)
@@ -298,6 +397,15 @@ pub struct Dump {
     pub suggesting: bool,
     /// The window's content size in points.
     pub window: WindowDump,
+    /// The active tab's agent panel — `null` while no tab has ever
+    /// opened one.
+    #[serde(default)]
+    pub agent: Option<AgentDump>,
+    /// The hit-target registry — name → rect for every interactive
+    /// surface the last painted frame registered. `click`/`pointer`
+    /// `target` names resolve against exactly this map.
+    #[serde(default)]
+    pub hits: BTreeMap<String, RectDump>,
 }
 
 /// The active tab's visible grid.
@@ -318,6 +426,10 @@ pub struct GridDump {
     pub rows: Vec<String>,
     /// The renderable cursor.
     pub cursor: CursorDump,
+    /// The drag-selection's normalized range — during and after a
+    /// drag (the highlight's lifetime), `null` when none.
+    #[serde(default)]
+    pub selection: Option<SelectionDump>,
 }
 
 /// The cursor's viewport position and shape name.
@@ -358,6 +470,81 @@ pub struct WindowDump {
     pub width: f32,
     /// Content height.
     pub height: f32,
+}
+
+/// A rectangle in points — the hit-target registry's value shape.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RectDump {
+    /// The left edge.
+    pub x: f32,
+    /// The top edge.
+    pub y: f32,
+    /// The width.
+    pub w: f32,
+    /// The height.
+    pub h: f32,
+}
+
+impl RectDump {
+    /// The rect's center — where `click`/`pointer` aim a named
+    /// target before `dx`/`dy` shift it.
+    pub fn center(&self) -> (f32, f32) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
+    }
+}
+
+/// A grid position — `line` is absolute (scrollback rows are
+/// negative), `column` a cell column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointDump {
+    /// The absolute line.
+    pub line: i32,
+    /// The cell column.
+    pub column: usize,
+}
+
+/// The drag-selection's normalized range — `start` ≤ `end` in
+/// reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionDump {
+    /// The earlier endpoint.
+    pub start: PointDump,
+    /// The later endpoint.
+    pub end: PointDump,
+}
+
+/// The active tab's agent panel — the open/focus split plus the
+/// parked gate card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDump {
+    /// The region claim.
+    pub open: bool,
+    /// Key routing.
+    pub focused: bool,
+    /// The gate card while one parks — `approve`/`ask`/`null`.
+    pub gate: Option<GateDump>,
+}
+
+/// The gate card — tagged on `kind` like the server's `GateDump`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GateDump {
+    /// An approve card, possibly mid-deny-prompt.
+    Approve {
+        /// The tool's registry name.
+        name: String,
+        /// The deny reason prompt replaced the buttons.
+        denying: bool,
+    },
+    /// A multiple-choice card.
+    Ask {
+        /// The question the card asks.
+        question: String,
+        /// The answer choices the card shows.
+        choices: Vec<String>,
+        /// The highlighted row.
+        selected: usize,
+    },
 }
 
 impl Dump {
@@ -401,9 +588,41 @@ impl Dump {
             fnv(&mut h, &find.hits.to_le_bytes());
         }
         fnv(&mut h, &[self.suggesting as u8]);
+        if let Some(agent) = &self.agent {
+            fnv(&mut h, &[agent.open as u8, agent.focused as u8]);
+            match &agent.gate {
+                Some(GateDump::Approve { name, denying }) => {
+                    fnv(&mut h, b"approve");
+                    fnv(&mut h, name.as_bytes());
+                    fnv(&mut h, &[*denying as u8]);
+                }
+                Some(GateDump::Ask { question, .. }) => {
+                    fnv(&mut h, b"ask");
+                    fnv(&mut h, question.as_bytes());
+                }
+                None => {}
+            }
+        }
+        if let Some(grid) = &self.grid {
+            if let Some(selection) = &grid.selection {
+                fnv(&mut h, &selection.start.line.to_le_bytes());
+                fnv(&mut h, &selection.start.column.to_le_bytes());
+                fnv(&mut h, &selection.end.line.to_le_bytes());
+                fnv(&mut h, &selection.end.column.to_le_bytes());
+            }
+        }
+        for name in self.hits.keys() {
+            fnv(&mut h, name.as_bytes());
+        }
         fnv(&mut h, &self.window.width.to_le_bytes());
         fnv(&mut h, &self.window.height.to_le_bytes());
         h
+    }
+
+    /// One hit-target registry entry by name — what `click`/`pointer`
+    /// resolve a `target` against.
+    pub fn hit(&self, name: &str) -> Option<&RectDump> {
+        self.hits.get(name)
     }
 }
 
@@ -717,6 +936,146 @@ impl GuiE2e {
         self.act(&Request::Resize { width, height });
     }
 
+    /// `pointer` — one gesture piece's full wire shape: `event` at
+    /// `target`'s rect center plus `dx`/`dy`, or at raw `x`/`y`;
+    /// `button` travels with `press`/`release`, `modifiers`
+    /// (`"Ctrl"`) sets the held set for the event. Delivered through
+    /// the app's input plugin so egui's own pointer fold runs the
+    /// production hit-test.
+    #[allow(clippy::too_many_arguments)]
+    fn pointer_request(
+        &self,
+        event: PointerEventKind,
+        target: Option<&str>,
+        x: Option<f32>,
+        y: Option<f32>,
+        dx: f32,
+        dy: f32,
+        button: Option<PointerButtonKind>,
+        modifiers: Option<&str>,
+    ) {
+        self.log_action(format!(
+            "pointer({event:?}, target={target:?}, at={x:?},{y:?}, \
+             dx={dx}, dy={dy}, button={button:?}, modifiers={modifiers:?})"
+        ));
+        self.act(&Request::Pointer {
+            event,
+            target,
+            x,
+            y,
+            dx,
+            dy,
+            button,
+            modifiers,
+        });
+    }
+
+    /// `pointer` — one gesture piece at a raw position in points
+    /// (`move`/`press`/`release`), delivered through the app's input
+    /// plugin so egui's own pointer fold runs the production
+    /// hit-test.
+    pub fn pointer_at(&self, event: PointerEventKind, x: f32, y: f32) {
+        self.pointer_request(event, None, Some(x), Some(y), 0.0, 0.0, None, None);
+    }
+
+    /// `pointer` — one gesture piece on a named hit target: the
+    /// rect's center plus `dx`/`dy`, so a drag steps away from a
+    /// name without knowing its pixels. `modifiers` (`"Ctrl"`,
+    /// `"Ctrl+Shift"`) sets the held set for this event; `None`
+    /// leaves whatever the stream last held.
+    pub fn pointer_on(
+        &self,
+        event: PointerEventKind,
+        target: &str,
+        dx: f32,
+        dy: f32,
+        modifiers: Option<&str>,
+    ) {
+        self.pointer_request(event, Some(target), None, None, dx, dy, None, modifiers);
+    }
+
+    /// `pointer` — a bare held-set change (`"Ctrl"` holds, `""`
+    /// lifts) with no pointer event — the `modifiers` piece.
+    pub fn pointer_modifiers(&self, modifiers: &str) {
+        self.pointer_request(
+            PointerEventKind::Modifiers,
+            None,
+            None,
+            None,
+            0.0,
+            0.0,
+            None,
+            Some(modifiers),
+        );
+    }
+
+    /// `click`'s full wire shape — every convenience delegates here.
+    #[allow(clippy::too_many_arguments)]
+    fn click_request(
+        &self,
+        target: Option<&str>,
+        x: Option<f32>,
+        y: Option<f32>,
+        dx: f32,
+        dy: f32,
+        modifiers: Option<&str>,
+    ) {
+        self.log_action(format!(
+            "click(target={target:?}, at={x:?},{y:?}, dx={dx}, dy={dy}, \
+             modifiers={modifiers:?})"
+        ));
+        self.act(&Request::Click {
+            target,
+            x,
+            y,
+            dx,
+            dy,
+            button: None,
+            modifiers,
+        });
+    }
+
+    /// `click` — a complete click (move + press + release in one
+    /// frame batch) on a hit-registry name — `"panes.button"`,
+    /// `"gate.approve"`, a `panes.chip.<label>`, `"pill.scroll_bottom"`,
+    /// a `detect.*` token. Unknown names fail the step listing what
+    /// the last painted frame registered.
+    pub fn click(&self, target: &str) {
+        self.click_request(Some(target), None, None, 0.0, 0.0, None);
+    }
+
+    /// [`click`](Self::click) on a named target plus `dx`/`dy` —
+    /// the named-rect version of [`click_at`](Self::click_at).
+    pub fn click_offset(&self, target: &str, dx: f32, dy: f32) {
+        self.click_request(Some(target), None, None, dx, dy, None);
+    }
+
+    /// [`click`](Self::click) with a modifier set held for the click
+    /// only (`"Ctrl"` — the detected-token affordance) — the held
+    /// state restores on the next frame.
+    pub fn click_modifiers(&self, target: &str, modifiers: &str) {
+        self.click_request(Some(target), None, None, 0.0, 0.0, Some(modifiers));
+    }
+
+    /// `click` at a raw position in points — the escape hatch.
+    pub fn click_at(&self, x: f32, y: f32) {
+        self.click_request(None, Some(x), Some(y), 0.0, 0.0, None);
+    }
+
+    /// `agent` — stage an `AgentEvent::ApprovalRequest` on the active
+    /// tab's panel through `AgentPanel::apply`, the same fold real
+    /// worker events take — the parked approve card IS the panel's
+    /// real approval flow (the R13 dead-click-layer surface). Needs
+    /// the panel open (`key "Alt+A"` first).
+    pub fn agent_approve(&self, name: &str, summary: &str) {
+        self.log_action(format!("agent(approve, {name:?}, {summary:?})"));
+        self.act(&Request::Agent {
+            event: AgentEventKind::Approve,
+            name,
+            summary,
+        });
+    }
+
     /// `quit` — the app takes its normal close path; pair with
     /// [`wait_exit`](Self::wait_exit) to reap it.
     pub fn quit(&self) {
@@ -880,12 +1239,18 @@ const GUI_VERBS: &[&str] = &[
     "paste",
     "scroll",
     "resize",
+    "pointer",
+    "click",
+    "agent",
     "wait_text",
     "expect_text",
     "expect_pane",
     "expect_find",
     "expect_scroll",
     "expect_suggesting",
+    "expect_gate",
+    "expect_selection",
+    "expect_hit",
     "quit",
 ];
 
@@ -971,6 +1336,59 @@ pub enum GuiStep {
         /// The requested height.
         height: f32,
     },
+    /// `pointer` — one pointer gesture piece (`move`/`press`/
+    /// `release`/`modifiers`) through the production hit-test path:
+    /// the table's `event` is required; `target` names a hit-registry
+    /// entry (`x`/`y` are the raw alternative), `dx`/`dy` offset the
+    /// resolved point, `button` defaults `primary`, `modifiers`
+    /// (`"Ctrl"`) sets the held set for the event.
+    Pointer {
+        /// The gesture piece.
+        event: PointerEventKind,
+        /// The hit-registry name.
+        target: Option<String>,
+        /// A raw position in points.
+        x: Option<f32>,
+        /// See `x`.
+        y: Option<f32>,
+        /// Points added to the resolved position.
+        dx: f32,
+        /// See `dx`.
+        dy: f32,
+        /// The button for `press`/`release`.
+        button: Option<PointerButtonKind>,
+        /// The held modifier set for this event.
+        modifiers: Option<String>,
+    },
+    /// `click` — a complete click (move + press + release in one
+    /// frame batch): `click = "panes.button"` names a hit target,
+    /// `click = { x = .., y = .. }` is the raw escape hatch,
+    /// `modifiers` holds a set for the click only.
+    Click {
+        /// The hit-registry name.
+        target: Option<String>,
+        /// A raw position in points.
+        x: Option<f32>,
+        /// See `x`.
+        y: Option<f32>,
+        /// Points added to the resolved position.
+        dx: f32,
+        /// See `dx`.
+        dy: f32,
+        /// The modifier set held for the click.
+        modifiers: Option<String>,
+    },
+    /// `agent` — stage a gate card on the active tab's panel through
+    /// its real `apply` fold: `agent = { event = "approve",
+    /// name = "…", summary = "…" }` parks an approve card.
+    Agent {
+        /// The staged event.
+        event: AgentEventKind,
+        /// The tool's registry name — the card's title.
+        name: String,
+        /// The renderable argument summary the card shows.
+        summary: String,
+    },
     /// `wait_text` — gate until the grid text contains it.
     WaitText(String),
     /// `expect_text` — assert the grid text contains it.
@@ -988,6 +1406,21 @@ pub enum GuiStep {
     ExpectScroll(usize),
     /// `expect_suggesting` — assert the suggestion arm's state.
     ExpectSuggesting(bool),
+    /// `expect_gate` — assert the agent panel's parked gate:
+    /// `"none"` (no card), `"approve"` or `"ask"`.
+    ExpectGate(GateExpect),
+    /// `expect_selection` — `true`/`false` asserts a drag-selection
+    /// exists (`grid.selection` non-null / null).
+    ExpectSelection(bool),
+    /// `expect_hit` — bounded wait until the last painted frame
+    /// registered this hit-target name (`"panes.chip.explorer"`,
+    /// `"gate.approve"`, `"pill.scroll_bottom"`). The registry tracks
+    /// the paint pass, which can sit one frame behind a model-flag
+    /// expectation (`expect_pane` sees `panes` state before the frame
+    /// that paints — and registers — the host's chips runs): a named
+    /// `click` after a state expectation needs this to resolve, or it
+    /// can hit the `unknown hit target` refusal a frame early.
+    ExpectHit(String),
     /// `quit` — the app's normal close.
     Quit,
 }
@@ -1012,6 +1445,18 @@ pub enum FindExpect {
     Query(String),
 }
 
+/// What `expect_gate` asserts about the parked gate card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateExpect {
+    /// No gate card is parked (`agent.gate` is `null`).
+    None,
+    /// An approve card waits on a verdict.
+    Approve,
+    /// A multiple-choice card waits on an answer.
+    Ask,
+}
+
 impl GuiStep {
     /// The verb's TOML key, for failure messages.
     fn verb(&self) -> &'static str {
@@ -1021,12 +1466,18 @@ impl GuiStep {
             Self::Paste(_) => "paste",
             Self::Scroll { .. } => "scroll",
             Self::Resize { .. } => "resize",
+            Self::Pointer { .. } => "pointer",
+            Self::Click { .. } => "click",
+            Self::Agent { .. } => "agent",
             Self::WaitText(_) => "wait_text",
             Self::ExpectText(_) => "expect_text",
             Self::ExpectPane(_) => "expect_pane",
             Self::ExpectFind(_) => "expect_find",
             Self::ExpectScroll(_) => "expect_scroll",
             Self::ExpectSuggesting(_) => "expect_suggesting",
+            Self::ExpectGate(_) => "expect_gate",
+            Self::ExpectSelection(_) => "expect_selection",
+            Self::ExpectHit(_) => "expect_hit",
             Self::Quit => "quit",
         }
     }
@@ -1054,6 +1505,40 @@ impl GuiStep {
                 _ => e2e.scroll(*unit, *dx, *dy),
             },
             Self::Resize { width, height } => e2e.resize(*width, *height),
+            Self::Pointer {
+                event,
+                target,
+                x,
+                y,
+                dx,
+                dy,
+                button,
+                modifiers,
+            } => e2e.pointer_request(
+                *event,
+                target.as_deref(),
+                *x,
+                *y,
+                *dx,
+                *dy,
+                *button,
+                modifiers.as_deref(),
+            ),
+            Self::Click {
+                target,
+                x,
+                y,
+                dx,
+                dy,
+                modifiers,
+            } => e2e.click_request(target.as_deref(), *x, *y, *dx, *dy, modifiers.as_deref()),
+            Self::Agent {
+                event,
+                name,
+                summary,
+            } => match event {
+                AgentEventKind::Approve => e2e.agent_approve(name, summary),
+            },
             Self::WaitText(text) => {
                 e2e.wait_for_dump(&format!("wait_text {text:?}"), |dump| {
                     dump.grid_text().contains(text.as_str())
@@ -1099,6 +1584,28 @@ impl GuiStep {
             Self::ExpectSuggesting(want) => {
                 e2e.wait_for_dump(&format!("expect_suggesting {want}"), |dump| {
                     dump.suggesting == *want
+                });
+            }
+            Self::ExpectGate(expect) => {
+                e2e.wait_for_dump(&format!("expect_gate {expect:?}"), |dump| {
+                    let gate = dump.agent.as_ref().and_then(|agent| agent.gate.as_ref());
+                    match expect {
+                        GateExpect::None => gate.is_none(),
+                        GateExpect::Approve => matches!(gate, Some(GateDump::Approve { .. })),
+                        GateExpect::Ask => matches!(gate, Some(GateDump::Ask { .. })),
+                    }
+                });
+            }
+            Self::ExpectSelection(want) => {
+                e2e.wait_for_dump(&format!("expect_selection {want}"), |dump| {
+                    dump.grid
+                        .as_ref()
+                        .is_some_and(|grid| grid.selection.is_some() == *want)
+                });
+            }
+            Self::ExpectHit(name) => {
+                e2e.wait_for_dump(&format!("expect_hit {name:?}"), |dump| {
+                    dump.hit(name).is_some()
                 });
             }
             Self::Quit => e2e.quit(),
@@ -1315,6 +1822,81 @@ fn parse_gui_step(
                 height: table.height,
             })
         }
+        "pointer" => {
+            let table: PointerTable = want(
+                value,
+                verb,
+                "a { event, target? | x?, y?, dx?, dy?, button?, modifiers? } table",
+            )
+            .map_err(fail)?;
+            pointer_like(verb, table.target.clone(), table.x, table.y).map_err(fail)?;
+            if table.event != PointerEventKind::Modifiers
+                && table.target.is_none()
+                && table.x.is_none()
+            {
+                return Err(fail(
+                    "`pointer` needs a `target` name or an `x`/`y` pair — \
+                     only the `modifiers` piece takes neither"
+                        .to_string(),
+                ));
+            }
+            Ok(GuiStep::Pointer {
+                event: table.event,
+                target: table.target,
+                x: table.x,
+                y: table.y,
+                dx: table.dx,
+                dy: table.dy,
+                button: table.button,
+                modifiers: table.modifiers,
+            })
+        }
+        "click" => match value {
+            // `click = "panes.button"` — the everyday form.
+            toml::Value::String(target) => Ok(GuiStep::Click {
+                target: Some(target.clone()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                modifiers: None,
+            }),
+            toml::Value::Table(_) => {
+                let table: ClickTable = want(
+                    value,
+                    verb,
+                    "a { target? | x?, y?, dx?, dy?, modifiers? } table",
+                )
+                .map_err(fail)?;
+                pointer_like(verb, table.target.clone(), table.x, table.y).map_err(fail)?;
+                if table.target.is_none() && table.x.is_none() {
+                    return Err(fail(
+                        "`click` needs a `target` name or an `x`/`y` pair".to_string(),
+                    ));
+                }
+                Ok(GuiStep::Click {
+                    target: table.target,
+                    x: table.x,
+                    y: table.y,
+                    dx: table.dx,
+                    dy: table.dy,
+                    modifiers: table.modifiers,
+                })
+            }
+            _ => Err(fail(format!(
+                "`click` must be a hit-target name or a {{ target | x, y, … }} \
+                 table, got {value}"
+            ))),
+        },
+        "agent" => {
+            let table: AgentTable =
+                want(value, verb, "a { event, name, summary? } table").map_err(fail)?;
+            Ok(GuiStep::Agent {
+                event: table.event,
+                name: table.name,
+                summary: table.summary.unwrap_or_default(),
+            })
+        }
         "wait_text" => Ok(GuiStep::WaitText(
             want(value, verb, "a string").map_err(fail)?,
         )),
@@ -1340,6 +1922,15 @@ fn parse_gui_step(
         )),
         "expect_suggesting" => Ok(GuiStep::ExpectSuggesting(
             want(value, verb, "`true` or `false`").map_err(fail)?,
+        )),
+        "expect_gate" => Ok(GuiStep::ExpectGate(
+            want(value, verb, "`\"none\"`, `\"approve\"` or `\"ask\"`").map_err(fail)?,
+        )),
+        "expect_selection" => Ok(GuiStep::ExpectSelection(
+            want(value, verb, "`true` or `false`").map_err(fail)?,
+        )),
+        "expect_hit" => Ok(GuiStep::ExpectHit(
+            want(value, verb, "a hit-target name").map_err(fail)?,
         )),
         "quit" => {
             let flag: bool = want(value, verb, "`true`").map_err(fail)?;
@@ -1401,6 +1992,89 @@ struct ResizeTable {
     width: f32,
     /// The requested height in points.
     height: f32,
+}
+
+/// `pointer`'s table form — `event` required, the rest defaulted.
+#[derive(Deserialize)]
+struct PointerTable {
+    /// The gesture piece (`move`/`press`/`release`/`modifiers`).
+    event: PointerEventKind,
+    /// The hit-registry name.
+    #[serde(default)]
+    target: Option<String>,
+    /// A raw position in points.
+    #[serde(default)]
+    x: Option<f32>,
+    /// See `x`.
+    #[serde(default)]
+    y: Option<f32>,
+    /// Points added to the resolved position.
+    #[serde(default)]
+    dx: f32,
+    /// See `dx`.
+    #[serde(default)]
+    dy: f32,
+    /// The button for `press`/`release`.
+    #[serde(default)]
+    button: Option<PointerButtonKind>,
+    /// The held modifier set for this event.
+    #[serde(default)]
+    modifiers: Option<String>,
+}
+
+/// `click`'s table form.
+#[derive(Deserialize)]
+struct ClickTable {
+    /// The hit-registry name.
+    #[serde(default)]
+    target: Option<String>,
+    /// A raw position in points.
+    #[serde(default)]
+    x: Option<f32>,
+    /// See `x`.
+    #[serde(default)]
+    y: Option<f32>,
+    /// Points added to the resolved position.
+    #[serde(default)]
+    dx: f32,
+    /// See `dx`.
+    #[serde(default)]
+    dy: f32,
+    /// The modifier set held for the click.
+    #[serde(default)]
+    modifiers: Option<String>,
+}
+
+/// `agent`'s table form.
+#[derive(Deserialize)]
+struct AgentTable {
+    /// The staged event (`approve`).
+    event: AgentEventKind,
+    /// The tool's registry name — the card's title.
+    name: String,
+    /// The renderable argument summary the card shows.
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+/// The `target`/`x`/`y` shape `pointer` and `click` share: a named
+/// target, a raw pair, or — for `pointer`'s bare `modifiers` piece —
+/// neither; never a mix.
+fn pointer_like(
+    verb: &str,
+    target: Option<String>,
+    x: Option<f32>,
+    y: Option<f32>,
+) -> Result<(), String> {
+    match (target, x, y) {
+        (Some(_), None, None) | (None, Some(_), Some(_)) | (None, None, None) => Ok(()),
+        (None, Some(_), None) | (None, None, Some(_)) => Err(format!(
+            "`{verb}`'s `x` and `y` travel together or not at all"
+        )),
+        (Some(_), _, _) => Err(format!(
+            "`{verb}`'s `target` and `x`/`y` are alternatives, not partners"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1476,6 +2150,56 @@ mod tests {
             r#"{"verb":"resize","width":1100.0,"height":700.0}"#
         );
         assert_eq!(
+            serde_json::to_string(&Request::Pointer {
+                event: PointerEventKind::Press,
+                target: Some("grid"),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: Some("Ctrl"),
+            })
+            .unwrap(),
+            r#"{"verb":"pointer","event":"press","target":"grid","dx":0.0,"dy":0.0,"modifiers":"Ctrl"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Pointer {
+                event: PointerEventKind::Move,
+                target: None,
+                x: Some(10.0),
+                y: Some(20.0),
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            })
+            .unwrap(),
+            r#"{"verb":"pointer","event":"move","x":10.0,"y":20.0,"dx":0.0,"dy":0.0}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Click {
+                target: Some("gate.approve"),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            })
+            .unwrap(),
+            r#"{"verb":"click","target":"gate.approve","dx":0.0,"dy":0.0}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Agent {
+                event: AgentEventKind::Approve,
+                name: "run",
+                summary: "rm -rf /",
+            })
+            .unwrap(),
+            r#"{"verb":"agent","event":"approve","name":"run","summary":"rm -rf /"}"#
+        );
+        assert_eq!(
             serde_json::to_string(&Request::Dump).unwrap(),
             r#"{"verb":"dump"}"#
         );
@@ -1485,10 +2209,11 @@ mod tests {
         );
     }
 
-    /// The dump client decodes the server's payload.
+    /// The dump client decodes the server's payload — including the
+    /// hit registry, the agent panel and the drag-selection.
     #[test]
     fn dump_decodes_the_server_shape() {
-        let line = r#"{"ok":true,"dump":{"v":1,"grid":{"columns":80,"lines":24,"scroll_offset":2,"scrollback":100,"rows":["a","","c"],"cursor":{"line":1,"column":2,"shape":"block"}},"pane":{"shown":"explorer","selected":"explorer"},"find":{"query":"nd","hits":3,"position":[1,3]},"suggesting":false,"window":{"width":640.0,"height":480.0}}}"#;
+        let line = r#"{"ok":true,"dump":{"v":1,"grid":{"columns":80,"lines":24,"scroll_offset":2,"scrollback":100,"rows":["a","","c"],"cursor":{"line":1,"column":2,"shape":"block"},"selection":{"start":{"line":-2,"column":0},"end":{"line":0,"column":4}}},"pane":{"shown":"explorer","selected":"explorer"},"find":{"query":"nd","hits":3,"position":[1,3]},"suggesting":false,"window":{"width":640.0,"height":480.0},"agent":{"open":true,"focused":false,"gate":{"kind":"approve","name":"run","denying":false}},"hits":{"grid":{"x":10.0,"y":20.0,"w":300.0,"h":200.0},"gate.approve":{"x":1.0,"y":2.0,"w":3.0,"h":4.0}}}}"#;
         let response: Response = serde_json::from_str(line).unwrap();
         assert!(response.ok);
         let dump = response.dump.unwrap();
@@ -1498,11 +2223,29 @@ mod tests {
         assert_eq!(grid.cursor.shape, "block");
         assert_eq!(grid.scroll_offset, 2);
         assert_eq!(grid.scrollback, 100);
+        let selection = grid.selection.unwrap();
+        assert_eq!(selection.start.line, -2);
+        assert_eq!(selection.end.column, 4);
         let find = dump.find.as_ref().unwrap();
         assert_eq!(find.query, "nd");
         assert_eq!(find.position, Some((1, 3)));
         assert!(!dump.suggesting);
         assert_eq!(dump.grid_text(), "a\n\nc");
+        let agent = dump.agent.as_ref().unwrap();
+        assert!(agent.open && !agent.focused);
+        assert!(matches!(
+            agent.gate,
+            Some(GateDump::Approve { ref name, denying: false }) if name == "run"
+        ));
+        let hit = dump.hit("gate.approve").unwrap();
+        assert_eq!(hit.center(), (2.5, 4.0));
+        assert!(dump.hit("bogus").is_none());
+        // A pre-T3 payload — no agent/hits/selection — still decodes
+        // (the additive-fields convention).
+        let legacy = r#"{"ok":true,"dump":{"v":1,"grid":null,"pane":{"shown":null,"selected":null},"window":{"width":1.0,"height":1.0}}}"#;
+        let response: Response = serde_json::from_str(legacy).unwrap();
+        let dump = response.dump.unwrap();
+        assert!(dump.agent.is_none() && dump.hits.is_empty());
         let dump = Dump {
             v: 1,
             grid: Some(GridDump {
@@ -1516,6 +2259,7 @@ mod tests {
                     column: 0,
                     shape: "block".into(),
                 },
+                selection: None,
             }),
             pane: PaneDump {
                 shown: None,
@@ -1527,6 +2271,8 @@ mod tests {
                 width: 0.0,
                 height: 0.0,
             },
+            agent: None,
+            hits: BTreeMap::new(),
         };
         assert_eq!(dump.grid_text(), "a\n\nc");
     }
@@ -1552,6 +2298,24 @@ scroll = { unit = "pixel", dy = 3.0 }
 [[steps]]
 resize = { width = 1100, height = 700 }
 [[steps]]
+click = "panes.button"
+[[steps]]
+click = { target = "grid", modifiers = "Ctrl" }
+[[steps]]
+pointer = { event = "press", target = "grid" }
+[[steps]]
+pointer = { event = "move", target = "grid", dx = 40.0, dy = 12.0 }
+[[steps]]
+pointer = { event = "release", target = "grid", dx = 40.0, dy = 12.0 }
+[[steps]]
+pointer = { event = "modifiers", modifiers = "" }
+[[steps]]
+agent = { event = "approve", name = "run", summary = "rm -rf /" }
+[[steps]]
+expect_gate = "approve"
+[[steps]]
+expect_selection = true
+[[steps]]
 expect_pane = "explorer"
 [[steps]]
 expect_find = "needle"
@@ -1565,7 +2329,7 @@ quit = true
         )
         .unwrap();
         assert_eq!(scenario.feature, "panes");
-        assert_eq!(scenario.steps.len(), 10);
+        assert_eq!(scenario.steps.len(), 19);
 
         for (text, want) in [
             (r#"feature = "x""#, "missing steps is fine"),
@@ -1576,6 +2340,19 @@ quit = true
                 "[[steps]]\nscroll = { unit = \"line\", x = 1 }",
                 "x wants y",
             ),
+            (
+                "[[steps]]\nclick = { target = \"grid\", x = 1, y = 2 }",
+                "target wants no x/y",
+            ),
+            (
+                "[[steps]]\npointer = { target = \"grid\" }",
+                "pointer wants an event",
+            ),
+            (
+                "[[steps]]\nagent = { event = \"approve\" }",
+                "agent wants a name",
+            ),
+            ("[[steps]]\nexpect_gate = \"maybe\"", "typed gate"),
             ("[[steps]]\nexpect_find = 1", "typed find"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),

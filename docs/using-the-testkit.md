@@ -4,8 +4,25 @@ One-line pitch: drive the **real `ait` binary** in a real PTY with
 keystrokes and mouse, assert on the rendered screen. Deep docs:
 [testing-toolkit.md](testing-toolkit.md) (architecture, record/replay,
 dumps). Agent skill: `.devin/skills/e2e/SKILL.md`.
-GUI frontend (`ait-gui`) has no e2e harness — the manual checklist
-is [gui-verification.md](gui-verification.md).
+GUI frontend (`ait-gui`) has its own harness (`ait_testkit::gui`,
+Spec R15): TOML scenarios under `crates/ait-gui/tests/scenarios/`
+drive the real binary under Xvfb (or the developer's `DISPLAY` with
+`AIT_GUI_E2E_HEADED=1`) over a feature-gated socket. Build it with
+`cargo build -p ait-gui --features test-driver` and run
+`cargo test -p ait-gui --features test-driver --test scenarios`.
+Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
+app's own dispatch), `pointer = {event, target|x, y, …}` and
+`click = "hit.name"` (real egui pointer events aimed at the hit
+registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
+`pill.scroll_bottom`, `detect.url.<u>`, `detect.path.<p>`,
+`detect.<n>`), `agent = {event="approve", name, summary}` (stages a
+real gate card through `AgentPanel::apply`), plus waits/asserts
+`wait_text`/`expect_text`/`expect_pane`/`expect_find`/
+`expect_scroll`/`expect_suggesting`/`expect_gate`/`expect_selection`/
+`expect_hit` (the registry gate — use it when a model expectation
+like `expect_pane` can land a frame before the affordance's paint)
+and `quit`. The manual checklist stays in
+[gui-verification.md](gui-verification.md).
 
 ## Run
 

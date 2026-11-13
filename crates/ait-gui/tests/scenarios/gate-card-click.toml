@@ -1,0 +1,41 @@
+# Spec R15-T3 — a gate-card verdict button clicked by pointer on a
+# REAL approve card: `agent` stages an `AgentEvent::ApprovalRequest`
+# through `AgentPanel::apply` — the same fold the pump's
+# `drain_agent_events` feeds real worker events — so the parked card
+# IS the panel's real approval flow, and the click crosses the
+# overlay the R13 dead-click-layer regression broke.
+feature = "agent"
+
+[[steps]]
+wait_text = "$"
+
+# The agent panel owns the region — Alt+A's open.
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "agent"
+
+# Stage the approve card — `run` awaiting a verdict on `rm -rf`.
+[[steps]]
+agent = { event = "approve", name = "run", summary = "rm -rf build/" }
+
+[[steps]]
+expect_gate = "approve"
+
+# The verdict buttons register with the card's own paint — the named
+# click's registry gate (one frame of skew is normal across verbs).
+[[steps]]
+expect_hit = "gate.approve"
+
+# `a: once` by mouse — the click resolves the real verdict path
+# (`PanelAction::Verdict` → `AgentPanel::decide`), and the card
+# unparks: the gate clears, a dead click layer would leave it armed.
+[[steps]]
+click = "gate.approve"
+
+[[steps]]
+expect_gate = "none"
+
+[[steps]]
+quit = true
