@@ -29,6 +29,8 @@
 //! - [`webview`] — the `wry` adapter behind the `web` feature: the
 //!   child-webview handle, the gtk/glib plumbing and the platform
 //!   opener the external surface delegates to.
+//! - `test_driver` — the test-only injection/dump socket (Spec R15),
+//!   compiled only under the off-by-default `test-driver` feature.
 //! - [`layout`] — the five regions' pixel math (tab bar, content band,
 //!   side panel, status strip, modal layer) and the winsize derivation.
 //! - [`pump`] — the drain thread + `request_repaint` wakeups, the
@@ -54,6 +56,8 @@ pub(crate) mod paint;
 pub(crate) mod pane;
 pub(crate) mod panel;
 pub(crate) mod pump;
+#[cfg(feature = "test-driver")]
+pub(crate) mod test_driver;
 pub(crate) mod webview;
 
 use std::io::Write as _;

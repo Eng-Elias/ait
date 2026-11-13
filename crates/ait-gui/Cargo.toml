@@ -66,6 +66,13 @@ eframe = { version = "0.37", default-features = false, features = [
 wry = { version = "0.57.1", optional = true }
 dpi = { version = "0.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+# The test-driver socket's wire codec — compiled ONLY under the
+# off-by-default `test-driver` feature (Spec R15): release binaries
+# carry none of it. Semver requirements per ADR-0002, the same lines
+# ait-testkit resolves: serde 1.0.229 (2026-07-18), serde_json
+# 1.0.154 (2026-10-11).
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # Linux-only webview runtime glue (Spec R14 §5.13, R14-T3): wry's
 # `build_as_child` panics unless `gtk::init` ran on the creating
@@ -84,6 +91,11 @@ gtk = { version = "0.18", optional = true }
 # system packages.
 default = ["web"]
 web = ["dep:wry", "dep:dpi", "dep:raw-window-handle", "dep:gtk"]
+# `test-driver` (off by default, Spec R15): the test-only injection/
+# dump socket beside ctl, bound only when AIT_TEST_DRIVER_SOCKET names
+# its path. Release artifacts never see it — cargo-dist builds default
+# features, and the code compiles out without it.
+test-driver = ["dep:serde", "dep:serde_json"]
 
 [dev-dependencies]
 # Tempdirs for the pump tests' store database and settings-watcher
@@ -95,3 +107,7 @@ tempfile = "3"
 # with a second connection — production reaches the store only through
 # `ait_app::store::StoreHandle`.
 ait-store = { path = "../ait-store" }
+# The GUI e2e harness (Spec R15): `GuiE2e` spawns the real `ait-gui`
+# binary under a display and drives it over the test-driver socket;
+# the TOML scenarios live in tests/scenarios/.
+ait-testkit = { path = "../ait-testkit" }

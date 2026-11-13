@@ -129,6 +129,13 @@ pub struct Shared {
     /// The `!Send` wry handle itself is `GuiApp`'s, never this
     /// struct's (the pump's drain thread shares `Shared`).
     pub browser: BrowserState,
+    /// Test-driver input queued for the next frame's dispatch (Spec
+    /// R15): the pump's test-socket drain pushes translated verbs here
+    /// and `dispatch_events` prepends them to the frame's native
+    /// events. Feature-gated — a default build carries no injection
+    /// path.
+    #[cfg(feature = "test-driver")]
+    pub injected: std::collections::VecDeque<crate::test_driver::Injected>,
 }
 
 impl Shared {
@@ -152,14 +159,14 @@ impl Shared {
     /// Whether the active tab's agent panel claims the region — the
     /// precedence input `PaneHost` resolves against; the dispatch,
     /// the paint pass and the chord toggle all ask the same question.
-    fn agent_claiming(&self) -> bool {
+    pub(crate) fn agent_claiming(&self) -> bool {
         self.tabs.active().is_some_and(|tab| tab.agent_panel_open())
     }
 
     /// What the side region shows on the active tab right now — the
     /// agent panel's per-tab claim first, else the app-global aux
     /// selection, else the region is closed.
-    fn shown_pane(&self) -> Option<SidePane> {
+    pub(crate) fn shown_pane(&self) -> Option<SidePane> {
         self.panes.visible(self.agent_claiming())
     }
 }
@@ -271,6 +278,16 @@ impl GuiApp {
             Ok(server) => (Some(server), None),
             Err(error) => (None, Some(ctl::socket_error_text(error))),
         };
+        // The test-driver socket (Spec R15): bound beside ctl only
+        // when the feature is compiled AND the env var names its
+        // path — a bind failure degrades to a boot toast exactly
+        // like ctl's.
+        #[cfg(feature = "test-driver")]
+        let (driver, driver_error) = match crate::test_driver::TestDriver::bind_env() {
+            Some(Ok(server)) => (Some(server), None),
+            Some(Err(error)) => (None, Some(crate::test_driver::socket_error_text(error))),
+            None => (None, None),
+        };
         let mut template = config::session_template(config.settings());
         template.ctl_socket = ctl
             .as_ref()
@@ -286,6 +303,8 @@ impl GuiApp {
                 load_error.map(|text| config::error_text(&text)),
                 store_error.map(StoreHandle::unavailable_text),
                 ctl_error,
+                #[cfg(feature = "test-driver")]
+                driver_error,
             ]
             .into_iter()
             .flatten()
@@ -311,10 +330,19 @@ impl GuiApp {
             panes: PaneHost::default(),
             explorer: ExplorerState::default(),
             browser: BrowserState::default(),
+            #[cfg(feature = "test-driver")]
+            injected: std::collections::VecDeque::new(),
         }));
         let watcher = config::watcher();
-        let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
-            .map_err(|error| BootError(format!("pump spawn failed: {error}")))?;
+        let pump = Pump::start(
+            ctx.clone(),
+            Arc::clone(&shared),
+            ctl,
+            watcher,
+            #[cfg(feature = "test-driver")]
+            driver,
+        )
+        .map_err(|error| BootError(format!("pump spawn failed: {error}")))?;
         Ok(Self {
             shared,
             pump: Some(pump),
@@ -344,7 +372,25 @@ impl GuiApp {
     /// paste, wheel. Selection drags ride `interact` in the paint pass
     /// (they need the pane rect, which is layout state).
     fn dispatch_events(&mut self, ctx: &egui::Context, shared: &mut Shared) {
+        #[cfg(not(feature = "test-driver"))]
         let events = ctx.input(|input| input.events.clone());
+        // Spec R15: the pump's test-socket drain queued injected input
+        // between frames — it lands AHEAD of the frame's native events
+        // (it is the older input), joining the dispatch stream at
+        // frame start. `Quit` takes the same close path a resolved
+        // `AppAction::Quit` does.
+        #[cfg(feature = "test-driver")]
+        let events = {
+            let mut injected: Vec<egui::Event> = Vec::new();
+            for item in shared.injected.drain(..) {
+                match item {
+                    crate::test_driver::Injected::Event(event) => injected.push(event),
+                    crate::test_driver::Injected::Quit => self.quit = true,
+                }
+            }
+            injected.extend(ctx.input(|input| input.events.clone()));
+            injected
+        };
         // Chord chars whose `Event::Text` twin would be the same input
         // twice: some platforms emit BOTH `Key{A, alt}` and `Text("a")`
         // for `Alt+A`, which typed `a` into the PTY beside the panel
@@ -2387,6 +2433,8 @@ mod tests {
                 panes: PaneHost::default(),
                 explorer: ExplorerState::default(),
                 browser: BrowserState::default(),
+                #[cfg(feature = "test-driver")]
+                injected: std::collections::VecDeque::new(),
             }));
             Self {
                 app: GuiApp {

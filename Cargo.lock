@@ -230,10 +230,13 @@ dependencies = [
  "ait-config",
  "ait-store",
  "ait-term",
+ "ait-testkit",
  "dpi",
  "eframe",
  "gtk",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "tempfile",
  "wry",
 ]
