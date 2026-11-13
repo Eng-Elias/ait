@@ -228,6 +228,7 @@ dependencies = [
  "ait-agent",
  "ait-app",
  "ait-config",
+ "ait-llm",
  "ait-store",
  "ait-term",
  "ait-testkit",

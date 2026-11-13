@@ -111,3 +111,8 @@ ait-store = { path = "../ait-store" }
 # binary under a display and drives it over the test-driver socket;
 # the TOML scenarios live in tests/scenarios/.
 ait-testkit = { path = "../ait-testkit" }
+# `ait_llm::testing`'s scripted loopback server (Spec R15-T6): the
+# suggestion-trigger e2e points `command_model` at `Fixture`'s
+# drip-fed SSE stream so the in-flight `suggesting` window is a
+# deterministic hold, not a race — no real provider anywhere.
+ait-llm = { path = "../ait-llm", features = ["test-fixtures"] }
