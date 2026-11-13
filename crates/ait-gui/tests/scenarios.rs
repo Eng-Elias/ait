@@ -95,7 +95,7 @@ fn scenario_files() -> Vec<PathBuf> {
 
 /// One scenario end to end on its own named thread: load, pick the
 /// binary its `binary` leg names, spawn `ait-gui` with the
-/// scenario's `env`/`headed`/`stub_opener`, run its steps. Returns
+/// scenario's `env`/`headed`, run its steps. Returns
 /// `true` when the scenario actually ran — a `false` means a skip
 /// (display or binary leg). Panics propagate to the join below while
 /// the dropping `GuiE2e` leaves the evidence dump under the thread's
@@ -173,18 +173,7 @@ fn scenarios() {
 /// leg is code-first.
 #[test]
 fn resize_settle_reflows_on_settle_not_per_frame() {
-    if !cfg!(feature = "test-driver") {
-        eprintln!(
-            "skipping resize_settle: ait-gui was built without the \
-             `test-driver` feature"
-        );
-        return;
-    }
-    let bin = ait_gui_bin!();
-    let Some(app) =
-        GuiE2e::spawn(GuiSpawnConfig::new(bin)).unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
-    else {
-        eprintln!("resize_settle: skipped (no display reachable)");
+    let Some(app) = spawn_leg("resize_settle", GuiBinary::Any, Vec::new()) else {
         return;
     };
     app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));
@@ -216,18 +205,32 @@ fn resize_settle_reflows_on_settle_not_per_frame() {
     app.quit();
 }
 
-/// R15-T4 — spawn `ait-gui` for a code-first leg with the suite's
-/// feature/display skip conventions (the TOML runner's twin).
-fn spawn_leg(leg: &str, env: Vec<(OsString, OsString)>) -> Option<GuiE2e> {
+/// Spawn `ait-gui` for a code-first leg with the suite's whole skip
+/// matrix — the `test-driver` feature, the `binary` leg's
+/// resolution, and the display — each skip naming the leg loudly
+/// (the TOML runner's twin). `GuiBinary::Any` is the cargo-built
+/// binary.
+fn spawn_leg(leg: &str, binary: GuiBinary, env: Vec<(OsString, OsString)>) -> Option<GuiE2e> {
     if !cfg!(feature = "test-driver") {
         eprintln!("skipping {leg}: ait-gui was built without the `test-driver` feature");
         return None;
     }
-    let bin = ait_gui_bin!();
+    let bin = match bin_for(binary) {
+        Ok(bin) => bin,
+        Err(reason) => {
+            eprintln!("{leg}: skipped ({reason})");
+            return None;
+        }
+    };
     let mut config = GuiSpawnConfig::new(bin);
     config.env = env;
     match GuiE2e::spawn(config) {
-        Ok(app) => app,
+        Ok(app) => {
+            if app.is_none() {
+                eprintln!("{leg}: skipped (no display reachable)");
+            }
+            app
+        }
         Err(error) => panic!("{leg}: spawn ait-gui: {error}"),
     }
 }
@@ -263,12 +266,16 @@ fn cell_center(dump: &ait_testkit::gui::Dump, column: usize, row: usize) -> Opti
 /// application.
 #[test]
 fn explorer_editor_stub_and_refresh() {
-    // VISUAL/EDITOR blanked so `resolve_editor` walks to the stub.
+    // VISUAL/EDITOR blanked so `resolve_editor` walks to the stub;
+    // SHELL=bash makes the session's real snippet injection emit the
+    // OSC-7 cwd reports this leg relies on — no printf'd stand-in.
     let Some(app) = spawn_leg(
         "explorer_editor_stub",
+        GuiBinary::Any,
         vec![
             (OsString::from("VISUAL"), OsString::from("")),
             (OsString::from("EDITOR"), OsString::from("")),
+            (OsString::from("SHELL"), OsString::from("/bin/bash")),
         ],
     ) else {
         return;
@@ -279,10 +286,10 @@ fn explorer_editor_stub_and_refresh() {
     app.wait_for_dump("the fixture marker", |dump| {
         dump.grid_text().contains("FIX-UP")
     });
-    // `cd` + an explicit OSC-7 report — the non-integrated `/bin/sh`
-    // never reports, and `cwd_for`'s memo would keep the `/proc`
-    // answer until the tab moves.
-    app.text("cd fx && printf '\\033]7;file://h%s\\aCWD-%s\\n' \"$PWD\" OK");
+    // `cd` — the snippet's precmd emits the real OSC 7 with the
+    // next prompt, flipping `cwd_reported` and re-rooting the pane;
+    // the marker only gates the step.
+    app.text("cd fx && printf 'CWD-%s\\n' OK");
     app.key("Enter");
     app.wait_for_dump("the cwd marker", |dump| dump.grid_text().contains("CWD-OK"));
     app.key("Ctrl+Shift+E");
@@ -351,7 +358,13 @@ fn explorer_editor_stub_and_refresh() {
 /// `cwd_memo` key moves with the tab.
 #[test]
 fn explorer_reroots_on_tab_switch() {
-    let Some(app) = spawn_leg("explorer_tab_reroot", Vec::new()) else {
+    // SHELL=bash: the snippet's precmd emits the real OSC-7 reports
+    // both tabs' roots track — no printf'd stand-in.
+    let Some(app) = spawn_leg(
+        "explorer_tab_reroot",
+        GuiBinary::Any,
+        vec![(OsString::from("SHELL"), OsString::from("/bin/bash"))],
+    ) else {
         return;
     };
     app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));
@@ -360,7 +373,7 @@ fn explorer_reroots_on_tab_switch() {
     app.wait_for_dump("the fixture marker", |dump| {
         dump.grid_text().contains("FIX-UP")
     });
-    app.text("cd fx && printf '\\033]7;file://h%s\\aCWD-%s\\n' \"$PWD\" OK");
+    app.text("cd fx && printf 'CWD-%s\\n' OK");
     app.key("Enter");
     app.wait_for_dump("the cwd marker", |dump| dump.grid_text().contains("CWD-OK"));
     app.key("Ctrl+Shift+E");
@@ -375,12 +388,12 @@ fn explorer_reroots_on_tab_switch() {
     wait_explorer(&app, "tab 2 inheriting tab 1's cwd", |explorer| {
         explorer.root.as_deref().is_some_and(|r| r.ends_with("/fx"))
     });
-    // Tab 2's own cd + report moves its root to the parent — the
-    // per-tab memo re-evaluates on the new report. The shown pane
-    // owns composed text while it's up, so `Esc` drops the region
-    // for the shell command and the chord brings it back.
+    // Tab 2's own cd + the snippet's report moves its root to the
+    // parent — the per-tab memo re-evaluates on the new report. The
+    // shown pane owns composed text while it's up, so `Esc` drops
+    // the region for the shell command and the chord brings it back.
     app.key("Escape");
-    app.text("cd .. && printf '\\033]7;file://h%s\\aCWD2-%s\\n' \"$PWD\" OK");
+    app.text("cd .. && printf 'CWD2-%s\\n' OK");
     app.key("Enter");
     app.wait_for_dump("tab 2's cwd marker", |dump| {
         dump.grid_text().contains("CWD2-OK")
@@ -415,24 +428,7 @@ fn explorer_reroots_on_tab_switch() {
 /// binary — a feature-off build has no webview to navigate.
 #[test]
 fn browser_in_page_nav_syncs_address() {
-    if !cfg!(feature = "test-driver") {
-        eprintln!(
-            "skipping browser_in_page_nav: ait-gui was built without the \
-             `test-driver` feature"
-        );
-        return;
-    }
-    let bin = match bin_for(GuiBinary::Web) {
-        Ok(bin) => bin,
-        Err(reason) => {
-            eprintln!("browser_in_page_nav: skipped ({reason})");
-            return;
-        }
-    };
-    let Some(app) =
-        GuiE2e::spawn(GuiSpawnConfig::new(bin)).unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
-    else {
-        eprintln!("browser_in_page_nav: skipped (no display reachable)");
+    let Some(app) = spawn_leg("browser_in_page_nav", GuiBinary::Web, Vec::new()) else {
         return;
     };
 
@@ -498,7 +494,7 @@ fn browser_in_page_nav_syncs_address() {
 /// so the same position refusing after the scroll IS the gate.
 #[test]
 fn ctrl_hover_ignores_missing_paths_chords_and_scrollback() {
-    let Some(app) = spawn_leg("ctrl_hover_negatives", Vec::new()) else {
+    let Some(app) = spawn_leg("ctrl_hover_negatives", GuiBinary::Any, Vec::new()) else {
         return;
     };
     app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));
@@ -598,8 +594,11 @@ fn ctrl_hover_ignores_missing_paths_chords_and_scrollback() {
             .is_some_and(|detect| detect.ctrl && detect.token.is_none())
     });
     // And a Ctrl+click there routes nothing — the pane stays shut.
+    // `wait_settled` is the barrier: `input_done` catching `input_seq`
+    // means a completed frame folded the click — the negative claim
+    // reads post-frame state, never a guessed settle window.
     app.click_at(x, y);
-    std::thread::sleep(Duration::from_millis(300));
+    app.wait_settled();
     let settled = app.dump();
     assert!(
         settled.pane.shown.is_none(),
@@ -618,24 +617,7 @@ fn ctrl_hover_ignores_missing_paths_chords_and_scrollback() {
 /// Needs the `web` binary.
 #[test]
 fn browser_webview_tracks_resize_and_hides() {
-    if !cfg!(feature = "test-driver") {
-        eprintln!(
-            "skipping browser_webview_tracks: ait-gui was built without the \
-             `test-driver` feature"
-        );
-        return;
-    }
-    let bin = match bin_for(GuiBinary::Web) {
-        Ok(bin) => bin,
-        Err(reason) => {
-            eprintln!("browser_webview_tracks: skipped ({reason})");
-            return;
-        }
-    };
-    let Some(app) =
-        GuiE2e::spawn(GuiSpawnConfig::new(bin)).unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
-    else {
-        eprintln!("browser_webview_tracks: skipped (no display reachable)");
+    let Some(app) = spawn_leg("browser_webview_tracks", GuiBinary::Web, Vec::new()) else {
         return;
     };
 
@@ -708,17 +690,14 @@ fn error_chunk() -> Vec<u8> {
     .to_vec()
 }
 
-/// Spawn `ait-gui` with `XDG_CONFIG_HOME` pointed at `xdg` — the
-/// `env` pairs apply after the harness's pins and therefore override
-/// them (the PTY suite's `spawn_ait_with_xdg` convention).
-fn spawn_gui_with_xdg(xdg: &Path) -> Option<GuiE2e> {
-    let bin = ait_gui_bin!();
-    let mut config = GuiSpawnConfig::new(bin);
-    config.env.push((
+/// The `XDG_CONFIG_HOME` env pair pointing at `xdg` — `env` pairs
+/// apply after the harness's pins and therefore override them (the
+/// PTY suite's `spawn_ait_with_xdg` convention).
+fn xdg_env(xdg: &Path) -> Vec<(OsString, OsString)> {
+    vec![(
         OsString::from("XDG_CONFIG_HOME"),
         xdg.as_os_str().to_os_string(),
-    ));
-    GuiE2e::spawn(config).unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
+    )]
 }
 
 /// R15-T6 — the suggestion triggers' user-visible arc on the GUI's
@@ -731,13 +710,6 @@ fn spawn_gui_with_xdg(xdg: &Path) -> Option<GuiE2e> {
 /// hold rather than a race against an immediate error.
 #[test]
 fn suggest_triggers_arm_then_clear_on_error() {
-    if !cfg!(feature = "test-driver") {
-        eprintln!(
-            "skipping suggest_triggers: ait-gui was built without the \
-             `test-driver` feature"
-        );
-        return;
-    }
     // One held stream per trigger leg — `DripSse` answers `200
     // text/event-stream` and then blocks on the channel: the request
     // stays in flight until the test drips the error frame and drops
@@ -748,8 +720,7 @@ fn suggest_triggers_arm_then_clear_on_error() {
     let xdg = tempfile::tempdir().expect("fixture tempdir");
     write_settings(xdg.path(), &settings_with_stub(&stub.base_url));
 
-    let Some(app) = spawn_gui_with_xdg(xdg.path()) else {
-        eprintln!("suggest_triggers: skipped (no display reachable)");
+    let Some(app) = spawn_leg("suggest_triggers", GuiBinary::Any, xdg_env(xdg.path())) else {
         return;
     };
     app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));
@@ -811,14 +782,6 @@ fn suggest_triggers_arm_then_clear_on_error() {
 /// the pump's ctl drain — the two sockets never fight.
 #[test]
 fn ctl_and_driver_sockets_coexist() {
-    if !cfg!(feature = "test-driver") {
-        eprintln!(
-            "skipping ctl_coexistence: ait-gui was built without the \
-             `test-driver` feature"
-        );
-        return;
-    }
-    let gui_bin = ait_gui_bin!();
     // The `ait` ctl client binary: the `AIT_E2E_BIN` override first,
     // else the `ait-gui` binary's sibling in the workspace target
     // dir (`cargo test --workspace` builds both). Under a lone
@@ -827,17 +790,14 @@ fn ctl_and_driver_sockets_coexist() {
     let ait = std::env::var_os("AIT_E2E_BIN")
         .map(PathBuf::from)
         .or_else(|| {
-            let sibling = Path::new(&gui_bin).parent()?.join("ait");
+            let sibling = Path::new(&ait_gui_bin!()).parent()?.join("ait");
             sibling.exists().then_some(sibling)
         });
     let Some(ait) = ait else {
         eprintln!("ctl_coexistence: skipped (no `ait` binary — set AIT_E2E_BIN)");
         return;
     };
-    let Some(app) = GuiE2e::spawn(GuiSpawnConfig::new(gui_bin))
-        .unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
-    else {
-        eprintln!("ctl_coexistence: skipped (no display reachable)");
+    let Some(app) = spawn_leg("ctl_coexistence", GuiBinary::Any, Vec::new()) else {
         return;
     };
     app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));

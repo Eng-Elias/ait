@@ -1,15 +1,16 @@
 # Spec R15-T4 — the explorer pane's browse verbs end to end: a real
-# fixture under the shell's cwd, an OSC-7 report to re-root the pane
-# (a non-integrated `/bin/sh` never reports one, so `cwd_for` would
-# keep the `/proc` answer memoized — the printf IS the integrated
-# shell's report), then ↑/↓/Enter/→/←/⌫ browsing, the `..` root
-# clamp, the `.` dotfile toggle, wheel scrolling and the three
-# preview kinds. `o`/`Enter`'s editor spawn lands on the harness's
-# stub opener — blanking VISUAL/EDITOR walks `resolve_editor` to
+# fixture under the shell's cwd, the REAL integrated shell's OSC-7
+# precmd report re-rooting the pane (the leg runs `/bin/bash` so the
+# spawn's snippet injection applies — the `cd`'s report is emitted
+# by `ait-shell`'s own `snippet.bash`, not a printf'd stand-in),
+# then ↑/↓/Enter/→/←/⌫ browsing, the `..` root clamp, the `.`
+# dotfile toggle, wheel scrolling and the three preview kinds.
+# `o`/`Enter`'s editor spawn lands on the harness's stub opener —
+# blanking VISUAL/EDITOR walks `resolve_editor` to
 # `platform_opener`, whose `xdg-open`/`open` shadow records instead
 # of launching (the log itself is a code-first test's assert).
 feature = "explorer-browse"
-env = { VISUAL = "", EDITOR = "" }
+env = { VISUAL = "", EDITOR = "", SHELL = "/bin/bash" }
 
 [[steps]]
 wait_text = "$"
@@ -26,10 +27,11 @@ key = "Enter"
 [[steps]]
 expect_text = "FIX-READY"
 
-# `cd` then report it — the OSC 7 flips `cwd_reported`, the memo
-# key moves, and the pane re-roots at the reported path.
+# `cd` — the snippet's precmd emits the real OSC 7 with the next
+# prompt, flipping `cwd_reported`; the memo key moves and the pane
+# re-roots at the reported path. `CWD-OK` is only the step's gate.
 [[steps]]
-text = "cd fx && printf '\\033]7;file://h%s\\aCWD-%s\\n' \"$PWD\" OK"
+text = "cd fx && printf 'CWD-%s\\n' OK"
 
 [[steps]]
 key = "Enter"

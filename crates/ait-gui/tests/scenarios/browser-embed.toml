@@ -10,7 +10,6 @@
 # test target itself was built feature-off.
 feature = "browser"
 binary = "web"
-stub_opener = true
 
 [[steps]]
 wait_text = "$"

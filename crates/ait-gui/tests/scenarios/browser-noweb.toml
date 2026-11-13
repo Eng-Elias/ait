@@ -10,7 +10,6 @@
 # packages — or `AIT_GUI_E2E_BIN_NOWEB`.
 feature = "browser"
 binary = "noweb"
-stub_opener = true
 
 [[steps]]
 wait_text = "$"

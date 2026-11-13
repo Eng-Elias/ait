@@ -28,18 +28,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use ait_testkit::ait_gui_bin;
-use ait_testkit::gui::{GuiE2e, GuiSpawnConfig, WAIT_TIMEOUT};
+use ait_testkit::gui::{env_flag, GuiE2e, GuiSpawnConfig, WAIT_TIMEOUT};
 
 /// The opt-in env var — the canary runs only when named.
 const ENV_XTEST: &str = "AIT_GUI_E2E_XTEST";
-
-/// `AIT_GUI_E2E_XTEST=1` truthiness — the harness's env-flag rule.
-fn env_flag(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
-}
 
 /// `tool` resolves on `PATH` — the tool gate's check.
 fn on_path(tool: &str) -> bool {
