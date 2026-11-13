@@ -69,17 +69,34 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// pass, so a response taking this long means the app is wedged.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The env var naming the stub opener's invocation log — every
+/// spawned GUI exports it pointing at `<cwd>/open.log`, and the
+/// `stub-bin` scripts append `name args…` lines to it (Spec R15-T4:
+/// the explorer's `o`/`Enter` editor spawn and the browser's `ext ↗`
+/// both reach the platform opener; the stub records, never launches,
+/// so a test proves the route without a real application).
+const STUB_LOG_ENV: &str = "AIT_GUI_E2E_STUB_LOG";
+
 /// The pinned env every spawned GUI gets — the PTY harness's pins
 /// (SHELL/PS1/XDG_CONFIG_HOME/skip_global_compinit) plus the GUI's own:
 /// `HOME` and `XDG_RUNTIME_DIR` inside the throwaway dir, so a spawned
 /// app reads no host config, loads no host dotfiles into its tab
 /// shells, and places its ctl/runtime sockets under a dir the harness
-/// owns.
+/// owns. `stub-bin/` lands FIRST on `PATH`: its `xdg-open`/`open`
+/// scripts shadow the platform opener and append their invocation to
+/// [`STUB_LOG_ENV`]'s file — an external-open that never launches a
+/// real app.
 fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<Vec<(OsString, OsString)>> {
     use std::os::unix::fs::PermissionsExt;
     let runtime = cwd.join("xdg-runtime");
     std::fs::create_dir(&runtime)?;
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+    let bin = cwd.join("stub-bin");
+    install_opener_stubs(&bin)?;
+    let ambient = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(ambient);
     Ok(vec![
         (OsString::from("SHELL"), OsString::from("/bin/sh")),
         (OsString::from("PS1"), OsString::from("$ ")),
@@ -94,7 +111,33 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<Vec<(OsString, OsString)>
             OsString::from(ENV_DRIVER_SOCKET),
             socket.as_os_str().to_os_string(),
         ),
+        (OsString::from("PATH"), path),
+        (
+            OsString::from(STUB_LOG_ENV),
+            cwd.join("open.log").into_os_string(),
+        ),
     ])
+}
+
+/// Write `dir`'s opener stubs — `xdg-open` and `open`, the names
+/// `platform_opener` resolves on Linux/macOS. Each records
+/// `basename args…` to [`STUB_LOG_ENV`]'s file (falling back to
+/// `$HOME/open.log`) and exits 0 — deterministic, recorded, and
+/// never a real application.
+fn install_opener_stubs(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(dir)?;
+    for name in ["xdg-open", "open"] {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             printf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" \
+             >> \"${AIT_GUI_E2E_STUB_LOG:-$HOME/open.log}\"\n",
+        )?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
 }
 
 /// How the spawned binary reaches a display.
@@ -215,6 +258,16 @@ enum Request<'a> {
         /// The region a bare scroll hovers.
         #[serde(skip_serializing_if = "Option::is_none")]
         over: Option<ScrollRegion>,
+        /// A hit-registry name the scroll hovers — resolves to its
+        /// rect's center.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<&'a str>,
+        /// `true` delivers a real `Event::MouseWheel` through the
+        /// pointer batch (a `PointerMoved` first when a hover is
+        /// named) — the only delivery panes whose scroll lives in
+        /// their paint (the explorer listing) ever see.
+        #[serde(skip_serializing_if = "is_false")]
+        raw: bool,
     },
     /// `resize` — a viewport inner-size request in points.
     Resize {
@@ -364,6 +417,12 @@ pub enum ScrollRegion {
     Panel,
 }
 
+/// `skip_serializing_if` for a `bool` field — `false` keeps the wire
+/// identical to before the field existed.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One response on the wire — `ok` + optional `error`/`dump`.
 #[derive(Debug, Deserialize)]
 struct Response {
@@ -401,6 +460,15 @@ pub struct Dump {
     /// opened one.
     #[serde(default)]
     pub agent: Option<AgentDump>,
+    /// The file explorer's model — the listing, selection, preview
+    /// and navigation state the pane paints (R15-T4).
+    #[serde(default)]
+    pub explorer: Option<ExplorerDump>,
+    /// The Ctrl-hover affordance's resolved state — the token the
+    /// last painted frame found under the pointer while plain Ctrl
+    /// was held (R15-T4).
+    #[serde(default)]
+    pub detect: Option<DetectDump>,
     /// The hit-target registry — name → rect for every interactive
     /// surface the last painted frame registered. `click`/`pointer`
     /// `target` names resolve against exactly this map.
@@ -430,6 +498,20 @@ pub struct GridDump {
     /// drag (the highlight's lifetime), `null` when none.
     #[serde(default)]
     pub selection: Option<SelectionDump>,
+    /// The cell metrics the last painted frame laid out — the
+    /// `(row, column) → point` map for pointing at output no hit
+    /// name covers (R15-T4).
+    #[serde(default)]
+    pub cell: Option<CellDump>,
+}
+
+/// One terminal cell's pixel size on the last painted frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CellDump {
+    /// One grid column in points.
+    pub width: f32,
+    /// One grid row in points.
+    pub height: f32,
 }
 
 /// The cursor's viewport position and shape name.
@@ -547,6 +629,106 @@ pub enum GateDump {
     },
 }
 
+/// The file explorer's model (R15-T4) — `entries` is the FULL
+/// listing: `hidden` flags the dotfiles `show_hidden` suppresses, so
+/// the painted rows are exactly the entries where
+/// `show_hidden || !hidden` holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorerDump {
+    /// The remote-session gate — `remote session — browsing
+    /// unavailable` paints while set.
+    pub remote: bool,
+    /// The session root `..` clamps at — `null` until a local
+    /// session's cwd answer lands.
+    pub root: Option<String>,
+    /// The directory the listing describes.
+    pub dir: String,
+    /// The `.` toggle — whether dotfiles join the visible rows.
+    pub show_hidden: bool,
+    /// `dir`'s entries — dirs first, each class case-insensitive.
+    pub entries: Vec<ExplorerEntryDump>,
+    /// The highlighted row — `null` on an empty listing.
+    pub selected: Option<ExplorerEntryDump>,
+    /// The selected file's preview — `null` on dirs/others/remote.
+    pub preview: Option<PreviewDump>,
+    /// The listing's io error row — `null` on a clean read.
+    pub error: Option<String>,
+    /// The listing's scroll offset in visible rows.
+    pub scroll: usize,
+}
+
+impl ExplorerDump {
+    /// The painted listing — the names `show_hidden` lets through,
+    /// in order (what `entries` asserts on).
+    pub fn visible_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| self.show_hidden || !entry.hidden)
+            .map(|entry| entry.name.as_str())
+            .collect()
+    }
+}
+
+/// One listing row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorerEntryDump {
+    /// The file name — the pane draws dirs with a `/` suffix.
+    pub name: String,
+    /// `dir` / `file` / `other`.
+    pub kind: String,
+    /// A dotfile — suppressed while `show_hidden` is off.
+    pub hidden: bool,
+}
+
+/// The selected file's preview — tagged on `kind` like `GateDump`.
+/// `text` is the wire-capped head; `truncated` is the model's
+/// over-cap flag (the `…` the pane paints).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreviewDump {
+    /// A text file's preview head.
+    Text {
+        /// The head, capped for the wire.
+        text: String,
+        /// The file continues past the preview cap.
+        truncated: bool,
+    },
+    /// The `binary file — no preview` placeholder.
+    Binary,
+    /// The read error's text.
+    Unreadable {
+        /// What the failed read reported.
+        error: String,
+    },
+}
+
+/// The Ctrl-hover affordance's resolved state (R15-T4): `ctrl` is
+/// the plain-Ctrl-over-the-grid gate; `token` is the underline's
+/// span and the route a Ctrl+click takes — `null` when the
+/// affordance doesn't fire (the hand cursor paints on exactly
+/// `token` being `Some`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectDump {
+    /// Plain Ctrl held while the pointer hovered the grid.
+    pub ctrl: bool,
+    /// The detected token under the pointer.
+    pub token: Option<DetectTokenDump>,
+}
+
+/// A detected token — the underline's span plus the route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectTokenDump {
+    /// The token's grid line — absolute (scrollback rows are
+    /// negative).
+    pub line: i32,
+    /// Its starting cell column.
+    pub column: usize,
+    /// Its cell span.
+    pub cells: usize,
+    /// The route a Ctrl+click takes — `url:<u>` or `path:<p>`.
+    pub target: String,
+}
+
 impl Dump {
     /// The visible grid text, rows joined with `\n` — the GUI analog
     /// of [`E2e::screen_text`](crate::E2e::screen_text), empty with no
@@ -609,6 +791,32 @@ impl Dump {
                 fnv(&mut h, &selection.start.column.to_le_bytes());
                 fnv(&mut h, &selection.end.line.to_le_bytes());
                 fnv(&mut h, &selection.end.column.to_le_bytes());
+            }
+        }
+        if let Some(explorer) = &self.explorer {
+            fnv(&mut h, explorer.dir.as_bytes());
+            fnv(&mut h, &[explorer.show_hidden as u8]);
+            fnv(&mut h, &explorer.scroll.to_le_bytes());
+            if let Some(selected) = &explorer.selected {
+                fnv(&mut h, selected.name.as_bytes());
+            }
+            if let Some(error) = &explorer.error {
+                fnv(&mut h, error.as_bytes());
+            }
+            match &explorer.preview {
+                Some(PreviewDump::Text { truncated, .. }) => {
+                    fnv(&mut h, b"preview-text");
+                    fnv(&mut h, &[*truncated as u8]);
+                }
+                Some(PreviewDump::Binary) => fnv(&mut h, b"preview-binary"),
+                Some(PreviewDump::Unreadable { .. }) => fnv(&mut h, b"preview-unreadable"),
+                None => {}
+            }
+        }
+        if let Some(detect) = &self.detect {
+            fnv(&mut h, &[detect.ctrl as u8]);
+            if let Some(token) = &detect.token {
+                fnv(&mut h, token.target.as_bytes());
             }
         }
         for name in self.hits.keys() {
@@ -898,6 +1106,8 @@ impl GuiE2e {
             x: None,
             y: None,
             over: None,
+            target: None,
+            raw: false,
         });
     }
 
@@ -912,6 +1122,8 @@ impl GuiE2e {
             x: None,
             y: None,
             over: Some(over),
+            target: None,
+            raw: false,
         });
     }
 
@@ -925,6 +1137,57 @@ impl GuiE2e {
             x: Some(x),
             y: Some(y),
             over: None,
+            target: None,
+            raw: false,
+        });
+    }
+
+    /// [`scroll`](Self::scroll) over a hit-registry name — the
+    /// server resolves the rect's center as the hover position.
+    pub fn scroll_named(&self, unit: ScrollUnit, dx: f32, dy: f32, target: &str) {
+        self.log_action(format!(
+            "scroll({unit:?}, dx={dx}, dy={dy}, target={target:?})"
+        ));
+        self.act(&Request::Scroll {
+            unit,
+            dx,
+            dy,
+            x: None,
+            y: None,
+            over: None,
+            target: Some(target),
+            raw: false,
+        });
+    }
+
+    /// `scroll` delivered as a real `Event::MouseWheel` through the
+    /// app's pointer batch — a `PointerMoved` lands first when
+    /// `target` (its rect's center) or `x`/`y` names the hover.
+    /// Panes whose scroll lives in their own paint — the explorer
+    /// listing — answer only this delivery, since egui routes wheel
+    /// events on `pointer.hover_pos`; the app-side `wheel` route
+    /// knows just the grid and the agent conversation.
+    pub fn scroll_raw(
+        &self,
+        unit: ScrollUnit,
+        dx: f32,
+        dy: f32,
+        target: Option<&str>,
+        x: Option<f32>,
+        y: Option<f32>,
+    ) {
+        self.log_action(format!(
+            "scroll({unit:?}, dx={dx}, dy={dy}, target={target:?}, at={x:?},{y:?}, raw)"
+        ));
+        self.act(&Request::Scroll {
+            unit,
+            dx,
+            dy,
+            x,
+            y,
+            over: None,
+            target,
+            raw: true,
         });
     }
 
@@ -1156,6 +1419,13 @@ impl GuiE2e {
         self.cwd.path()
     }
 
+    /// The stub opener's invocation log ([`STUB_LOG_ENV`]'s file —
+    /// `<cwd>/open.log`): each line a recorded `xdg-open`/`open`
+    /// call. Absent until the first external-open runs.
+    pub fn stub_log(&self) -> PathBuf {
+        self.cwd.path().join("open.log")
+    }
+
     /// One action-log entry with the current dump hash — the same
     /// `#<seq> [t+<ms>] <action> screen=<hash>` line shape `E2e` writes.
     fn log_action(&self, action: String) {
@@ -1251,6 +1521,8 @@ const GUI_VERBS: &[&str] = &[
     "expect_gate",
     "expect_selection",
     "expect_hit",
+    "expect_explorer",
+    "expect_detect",
     "quit",
 ];
 
@@ -1314,7 +1586,10 @@ pub enum GuiStep {
     Paste(String),
     /// `scroll` — one wheel gesture; the table's `unit` is required,
     /// `dx`/`dy` default to `0`, `x`/`y` give an explicit position,
-    /// `over` (`grid`/`panel`) the named region.
+    /// `over` (`grid`/`panel`) the named region, `target` a
+    /// hit-registry name, `raw` the real-`MouseWheel` delivery (the
+    /// only scroll a pane-own-paint listing like the explorer's
+    /// answers).
     Scroll {
         /// The delta's unit (`line`/`pixel`/`page`).
         unit: ScrollUnit,
@@ -1328,6 +1603,10 @@ pub enum GuiStep {
         y: Option<f32>,
         /// The named hover region.
         over: Option<ScrollRegion>,
+        /// A hit-registry name the scroll hovers.
+        target: Option<String>,
+        /// Deliver the real `MouseWheel` through the pointer batch.
+        raw: bool,
     },
     /// `resize` — a viewport inner-size request in points.
     Resize {
@@ -1421,8 +1700,263 @@ pub enum GuiStep {
     /// `click` after a state expectation needs this to resolve, or it
     /// can hit the `unknown hit target` refusal a frame early.
     ExpectHit(String),
+    /// `expect_explorer` — bounded wait on the explorer model's
+    /// visible state (R15-T4):
+    /// `expect_explorer = { dir = "/suffix", selected = "file.txt",
+    /// entries = ["a", "b"], has = ["x"], lacks = [".dot"],
+    /// hidden = true, scroll = 0, preview = { kind = "text",
+    /// contains = "…", truncated = true } }` — every present field
+    /// must hold; `dir`/`root` match as path suffixes, `entries`/
+    /// `has`/`lacks` against the visible listing, `scroll` the
+    /// `expect_scroll` convention (`0` exact, `n` at-least).
+    ExpectExplorer(ExplorerExpect),
+    /// `expect_detect` — bounded wait on the Ctrl-hover affordance
+    /// (R15-T4): `"none"` asserts `detect.token` is `null` (the
+    /// hand-cursor condition), `"url:<u>"`/`"path:<p>"` the resolved
+    /// route (`path:` as a suffix), and the table
+    /// `{ ctrl = true, token = "none" }` asserts the gate beside it.
+    ExpectDetect(DetectExpect),
     /// `quit` — the app's normal close.
     Quit,
+}
+
+/// `expect_explorer`'s table fields — every present field must hold
+/// for the dump's explorer block (the wait polls until they all do).
+#[derive(Debug, Default, Deserialize)]
+pub struct ExplorerExpect {
+    /// The session root — a path SUFFIX (`"/ait-fix"` matches
+    /// `"/tmp/ait-fix"`); `"none"` asserts no root landed yet.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// The browsed dir — a path suffix like `root`.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// The highlighted entry's name — `"none"` for an empty listing.
+    #[serde(default)]
+    pub selected: Option<String>,
+    /// The exact visible listing — names in painted order.
+    #[serde(default)]
+    pub entries: Option<Vec<String>>,
+    /// Names the visible listing must contain.
+    #[serde(default)]
+    pub has: Option<Vec<String>>,
+    /// Names the visible listing must not contain.
+    #[serde(default)]
+    pub lacks: Option<Vec<String>>,
+    /// The `.` toggle's state.
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    /// The listing's scroll offset — `0` exact, `n` at-least.
+    #[serde(default)]
+    pub scroll: Option<usize>,
+    /// The selected file's preview — `"none"`/`"text"`/`"binary"`/
+    /// `"unreadable"`, or `{ kind, contains?, truncated? }`.
+    #[serde(default)]
+    pub preview: Option<PreviewExpect>,
+}
+
+impl ExplorerExpect {
+    /// `true` iff every present field holds for `explorer`.
+    fn matches(&self, explorer: &ExplorerDump) -> bool {
+        if let Some(want) = self.root.as_deref() {
+            match want {
+                "none" => {
+                    if explorer.root.is_some() {
+                        return false;
+                    }
+                }
+                suffix => {
+                    let Some(root) = &explorer.root else {
+                        return false;
+                    };
+                    if !root.ends_with(suffix) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(want) = self.dir.as_deref() {
+            if !explorer.dir.ends_with(want) {
+                return false;
+            }
+        }
+        if let Some(want) = self.selected.as_deref() {
+            match want {
+                "none" => {
+                    if explorer.selected.is_some() {
+                        return false;
+                    }
+                }
+                name => {
+                    if explorer
+                        .selected
+                        .as_ref()
+                        .is_none_or(|entry| entry.name != name)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        let visible = explorer.visible_names();
+        if let Some(want) = &self.entries {
+            if visible != want.iter().map(String::as_str).collect::<Vec<_>>() {
+                return false;
+            }
+        }
+        if let Some(want) = &self.has {
+            if !want.iter().all(|name| visible.contains(&name.as_str())) {
+                return false;
+            }
+        }
+        if let Some(want) = &self.lacks {
+            if want.iter().any(|name| visible.contains(&name.as_str())) {
+                return false;
+            }
+        }
+        if let Some(want) = self.hidden {
+            if explorer.show_hidden != want {
+                return false;
+            }
+        }
+        if let Some(want) = self.scroll {
+            let ok = if want == 0 {
+                explorer.scroll == 0
+            } else {
+                explorer.scroll >= want
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if let Some(preview) = &self.preview {
+            if !preview.matches(explorer.preview.as_ref()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// `expect_explorer`'s `preview` — the kind, plus the optional head
+/// asserts (`contains`, `truncated`).
+#[derive(Debug)]
+pub struct PreviewExpect {
+    /// `none`/`text`/`binary`/`unreadable`.
+    pub kind: String,
+    /// A substring the text head must carry.
+    pub contains: Option<String>,
+    /// The over-cap flag.
+    pub truncated: Option<bool>,
+}
+
+impl PreviewExpect {
+    /// `true` iff the present fields hold for `preview`.
+    fn matches(&self, preview: Option<&PreviewDump>) -> bool {
+        let ok = matches!(
+            (self.kind.as_str(), preview),
+            ("none", None)
+                | ("text", Some(PreviewDump::Text { .. }))
+                | ("binary", Some(PreviewDump::Binary))
+                | ("unreadable", Some(PreviewDump::Unreadable { .. }))
+        );
+        if !ok {
+            return false;
+        }
+        if let Some(want) = &self.contains {
+            match preview {
+                Some(PreviewDump::Text { text, .. }) if text.contains(want.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(want) = self.truncated {
+            match preview {
+                Some(PreviewDump::Text { truncated, .. }) if *truncated == want => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// `preview`'s TOML shapes — `"kind"` alone or
+/// `{ kind, contains?, truncated? }`.
+impl<'de> Deserialize<'de> for PreviewExpect {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            /// `preview = "binary"`.
+            Kind(String),
+            /// `preview = { kind = "text", … }`.
+            Table(PreviewTable),
+        }
+
+        /// The table form.
+        #[derive(Deserialize)]
+        struct PreviewTable {
+            /// The kind.
+            kind: String,
+            /// The head substring.
+            #[serde(default)]
+            contains: Option<String>,
+            /// The over-cap flag.
+            #[serde(default)]
+            truncated: Option<bool>,
+        }
+
+        Ok(match Form::deserialize(deserializer)? {
+            Form::Kind(kind) => Self {
+                kind,
+                contains: None,
+                truncated: None,
+            },
+            Form::Table(table) => Self {
+                kind: table.kind,
+                contains: table.contains,
+                truncated: table.truncated,
+            },
+        })
+    }
+}
+
+/// `expect_detect`'s assertion — `ctrl` asserts the gate iff
+/// `Some`, `token` the route: `"none"` means `detect.token` is
+/// `null`; `"url:<u>"`/`"path:<p>"` the target (`path:` suffix).
+#[derive(Debug)]
+pub struct DetectExpect {
+    /// The plain-Ctrl gate.
+    pub ctrl: Option<bool>,
+    /// The route token — `"none"`/`"url:<u>"`/`"path:<p>"`.
+    pub token: Option<String>,
+}
+
+impl DetectExpect {
+    /// `true` iff the present fields hold for `dump`'s detect block.
+    fn matches(&self, dump: &Dump) -> bool {
+        let Some(detect) = &dump.detect else {
+            return false;
+        };
+        if let Some(want) = self.ctrl {
+            if detect.ctrl != want {
+                return false;
+            }
+        }
+        match self.token.as_deref() {
+            None => true,
+            Some("none") => detect.token.is_none(),
+            Some(want) => match &detect.token {
+                None => false,
+                Some(token) => match want.strip_prefix("path:") {
+                    Some(suffix) => token
+                        .target
+                        .strip_prefix("path:")
+                        .is_some_and(|path| path.ends_with(suffix)),
+                    None => token.target == want,
+                },
+            },
+        }
+    }
 }
 
 /// `key`'s `twin` — how the platform text twin's payload resolves.
@@ -1478,6 +2012,8 @@ impl GuiStep {
             Self::ExpectGate(_) => "expect_gate",
             Self::ExpectSelection(_) => "expect_selection",
             Self::ExpectHit(_) => "expect_hit",
+            Self::ExpectExplorer(_) => "expect_explorer",
+            Self::ExpectDetect(_) => "expect_detect",
             Self::Quit => "quit",
         }
     }
@@ -1499,11 +2035,20 @@ impl GuiStep {
                 x,
                 y,
                 over,
-            } => match (x, y, over) {
-                (Some(x), Some(y), _) => e2e.scroll_at(*unit, *dx, *dy, *x, *y),
-                (_, _, Some(over)) => e2e.scroll_over(*unit, *dx, *dy, *over),
-                _ => e2e.scroll(*unit, *dx, *dy),
-            },
+                target,
+                raw,
+            } => {
+                if *raw {
+                    e2e.scroll_raw(*unit, *dx, *dy, target.as_deref(), *x, *y)
+                } else {
+                    match (x, y, over, target) {
+                        (_, _, _, Some(target)) => e2e.scroll_named(*unit, *dx, *dy, target),
+                        (Some(x), Some(y), _, _) => e2e.scroll_at(*unit, *dx, *dy, *x, *y),
+                        (_, _, Some(over), _) => e2e.scroll_over(*unit, *dx, *dy, *over),
+                        _ => e2e.scroll(*unit, *dx, *dy),
+                    }
+                }
+            }
             Self::Resize { width, height } => e2e.resize(*width, *height),
             Self::Pointer {
                 event,
@@ -1606,6 +2151,18 @@ impl GuiStep {
             Self::ExpectHit(name) => {
                 e2e.wait_for_dump(&format!("expect_hit {name:?}"), |dump| {
                     dump.hit(name).is_some()
+                });
+            }
+            Self::ExpectExplorer(expect) => {
+                e2e.wait_for_dump(&format!("expect_explorer {expect:?}"), |dump| {
+                    dump.explorer
+                        .as_ref()
+                        .is_some_and(|explorer| expect.matches(explorer))
+                });
+            }
+            Self::ExpectDetect(expect) => {
+                e2e.wait_for_dump(&format!("expect_detect {expect:?}"), |dump| {
+                    expect.matches(dump)
                 });
             }
             Self::Quit => e2e.quit(),
@@ -1798,11 +2355,25 @@ fn parse_gui_step(
         "text" => Ok(GuiStep::Text(want(value, verb, "a string").map_err(fail)?)),
         "paste" => Ok(GuiStep::Paste(want(value, verb, "a string").map_err(fail)?)),
         "scroll" => {
-            let table: ScrollTable =
-                want(value, verb, "a { unit, dx?, dy?, x?, y?, over? } table").map_err(fail)?;
+            let table: ScrollTable = want(
+                value,
+                verb,
+                "a { unit, dx?, dy?, x?, y?, over?, target?, raw? } table",
+            )
+            .map_err(fail)?;
             if table.x.is_some() != table.y.is_some() {
                 return Err(fail(
                     "`scroll`'s `x` and `y` travel together or not at all".to_string(),
+                ));
+            }
+            if table.raw && table.over.is_some() {
+                return Err(fail(
+                    "`scroll`'s `raw` rides the pointer's hover — `over` doesn't apply".to_string(),
+                ));
+            }
+            if table.target.is_some() && (table.x.is_some() || table.over.is_some()) {
+                return Err(fail(
+                    "`scroll`'s `target` stands alone — no `x`/`y`/`over`".to_string(),
                 ));
             }
             Ok(GuiStep::Scroll {
@@ -1812,6 +2383,8 @@ fn parse_gui_step(
                 x: table.x,
                 y: table.y,
                 over: table.over,
+                target: table.target,
+                raw: table.raw,
             })
         }
         "resize" => {
@@ -1932,6 +2505,35 @@ fn parse_gui_step(
         "expect_hit" => Ok(GuiStep::ExpectHit(
             want(value, verb, "a hit-target name").map_err(fail)?,
         )),
+        "expect_explorer" => {
+            let expect: ExplorerExpect = want(
+                value,
+                verb,
+                "a { root?, dir?, selected?, entries?, has?, lacks?, hidden?, scroll?, preview? } table",
+            )
+            .map_err(fail)?;
+            Ok(GuiStep::ExpectExplorer(expect))
+        }
+        "expect_detect" => match value {
+            // `expect_detect = "none"` — nothing affords; the
+            // `"url:…"`/`"path:…"` shapes name the resolved route.
+            toml::Value::String(token) => Ok(GuiStep::ExpectDetect(DetectExpect {
+                ctrl: None,
+                token: Some(token.clone()),
+            })),
+            toml::Value::Table(_) => {
+                let table: DetectTable =
+                    want(value, verb, "a { ctrl?, token? } table").map_err(fail)?;
+                Ok(GuiStep::ExpectDetect(DetectExpect {
+                    ctrl: table.ctrl,
+                    token: table.token,
+                }))
+            }
+            _ => Err(fail(format!(
+                "`expect_detect` must be a target string (\"none\", \"url:…\", \
+                 \"path:…\") or a {{ ctrl?, token? }} table, got {value}"
+            ))),
+        },
         "quit" => {
             let flag: bool = want(value, verb, "`true`").map_err(fail)?;
             if !flag {
@@ -1983,6 +2585,14 @@ struct ScrollTable {
     /// The named hover region.
     #[serde(default)]
     over: Option<ScrollRegion>,
+    /// A hit-registry name the scroll hovers.
+    #[serde(default)]
+    target: Option<String>,
+    /// `true` delivers the real `MouseWheel` through the pointer
+    /// batch — the only delivery a pane-own-paint listing (the
+    /// explorer's) answers.
+    #[serde(default)]
+    raw: bool,
 }
 
 /// `resize`'s table form.
@@ -2043,6 +2653,17 @@ struct ClickTable {
     /// The modifier set held for the click.
     #[serde(default)]
     modifiers: Option<String>,
+}
+
+/// `expect_detect`'s table form — `{ ctrl?, token? }`.
+#[derive(Deserialize)]
+struct DetectTable {
+    /// The plain-Ctrl gate.
+    #[serde(default)]
+    ctrl: Option<bool>,
+    /// The route token — `"none"`/`"url:…"`/`"path:…"`.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// `agent`'s table form.
@@ -2125,6 +2746,8 @@ mod tests {
                 x: None,
                 y: None,
                 over: None,
+                target: None,
+                raw: false,
             })
             .unwrap(),
             r#"{"verb":"scroll","unit":"pixel","dx":0.0,"dy":3.0}"#
@@ -2137,9 +2760,28 @@ mod tests {
                 x: None,
                 y: None,
                 over: Some(ScrollRegion::Panel),
+                target: None,
+                raw: false,
             })
             .unwrap(),
             r#"{"verb":"scroll","unit":"line","dx":0.0,"dy":1.0,"over":"panel"}"#
+        );
+        // R15-T4's additions: `target` names a hit-registry rect,
+        // `raw` switches to the real `MouseWheel` delivery — both
+        // skip-serialize cleanly off the wire when absent.
+        assert_eq!(
+            serde_json::to_string(&Request::Scroll {
+                unit: ScrollUnit::Line,
+                dx: 0.0,
+                dy: -3.0,
+                x: None,
+                y: None,
+                over: None,
+                target: Some("explorer.up"),
+                raw: true,
+            })
+            .unwrap(),
+            r#"{"verb":"scroll","unit":"line","dx":0.0,"dy":-3.0,"target":"explorer.up","raw":true}"#
         );
         assert_eq!(
             serde_json::to_string(&Request::Resize {
@@ -2213,7 +2855,7 @@ mod tests {
     /// hit registry, the agent panel and the drag-selection.
     #[test]
     fn dump_decodes_the_server_shape() {
-        let line = r#"{"ok":true,"dump":{"v":1,"grid":{"columns":80,"lines":24,"scroll_offset":2,"scrollback":100,"rows":["a","","c"],"cursor":{"line":1,"column":2,"shape":"block"},"selection":{"start":{"line":-2,"column":0},"end":{"line":0,"column":4}}},"pane":{"shown":"explorer","selected":"explorer"},"find":{"query":"nd","hits":3,"position":[1,3]},"suggesting":false,"window":{"width":640.0,"height":480.0},"agent":{"open":true,"focused":false,"gate":{"kind":"approve","name":"run","denying":false}},"hits":{"grid":{"x":10.0,"y":20.0,"w":300.0,"h":200.0},"gate.approve":{"x":1.0,"y":2.0,"w":3.0,"h":4.0}}}}"#;
+        let line = r#"{"ok":true,"dump":{"v":1,"grid":{"columns":80,"lines":24,"scroll_offset":2,"scrollback":100,"rows":["a","","c"],"cursor":{"line":1,"column":2,"shape":"block"},"selection":{"start":{"line":-2,"column":0},"end":{"line":0,"column":4}},"cell":{"width":9.0,"height":18.0}},"pane":{"shown":"explorer","selected":"explorer"},"find":{"query":"nd","hits":3,"position":[1,3]},"suggesting":false,"window":{"width":640.0,"height":480.0},"agent":{"open":true,"focused":false,"gate":{"kind":"approve","name":"run","denying":false}},"explorer":{"remote":false,"root":"/tmp/fx","dir":"/tmp/fx/sub","show_hidden":false,"entries":[{"name":"sub","kind":"dir","hidden":false},{"name":".dot","kind":"file","hidden":true},{"name":"a.txt","kind":"file","hidden":false}],"selected":{"name":"a.txt","kind":"file","hidden":false},"preview":{"kind":"text","text":"HEAD","truncated":true},"error":null,"scroll":0},"detect":{"ctrl":true,"token":{"line":-1,"column":2,"cells":11,"target":"url:https://a/b"}},"hits":{"grid":{"x":10.0,"y":20.0,"w":300.0,"h":200.0},"gate.approve":{"x":1.0,"y":2.0,"w":3.0,"h":4.0}}}}"#;
         let response: Response = serde_json::from_str(line).unwrap();
         assert!(response.ok);
         let dump = response.dump.unwrap();
@@ -2223,6 +2865,7 @@ mod tests {
         assert_eq!(grid.cursor.shape, "block");
         assert_eq!(grid.scroll_offset, 2);
         assert_eq!(grid.scrollback, 100);
+        assert_eq!(grid.cell.unwrap().width, 9.0);
         let selection = grid.selection.unwrap();
         assert_eq!(selection.start.line, -2);
         assert_eq!(selection.end.column, 4);
@@ -2237,15 +2880,39 @@ mod tests {
             agent.gate,
             Some(GateDump::Approve { ref name, denying: false }) if name == "run"
         ));
+        // R15-T4's blocks: the explorer model and the Ctrl-hover
+        // resolution.
+        let explorer = dump.explorer.as_ref().unwrap();
+        assert_eq!(explorer.dir, "/tmp/fx/sub");
+        assert_eq!(
+            explorer.visible_names(),
+            vec!["sub", "a.txt"],
+            "the dotfile row stays in `entries`, filtered from the visible listing"
+        );
+        assert_eq!(explorer.selected.as_ref().unwrap().name, "a.txt");
+        assert!(matches!(
+            explorer.preview,
+            Some(PreviewDump::Text {
+                ref text,
+                truncated: true
+            }) if text == "HEAD"
+        ));
+        let detect = dump.detect.as_ref().unwrap();
+        assert!(detect.ctrl);
+        let token = detect.token.as_ref().unwrap();
+        assert_eq!(token.line, -1);
+        assert_eq!(token.target, "url:https://a/b");
         let hit = dump.hit("gate.approve").unwrap();
         assert_eq!(hit.center(), (2.5, 4.0));
         assert!(dump.hit("bogus").is_none());
         // A pre-T3 payload — no agent/hits/selection — still decodes
-        // (the additive-fields convention).
+        // (the additive-fields convention), as does a pre-T4 one
+        // with no explorer/detect/cell.
         let legacy = r#"{"ok":true,"dump":{"v":1,"grid":null,"pane":{"shown":null,"selected":null},"window":{"width":1.0,"height":1.0}}}"#;
         let response: Response = serde_json::from_str(legacy).unwrap();
         let dump = response.dump.unwrap();
         assert!(dump.agent.is_none() && dump.hits.is_empty());
+        assert!(dump.explorer.is_none() && dump.detect.is_none());
         let dump = Dump {
             v: 1,
             grid: Some(GridDump {
@@ -2260,6 +2927,7 @@ mod tests {
                     shape: "block".into(),
                 },
                 selection: None,
+                cell: None,
             }),
             pane: PaneDump {
                 shown: None,
@@ -2272,6 +2940,8 @@ mod tests {
                 height: 0.0,
             },
             agent: None,
+            explorer: None,
+            detect: None,
             hits: BTreeMap::new(),
         };
         assert_eq!(dump.grid_text(), "a\n\nc");
@@ -2324,12 +2994,20 @@ expect_scroll = 1
 [[steps]]
 expect_suggesting = false
 [[steps]]
+scroll = { unit = "line", dy = -3.0, target = "explorer.up", raw = true }
+[[steps]]
+expect_explorer = { dir = "/tmp/fx", selected = "a.txt", has = ["sub"], lacks = [".dot"], preview = { kind = "text", contains = "HEAD", truncated = true } }
+[[steps]]
+expect_detect = "url:https://a/b"
+[[steps]]
+expect_detect = { ctrl = true, token = "none" }
+[[steps]]
 quit = true
 "#,
         )
         .unwrap();
         assert_eq!(scenario.feature, "panes");
-        assert_eq!(scenario.steps.len(), 19);
+        assert_eq!(scenario.steps.len(), 23);
 
         for (text, want) in [
             (r#"feature = "x""#, "missing steps is fine"),
@@ -2352,8 +3030,21 @@ quit = true
                 "[[steps]]\nagent = { event = \"approve\" }",
                 "agent wants a name",
             ),
+            (
+                "[[steps]]\nscroll = { unit = \"line\", raw = true, over = \"grid\" }",
+                "raw wants no region",
+            ),
+            (
+                "[[steps]]\nscroll = { unit = \"line\", target = \"grid\", x = 1, y = 2 }",
+                "target wants no x/y",
+            ),
             ("[[steps]]\nexpect_gate = \"maybe\"", "typed gate"),
             ("[[steps]]\nexpect_find = 1", "typed find"),
+            (
+                "[[steps]]\nexpect_explorer = \"x\"",
+                "expect_explorer wants a table",
+            ),
+            ("[[steps]]\nexpect_detect = 1", "typed detect"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),
         ] {
