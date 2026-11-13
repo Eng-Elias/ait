@@ -1,0 +1,60 @@
+# Spec R15-T2 — the pane chords hold while an overlay owns focus: a
+# `Ctrl+Shift+E`/`Ctrl+Shift+B` mid-search is swallowed (the region
+# would drop out from under the find bar), never toggles and never
+# reaches the PTY. The ordering probe: text typed after the chords
+# lands in the find query, so the dump that shows the query already
+# reflects the chords' dispatch — `expect_pane "none"` on that state
+# is the hold assertion.
+feature = "panes"
+
+[[steps]]
+wait_text = "$"
+
+# The find bar owns focus.
+[[steps]]
+key = "Ctrl+Shift+F"
+
+[[steps]]
+expect_find = true
+
+# Both pane chords, swallowed — the region must not open.
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+key = "Ctrl+Shift+B"
+
+# Text lands in the find query — dispatched after the chords, so a
+# dump showing it already carries the chords' effects.
+[[steps]]
+text = "needle"
+
+[[steps]]
+expect_find = "needle"
+
+# …and neither chord toggled the region under the overlay.
+[[steps]]
+expect_pane = "none"
+
+# Esc closes the bar; with focus back the same chord toggles on and
+# off again — the hold was the overlay's, not a dead binding.
+[[steps]]
+key = "Escape"
+
+[[steps]]
+expect_find = false
+
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+expect_pane = "none"
+
+[[steps]]
+quit = true

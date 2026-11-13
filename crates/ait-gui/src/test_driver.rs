@@ -18,13 +18,27 @@
 //!   bits (`ctrl`/`alt`/`shift`/`mac_cmd`; `command` is derived the
 //!   way winit derives it), queued for the next frame's
 //!   `dispatch_events` — everything downstream is production input
-//!   code.
+//!   code. `"twin":true` adds the chord's `Event::Text` twin between
+//!   press and release — the shape twin-emitting platforms deliver
+//!   for `Alt+<letter>` (the R13 leak); `"twin":"å"` gives the twin
+//!   an explicit payload.
 //! - `{"verb":"text","text":"…"}` — one `egui::Event::Text`, the
 //!   composed-text twin of real typing.
+//! - `{"verb":"paste","text":"…"}` — one `egui::Event::Paste`, the
+//!   OS-clipboard shape a Ctrl+V delivers.
+//! - `{"verb":"scroll","unit":"…","dx":…,"dy":…}` — one wheel
+//!   gesture: `unit` is `line`, `pixel` (sub-line touchpad deltas —
+//!   winit's `PixelDelta`) or `page`; `dx`/`dy` are in the unit.
+//!   `over` (`grid`/`panel`) picks the hover region — `grid` is the
+//!   default — and `x`/`y` give an explicit position in points.
+//! - `{"verb":"resize","width":…,"height":…}` — a viewport resize
+//!   request in points, sent as a real `ViewportCommand::InnerSize`
+//!   so the winsize settle path runs end to end.
 //! - `{"verb":"dump"}` — a versioned JSON snapshot of what the user
 //!   sees, sourced from the same [`Shared`] state `ui`'s paint pass
-//!   reads: the active tab's visible grid rows + cursor, the pane
-//!   host's selection, and the window's content size.
+//!   reads: the active tab's visible grid rows + cursor and scroll
+//!   position, the pane host's selection, the find bar, the
+//!   suggestion arm, and the window's content size.
 //! - `{"verb":"quit"}` — the app takes its normal close path
 //!   (`GuiApp::quit` → `ViewportCommand::Close`).
 //!
@@ -75,6 +89,12 @@ pub enum Request {
     Key {
         /// The chord to press and release.
         chord: String,
+        /// The platform text twin — `true` derives the chord's
+        /// character (`Alt+A` → `"a"`), a string is the payload
+        /// verbatim. Emitted between press and release, the order
+        /// egui-winit produces from one winit `KeyboardInput`.
+        #[serde(default)]
+        twin: Option<TwinSpec>,
     },
     /// `text` — one `egui::Event::Text` payload, composed text the way
     /// real typing delivers it.
@@ -82,10 +102,105 @@ pub enum Request {
         /// The text to compose.
         text: String,
     },
+    /// `paste` — one `egui::Event::Paste` payload, the OS-clipboard
+    /// shape a Ctrl+V delivers.
+    Paste {
+        /// The clipboard payload.
+        text: String,
+    },
+    /// `scroll` — one wheel gesture with an explicit hover region:
+    /// real wheel events route on `pointer.hover_pos`, which injected
+    /// events can't reach (egui consumed the pointer state at
+    /// `begin_pass`), so the scroll's target is resolved at dispatch
+    /// instead.
+    Scroll {
+        /// The delta's unit — `line`, `pixel` or `page`.
+        unit: ScrollUnit,
+        /// The horizontal delta in `unit`s — positive is right.
+        #[serde(default)]
+        dx: f32,
+        /// The vertical delta in `unit`s — positive scrolls back, like
+        /// a wheel flick toward the user.
+        #[serde(default)]
+        dy: f32,
+        /// An explicit hover position in points — `x` and `y` travel
+        /// together and win over `over`.
+        #[serde(default)]
+        x: Option<f32>,
+        /// See `x`.
+        #[serde(default)]
+        y: Option<f32>,
+        /// The region a bare scroll hovers — `grid` (the default) or
+        /// `panel` (the agent conversation's region).
+        #[serde(default)]
+        over: Option<ScrollRegion>,
+    },
+    /// `resize` — a viewport resize request in points, sent as a real
+    /// `ViewportCommand::InnerSize` so the window manager round trip
+    /// and the winsize settle run for real.
+    Resize {
+        /// The requested inner width.
+        width: f32,
+        /// The requested inner height.
+        height: f32,
+    },
     /// `dump` — answer with the versioned state snapshot.
     Dump,
     /// `quit` — close the window the normal way.
     Quit,
+}
+
+/// `key`'s `twin` — the `Event::Text` payload twin-emitting platforms
+/// send beside a `Key` event.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TwinSpec {
+    /// `true` derives the chord's own character (`Alt+A` → `"a"`,
+    /// `Alt+Shift+A` → `"A"`); `false` is no twin, same as absent.
+    Flag(bool),
+    /// The literal payload — a layout whose `Alt+A` composes `å`
+    /// writes `"twin":"å"`.
+    Text(String),
+}
+
+/// `scroll`'s `unit` — egui's [`egui::MouseWheelUnit`] spelled the
+/// winit way, so a scenario reads like the event it reproduces.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollUnit {
+    /// Whole lines — winit's `LineDelta`.
+    #[serde(alias = "line_delta")]
+    Line,
+    /// Physical pixels — winit's `PixelDelta`, the touchpad shape
+    /// whose sub-line deltas were the R13 dead-zone.
+    #[serde(alias = "pixel_delta")]
+    Pixel,
+    /// Whole pages — `PageUp`/`PageDown` semantics.
+    Page,
+}
+
+/// `scroll`'s `over` — the named region an explicit `x`/`y` replaces.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollRegion {
+    /// The terminal grid's pane.
+    Grid,
+    /// The agent panel's conversation region.
+    Panel,
+}
+
+/// Where a `scroll` lands — resolved against `GuiApp`'s last-painted
+/// rects at dispatch time (they're frontend-local, like the wheel
+/// remainders).
+#[derive(Debug)]
+pub enum ScrollTarget {
+    /// The grid pane's center — the bare `scroll`'s default.
+    Grid,
+    /// The panel region's center, falling back to the grid when no
+    /// agent panel is up (the region is plain grid then).
+    Panel,
+    /// An explicit position in points.
+    At(egui::Pos2),
 }
 
 /// One response — `{"ok":true}` on success (`dump` adds its payload),
@@ -146,6 +261,12 @@ pub struct Dump {
     pub grid: Option<GridDump>,
     /// The side region's state.
     pub pane: PaneDump,
+    /// The find bar while it's open — `Some` IS its visibility (the
+    /// `Shared::find` rule the overlays and hit highlights share).
+    pub find: Option<FindDump>,
+    /// Whether a suggestion is armed — the status line's `suggesting`
+    /// segment paints on exactly this.
+    pub suggesting: bool,
     /// The window's content area in points.
     pub window: WindowDump,
 }
@@ -159,6 +280,11 @@ pub struct GridDump {
     pub columns: usize,
     /// The session's cell height.
     pub lines: usize,
+    /// Rows scrolled back into scrollback — the `⤓` jump-to-bottom
+    /// pill paints on exactly `scroll_offset > 0`.
+    pub scroll_offset: usize,
+    /// Rows held in scrollback above the viewport.
+    pub scrollback: usize,
     /// Every visible row's text, top to bottom, trailing whitespace
     /// trimmed (the `screen_text` convention).
     pub rows: Vec<String>,
@@ -189,6 +315,19 @@ pub struct PaneDump {
     pub selected: Option<&'static str>,
 }
 
+/// The find bar's visible state while it's open — the same query,
+/// hit count and position the bar itself paints.
+#[derive(Debug, Serialize)]
+pub struct FindDump {
+    /// The query typed so far.
+    pub query: String,
+    /// The number of hits the grid holds.
+    pub hits: usize,
+    /// The 1-based `(current, total)` position over the hits — `null`
+    /// with no hits at all.
+    pub position: Option<(usize, usize)>,
+}
+
 /// The window's content rect in points — the same `content_rect` the
 /// `ui` pass layouts against.
 #[derive(Debug, Serialize)]
@@ -209,6 +348,8 @@ impl Dump {
             GridDump {
                 columns: size.columns,
                 lines: size.lines,
+                scroll_offset: tab.scroll_offset(),
+                scrollback: tab.scrollback(),
                 rows: tab
                     .grid()
                     .visible_rows()
@@ -229,6 +370,12 @@ impl Dump {
                 shown: shared.shown_pane().map(side_pane_name),
                 selected: shared.panes.selected().map(pane_name),
             },
+            find: shared.find.as_ref().map(|find| FindDump {
+                query: find.query().to_owned(),
+                hits: find.hits().len(),
+                position: find.position(),
+            }),
+            suggesting: shared.suggestion.is_some(),
             window: WindowDump {
                 width: area.width(),
                 height: area.height(),
@@ -270,8 +417,25 @@ fn pane_name(id: PaneId) -> &'static str {
 #[derive(Debug)]
 pub enum Injected {
     /// A native-shaped `egui::Event` — key press/release, composed
-    /// text. Everything downstream is production code.
+    /// text, a clipboard paste. Everything downstream is production
+    /// code.
     Event(egui::Event),
+    /// A wheel gesture with its target resolved at dispatch — real
+    /// wheel events route on `pointer.hover_pos`, which the cloned
+    /// event vec can't reach (egui consumed the pointer state at
+    /// `begin_pass`), so `scroll` carries the hover region instead.
+    Wheel {
+        /// The delta's unit — line, sub-line pixel or page.
+        unit: egui::MouseWheelUnit,
+        /// The delta in `unit`s — `y` positive scrolls back.
+        delta: egui::Vec2,
+        /// Where the gesture hovers.
+        target: ScrollTarget,
+    },
+    /// A viewport resize request in points — dispatched as a real
+    /// `ViewportCommand::InnerSize`, so the winsize settle path the
+    /// scenario asserts is the production one end to end.
+    Resize(egui::Vec2),
     /// Close the window — `GuiApp::quit`'s flag path.
     Quit,
 }
@@ -283,25 +447,41 @@ pub fn socket_error_text(error: impl std::fmt::Display) -> String {
     format!("test-driver socket unavailable: {error}")
 }
 
-/// The per-request dispatch: `key`/`text`/`quit` push onto
+/// The per-request dispatch: the input verbs push onto
 /// `shared.injected` for the next frame's `dispatch_events`, `dump`
 /// answers from `shared` — the same state the paint pass reads.
 fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Response {
     match request {
-        Request::Key { chord } => match parse_chord(chord) {
+        Request::Key { chord, twin } => match parse_chord(chord) {
             Ok((key, modifiers)) => {
-                // Press then release — a real chord is both events;
-                // the release is a no-op downstream, the press does
-                // the work.
-                for pressed in [true, false] {
-                    shared.injected.push_back(Injected::Event(egui::Event::Key {
-                        key,
-                        physical_key: Some(key),
-                        pressed,
-                        repeat: false,
-                        modifiers,
-                    }));
+                let twin = match twin_text(twin.as_ref(), chord, key, modifiers) {
+                    Ok(twin) => twin,
+                    Err(error) => return Response::error(error),
+                };
+                // Press, then the platform text twin, then release —
+                // the order egui-winit produces from one winit
+                // `KeyboardInput` event carrying `text` (the release
+                // never carries one). The release is a no-op
+                // downstream; the press does the work.
+                shared.injected.push_back(Injected::Event(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }));
+                if let Some(text) = twin {
+                    shared
+                        .injected
+                        .push_back(Injected::Event(egui::Event::Text(text)));
                 }
+                shared.injected.push_back(Injected::Event(egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                }));
                 Response::ok()
             }
             Err(error) => Response::error(error),
@@ -312,11 +492,95 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
                 .push_back(Injected::Event(egui::Event::Text(text.clone())));
             Response::ok()
         }
+        Request::Paste { text } => {
+            shared
+                .injected
+                .push_back(Injected::Event(egui::Event::Paste(text.clone())));
+            Response::ok()
+        }
+        Request::Scroll {
+            unit,
+            dx,
+            dy,
+            x,
+            y,
+            over,
+        } => match scroll_target(*x, *y, *over) {
+            Ok(target) => {
+                shared.injected.push_back(Injected::Wheel {
+                    unit: wheel_unit(*unit),
+                    delta: egui::Vec2::new(*dx, *dy),
+                    target,
+                });
+                Response::ok()
+            }
+            Err(error) => Response::error(error),
+        },
+        Request::Resize { width, height } => {
+            if !width.is_finite() || !height.is_finite() || *width <= 0.0 || *height <= 0.0 {
+                return Response::error(format!(
+                    "resize needs finite positive points, got {width}x{height}"
+                ));
+            }
+            shared
+                .injected
+                .push_back(Injected::Resize(egui::Vec2::new(*width, *height)));
+            Response::ok()
+        }
         Request::Dump => Response::dump(Dump::capture(ctx, shared)),
         Request::Quit => {
             shared.injected.push_back(Injected::Quit);
             Response::ok()
         }
+    }
+}
+
+/// `key`'s `twin` → the `Event::Text` payload to emit between press
+/// and release: `true` derives the chord's own character through the
+/// same `char_key` the production translator uses; a string is the
+/// payload verbatim.
+fn twin_text(
+    twin: Option<&TwinSpec>,
+    chord: &str,
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> Result<Option<String>, String> {
+    match twin {
+        None | Some(TwinSpec::Flag(false)) => Ok(None),
+        Some(TwinSpec::Text(text)) => Ok(Some(text.clone())),
+        Some(TwinSpec::Flag(true)) => match crate::keys::char_key(key, modifiers.shift) {
+            Some(c) => Ok(Some(c.to_string())),
+            None => Err(format!(
+                "chord {chord:?} has no character twin to derive — \
+                 pass an explicit \"twin\":\"<text>\" instead"
+            )),
+        },
+    }
+}
+
+/// A `scroll` request's target: explicit `x`/`y` wins and must travel
+/// as a pair; else the named region; else the grid.
+fn scroll_target(
+    x: Option<f32>,
+    y: Option<f32>,
+    over: Option<ScrollRegion>,
+) -> Result<ScrollTarget, String> {
+    match (x, y) {
+        (Some(x), Some(y)) => Ok(ScrollTarget::At(egui::Pos2::new(x, y))),
+        (None, None) => Ok(match over {
+            Some(ScrollRegion::Panel) => ScrollTarget::Panel,
+            Some(ScrollRegion::Grid) | None => ScrollTarget::Grid,
+        }),
+        _ => Err("scroll's `x` and `y` travel together or not at all".to_owned()),
+    }
+}
+
+/// The wire's unit names → egui's.
+fn wheel_unit(unit: ScrollUnit) -> egui::MouseWheelUnit {
+    match unit {
+        ScrollUnit::Line => egui::MouseWheelUnit::Line,
+        ScrollUnit::Pixel => egui::MouseWheelUnit::Point,
+        ScrollUnit::Page => egui::MouseWheelUnit::Page,
     }
 }
 
@@ -778,11 +1042,50 @@ mod tests {
     fn requests_decode_from_their_wire_shapes() {
         assert!(matches!(
             decode_request(r#"{"verb":"key","chord":"Ctrl+Shift+E"}"#),
-            Ok(Request::Key { .. })
+            Ok(Request::Key { twin: None, .. })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"key","chord":"Alt+A","twin":true}"#),
+            Ok(Request::Key {
+                twin: Some(TwinSpec::Flag(true)),
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"key","chord":"Alt+A","twin":"å"}"#),
+            Ok(Request::Key {
+                twin: Some(TwinSpec::Text(_)),
+                ..
+            })
         ));
         assert!(matches!(
             decode_request(r#"{"verb":"text","text":"echo hi"}"#),
             Ok(Request::Text { .. })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"paste","text":"echo hi"}"#),
+            Ok(Request::Paste { .. })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"scroll","unit":"pixel","dy":3.0}"#),
+            Ok(Request::Scroll {
+                unit: ScrollUnit::Pixel,
+                ..
+            })
+        ));
+        // The winit spellings alias — a scenario reads like the event
+        // it reproduces.
+        assert!(matches!(
+            decode_request(r#"{"verb":"scroll","unit":"line_delta","dy":1.0,"over":"panel"}"#),
+            Ok(Request::Scroll {
+                unit: ScrollUnit::Line,
+                over: Some(ScrollRegion::Panel),
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"resize","width":1100,"height":700}"#),
+            Ok(Request::Resize { .. })
         ));
         assert!(matches!(
             decode_request(r#"{"verb":"dump"}"#),
@@ -796,9 +1099,14 @@ mod tests {
             "",
             "not json",
             r#"{"verb":"bogus"}"#,
-            r#"{"verb":"key"}"#,             // missing chord
-            r#"{"verb":"key","chord":1}"#,   // wrong type
-            r#"{"verb":"send","text":"x"}"#, // a ctl verb — NOT this socket
+            r#"{"verb":"key"}"#,                                // missing chord
+            r#"{"verb":"key","chord":1}"#,                      // wrong type
+            r#"{"verb":"key","chord":"a","twin":1}"#,           // twin is bool|string
+            r#"{"verb":"scroll","dy":3.0}"#,                    // missing unit
+            r#"{"verb":"scroll","unit":"inch","dy":1}"#,        // unknown unit
+            r#"{"verb":"scroll","unit":"line","over":"moon"}"#, // unknown region
+            r#"{"verb":"resize","width":1100}"#,                // missing height
+            r#"{"verb":"send","text":"x"}"#,                    // a ctl verb — NOT this socket
         ] {
             assert!(decode_request(line).is_err(), "{line:?}");
         }
@@ -923,6 +1231,162 @@ mod tests {
         assert!(response.contains(r#""ok":false"#), "{response}");
     }
 
+    /// `"twin":true` queues press → `Text` → release — the order
+    /// egui-winit emits the pair from one `KeyboardInput` — with the
+    /// chord's own character as the payload; an explicit `twin` is
+    /// verbatim, and a non-character chord refuses to derive.
+    #[test]
+    fn the_twin_emits_the_platform_leak_shape() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+
+        // The derived twin: `Alt+A` → `Text("a")` between press and
+        // release.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Key {
+                chord: "Alt+A".to_owned(),
+                twin: Some(TwinSpec::Flag(true)),
+            },
+        );
+        assert!(response.ok);
+        assert_eq!(shared.injected.len(), 3);
+        match shared.injected.pop_front().unwrap() {
+            Injected::Event(egui::Event::Key {
+                pressed, modifiers, ..
+            }) => assert!(pressed && modifiers.alt),
+            other => panic!("expected the key press, got {other:?}"),
+        }
+        match shared.injected.pop_front().unwrap() {
+            Injected::Event(egui::Event::Text(text)) => assert_eq!(text, "a"),
+            other => panic!("expected the text twin, got {other:?}"),
+        }
+        match shared.injected.pop_front().unwrap() {
+            Injected::Event(egui::Event::Key { pressed, .. }) => assert!(!pressed),
+            other => panic!("expected the key release, got {other:?}"),
+        }
+
+        // An explicit payload rides verbatim — `Alt+Shift+A` style
+        // chords that derive nothing still take their literal twin.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Key {
+                chord: "Alt+Enter".to_owned(),
+                twin: Some(TwinSpec::Text("x".to_owned())),
+            },
+        );
+        assert!(response.ok);
+        assert_eq!(shared.injected.len(), 3);
+        let events: Vec<egui::Event> = shared
+            .injected
+            .drain(..)
+            .filter_map(|item| match item {
+                Injected::Event(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(events[1], egui::Event::Text(ref t) if t == "x"));
+
+        // `twin:true` on a non-character chord is a dispatch error,
+        // never a silent drop.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Key {
+                chord: "Alt+F5".to_owned(),
+                twin: Some(TwinSpec::Flag(true)),
+            },
+        );
+        assert!(!response.ok, "{response:?}");
+        assert!(shared.injected.is_empty());
+    }
+
+    /// `paste`, `scroll` and `resize` queue their injected shapes;
+    /// the malformed halves (a lone `x`, a non-positive size) answer
+    /// `ok:false` and inject nothing.
+    #[test]
+    fn paste_scroll_resize_dispatch_their_injected_shapes() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Paste {
+                text: "echo hi".to_owned(),
+            },
+        );
+        assert!(response.ok);
+        match shared.injected.pop_front().unwrap() {
+            Injected::Event(egui::Event::Paste(text)) => assert_eq!(text, "echo hi"),
+            other => panic!("expected the paste event, got {other:?}"),
+        }
+
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Scroll {
+                unit: ScrollUnit::Pixel,
+                dx: 0.0,
+                dy: 3.0,
+                x: None,
+                y: None,
+                over: None,
+            },
+        );
+        assert!(response.ok);
+        match shared.injected.pop_front().unwrap() {
+            Injected::Wheel {
+                unit,
+                delta,
+                target,
+            } => {
+                assert_eq!(unit, egui::MouseWheelUnit::Point);
+                assert_eq!(delta, egui::Vec2::new(0.0, 3.0));
+                assert!(matches!(target, ScrollTarget::Grid));
+            }
+            other => panic!("expected the wheel item, got {other:?}"),
+        }
+
+        // `x` without `y` is a decode-clean dispatch error.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Scroll {
+                unit: ScrollUnit::Line,
+                dx: 0.0,
+                dy: 1.0,
+                x: Some(4.0),
+                y: None,
+                over: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(shared.injected.is_empty());
+
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Resize {
+                width: 1100.0,
+                height: 700.0,
+            },
+        );
+        assert!(response.ok);
+        match shared.injected.pop_front().unwrap() {
+            Injected::Resize(size) => assert_eq!(size, egui::Vec2::new(1100.0, 700.0)),
+            other => panic!("expected the resize item, got {other:?}"),
+        }
+
+        for (width, height) in [(0.0, 100.0), (100.0, -1.0), (f32::NAN, 100.0)] {
+            let response = dispatch(&ctx, &mut shared, &Request::Resize { width, height });
+            assert!(!response.ok, "{width}x{height}");
+            assert!(shared.injected.is_empty());
+        }
+    }
+
     /// A bad `key` chord answers `ok:false` and injects nothing; the
     /// dump reflects the pane host's selection and the active tab's
     /// grid state.
@@ -935,6 +1399,7 @@ mod tests {
             &mut shared,
             &Request::Key {
                 chord: "Bogus".to_owned(),
+                twin: None,
             },
         );
         assert!(!response.ok);

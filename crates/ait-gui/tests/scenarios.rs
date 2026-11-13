@@ -21,7 +21,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ait_testkit::gui::{GuiE2e, GuiScenario};
+use ait_testkit::gui::{GuiE2e, GuiScenario, GuiSpawnConfig};
 use ait_testkit::{ait_gui_bin, panic_text};
 
 /// The committed scenario set, sorted for deterministic order.
@@ -97,4 +97,56 @@ fn scenarios() {
     if ran == 0 {
         eprintln!("all GUI scenarios skipped: no display was reachable");
     }
+}
+
+/// R15-T2 — the `resize` verb and the winsize settle: an injected
+/// `ViewportCommand::InnerSize` rides the real window-manager round
+/// trip, and the session reflows only after the content band sits
+/// still (`RESIZE_SETTLE`), never on the first frame that sees a new
+/// size — the R13 resize-jank fix's contract. TOML can't express the
+/// two-phase "changed window, unchanged winsize" observation, so this
+/// leg is code-first.
+#[test]
+fn resize_settle_reflows_on_settle_not_per_frame() {
+    if !cfg!(feature = "test-driver") {
+        eprintln!(
+            "skipping resize_settle: ait-gui was built without the \
+             `test-driver` feature"
+        );
+        return;
+    }
+    let bin = ait_gui_bin!();
+    let Some(app) =
+        GuiE2e::spawn(GuiSpawnConfig::new(bin)).unwrap_or_else(|e| panic!("spawn ait-gui: {e}"))
+    else {
+        eprintln!("resize_settle: skipped (no display reachable)");
+        return;
+    };
+    app.wait_for_dump("the shell prompt", |dump| dump.grid_text().contains('$'));
+    let before = app.dump();
+    let columns = before.grid.as_ref().expect("a tab is active").columns;
+    let width = before.window.width;
+    // A narrower window — plenty of cells' worth, and never
+    // clamped by the virtual screen.
+    app.resize(width - 200.0, before.window.height);
+
+    // Phase one: a frame that already sees the smaller window still
+    // holds the old session winsize — the band is pending its
+    // settle, not reflowing per frame.
+    app.wait_for_dump("the resized window before the reflow", |dump| {
+        dump.window.width != width
+            && dump
+                .grid
+                .as_ref()
+                .is_some_and(|grid| grid.columns == columns)
+    });
+
+    // Phase two: the settle fires and the session reflows to the
+    // new band.
+    app.wait_for_dump("the settled reflow", |dump| {
+        dump.grid
+            .as_ref()
+            .is_some_and(|grid| grid.columns != columns)
+    });
+    app.quit();
 }

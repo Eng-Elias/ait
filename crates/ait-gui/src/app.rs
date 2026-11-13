@@ -368,160 +368,214 @@ impl GuiApp {
     // events translate to `ait_term::KeyEvent`, resolve through the
     // shared keymap, and only `PassThrough` may reach the PTY.
 
-    /// One frame's native events, in order — keys, composed text,
+    /// One frame's input events, in order — keys, composed text,
     /// paste, wheel. Selection drags ride `interact` in the paint pass
     /// (they need the pane rect, which is layout state).
     fn dispatch_events(&mut self, ctx: &egui::Context, shared: &mut Shared) {
-        #[cfg(not(feature = "test-driver"))]
-        let events = ctx.input(|input| input.events.clone());
-        // Spec R15: the pump's test-socket drain queued injected input
-        // between frames — it lands AHEAD of the frame's native events
-        // (it is the older input), joining the dispatch stream at
-        // frame start. `Quit` takes the same close path a resolved
-        // `AppAction::Quit` does.
-        #[cfg(feature = "test-driver")]
-        let events = {
-            let mut injected: Vec<egui::Event> = Vec::new();
-            for item in shared.injected.drain(..) {
-                match item {
-                    crate::test_driver::Injected::Event(event) => injected.push(event),
-                    crate::test_driver::Injected::Quit => self.quit = true,
-                }
-            }
-            injected.extend(ctx.input(|input| input.events.clone()));
-            injected
-        };
         // Chord chars whose `Event::Text` twin would be the same input
         // twice: some platforms emit BOTH `Key{A, alt}` and `Text("a")`
         // for `Alt+A`, which typed `a` into the PTY beside the panel
         // the chord opened. The Key event carries the whole chord to
-        // the resolver — a matching Text char is its twin, eaten here.
+        // the resolver — a matching Text char in the ADJACENT Text
+        // event is its twin, eaten there (winit emits the pair from
+        // one KeyboardInput, so nothing else can interleave); any
+        // other event closes the twin window, or a burst that types
+        // right behind a chord would lose real characters.
         let mut eaten: Vec<char> = Vec::new();
-        for event in events {
-            match event {
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    repeat,
-                    modifiers,
-                    ..
+        // Spec R15: the pump's test-socket drain queued injected input
+        // between frames — it lands AHEAD of the frame's native events
+        // (it is the older input), dispatched item by item so the
+        // queue's own order holds (a `scroll` between two `key`s
+        // dispatches between them). `Quit` takes the same close path
+        // a resolved `AppAction::Quit` does.
+        #[cfg(feature = "test-driver")]
+        for item in shared.injected.drain(..).collect::<Vec<_>>() {
+            match item {
+                crate::test_driver::Injected::Event(event) => {
+                    self.dispatch_event(ctx, shared, event, &mut eaten);
+                }
+                // A wheel gesture carries its own hover: real
+                // `MouseWheel` events route on `pointer.hover_pos`,
+                // which an injected event can't reach — egui consumed
+                // the pointer state at `begin_pass` — so the verb's
+                // region resolves against last frame's pane rects.
+                crate::test_driver::Injected::Wheel {
+                    unit,
+                    delta,
+                    target,
                 } => {
-                    // GUI-local bindings the keymap can't own — zoom is
-                    // a frontend concern and these chords are unbound in
-                    // the table (Ctrl+0/=/- type nothing a shell wants).
-                    if self.zoom_key(key, modifiers) {
-                        continue;
-                    }
-                    // The find bar's open chord — Ctrl+Shift+F, or
-                    // ⌘F on macOS (Spec R13-T4). The keymap can't own
-                    // it: the TUI has no find bar, so the chord is
-                    // GUI-local like zoom. Bare Ctrl+F is readline's
-                    // forward-char — it falls through to the PTY.
-                    if find_open_chord(key, modifiers) {
-                        self.open_find(shared);
-                        continue;
-                    }
-                    // The pane host's toggle chords — `Ctrl+Shift+E`
-                    // explorer, `Ctrl+Shift+B` browser (Spec R14
-                    // §5.13). GUI-local like the find chord: the
-                    // keymap can't own them and they never reach
-                    // the PTY. They hold while an overlay owns focus
-                    // — the find bar or a modal picker would lose the
-                    // region under it mid-interaction; the chord
-                    // falls through to the overlay's swallow arm, so
-                    // nothing reaches the PTY either way.
-                    let overlay_owns_focus = shared.find.is_some()
-                        || shared.picker.is_some()
-                        || shared.conversations.is_some();
-                    if !overlay_owns_focus {
-                        if let Some(id) = pane_chord(key, modifiers) {
-                            // A held chord's autorepeat must not
-                            // strobe the toggle — one flip per
-                            // physical press; the repeat is still
-                            // swallowed, never PTY input.
-                            if !repeat {
-                                self.toggle_pane(shared, id);
-                            }
-                            continue;
+                    let hover = match target {
+                        crate::test_driver::ScrollTarget::Grid => {
+                            self.grid_pane.map(|pane| pane.center())
                         }
-                    }
-                    let translated = translate_key(key, modifiers);
-                    if let Some(KeyEvent {
-                        key: Key::Char(c), ..
-                    }) = translated
-                    {
-                        eaten.push(c);
-                    }
-                    self.dispatch_key(ctx, shared, translated);
+                        crate::test_driver::ScrollTarget::Panel => {
+                            self.panel_pane.or(self.grid_pane).map(|pane| pane.center())
+                        }
+                        crate::test_driver::ScrollTarget::At(pos) => Some(pos),
+                    };
+                    // Before the first painted pane the content rect
+                    // stands in — a wheel still lands somewhere real.
+                    let hover = hover.or_else(|| Some(ctx.content_rect().center()));
+                    self.wheel(shared, ctx, unit, delta, hover);
                 }
-                // Releases carry no input — same as the TUI's
-                // `KeyEventKind::Release` guard.
-                egui::Event::Key { pressed: false, .. } => {}
-                // Composed text: one Char event per character through
-                // the same resolver (every Char resolves PassThrough —
-                // the trip costs nothing and keeps ONE dispatch path).
-                // While the find bar is open, text is the query —
-                // nothing reaches the PTY mid-search.
-                egui::Event::Text(text) => {
-                    // The twin/meta guard runs BEFORE any routing: on
-                    // twin-emitting platforms an `Alt+<letter>` chord
-                    // arrives as `Key{.., alt}` + `Text("a")`, and the
-                    // Text twin must land nowhere — not the PTY, not
-                    // the find query, not an aux pane's address entry.
-                    // `meta_held` also eats the twin whose Key event
-                    // lands after this Text (a Meta chord still held
-                    // while Text composes wants the chord's bytes —
-                    // Option-as-Alt — never a literal).
-                    let meta_held =
-                        ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
-                    let text: String = text
-                        .chars()
-                        .filter(|c| {
-                            !meta_held
-                                && !eaten
-                                    .iter()
-                                    .position(|e| e.eq_ignore_ascii_case(c))
-                                    .map(|pos| eaten.remove(pos))
-                                    .is_some()
-                        })
-                        .collect();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if shared.find.is_some() {
-                        self.find_text(shared, &text);
-                        continue;
-                    }
-                    // A shown aux pane owns composed text while it's
-                    // up (the find bar's focus rule) — nothing
-                    // reaches the PTY mid-pane.
-                    if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                        pane(id).text(shared, &text);
-                        continue;
-                    }
-                    for key in translate_text(&text) {
-                        self.dispatch_key(ctx, shared, Some(key));
-                    }
+                // A viewport resize rides the real path: the window
+                // manager round trip, then the band's `RESIZE_SETTLE`
+                // debounce — the settle a scenario asserts IS the
+                // production one.
+                crate::test_driver::Injected::Resize(size) => {
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 }
-                // A native paste (Ctrl+V / ⌘V, menu paste): encode the
-                // payload through the shared `encode_paste` so
-                // bracketed-paste children see their mode honored.
-                // While the find bar is open it pastes into the query
-                // — the browser convention.
-                egui::Event::Paste(text) => {
-                    if shared.find.is_some() {
-                        self.find_text(shared, &text);
-                    } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                        pane(id).text(shared, &text);
-                    } else {
-                        self.paste(shared, &text);
-                    }
-                }
-                egui::Event::MouseWheel { unit, delta, .. } => {
-                    self.wheel(shared, ctx, unit, delta);
-                }
-                _ => {}
+                crate::test_driver::Injected::Quit => self.quit = true,
             }
+        }
+        for event in ctx.input(|input| input.events.clone()) {
+            self.dispatch_event(ctx, shared, event, &mut eaten);
+        }
+    }
+
+    /// One `egui::Event` through the input dispatch — the per-event
+    /// arm `dispatch_events` runs for native and (Spec R15) injected
+    /// events alike; `eaten` is the frame's twin-char filter, shared
+    /// across the whole stream.
+    fn dispatch_event(
+        &mut self,
+        ctx: &egui::Context,
+        shared: &mut Shared,
+        event: egui::Event,
+        eaten: &mut Vec<char>,
+    ) {
+        // Only a `Text` event consults the twin filter: winit emits
+        // `Key` + `Text` adjacently from one `KeyboardInput`, so any
+        // other event — the chord's own release, the next press, a
+        // paste, a wheel — closes the twin window. Without this a
+        // burst that types right behind a chord (injected input, a
+        // scripted macro) loses real characters to a stale `eaten`.
+        if !matches!(event, egui::Event::Text(_)) {
+            eaten.clear();
+        }
+        match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } => {
+                // GUI-local bindings the keymap can't own — zoom is
+                // a frontend concern and these chords are unbound in
+                // the table (Ctrl+0/=/- type nothing a shell wants).
+                if self.zoom_key(key, modifiers) {
+                    return;
+                }
+                // The find bar's open chord — Ctrl+Shift+F, or
+                // ⌘F on macOS (Spec R13-T4). The keymap can't own
+                // it: the TUI has no find bar, so the chord is
+                // GUI-local like zoom. Bare Ctrl+F is readline's
+                // forward-char — it falls through to the PTY.
+                if find_open_chord(key, modifiers) {
+                    self.open_find(shared);
+                    return;
+                }
+                // The pane host's toggle chords — `Ctrl+Shift+E`
+                // explorer, `Ctrl+Shift+B` browser (Spec R14
+                // §5.13). GUI-local like the find chord: the
+                // keymap can't own them and they never reach
+                // the PTY. They hold while an overlay owns focus
+                // — the find bar or a modal picker would lose the
+                // region under it mid-interaction; the chord
+                // falls through to the overlay's swallow arm, so
+                // nothing reaches the PTY either way.
+                let overlay_owns_focus = shared.find.is_some()
+                    || shared.picker.is_some()
+                    || shared.conversations.is_some();
+                if !overlay_owns_focus {
+                    if let Some(id) = pane_chord(key, modifiers) {
+                        // A held chord's autorepeat must not
+                        // strobe the toggle — one flip per
+                        // physical press; the repeat is still
+                        // swallowed, never PTY input.
+                        if !repeat {
+                            self.toggle_pane(shared, id);
+                        }
+                        return;
+                    }
+                }
+                let translated = translate_key(key, modifiers);
+                if let Some(KeyEvent {
+                    key: Key::Char(c), ..
+                }) = translated
+                {
+                    eaten.push(c);
+                }
+                self.dispatch_key(ctx, shared, translated);
+            }
+            // Releases carry no input — same as the TUI's
+            // `KeyEventKind::Release` guard.
+            egui::Event::Key { pressed: false, .. } => {}
+            // Composed text: one Char event per character through
+            // the same resolver (every Char resolves PassThrough —
+            // the trip costs nothing and keeps ONE dispatch path).
+            // While the find bar is open, text is the query —
+            // nothing reaches the PTY mid-search.
+            egui::Event::Text(text) => {
+                // The twin/meta guard runs BEFORE any routing: on
+                // twin-emitting platforms an `Alt+<letter>` chord
+                // arrives as `Key{.., alt}` + `Text("a")`, and the
+                // Text twin must land nowhere — not the PTY, not
+                // the find query, not an aux pane's address entry.
+                // `meta_held` also eats the twin whose Key event
+                // lands after this Text (a Meta chord still held
+                // while Text composes wants the chord's bytes —
+                // Option-as-Alt — never a literal).
+                let meta_held = ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
+                let text: String = text
+                    .chars()
+                    .filter(|c| {
+                        !meta_held
+                            && !eaten
+                                .iter()
+                                .position(|e| e.eq_ignore_ascii_case(c))
+                                .map(|pos| eaten.remove(pos))
+                                .is_some()
+                    })
+                    .collect();
+                if text.is_empty() {
+                    return;
+                }
+                if shared.find.is_some() {
+                    self.find_text(shared, &text);
+                    return;
+                }
+                // A shown aux pane owns composed text while it's
+                // up (the find bar's focus rule) — nothing
+                // reaches the PTY mid-pane.
+                if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                    pane(id).text(shared, &text);
+                    return;
+                }
+                for key in translate_text(&text) {
+                    self.dispatch_key(ctx, shared, Some(key));
+                }
+            }
+            // A native paste (Ctrl+V / ⌘V, menu paste): encode the
+            // payload through the shared `encode_paste` so
+            // bracketed-paste children see their mode honored.
+            // While the find bar is open it pastes into the query
+            // — the browser convention.
+            egui::Event::Paste(text) => {
+                if shared.find.is_some() {
+                    self.find_text(shared, &text);
+                } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                    pane(id).text(shared, &text);
+                } else {
+                    self.paste(shared, &text);
+                }
+            }
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let hover = ctx.input(|input| input.pointer.hover_pos());
+                self.wheel(shared, ctx, unit, delta, hover);
+            }
+            _ => {}
         }
     }
 
@@ -757,8 +811,9 @@ impl GuiApp {
         ctx: &egui::Context,
         unit: egui::MouseWheelUnit,
         delta: Vec2,
+        hover: Option<Pos2>,
     ) {
-        let Some(hover) = ctx.input(|input| input.pointer.hover_pos()) else {
+        let Some(hover) = hover else {
             return;
         };
         if self.panel_pane.is_some_and(|pane| pane.contains(hover)) {
@@ -3265,6 +3320,48 @@ mod tests {
         // `head -c 1` is still blocked — nothing leaked to the PTY.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The twin window is the ADJACENT Text only: a chord whose
+    /// press+release is followed by typed text in the SAME event
+    /// batch (injected input, a scripted macro — native streams
+    /// coalesce like this too) must not lose the typed char that
+    /// happens to share the chord's letter (R15-T2: `Alt+R` then
+    /// `printf` used to land `pintf`).
+    #[test]
+    fn a_chords_twin_window_closes_at_the_release() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        let modifiers = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        feed(
+            &mut harness,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text("printf".into()),
+            ],
+        );
+        // `Alt+R` on a disabled store toasts — and the whole typed
+        // line survived, 'r' included.
+        assert_eq!(
+            harness.shared().tabs.active().unwrap().shadow.text(),
+            "printf"
+        );
     }
 
     /// The winsize invariant under the host: a pane toggle narrows
