@@ -1016,6 +1016,9 @@ fn dispatch(ctx: &egui::Context, shared: &mut Shared, request: &Request) -> Resp
 /// `+`; `""` or `none` is the empty set. Unlike `parse_chord` there
 /// is no key to name — a chord is the wrong shape for a held set.
 fn parse_modifiers(text: &str) -> Result<egui::Modifiers, String> {
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return Ok(egui::Modifiers::NONE);
+    }
     let mut mods = egui::Modifiers::NONE;
     for name in text.split('+').filter(|part| !part.is_empty()) {
         match name.to_ascii_lowercase().as_str() {
@@ -1593,6 +1596,7 @@ mod tests {
     use ait_app::tabs::{SessionTemplate, TabManager};
     use ait_config::Settings;
     use ait_term::Size;
+    use eframe::egui::Plugin;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1682,6 +1686,36 @@ mod tests {
             Ok(Request::Resize { .. })
         ));
         assert!(matches!(
+            decode_request(
+                r#"{"verb":"pointer","event":"press","target":"grid","modifiers":"Ctrl"}"#
+            ),
+            Ok(Request::Pointer {
+                event: PointerEventKind::Press,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"pointer","event":"move","x":10,"y":20,"dx":1}"#),
+            Ok(Request::Pointer {
+                event: PointerEventKind::Move,
+                x: Some(10.0),
+                y: Some(20.0),
+                dx: 1.0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"click","target":"gate.approve"}"#),
+            Ok(Request::Click { .. })
+        ));
+        assert!(matches!(
+            decode_request(r#"{"verb":"agent","event":"approve","name":"run"}"#),
+            Ok(Request::Agent {
+                event: AgentEventKind::Approve,
+                ..
+            })
+        ));
+        assert!(matches!(
             decode_request(r#"{"verb":"dump"}"#),
             Ok(Request::Dump)
         ));
@@ -1700,6 +1734,11 @@ mod tests {
             r#"{"verb":"scroll","unit":"inch","dy":1}"#,        // unknown unit
             r#"{"verb":"scroll","unit":"line","over":"moon"}"#, // unknown region
             r#"{"verb":"resize","width":1100}"#,                // missing height
+            r#"{"verb":"pointer"}"#,                            // missing event
+            r#"{"verb":"pointer","event":"blink"}"#,            // unknown piece
+            r#"{"verb":"pointer","event":"press","button":"extra"}"#, // unknown button
+            r#"{"verb":"agent","event":"refuse","name":"x"}"#,  // unknown stageable
+            r#"{"verb":"agent","event":"approve"}"#,            // missing name
             r#"{"verb":"send","text":"x"}"#,                    // a ctl verb — NOT this socket
         ] {
             assert!(decode_request(line).is_err(), "{line:?}");
@@ -1978,6 +2017,297 @@ mod tests {
             let response = dispatch(&ctx, &mut shared, &Request::Resize { width, height });
             assert!(!response.ok, "{width}x{height}");
             assert!(shared.injected.is_empty());
+        }
+    }
+
+    /// `pointer`'s `modifiers` strings → the held set: modifier-only
+    /// names joined by `+`, `""`/`none` lifts, anything else errors.
+    #[test]
+    fn modifier_sets_parse_or_fail_loudly() {
+        let mods = parse_modifiers("Ctrl").unwrap();
+        assert!(mods.ctrl && !mods.alt && !mods.shift);
+        assert!(mods.command, "ctrl derives command off macOS");
+        let mods = parse_modifiers("ctrl+shift").unwrap();
+        assert!(mods.ctrl && mods.shift && !mods.alt);
+        let mods = parse_modifiers("Alt+Super").unwrap();
+        assert!(mods.alt && mods.mac_cmd);
+        for empty in ["", "none"] {
+            assert_eq!(parse_modifiers(empty).unwrap(), egui::Modifiers::NONE);
+        }
+        // Empty join parts skip — `ctrl++alt` is `ctrl+alt`.
+        let mods = parse_modifiers("ctrl++alt").unwrap();
+        assert!(mods.ctrl && mods.alt);
+        for bad in ["Ctrl+E", "bogus", "ctrl "] {
+            assert!(parse_modifiers(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `pointer`/`click` positions: `target` resolves to its rect's
+    /// center plus `dx`/`dy`, `x`/`y` is the raw pair — and an
+    /// unknown name fails naming the registry's real vocabulary.
+    #[test]
+    fn pointer_positions_resolve_names_and_raw_pairs() {
+        let mut shared = shared();
+        shared.hits.register(
+            "grid",
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0)),
+        );
+        // The target's rect IS the answer — its center, plus offset.
+        let pos = pointer_pos(&shared, Some("grid"), None, None, 0.0, 0.0).unwrap();
+        assert_eq!(pos, egui::pos2(60.0, 45.0));
+        let pos = pointer_pos(&shared, Some("grid"), None, None, 5.0, -5.0).unwrap();
+        assert_eq!(pos, egui::pos2(65.0, 40.0));
+        // The raw escape hatch.
+        let pos = pointer_pos(&shared, None, Some(1.0), Some(2.0), 1.0, 1.0).unwrap();
+        assert_eq!(pos, egui::pos2(2.0, 3.0));
+        // An unknown name names the miss AND the registry.
+        let error = pointer_pos(&shared, Some("bogus"), None, None, 0.0, 0.0).unwrap_err();
+        assert!(error.contains("bogus"), "{error}");
+        assert!(error.contains("grid"), "{error}");
+        // The shape mismatches: neither, half a pair, or both forms.
+        for (target, x, y) in [
+            (None, None, None),
+            (None, Some(1.0), None),
+            (None, None, Some(2.0)),
+            (Some("grid"), Some(1.0), Some(2.0)),
+        ] {
+            assert!(pointer_pos(&shared, target, x, y, 0.0, 0.0).is_err());
+        }
+    }
+
+    /// `pointer_batch` builds the modifier-first batch per piece —
+    /// real input's order — and `pointer`/`click` deliveries ride the
+    /// plugin's `input_hook` into `RawInput` one batch per frame,
+    /// ahead of the frame's native events.
+    #[test]
+    fn pointer_batches_splice_into_raw_input() {
+        // A press under a named set: `ModifiersChanged` leads, the
+        // button event carries the set.
+        let batch = pointer_batch(
+            PointerEventKind::Press,
+            Some(egui::pos2(3.0, 4.0)),
+            PointerButtonKind::Primary,
+            Some(egui::Modifiers::CTRL),
+            egui::Modifiers::NONE,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::ModifiersChanged(m) if m.ctrl
+        ));
+        assert!(matches!(
+            batch[1],
+            egui::Event::PointerButton {
+                pos,
+                pressed: true,
+                modifiers,
+                ..
+            } if pos == egui::pos2(3.0, 4.0) && modifiers.ctrl
+        ));
+        // No set named → the event carries the stream's held state.
+        let batch = pointer_batch(
+            PointerEventKind::Release,
+            Some(egui::pos2(3.0, 4.0)),
+            PointerButtonKind::Primary,
+            None,
+            egui::Modifiers::CTRL,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::PointerButton {
+                pressed: false,
+                modifiers,
+                ..
+            } if modifiers.ctrl
+        ));
+        // The bare `modifiers` piece with no set lifts all.
+        let batch = pointer_batch(
+            PointerEventKind::Modifiers,
+            None,
+            PointerButtonKind::Primary,
+            None,
+            egui::Modifiers::CTRL,
+        );
+        assert!(matches!(
+            batch[0],
+            egui::Event::ModifiersChanged(m) if m == egui::Modifiers::NONE
+        ));
+
+        // The plugin: one batch per `input_hook` call, spliced ahead
+        // of native events; `held` tracks the queued stream's sets.
+        let mut plugin = DriverInputPlugin::default();
+        plugin.push(vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL)]);
+        plugin.push(vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]);
+        assert_eq!(plugin.held(), egui::Modifiers::CTRL);
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::Text("native".to_owned())],
+            ..Default::default()
+        };
+        plugin.input_hook(&ctx, &mut input);
+        assert!(matches!(
+            input.events[0],
+            egui::Event::ModifiersChanged(_)
+        ));
+        assert!(matches!(input.events[1], egui::Event::Text(_)));
+        let mut next = egui::RawInput::default();
+        plugin.input_hook(&ctx, &mut next);
+        assert_eq!(next.events.len(), 1);
+        assert!(matches!(next.events[0], egui::Event::PointerMoved(_)));
+    }
+
+    /// `click`/`pointer` queue their batches on the plugin and earn a
+    /// frame through the `Repaint` marker; an `agent` stage needs the
+    /// panel open and lands an `Injected::AgentEvent` for
+    /// `dispatch_events`' `apply` fold.
+    #[test]
+    fn pointer_click_agent_dispatch_their_shapes() {
+        let ctx = egui::Context::default();
+        let mut shared = shared();
+        shared.hits.register(
+            "grid",
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 40.0)),
+        );
+
+        // No plugin registered → a clean `ok:false`, nothing queued.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(shared.injected.is_empty());
+
+        ctx.add_plugin(DriverInputPlugin::default());
+        // `click` on a name → the move+press+release batch queued on
+        // the plugin, the frame earned through `Injected::Repaint`.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(response.ok);
+        assert!(matches!(
+            shared.injected.pop_front(),
+            Some(Injected::Repaint)
+        ));
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 1);
+            let batch = &plugin.queue[0];
+            assert!(matches!(batch[0], egui::Event::PointerMoved(_)));
+            assert!(matches!(
+                batch[1],
+                egui::Event::PointerButton {
+                    pos,
+                    pressed: true,
+                    ..
+                } if pos == egui::pos2(40.0, 20.0)
+            ));
+            assert!(matches!(
+                batch[2],
+                egui::Event::PointerButton { pressed: false, .. }
+            ));
+        });
+
+        // An unknown name fails loudly and queues nothing.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("bogus".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert!(!response.ok);
+        assert!(shared.injected.is_empty());
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 1, "nothing new queued");
+        });
+
+        // A `click` naming a modifier set appends the restore batch —
+        // the held state survives the gesture.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Click {
+                target: Some("grid".to_owned()),
+                x: None,
+                y: None,
+                dx: 0.0,
+                dy: 0.0,
+                button: None,
+                modifiers: Some("Ctrl".to_owned()),
+            },
+        );
+        assert!(response.ok);
+        ctx.with_plugin(|plugin: &mut DriverInputPlugin| {
+            assert_eq!(plugin.queue.len(), 3, "click batch + restore");
+            assert!(matches!(
+                plugin.queue[1][0],
+                egui::Event::ModifiersChanged(m) if m.ctrl
+            ));
+            assert!(matches!(
+                plugin.queue[2][0],
+                egui::Event::ModifiersChanged(m) if m == egui::Modifiers::NONE
+            ));
+        });
+        shared.injected.clear();
+
+        // `agent` without an open panel refuses; with one it stages
+        // the approval through the same `apply` fold real events take.
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Agent {
+                event: AgentEventKind::Approve,
+                name: "run".to_owned(),
+                summary: "rm -rf /".to_owned(),
+            },
+        );
+        assert!(!response.ok, "no panel open yet");
+        shared
+            .tabs
+            .active_mut()
+            .expect("a tab is active")
+            .toggle_agent_panel();
+        let response = dispatch(
+            &ctx,
+            &mut shared,
+            &Request::Agent {
+                event: AgentEventKind::Approve,
+                name: "run".to_owned(),
+                summary: "rm -rf /".to_owned(),
+            },
+        );
+        assert!(response.ok);
+        match shared.injected.pop_front().unwrap() {
+            Injected::AgentEvent(ait_agent::AgentEvent::ApprovalRequest {
+                call, summary, ..
+            }) => {
+                assert_eq!(call.name, "run");
+                assert_eq!(summary, "rm -rf /");
+            }
+            other => panic!("expected the staged approval, got {other:?}"),
         }
     }
 
