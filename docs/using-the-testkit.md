@@ -11,18 +11,31 @@ drive the real binary under Xvfb (or the developer's `DISPLAY` with
 `cargo build -p ait-gui --features test-driver` and run
 `cargo test -p ait-gui --features test-driver --test scenarios`.
 Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
-app's own dispatch), `pointer = {event, target|x, y, …}` and
+app's own dispatch — `scroll` adds `target`/`x`/`y` aiming and
+`raw = true` for a real `MouseWheel` batch, the only delivery a
+pane-own-paint surface like the explorer's listing answers),
+`pointer = {event, target|x, y, …, modifiers?}` and
 `click = "hit.name"` (real egui pointer events aimed at the hit
 registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
 `pill.scroll_bottom`, `detect.url.<u>`, `detect.path.<p>`,
-`detect.<n>`), `agent = {event="approve", name, summary}` (stages a
-real gate card through `AgentPanel::apply`), plus waits/asserts
-`wait_text`/`expect_text`/`expect_pane`/`expect_find`/
+`detect.<n>`, `explorer.up`, `explorer.entry.<name>`,
+`explorer.row.<n>`), `agent = {event="approve", name, summary}`
+(stages a real gate card through `AgentPanel::apply`), plus
+waits/asserts `wait_text`/`expect_text`/`expect_pane`/`expect_find`/
 `expect_scroll`/`expect_suggesting`/`expect_gate`/`expect_selection`/
 `expect_hit` (the registry gate — use it when a model expectation
-like `expect_pane` can land a frame before the affordance's paint)
-and `quit`. The manual checklist stays in
-[gui-verification.md](gui-verification.md).
+like `expect_pane` can land a frame before the affordance's paint),
+`expect_explorer` (the explorer model — `dir`/`root` as path
+suffixes, `entries`/`has`/`lacks` over the visible listing,
+`selected`, `hidden`, `scroll`, `preview` kind/head/`truncated`)
+and `expect_detect` (the Ctrl-hover affordance — `"none"`,
+`"url:<u>"`/`"path:<p>"` or `{ctrl, token}`; pair `ctrl = true`
+with `token = "none"` to prove a non-affording hover frame was
+processed), and `quit`. `env = {K = "v"}` layers extra variables
+after the harness pins; `stub-bin/` shadows `xdg-open`/`open`
+first on `PATH` and records spawns to `$AIT_GUI_E2E_STUB_LOG`
+(`GuiE2e::stub_log()` in code-first tests). The manual checklist
+stays in [gui-verification.md](gui-verification.md).
 
 ## Run
 

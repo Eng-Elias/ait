@@ -1,0 +1,131 @@
+# Spec R15-T4 — the §5.13 Ctrl-hover affordance and Ctrl+click
+# routing end to end (us-24/25/26): real tokens in real output —
+# an `https://` URL, an existing file, an existing directory and a
+# `file://` URL — resolve under a held plain Ctrl (the `detect`
+# block's `token` IS the underline + pointing-hand condition), and
+# a Ctrl+click on each routes: URL → browser pane, file → explorer
+# preview, directory → explorer navigation. Every probe is
+# output-only (std.15): `htt%s`/`fi%s` splits keep the typed echo
+# free of URL tokens, the fixture commands quote through `$PWD`
+# so no bare relative path leaks a token, and the `resize` keeps
+# the token row under one line's width — the ordinal aliases then
+# map 1:1 to the printed row's left-to-right order. The
+# nonexistent-path and scrollback/modifier-chord non-affordance
+# cases are the code-first tests' precision work (they need
+# cell-metric coordinates TOML can't name).
+feature = "detect-routes"
+
+[[steps]]
+wait_text = "$"
+
+# A wide window — the whole token line stays one row, so wraps
+# never split a token's rect (or its alias) across rows.
+[[steps]]
+resize = { width = 1600.0, height = 540.0 }
+
+[[steps]]
+text = "mkdir -p \"$PWD/fx/sub\" && printf 'HEAD-LINE\\n' > \"$PWD/fx/head.txt\" && printf 'FIX-%s\\n' UP"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "FIX-UP"
+
+[[steps]]
+text = "printf 'htt%s://%s/docs %s %s fi%s:///%s\\n' ps example.com \"$PWD/fx/head.txt\" \"$PWD/fx/sub\" le etc/hostname"
+
+[[steps]]
+key = "Enter"
+
+# The aliases and ordinals land over the token cells — the URL, the
+# file, the directory and the `file://` URL in printed order.
+[[steps]]
+expect_hit = "detect.url.https://example.com/docs"
+
+[[steps]]
+expect_hit = "detect.url.file:///etc/hostname"
+
+[[steps]]
+expect_hit = "detect.0"
+
+[[steps]]
+expect_hit = "detect.3"
+
+# Ctrl-hover: a move carrying the held set lands, the frame's
+# affordance resolution records the route it would take. `token`
+# is exactly the underline + hand-cursor condition.
+[[steps]]
+pointer = { event = "move", target = "detect.0", modifiers = "Ctrl" }
+
+[[steps]]
+expect_detect = { ctrl = true, token = "url:https://example.com/docs" }
+
+[[steps]]
+pointer = { event = "move", target = "detect.1", modifiers = "Ctrl" }
+
+[[steps]]
+expect_detect = { ctrl = true, token = "path:/fx/head.txt" }
+
+[[steps]]
+pointer = { event = "move", target = "detect.3", modifiers = "Ctrl" }
+
+[[steps]]
+expect_detect = { ctrl = true, token = "url:file:///etc/hostname" }
+
+# A non-token cell under plain Ctrl resolves nothing — `ctrl`
+# proves the hover frame was processed.
+[[steps]]
+pointer = { event = "move", target = "grid", dx = -80.0, dy = -60.0, modifiers = "Ctrl" }
+
+[[steps]]
+expect_detect = { ctrl = true, token = "none" }
+
+# Lift the held set, then route each target. `expect_hit` first —
+# a pane opening steals grid columns and the row re-registers
+# against the new pane rect a frame later.
+[[steps]]
+pointer = { event = "modifiers", modifiers = "none" }
+
+[[steps]]
+click = { target = "detect.0", modifiers = "Ctrl" }
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+expect_hit = "detect.1"
+
+[[steps]]
+click = { target = "detect.1", modifiers = "Ctrl" }
+
+[[steps]]
+expect_pane = "explorer"
+
+# An existing file routes to the explorer previewing it — the
+# browse dir is its parent, the selection the file, the preview
+# loaded.
+[[steps]]
+expect_explorer = { dir = "/fx", selected = "head.txt", preview = { kind = "text", contains = "HEAD-LINE" } }
+
+[[steps]]
+expect_hit = "detect.2"
+
+[[steps]]
+click = { target = "detect.2", modifiers = "Ctrl" }
+
+# An existing directory routes to explorer navigation.
+[[steps]]
+expect_explorer = { dir = "/fx/sub" }
+
+[[steps]]
+expect_hit = "detect.3"
+
+[[steps]]
+click = { target = "detect.3", modifiers = "Ctrl" }
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+quit = true
