@@ -40,6 +40,10 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `init_shell`), `Integrated` (`init_shell`/`bootstrapped` seen).
 - **OSC 133** — the standard semantic-prompt sequences marking prompt/command
   boundaries.
+- **ConPTY** — the Windows console's pseudo-terminal (Windows 10 1809+):
+  `portable-pty`'s Windows backend for `ait-term` sessions, through which
+  the same byte stream — OSC 133/7 marks and the OSC 770x hook events —
+  reaches the session model (§5.14, ADR-0020).
 - **Endpoint** — a configured LLM server (`name`, `base_url`, `schema`,
   models).
 - **Endpoint schema** — wire format: `openai_chat_completions`,
@@ -157,20 +161,27 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   `AgentRequest.skills`; the frontend's `LiveSkills` watcher refreshes
   it on changes under either root, keeping last-good copies of
   entries a write left malformed (§5.10.2, ADR-0006).
-- **Control socket** — the per-instance Unix socket a running `ait`
+- **Control socket** — the per-instance local socket a running `ait`
   listens on (`${XDG_RUNTIME_DIR}/ait/<pid>.sock`, else
-  `$TMPDIR/ait-<uid>`; dir `0700`, socket `0600`), drained on the app
-  tick and carrying one single-line JSON request/response per
+  `$TMPDIR/ait-<uid>`, on Unix — dir `0700`, socket `0600`; the
+  `\\.\pipe\ait-<user>-<pid>` named pipe on Windows), drained on the
+  app tick and carrying one single-line JSON request/response per
   connection. `ait ctl <verb>` is its client; `AIT_CTL_SOCKET` —
   exported into every spawned session — names it (§5.10.5).
-- **Test-driver socket** — `ait-gui`'s second, test-only Unix socket
+- **Test-driver socket** — `ait-gui`'s second, test-only local socket
   beside the control socket (Spec R15, ADR-0019), compiled only under
   the off-by-default `test-driver` cargo feature and bound only when
-  `AIT_TEST_DRIVER_SOCKET` names a path. Same wire shape as ctl (one
+  `AIT_TEST_DRIVER_SOCKET` names its Unix path or Windows pipe
+  (`ait-driver-<user>-<pid>`). Same wire shape as ctl (one
   single-line JSON request/response per connection); its verbs inject
   real `egui::Event`s/`RawInput` and answer a versioned JSON **dump**
   of the state paint draws — grid, panes, browser, explorer, status
   and the hit-target registry.
+- **Named pipe** — Windows' same-machine IPC transport
+  (`\\.\pipe\<name>`): what the control and test-driver sockets bind
+  on Windows through `interprocess`'s local-socket API
+  (`ait_app::ipc`); its default same-user ACL is the `0600`
+  equivalent (§5.14, ADR-0020).
 - **Scenario** — a declarative TOML test of user-visible behavior.
 - **Recording** — the committed concrete inputs an agent step resolved to.
 - **Driver** — the backing that resolves agent steps.
