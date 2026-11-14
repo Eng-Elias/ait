@@ -46,10 +46,12 @@ pub fn panel_has_line(app: &E2e, text: &str) -> bool {
 
 /// `true` when `row`'s terminal half carries a `run_command` sentinel
 /// *result* line — `__AIT_END_<id>=<exit>` — which only the run's
-/// `printf` produces. The echoed type-in line carries the same
-/// `__AIT_END_` prefix verbatim but `=%d`, never `=<digit>`, so a bare
-/// `contains("__AIT_END_")` wait passes on echo alone — the trap
-/// CODING_STANDARDS §15 forbids.
+/// sentinel print produces. The echoed type-in line carries the same
+/// `__AIT_END_` prefix verbatim but `=%d`/`=$LASTEXITCODE`-style
+/// text, never `=<digit>`, so a bare `contains("__AIT_END_")` wait
+/// passes on echo alone — the trap CODING_STANDARDS §15 forbids. A
+/// leading `-` counts: signed codes (`exit -1`, killed-process
+/// statuses) are results too (§5.14).
 pub fn sentinel_result(row: &str) -> bool {
     let half = terminal_half(row);
     let Some(start) = half.find("__AIT_END_") else {
@@ -58,7 +60,7 @@ pub fn sentinel_result(row: &str) -> bool {
     half[start..]
         .split('=')
         .nth(1)
-        .is_some_and(|tail| tail.starts_with(|ch: char| ch.is_ascii_digit()))
+        .is_some_and(|tail| tail.starts_with(|ch: char| ch.is_ascii_digit() || ch == '-'))
 }
 
 /// A JSON string literal (`"…"`) for hand-built wire bodies — the
@@ -85,12 +87,22 @@ mod tests {
     use super::*;
 
     /// The sentinel predicate's whole job: the echoed type-in carries
-    /// `=%d` and never satisfies it; the `printf`'s own output does;
-    /// a panel-side `=<digit>` never leaks through the `│` split.
+    /// `=%d`-style text and never satisfies it — whatever the shell
+    /// family spells (§5.14's `Write-Output`/`call echo` forms echo
+    /// `=$(…`/`=%^ERRORLEVEL%` literally); the result's own output —
+    /// signed codes included — does; a panel-side `=<digit>` never
+    /// leaks through the `│` split.
     #[test]
     fn sentinel_result_needs_the_result_row_not_the_echo() {
         assert!(!sentinel_result("$ echo hi; printf '__AIT_END_7=%d\\n' $?"));
+        assert!(!sentinel_result(
+            "PS> Write-Output x; Write-Output \"__AIT_END_7=$(if ($null -ne $LASTEXITCODE) { 1 })\""
+        ));
+        assert!(!sentinel_result(
+            "C:\\> echo x & call echo __AIT_END_7=%^ERRORLEVEL%"
+        ));
         assert!(sentinel_result("__AIT_END_7=0"));
+        assert!(sentinel_result("__AIT_END_7=-1"));
         assert!(!sentinel_result("some output │ __AIT_END_7=0"));
         assert!(!sentinel_result("no sentinel here"));
     }

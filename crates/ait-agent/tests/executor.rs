@@ -174,6 +174,10 @@ struct ScriptedBridge {
     /// What [`remote_state`](ShellBridge::remote_state) reports —
     /// `Local` by default; the remote-session tests arm a `Remote`.
     remote: Mutex<RemoteState>,
+    /// What [`shell_name`](ShellBridge::shell_name) reports — the
+    /// session program's basename the `Absent` sentinel keys on;
+    /// `""` (POSIX) unless the test names a Windows shell.
+    shell: Mutex<String>,
     /// The recorded traffic.
     shares: Shares,
     /// When `Some`, `run_in_band` fails with this error instead of
@@ -187,6 +191,7 @@ fn scripted(state: ShellIntegration) -> (ScriptedBridge, Shares) {
     let bridge = ScriptedBridge {
         state,
         remote: Mutex::new(RemoteState::Local),
+        shell: Mutex::new(String::new()),
         shares: shares.clone(),
         fail_run: Mutex::new(None),
     };
@@ -200,6 +205,10 @@ impl ShellBridge for ScriptedBridge {
 
     fn remote_state(&self) -> Result<RemoteState, BridgeError> {
         Ok(self.remote.lock().expect("remote lock").clone())
+    }
+
+    fn shell_name(&self) -> Result<String, BridgeError> {
+        Ok(self.shell.lock().expect("shell lock").clone())
     }
 
     fn run_in_band(&self, command: &[u8]) -> Result<Receiver<RunResult>, BridgeError> {
@@ -667,6 +676,189 @@ fn absent_torn_sentinel_never_resolves() {
     driver.join().expect("driver");
     assert!(matches!(error, ExecutorError::TypedTimedOut), "{error:?}");
     assert!(started.elapsed() < BOUND);
+}
+
+// ── Spec R16 §5.14: the Absent sentinel is per shell family ──────
+//
+// `shell_name` (the same basename the planner keyed on) picks the
+// sentinel's syntax: PowerShell `Write-Output` carrying
+// `$LASTEXITCODE` — cleared first so a stale native code can't
+// poison a cmdlet run — cmd's `call echo %^ERRORLEVEL%`, everything
+// else the POSIX `printf` form. A remote session always takes the
+// POSIX form — the remote shell is the POSIX bootstrap however the
+// local program spells.
+
+/// A `pwsh` session's `Absent` run types the PowerShell sentinel —
+// the `Write-Output`/`$LASTEXITCODE` form, not `printf` — and still
+/// completes on `<marker>=<digits>` in the tail. `powershell.exe`
+/// (the 5.1 host) spells the same family.
+#[test]
+fn absent_pwsh_types_the_powershell_sentinel() {
+    for shell in ["pwsh", "powershell.exe", "PWSH.EXE"] {
+        let (bridge, shares) = scripted(ShellIntegration::Absent);
+        *bridge.shell.lock().expect("shell lock") = shell.to_owned();
+        shares
+            .tail
+            .lock()
+            .expect("tail lock")
+            .extend_from_slice(b"PS C:\\> ");
+        let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+        let driver = std::thread::spawn({
+            let shares = shares.clone();
+            move || {
+                let _events = shares.subscriber();
+                let typed = shares.next_typed();
+                let marker = sentinel_marker(&typed);
+                // The interactive echo carries the literal
+                // `$LASTEXITCODE`/`$(…)` text — `=`-without-digits,
+                // never a result — then the run's real result line.
+                let mut stream = typed.clone();
+                *stream.last_mut().expect("typed line") = b'\r';
+                stream.extend_from_slice(b"\nsmoke output\r\n__AIT_END_");
+                stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+                stream.extend_from_slice(b"=4\r\nPS C:\\> ");
+                shares.emit(&stream);
+            }
+        });
+
+        let result = executor
+            .run("Write-Output 'smoke output'")
+            .expect("the pwsh sentinel resolves the run");
+        driver.join().expect("driver");
+
+        assert_eq!(result.exit_code, Some(4), "{shell}");
+        let text = String::from_utf8(shares.sent()[0].clone()).expect("typed is text");
+        assert!(
+            text.contains("; Write-Output \"__AIT_END_"),
+            "{shell}: the PowerShell sentinel was typed: {text:?}"
+        );
+        assert!(
+            text.contains("LASTEXITCODE"),
+            "{shell}: the exit code rides $LASTEXITCODE: {text:?}"
+        );
+        assert!(
+            !text.contains("printf"),
+            "{shell}: never the POSIX form: {text:?}"
+        );
+    }
+}
+
+/// A `cmd.exe` session's `Absent` run types the cmd sentinel —
+/// `& call echo <marker>=%^ERRORLEVEL%`: `call` plus the `^`-escape
+/// defers `%ERRORLEVEL%` past cmd's parse-time expansion so it reads
+/// THIS command's code (a bare `%ERRORLEVEL%` would report the
+/// previous line's).
+#[test]
+fn absent_cmd_types_the_cmd_sentinel() {
+    for shell in ["cmd.exe", "CMD.EXE"] {
+        let (bridge, shares) = scripted(ShellIntegration::Absent);
+        *bridge.shell.lock().expect("shell lock") = shell.to_owned();
+        let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+        let driver = std::thread::spawn({
+            let shares = shares.clone();
+            move || {
+                let _events = shares.subscriber();
+                let typed = shares.next_typed();
+                let marker = sentinel_marker(&typed);
+                let mut stream = typed.clone();
+                *stream.last_mut().expect("typed line") = b'\r';
+                stream.extend_from_slice(b"\nout\r\n__AIT_END_");
+                stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+                stream.extend_from_slice(b"=2\r\nC:\\>");
+                shares.emit(&stream);
+            }
+        });
+
+        let result = executor
+            .run("echo out")
+            .expect("the cmd sentinel resolves the run");
+        driver.join().expect("driver");
+
+        assert_eq!(result.exit_code, Some(2), "{shell}");
+        let text = String::from_utf8(shares.sent()[0].clone()).expect("typed is text");
+        assert!(
+            text.contains(" & call echo __AIT_END_"),
+            "{shell}: the cmd sentinel was typed: {text:?}"
+        );
+        assert!(
+            text.ends_with("=%^ERRORLEVEL%\n"),
+            "{shell}: the escaped expansion, not the parse-time one: {text:?}"
+        );
+    }
+}
+
+/// A sentinel result's exit code may be negative — `exit -1` under
+/// pwsh, a killed process's status under cmd — and still parses:
+/// `-1` is a result, not a torn line.
+#[test]
+fn absent_sentinel_parses_a_negative_exit_code() {
+    let (bridge, shares) = scripted(ShellIntegration::Absent);
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=-1\r\n");
+            shares.emit(&stream);
+        }
+    });
+
+    let result = executor.run("exit -1").expect("a signed code resolves");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(-1));
+}
+
+/// A remote session reached through ssh() always types the POSIX
+/// sentinel — the remote shell is the POSIX bootstrap however the
+/// LOCAL program spells (a pwsh tab's unbootstrapped remote gets
+/// `printf`, never `Write-Output`).
+#[test]
+fn a_remote_session_keeps_the_posix_sentinel() {
+    let (bridge, shares) = scripted(ShellIntegration::Integrated);
+    *bridge.shell.lock().expect("shell lock") = "pwsh.exe".to_owned();
+    *bridge.remote.lock().expect("remote lock") = RemoteState::Remote {
+        target: "prod".to_owned(),
+        control_path: None,
+        bootstrapped: false,
+    };
+    let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
+
+    let driver = std::thread::spawn({
+        let shares = shares.clone();
+        move || {
+            let _events = shares.subscriber();
+            let typed = shares.next_typed();
+            let marker = sentinel_marker(&typed);
+            let mut stream = typed.clone();
+            *stream.last_mut().expect("typed line") = b'\r';
+            stream.extend_from_slice(b"\nremote-out\r\n__AIT_END_");
+            stream.extend_from_slice(&marker[b"__AIT_END_".len()..]);
+            stream.extend_from_slice(b"=0\r\n");
+            shares.emit(&stream);
+        }
+    });
+
+    let result = executor.run("echo hi").expect("the sentinel tier runs");
+    driver.join().expect("driver");
+    assert_eq!(result.exit_code, Some(0));
+    let text = String::from_utf8(shares.sent()[0].clone()).expect("typed is text");
+    assert!(
+        text.contains("printf '__AIT_END_"),
+        "the remote shell takes the POSIX form: {text:?}"
+    );
+    assert!(
+        !text.contains("Write-Output") && !text.contains("call echo"),
+        "the local pwsh spelling never reaches a remote: {text:?}"
+    );
 }
 
 /// The session exiting mid-wait — on either typed tier — is

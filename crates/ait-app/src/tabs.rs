@@ -718,6 +718,13 @@ impl Tab {
                 };
                 let _ = reply.send(state);
             }
+            BridgeRequest::Shell(reply) => {
+                // The resolved program's basename — the same
+                // `title_for` answer the tab bar paints and the
+                // classifier's `ProgramIndex` keyed on (§5.14: the
+                // sentinel's family reads the one name).
+                let _ = reply.send(self.title.clone());
+            }
             BridgeRequest::Context(reply) => {
                 // Spec R11 us-30: the headless driver's §5.6 context —
                 // the same assembly the panel runs for a visible tab.
@@ -3367,6 +3374,33 @@ mod tests {
         let tab = manager.active_mut().expect("an active tab");
         tab.bridge = Some(service);
         (handle, manager.active().unwrap())
+    }
+
+    /// §5.14: the bridge's `shell_name` answers the resolved
+    /// program's basename — the key the `Absent` tier's sentinel
+    /// family reads (the same `title_for` the tab bar and the
+    /// classifier use).
+    #[test]
+    fn bridge_shell_name_answers_the_program_basename() {
+        if !Path::new("/bin/sh").exists() {
+            return; // sh isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (bridge, _) = attach_bridge(&mut manager);
+        use ait_agent::ShellBridge;
+        let name = bridge_call(&mut manager, &bridge, |b| b.shell_name().expect("shell"));
+        assert_eq!(name, "sh");
     }
 
     /// Spec R06-T4 (issue #87) through a REAL injected bash: the

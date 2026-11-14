@@ -40,8 +40,13 @@
 //!   prompt's row — resolved through [`ShellBridge::grid_lines`];
 //!   the exit code is `D`'s payload, and a payload-free `D` reports
 //!   "unknown" — never a guess (us-15).
-//! - **`Absent`** (R06-T5, us-14) — the command is typed wrapped in a
-//!   sentinel: `cmd; printf '__AIT_END_<id>=%d\n' $?`. Completion and
+//! - **`Absent`** (R06-T5, us-14; §5.14 shell-aware since R16) — the
+//!   command is typed wrapped in a sentinel spelled for the session's
+//!   shell family: `cmd; printf '__AIT_END_<id>=%d\n' $?` on POSIX
+//!   shells, `Write-Output`/`$LASTEXITCODE` on PowerShell,
+//!   `call echo __AIT_END_<id>=%^ERRORLEVEL%` on cmd (remote sessions
+//!   always take the POSIX
+//!   form — the remote shell is the POSIX bootstrap). Completion and
 //!   the exit code are scanned out of [`ShellBridge::output_tail`];
 //!   the output is the tail between the echoed type-in line and the
 //!   sentinel's own line (raw bytes — escapes may survive; the grid
@@ -69,7 +74,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use ait_shell::RunResult;
+use ait_shell::{RunResult, ShellFamily};
 use tokio_util::sync::CancellationToken;
 
 /// How often a pending in-band run wakes to check the cancellation
@@ -289,6 +294,19 @@ pub trait ShellBridge: Send {
     /// the frontend's per-tab implementation tracks the real state.
     fn remote_state(&self) -> Result<RemoteState, BridgeError> {
         Ok(RemoteState::Local)
+    }
+
+    /// The session program's basename — the same string the injection
+    /// planner matched and the §5.10.4 classifier's builtin table keys
+    /// on (`bash`, `pwsh.exe`, `cmd.exe`). The `Absent` tier renders
+    /// its completion sentinel in this name's
+    /// [`ait_shell::ShellFamily`] (§5.14): PowerShell's `Write-Output`,
+    /// cmd's `call echo`, the POSIX `printf` for everything else. The
+    /// default answers `""` — bridges that predate the shell-aware
+    /// sentinel (and every scripted test bridge) keep the POSIX form
+    /// they were written against.
+    fn shell_name(&self) -> Result<String, BridgeError> {
+        Ok(String::new())
     }
 }
 
@@ -540,7 +558,8 @@ impl UserShellExecutor {
     }
 
     /// The `Absent` tier (us-14): type the command wrapped in a
-    /// sentinel — `cmd; printf '__AIT_END_<id>=%d\n' $?`, the whole
+    /// sentinel — `cmd; printf '__AIT_END_<id>=%d\n' $?` on POSIX
+    /// shells, the §5.14 per-family spellings on Windows — the whole
     /// line visible in the grid (us-16) — then scan the raw output
     /// tail for `__AIT_END_<id>=<digits>`. The result line's number
     /// is the exit code; the output is the tail between the echoed
@@ -557,7 +576,17 @@ impl UserShellExecutor {
         // `;` after a trailing `;`/blank would be a syntax error in
         // the user's shell — trim so the wrap always parses.
         let command = command.trim_end_matches([';', ' ', '\t', '\n']);
-        let typed = format!("{command}; printf '{marker}=%d\\n' $?\n");
+        // The sentinel spells the shell that READS it (§5.14): a
+        // remote session reached through ssh() is always the POSIX
+        // bootstrap however the local program reports (§5.14's
+        // "remote sessions are unchanged"); a local session keys on
+        // the tab's own basename — the same resolved name the
+        // planner matched — through `ait_shell::shell_family`.
+        let family = match self.bridge.remote_state()? {
+            RemoteState::Remote { .. } => ShellFamily::Posix,
+            RemoteState::Local => ait_shell::shell_family(&self.bridge.shell_name()?),
+        };
+        let typed = sentinel_line(family, command, &marker);
         self.bridge.send_bytes(typed.as_bytes())?;
 
         let mut deadline = self.fresh_deadline();
@@ -686,6 +715,30 @@ fn typed_line(command: &str) -> Vec<u8> {
     typed
 }
 
+/// The wrapped line the `Absent` tier types (§5.14): `command` plus
+/// the sentinel that prints `<marker>=<exit code>` in `family`'s
+/// syntax.
+///
+/// - POSIX shells keep the original `printf` form.
+/// - PowerShell gets `Write-Output` carrying `$LASTEXITCODE` —
+///   cleared to `$null` first, so a stale native code can't poison a
+///   cmdlet run (cmdlets never set it): the pending native code
+///   reports verbatim, else `?` reads 0/1 — the same rule the
+///   snippet's `__ait_run` and `prompt` apply (`pwsh.ps1`).
+/// - `cmd.exe` gets `call echo` with `^`-escaped `%ERRORLEVEL%` —
+///   `call`'s second parse expands it at run time to THIS command's
+///   code; a bare `%ERRORLEVEL%` would expand in cmd's parse-time
+///   pass and report the *previous* line's errorlevel.
+fn sentinel_line(family: ShellFamily, command: &str, marker: &str) -> String {
+    match family {
+        ShellFamily::PowerShell => format!(
+            "$global:LASTEXITCODE = $null; {command}; Write-Output \"{marker}=$(if ($null -ne $global:LASTEXITCODE) {{ [int]$global:LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }})\"\n"
+        ),
+        ShellFamily::Cmd => format!("{command} & call echo {marker}=%^ERRORLEVEL%\n"),
+        ShellFamily::Posix => format!("{command}; printf '{marker}=%d\\n' $?\n"),
+    }
+}
+
 /// A sentinel id unique per run — process id plus a global sequence
 /// so a live wait's marker never collides with a stale `__AIT_END`
 /// line the scrollback still holds (an earlier task's sentinel, or a
@@ -706,8 +759,10 @@ struct SentinelResult {
 }
 
 /// The sentinel's *result* line in `tail` — `<marker>=` followed by
-/// at least one digit (the type-in echo carries `=%d`, never a
-/// digit, so it can never match). The last valid match wins, so a
+/// at least one digit, optionally signed (the type-in echo carries
+/// `=%d`/`=$LASTEXITCODE`/`=%^ERRORLEVEL%`, never a digit, so it can
+/// never match; `exit -1` under pwsh or a killed process's cmd
+/// status reports negative). The last valid match wins, so a
 /// repeated result still resolves.
 fn sentinel_result(tail: &[u8], marker: &str) -> Option<SentinelResult> {
     let marker = marker.as_bytes();
@@ -717,8 +772,10 @@ fn sentinel_result(tail: &[u8], marker: &str) -> Option<SentinelResult> {
     while let Some(at) = find_subslice(search, marker) {
         let after = &search[at + marker.len()..];
         if let Some(rest) = after.strip_prefix(b"=") {
-            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-            let parsed = std::str::from_utf8(&rest[..digits])
+            let unsigned = rest.strip_prefix(b"-").unwrap_or(rest);
+            let digits = unsigned.iter().take_while(|b| b.is_ascii_digit()).count();
+            let len = rest.len() - unsigned.len() + digits;
+            let parsed = std::str::from_utf8(&rest[..len])
                 .ok()
                 .and_then(|code| code.parse::<i32>().ok());
             if digits > 0 {
