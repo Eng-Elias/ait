@@ -93,7 +93,7 @@ pub fn report_error(error: &eframe::Error) {
 
 /// The platform's "open this target" command — `open` on macOS,
 /// `xdg-open` on the freedesktop desktops, `cmd /c start` on Windows
-/// (§5.14, not yet shipped); the target is the single payload
+/// (§5.14, shipped in R16-T7); the target is the single payload
 /// argument. Both OS-handoff surfaces share it: the explorer's
 /// platform-opener editor resolution (a file path) and the browser
 /// pane's external-open sink (a URL). Stdio is detached so the child
