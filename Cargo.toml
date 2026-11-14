@@ -9,9 +9,10 @@ members = ["crates/*"]
 version = "1.0.0"
 
 # cargo-dist release pipeline (Spec R12 §5.11): pushing a version tag
-# builds tarballs for the five §6 targets plus the `ait-installer.sh`
-# curl|sh installer, publishes the GitHub Release, and announces only
-# after the verify-install gate passes. The generated
+# builds archives for the six §6 targets plus the `ait-installer.sh`
+# curl|sh and `ait-installer.ps1` PowerShell installers, publishes the
+# GitHub Release, and announces only after the verify-install gate
+# passes. The generated
 # .github/workflows/release.yml is refreshed by `dist generate` —
 # never hand-edit it (dist errors on a stale generated file).
 [workspace.metadata.dist]
@@ -24,21 +25,26 @@ ci = ["github"]
 # — the ait-llm `chat` example and ait-testkit are never release
 # artifacts.
 packages = ["ait", "ait-gui"]
-# The shell installer is the only installer §5.11 ships — no
-# homebrew/npm/msi this round.
-installers = ["shell"]
+# §5.11 ships the curl|sh installer; §5.14 (Spec R16) adds the
+# PowerShell twin dist emits as `ait-installer.ps1` /
+# `ait-gui-installer.ps1` for Windows users. No homebrew/npm/msi.
+installers = ["shell", "powershell"]
 # gzip archives (ait-<target>.tar.gz): decompresses everywhere the
 # installer runs with no extra tooling; dist's default is .tar.xz.
 unix-archive = ".tar.gz"
 # x86_64-musl is the fully static leg (the dep tree is rustls-only, no
 # OpenSSL — Spec R12); aarch64-linux builds natively on the ARM64
 # runner below rather than dist's cargo-zigbuild cross default.
+# x86_64-pc-windows-msvc joins in Round 16 (§5.14); aarch64-windows
+# stays skipped — §5.14 marks it optional, there's no free native
+# runner, and nothing could test it.
 targets = [
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ]
 # "skip" removes the pull_request trigger dist would otherwise emit —
 # a dist dry-run on every PR would bill private-repo minutes on `dev`

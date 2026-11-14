@@ -7,18 +7,27 @@ name: Verify install
 # here means a failed verify leaves the release built but unannounced —
 # the workflow stays re-runnable after a fix (us-31).
 #
-# Two legs, one shared implementation (scripts/verify-install.sh):
+# Three legs (Spec R16 added the third for §5.14's Windows target):
 #
-#   verify-linux  runs the published installer inside a curl-less
-#                 ubuntu:24.04 docker container (ubuntu-latest runners
-#                 ship docker) — the "clean machine" §5.11 asks for.
-#                 Curl is apt-installed inside the container, the way a
-#                 real fresh user machine would gain it.
-#   verify-macos  macos runners have no docker, so the script's
-#                 --native mode runs the installer on the runner
-#                 itself. This is also the leg that exercises the
-#                 aarch64-apple-darwin tarball the installer selects
-#                 on Apple Silicon.
+#   verify-linux    runs the published installer inside a curl-less
+#                   ubuntu:24.04 docker container (ubuntu-latest runners
+#                   ship docker) — the "clean machine" §5.11 asks for.
+#                   Curl is apt-installed inside the container, the way a
+#                   real fresh user machine would gain it.
+#   verify-macos    macos runners have no docker, so the script's
+#                   --native mode runs the installer on the runner
+#                   itself. This is also the leg that exercises the
+#                   aarch64-apple-darwin tarball the installer selects
+#                   on Apple Silicon.
+#   verify-windows  scripts/verify-install.ps1 — the PowerShell twin of
+#                   verify-install.sh — runs the published
+#                   ait-installer.ps1 under powershell.exe (the 5.1 host
+#                   a stock machine ships) and asserts both binaries'
+#                   --version on the runner itself (windows runners
+#                   have no docker either).
+#
+# The unix legs share scripts/verify-install.sh; the Windows leg's twin
+# mirrors its env contract.
 on:
   workflow_call:
     inputs:
@@ -53,3 +62,12 @@ jobs:
       # lands ait under ~/.cargo/bin, which the script resolves
       # directly rather than relying on PATH.
       - run: scripts/verify-install.sh --native "${{ github.ref_name }}"
+
+  verify-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # pwsh step shell; the script itself runs the published
+      # installer under powershell.exe (5.1) — the stock host.
+      - shell: pwsh
+        run: scripts/verify-install.ps1 "${{ github.ref_name }}"

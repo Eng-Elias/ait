@@ -9,15 +9,17 @@ description = "AIT's GUI frontend (Spec R13 §5.12): a native desktop window —
 repository = "https://github.com/Eng-Elias/ait"
 
 # cargo-dist's `targets` is package-local: this list replaces the
-# workspace's five for ait-gui only (Spec R13 §5.12) — glibc Linux +
-# macOS on both arches. x86_64-unknown-linux-musl stays ait-only: a
-# fully static GUI is unsupportable (GPU drivers are never static).
+# workspace's six for ait-gui only (Spec R13 §5.12) — glibc Linux +
+# macOS on both arches + Windows MSVC (§5.14, Spec R16).
+# x86_64-unknown-linux-musl stays ait-only: a fully static GUI is
+# unsupportable (GPU drivers are never static).
 [package.metadata.dist]
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
 ]
 
 [dependencies]
