@@ -125,8 +125,13 @@ def binary_stale(binary: Path, root: Path) -> bool:
 
 def binary_version(root: Path) -> str:
     """`ait --version`'s version, rebuilding target/debug/ait first when
-    it is missing or stale."""
-    binary = root / "target" / "debug" / "ait"
+    it is missing or stale. Honors CARGO_TARGET_DIR — the ext4 sidestep
+    for ntfs3 link EINVAL — the same way cargo itself resolves it
+    (relative paths anchor at the build cwd, i.e. `root`)."""
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
+    if not target_dir.is_absolute():
+        target_dir = root / target_dir
+    binary = target_dir / "debug" / "ait"
     if binary_stale(binary, root):
         subprocess.run(
             ["cargo", "build", "-p", "ait"], cwd=root, check=True
