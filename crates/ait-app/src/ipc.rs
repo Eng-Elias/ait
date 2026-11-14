@@ -30,10 +30,10 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericFilePath, ListenerNonblockingMode, ListenerOptions, Name};
 
-#[cfg(unix)]
-use std::path::Path;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
+#[cfg(unix)]
+use std::path::Path;
 
 /// The listener type [`bind_socket`] returns — `interprocess`'s
 /// local-socket listener, a Unix socket on Unix and a named-pipe
@@ -284,10 +284,7 @@ mod tests {
     /// platform so the shape can't drift.
     #[test]
     fn pipe_name_builds_the_spec_shape() {
-        assert_eq!(
-            pipe_name("ait", "alice", 4242),
-            r"\\.\pipe\ait-alice-4242"
-        );
+        assert_eq!(pipe_name("ait", "alice", 4242), r"\\.\pipe\ait-alice-4242");
         assert_eq!(
             pipe_name("ait-driver", "bob", 7),
             r"\\.\pipe\ait-driver-bob-7"

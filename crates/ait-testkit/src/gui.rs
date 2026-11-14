@@ -181,7 +181,7 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)
             cwd.join("open.log").into_os_string(),
         ),
     ];
-    Ok((env, cwd.path().to_path_buf()))
+    Ok((env, cwd.to_path_buf()))
 }
 
 /// Write `dir`'s opener stubs — `xdg-open` and `open`, the names
@@ -238,6 +238,7 @@ enum Display {
     Direct,
     /// Wrap the spawn in `xvfb-run -a` — the suite's own virtual
     /// display, no focus stealing.
+    #[cfg(unix)]
     Xvfb(PathBuf),
 }
 
@@ -1194,6 +1195,7 @@ impl GuiE2e {
                 command.args(&config.args);
                 command
             }
+            #[cfg(unix)]
             Display::Xvfb(xvfb) => {
                 // `-a` picks a free display number — parallel tests
                 // never race for :99.
@@ -3876,6 +3878,7 @@ mod tests {
     /// The stub opener install: executable scripts that record the
     /// `name args…` invocation to [`STUB_LOG_ENV`]'s file — the
     /// PATH-lead trick `pinned_env` wires for every spawn.
+    #[cfg(unix)]
     #[test]
     fn opener_stub_records_invocations() {
         let dir = TempDir::fresh().unwrap();

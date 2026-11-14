@@ -1935,9 +1935,9 @@ mod tests {
     use eframe::egui::Plugin;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
-    use std::time::Duration;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     /// A `Shared` built like `GuiApp::new`'s minus the store, over a
     /// real interactive `/bin/sh` tab — the pump tests' shape.
@@ -2222,11 +2222,7 @@ mod tests {
     /// Connect a client to `server`'s endpoint — the same
     /// [`ait_app::ipc::connect`] the testkit drives.
     fn client(server: &TestDriver) -> ait_app::ipc::LocalSocketStream {
-        ait_app::ipc::connect(
-            server.socket_path().as_os_str(),
-            Duration::from_secs(10),
-        )
-        .unwrap()
+        ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(10)).unwrap()
     }
 
     /// The full socket round trip through `drain`: `key` queues a

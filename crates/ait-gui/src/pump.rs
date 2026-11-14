@@ -551,7 +551,8 @@ mod tests {
         request: &Request,
     ) -> Response {
         let mut conn =
-            ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(2)).unwrap();
+            ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(2))
+                .unwrap();
         writeln!(conn, "{}", encode_request(request)).unwrap();
         let deadline = Instant::now() + TIMEOUT;
         let mut buf = String::new();
