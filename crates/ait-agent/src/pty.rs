@@ -443,6 +443,7 @@ mod tests {
 
     /// Spec R06 / #90: no PTY exists before the first call — the
     /// first call spawns it and later calls reuse the same one.
+    #[cfg(unix)]
     #[test]
     fn spawn_is_lazy_until_the_first_write() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -464,6 +465,7 @@ mod tests {
     /// Spec R06 / #90 (us-17/18): a program parked mid-command on
     /// `read` answers the next call's input — the call↔read loop the
     /// tool exists for.
+    #[cfg(unix)]
     #[test]
     fn written_input_round_trips_through_a_repl() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -484,6 +486,7 @@ mod tests {
 
     /// Spec R06 / #90 (us-18): each call returns output produced
     /// *since the previous call* — earlier rows never repeat.
+    #[cfg(unix)]
     #[test]
     fn output_since_previous_call_is_a_delta() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -504,6 +507,7 @@ mod tests {
     /// Spec R06 / #90: the settle is bounded — a program that never
     /// goes quiet still answers inside the cap, with the flood capped
     /// to [`OUTPUT_CAP`] plus the truncation note.
+    #[cfg(unix)]
     #[test]
     fn flood_still_answers_within_the_settle_bound() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -533,6 +537,7 @@ mod tests {
     /// An `exit` ends the session: the call reports it, the dead PTY
     /// is dropped, and the next call lazily spawns a fresh one —
     /// `exit` never bricks the tool.
+    #[cfg(unix)]
     #[test]
     fn exit_reports_and_the_next_call_respawns() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -585,6 +590,7 @@ mod tests {
     /// `Materialized` guard + `0700` dir exist beside the session);
     /// `/bin/sh` plans to `None` and spawns plain — the degrade path
     /// the tool keeps working under.
+    #[cfg(unix)]
     #[test]
     fn spawn_plans_injection_for_supported_shells_only() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -605,6 +611,7 @@ mod tests {
     /// on the prompt mark + [`PROMPT_GRACE`], well under the blind
     /// quiet window — and the `read`-parked variant still waits for
     /// the mark rather than straddling a gap.
+    #[cfg(unix)]
     #[test]
     fn prompt_marks_settle_an_injected_shell() {
         if !Path::new("/bin/bash").exists() {
@@ -637,6 +644,7 @@ mod tests {
     /// policy the tab's does — `AIT_SSH_*` lands in its env so the
     /// snippet's `ssh()` wraps `write_to_pty`-driven sessions too.
     /// A policy-armed-off spawn exports `0`, never omits the var.
+    #[cfg(unix)]
     #[test]
     fn the_agent_shell_arms_the_ssh_policy() {
         if !Path::new("/bin/bash").exists() {

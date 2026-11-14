@@ -958,6 +958,7 @@ fn a_profile_without_agent_decides_ships_identical_declarations() {
 /// the interactive session's consent, so the second write runs with
 /// a `Running` card and no ask — and the bytes really reach the live
 /// PTY the first write spawned.
+#[cfg(unix)]
 #[test]
 fn write_to_pty_first_write_asks_then_the_session_runs_free() {
     // Same shell pin as the R06 round-trip test: bash's `OSC 133`
@@ -1030,6 +1031,7 @@ fn write_to_pty_first_write_asks_then_the_session_runs_free() {
 /// A deny on the first write answers that call only — the next write
 /// asks again (us-12: one refusal doesn't lock the model out), and
 /// the allow that lands then covers the rest of the task.
+#[cfg(unix)]
 #[test]
 fn a_denied_first_write_asks_again_on_the_next_call() {
     if std::path::Path::new("/bin/bash").exists() {
@@ -1217,6 +1219,7 @@ fn a_new_task_asks_on_first_write_again() {
 /// `execute_commands = "never"` refuses its call outright — card
 /// `Denied`, no approve card, floor first in the decision order —
 /// while `write_to_pty`'s first-write ask still parks.
+#[cfg(unix)]
 #[test]
 fn the_deny_floor_still_refuses_alongside_a_first_write_ask() {
     if std::path::Path::new("/bin/bash").exists() {

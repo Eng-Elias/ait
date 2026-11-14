@@ -1169,7 +1169,7 @@ fn exit_code(status: Option<&ExitStatus>) -> ExitCode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     //! Dispatch tests: `handle_event` is where the keymap's tab actions
     //! meet the [`TabManager`]. Real `/bin/sh`-class sessions keep the
