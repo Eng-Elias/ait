@@ -749,7 +749,18 @@ fn a_dropped_run_channel_is_session_lost() {
     let mut executor = UserShellExecutor::new(Box::new(bridge), CancellationToken::new());
 
     let dropper = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(20));
+        // Clear only AFTER the run registers its waiter: a fixed sleep
+        // races the registration under load, and a clear that lands
+        // first leaves a live sender — the run then waits for frames
+        // forever instead of seeing the mid-wait disconnect.
+        let deadline = std::time::Instant::now() + BOUND;
+        loop {
+            if !shares.runs.lock().expect("runs lock").is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "run never registered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         shares.runs.lock().expect("runs lock").clear();
     });
 
