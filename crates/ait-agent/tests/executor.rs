@@ -689,7 +689,7 @@ fn absent_torn_sentinel_never_resolves() {
 // local program spells.
 
 /// A `pwsh` session's `Absent` run types the PowerShell sentinel —
-// the `Write-Output`/`$LASTEXITCODE` form, not `printf` — and still
+/// the `Write-Output`/`$LASTEXITCODE` form, not `printf` — and still
 /// completes on `<marker>=<digits>` in the tail. `powershell.exe`
 /// (the 5.1 host) spells the same family.
 #[test]
