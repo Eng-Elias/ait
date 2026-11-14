@@ -1,6 +1,7 @@
 //! `ait` — AIT's TUI binary (REQUIREMENTS.md §5.2).
 //!
-//! Bare `ait` opens a full-screen terminal running `$SHELL`; `--init`
+//! Bare `ait` opens a full-screen terminal running the user's shell;
+//! `--init`
 //! writes a commented default `settings.toml` and `--print-schema` emits
 //! its JSON Schema (Spec R03, user stories 2–5). Everything the binary
 //! does is presentation + event routing (CODING_STANDARDS.md §9) — the
@@ -28,8 +29,8 @@ use ait_app::headless;
 /// headless's stdout/stderr/exit-code contract. Documentation only;
 /// the accepted forms are the parser's.
 const USAGE: &str = "NAME
-    ait — AI terminal: $SHELL in a full-screen TUI, with an agent
-    that sees and drives it
+    ait — AI terminal: your shell in a full-screen TUI, with an
+    agent that sees and drives it
 
 SYNOPSIS
     ait
@@ -44,7 +45,7 @@ SYNOPSIS
     ait --help
 
 DESCRIPTION
-    Bare ait opens a full-screen terminal running $SHELL — tabs,
+    Bare ait opens a full-screen terminal running your shell — tabs,
     command blocks, an agent sidebar. Every other form performs
     one action and exits. An unrecognized argument is a usage
     error: the message and this text land on stderr and the exit

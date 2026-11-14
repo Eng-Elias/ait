@@ -353,7 +353,8 @@ pub struct GuiSettings {
 #[serde(deny_unknown_fields)]
 pub struct TerminalSettings {
     /// Program new sessions spawn; unset falls back to `$SHELL` then
-    /// `/bin/sh` (§5.1).
+    /// the platform shell — `/bin/sh` on unix (§5.1), the `pwsh.exe` →
+    /// `powershell.exe` → `%ComSpec%` probe on Windows (§5.14).
     pub shell: Option<String>,
     /// Scrollback capacity in lines for new sessions.
     pub scrollback_lines: Option<usize>,

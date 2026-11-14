@@ -33,7 +33,7 @@ pub fn default_template() -> String {
 # platform's tools.
 
 # [terminal]
-# shell            = "/usr/bin/fish"  # program new sessions spawn (default: $SHELL)
+# shell            = "/usr/bin/fish"  # program new sessions spawn (default: $SHELL, else the platform shell)
 # scrollback_lines = 20000            # scrollback capacity for new sessions
 # osc52            = false            # let child apps write the host clipboard via OSC 52
 # shell_integration = true            # inject OSC 133 + hook events into bash/zsh/fish (default: on)

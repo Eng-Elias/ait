@@ -56,8 +56,8 @@ use crate::store::StoreHandle;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
-/// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
-/// this only guards pathological paths (e.g. `/`).
+/// resolved program is `$SHELL` or `ait-term`'s platform-shell fallback,
+/// so this only guards pathological paths (e.g. `/`).
 const FALLBACK_TITLE: &str = "sh";
 
 /// How many prompt marks a tab retains — four arrive per shell
@@ -1443,7 +1443,7 @@ impl TabManager {
     /// Spawn the manager with its first tab in the directory `ait` was
     /// launched from: `template` — the app's `[terminal]`-derived
     /// template (Spec R03), `SessionTemplate::default()` for
-    /// `$SHELL`-or-`/bin/sh` — shapes the first tab AND every
+    /// `$SHELL`-or-platform-shell — shapes the first tab AND every
     /// `new_tab` after it.
     pub fn spawn_with(size: Size, template: SessionTemplate) -> Result<Self, SpawnError> {
         let launch_cwd = std::env::current_dir().unwrap_or_default();

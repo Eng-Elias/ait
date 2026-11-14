@@ -53,7 +53,8 @@
 //! the loop breaks and exits cleanly instead of spinning on errors. The
 //! [`TerminalGuard`](crate::terminal::TerminalGuard) restores the host
 //! terminal on every way out; dropping the manager drops every
-//! `LiveSession`, which kills the children (SIGHUP → SIGKILL).
+//! `LiveSession`, which kills the children (portable-pty's kill —
+//! SIGHUP → SIGKILL on unix, terminate on Windows).
 
 use std::cell::RefCell;
 use std::io::{self, Write};

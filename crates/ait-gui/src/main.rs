@@ -17,7 +17,7 @@ use std::process::ExitCode;
 /// man-page layout (NAME/SYNOPSIS/DESCRIPTION/OPTIONS) covering
 /// the binary's whole surface, which is just these three arms.
 const USAGE: &str = "NAME
-    ait-gui — AI terminal, GUI frontend: $SHELL sessions in a
+    ait-gui — AI terminal, GUI frontend: shell sessions in a
     native desktop window
 
 SYNOPSIS
@@ -26,7 +26,7 @@ SYNOPSIS
     ait-gui --help
 
 DESCRIPTION
-    Bare ait-gui opens a native window running $SHELL — tabs,
+    Bare ait-gui opens a native window running your shell — tabs,
     command blocks, an agent sidebar — over the same session
     model ait's TUI renders. Every other form performs one
     action and exits. An unrecognized argument is a usage
