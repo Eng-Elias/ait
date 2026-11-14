@@ -58,7 +58,14 @@ use crate::suggest::InputShadow;
 /// Title shown when the resolved program has no usable basename — the
 /// resolved program is `$SHELL` or `ait-term`'s platform-shell fallback,
 /// so this only guards pathological paths (e.g. `/`).
+#[cfg(unix)]
 const FALLBACK_TITLE: &str = "sh";
+
+/// [`FALLBACK_TITLE`]'s Windows arm — the platform fallback there is
+/// `pwsh.exe`/`powershell.exe`/`cmd.exe`, and "shell" stays honest
+/// without naming one.
+#[cfg(windows)]
+const FALLBACK_TITLE: &str = "shell";
 
 /// How many prompt marks a tab retains — four arrive per shell
 /// command (A/B/C/D), so this covers ~1000 commands of history; the

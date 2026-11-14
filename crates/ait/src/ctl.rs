@@ -216,9 +216,8 @@ fn resolve_socket(
 #[cfg(windows)]
 fn resolve_socket(
     socket_env: Option<&OsStr>,
-    runtime_dir: Option<&OsStr>,
+    _runtime_dir: Option<&OsStr>,
 ) -> Result<PathBuf, String> {
-    let _ = runtime_dir;
     if let Some(path) = socket_env.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }

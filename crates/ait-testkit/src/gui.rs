@@ -291,8 +291,7 @@ fn display(headed: bool) -> Option<Display> {
 
 /// [`display`](fn@display)'s Windows arm — always direct.
 #[cfg(windows)]
-fn display(headed: bool) -> Option<Display> {
-    let _ = headed;
+fn display(_headed: bool) -> Option<Display> {
     Some(Display::Direct)
 }
 
