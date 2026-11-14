@@ -1,16 +1,19 @@
 //! The injection planner (REQUIREMENTS.md §5.5, Spec R05 / issue #71).
 //!
 //! [`plan`] maps a *resolved* program path to an [`Injection`] purely on
-//! the basename — `bash`, `zsh` and `fish` get argv/env rewrites plus the
-//! files a per-session `0700` dir must hold; every other program plans
-//! to `None` (§5.5 graceful degrade: unknown shells get nothing, the
-//! terminal keeps working).
+//! the basename — `bash`, `zsh` and `fish` match exactly, `pwsh` and
+//! `powershell` match case-insensitively with `.exe` stripped (§5.14) —
+//! each gets argv/env rewrites plus the files a per-session `0700` dir
+//! must hold; every other program plans to `None` (§5.5 graceful
+//! degrade: unknown shells get nothing, the terminal keeps working).
 //!
 //! The planner never touches the user's dotfiles: bash gets a `--rcfile`
 //! wrapper that sources `~/.bashrc` first, zsh gets a temp `ZDOTDIR`
 //! whose forwarders source the real files from the original `ZDOTDIR`
-//! (then restore it so nested zsh behaves), and fish gets
-//! `--init-command 'source <snippet>'` which runs after its own config.
+//! (then restore it so nested zsh behaves), fish gets
+//! `--init-command 'source <snippet>'` which runs after its own config,
+//! and PowerShell gets `-NoExit -Command ". '<snippet.ps1>'"` so its
+//! profiles load before the hooks install.
 //!
 //! [`Injection::materialize_in`] writes the files into a fresh `0700`
 //! session dir and returns a [`Materialized`] guard that removes it on
@@ -43,6 +46,10 @@ pub enum ShellKind {
     Zsh,
     /// fish — injected via `--init-command 'source <snippet>'`.
     Fish,
+    /// PowerShell — `pwsh` (7+) and `powershell.exe` (5.1) share the one
+    /// `pwsh.ps1` snippet, dot-sourced via `-NoExit -ExecutionPolicy
+    /// Bypass -Command` so the user's profiles load first (§5.14).
+    Pwsh,
 }
 
 /// A planned integration for one supported shell — pure data until
@@ -57,8 +64,9 @@ pub struct Injection {
 }
 
 /// Plan shell integration for a resolved program path. Returns `None`
-/// for any basename that isn't bash, zsh or fish — `sh`, `nu`, `sudo -i`
-/// and dumb remotes all degrade to a plain terminal (§5.5).
+/// for any basename that isn't bash, zsh, fish or PowerShell — `sh`,
+/// `nu`, `cmd`, `sudo -i` and dumb remotes all degrade to a plain
+/// terminal (§5.5).
 pub fn plan(resolved_program: &Path) -> Option<Injection> {
     plan_with_zdotdir(resolved_program, std::env::var_os("ZDOTDIR"))
 }
@@ -75,7 +83,7 @@ pub fn plan_with_zdotdir(
         "bash" => ShellKind::Bash,
         "zsh" => ShellKind::Zsh,
         "fish" => ShellKind::Fish,
-        _ => return None,
+        _ => powershell_kind(basename)?,
     };
     // An empty ZDOTDIR means `$HOME` in practice — record it as absent.
     let orig_zdotdir = orig_zdotdir.filter(|v| !v.is_empty());
@@ -104,6 +112,9 @@ impl Injection {
                 ("snippet.zsh", snippets::ZSH.to_owned()),
             ],
             ShellKind::Fish => vec![("snippet.fish", snippets::FISH.to_owned())],
+            // One file, no wrapper — the argv rewrite carries the
+            // profile-before-hooks ordering.
+            ShellKind::Pwsh => vec![("snippet.ps1", snippets::PWSH.to_owned())],
         }
     }
 
@@ -122,6 +133,20 @@ impl Injection {
                 OsString::from(format!(
                     "source {}",
                     fish_single_quote(&dir.join("snippet.fish").to_string_lossy())
+                )),
+            ],
+            // `-NoExit` (not `-NoProfile`): the user's profiles load
+            // first, the dot-source installs the hooks after, and the
+            // session stays interactive. `Bypass` is scoped to this one
+            // spawned process (§5.14).
+            ShellKind::Pwsh => vec![
+                OsString::from("-NoExit"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-Command"),
+                OsString::from(format!(
+                    ". {}",
+                    ps_single_quote(&dir.join("snippet.ps1").to_string_lossy())
                 )),
             ],
         }
@@ -287,6 +312,20 @@ fn zsh_forwarder(file: &str) -> String {
     )
 }
 
+/// PowerShell basename detection (§5.14): `pwsh` and `powershell` map
+/// to [`ShellKind::Pwsh`] case-insensitively with one `.exe` suffix
+/// stripped — `pwsh`, `pwsh.exe`, `PWSH.EXE` and `powershell.exe` all
+/// integrate. The unix names stay exact-case (`BASH`/`Fish` aren't
+/// real program names); `cmd` and everything else plans `None`.
+fn powershell_kind(basename: &str) -> Option<ShellKind> {
+    let lowered = basename.to_ascii_lowercase();
+    let stem = lowered.strip_suffix(".exe").unwrap_or(&lowered);
+    match stem {
+        "pwsh" | "powershell" => Some(ShellKind::Pwsh),
+        _ => None,
+    }
+}
+
 /// `0700` on unix; a no-op elsewhere (other platforms get whatever the
 /// filesystem gives `create_dir`).
 #[cfg(unix)]
@@ -317,4 +356,10 @@ fn sh_double_quote(text: &str) -> String {
 /// inside fish single quotes only `\'` and `\\` escape.
 fn fish_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Single-quote a path for interpolation into a PowerShell `-Command`
+/// string — inside PS single quotes a doubled `''` is the only escape.
+fn ps_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }

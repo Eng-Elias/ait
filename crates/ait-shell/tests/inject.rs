@@ -43,6 +43,27 @@ fn supported_basenames_plan_to_their_shell_kind() {
 }
 
 #[test]
+fn powershell_basenames_plan_to_pwsh() {
+    // `.exe`-stripped and case-insensitive (§5.14): `PWSH.EXE`
+    // integrates exactly like bare `pwsh`; both PowerShell hosts share
+    // the one `ShellKind::Pwsh`.
+    for program in [
+        "pwsh",
+        "powershell",
+        "pwsh.exe",
+        "PWSH.EXE",
+        "powershell.exe",
+        "PowerShell.EXE",
+        "C:/Program Files/PowerShell/7/pwsh.exe",
+        "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        "/usr/local/bin/pwsh",
+    ] {
+        let injection = plan(Path::new(program)).unwrap_or_else(|| panic!("{program} should plan"));
+        assert_eq!(injection.kind(), ShellKind::Pwsh, "{program}");
+    }
+}
+
+#[test]
 fn unknown_programs_plan_to_none() {
     for program in [
         "sh",
@@ -51,7 +72,12 @@ fn unknown_programs_plan_to_none() {
         "/usr/bin/nu",
         "sudo",
         "/usr/bin/sudo",
-        "pwsh",
+        // cmd and near-miss PowerShell names stay unintegrated (§5.5).
+        "cmd",
+        "cmd.exe",
+        "CMD.EXE",
+        "pwsh.bat",
+        "powershell7",
         "/usr/bin/env",
         "",
     ] {
@@ -182,6 +208,75 @@ fn fish_plan_injects_init_command_sourcing_the_snippet() {
 }
 
 #[test]
+fn pwsh_plan_dot_sources_one_snippet_after_profiles() {
+    let injection = plan(Path::new("C:/Program Files/PowerShell/7/pwsh.exe")).unwrap();
+    let dir = Path::new("/tmp/ait-test-dir");
+
+    // -NoExit (not -NoProfile): the user's profiles load first, the
+    // dot-sourced snippet installs the hooks after, and the session
+    // stays interactive. Bypass is scoped to this spawned process.
+    assert_eq!(
+        injection.args(dir),
+        vec![
+            OsString::from("-NoExit"),
+            OsString::from("-ExecutionPolicy"),
+            OsString::from("Bypass"),
+            OsString::from("-Command"),
+            OsString::from(". '/tmp/ait-test-dir/snippet.ps1'"),
+        ]
+    );
+
+    // PowerShell needs no feature flags — only the universal
+    // session-id scrub applies.
+    let env = injection.env(dir);
+    assert_eq!(env.len(), 1);
+    assert!(env_has(&env, ENV_SESSION_ID, ""));
+
+    // One file, no wrapper — the argv rewrite carries the ordering.
+    let files = injection.files(dir);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "snippet.ps1");
+
+    // The full §5.5 surface the Unix snippets emit, translated to
+    // PowerShell mechanisms.
+    let snippet = files[0].1.as_str();
+    for needle in [
+        "133;A",
+        "133;B",
+        "133;C",
+        "133;D",
+        "]7;",
+        "7700",
+        "7701",
+        "__ait_emit",
+        "__ait_run",
+        "init_shell",
+        "bootstrapped",
+        "precmd",
+        "preexec",
+        "exit_shell",
+        "Set-PSReadLineKeyHandler",
+        "GetBufferState",
+        "Register-EngineEvent",
+        "function global:prompt",
+        "LASTEXITCODE",
+    ] {
+        assert!(snippet.contains(needle), "pwsh snippet missing {needle}");
+    }
+}
+
+#[test]
+fn pwsh_command_arg_escapes_single_quotes_in_the_dir() {
+    let injection = plan(Path::new("pwsh")).unwrap();
+    let args = injection.args(Path::new("/tmp/it's dir"));
+    assert_eq!(
+        args[4],
+        OsString::from(". '/tmp/it''s dir/snippet.ps1'"),
+        "a `'` in the session dir doubles inside the PS single quote"
+    );
+}
+
+#[test]
 fn materialize_writes_files_into_a_0700_dir_and_cleans_up() {
     let base = scratch_base("materialize");
     let injection = plan(Path::new("/bin/bash")).unwrap();
@@ -268,4 +363,114 @@ fn bash_snippet_emits_marks_hooks_and_a_run_response() {
         assert!(text.contains(needle), "bash smoke missing {needle:?}");
     }
     let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// Windows legs: the PowerShell snippet executed by real `pwsh`/`powershell`.
+// Linux has no PowerShell host, so these compile and run only on Windows —
+// the windows-latest CI leg is the verifier. PSReadLine's Enter wrapper
+// (B/C marks + preexec) needs a real console; a piped session still proves
+// init_shell, prompt marks (D/A/OSC 7), the 7701 run channel and
+// exit_shell — the ConPTY e2e matrix covers the interactive rest.
+
+#[cfg(windows)]
+fn hex_of(text: &str) -> String {
+    text.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(windows)]
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len() / 2).map(|i| byte(2 * i)).collect()
+}
+
+/// The `7700;<hex>` payloads a byte stream carried, decoded in order.
+#[cfg(windows)]
+fn hook_payloads(text: &str) -> Vec<String> {
+    text.match_indices("\u{1b}]7700;")
+        .filter_map(|(at, _)| {
+            let hex: String = text[at + "\u{1b}]7700;".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect();
+            unhex(&hex).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .collect()
+}
+
+/// A shell name runnable via PATH lookup (the spawn probe's own view).
+#[cfg(windows)]
+fn on_path(name: &str) -> bool {
+    Command::new(name)
+        .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Byte-fed smoke test (§5.14): the materialized `snippet.ps1` emits
+/// `init_shell`, prompt marks (`D`, `A`, OSC 7 — the prompt function
+/// fires even for a redirected-stdin interactive session), a `7701`
+/// `__ait_run` round trip, and `exit_shell` on a clean `exit`.
+#[cfg(windows)]
+#[test]
+fn pwsh_snippet_emits_hooks_marks_and_a_run_response() {
+    for shell in ["pwsh", "powershell"] {
+        if !on_path(shell) {
+            continue; // host absent — the CI matrix supplies both
+        }
+        let base = scratch_base(&format!("{shell}-smoke"));
+        let injection = plan(Path::new(shell)).unwrap();
+        let materialized = match injection.materialize_in(&base) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        // The materialized argv already carries the full
+        // `-NoExit -ExecutionPolicy Bypass -Command ". '<dir>\snippet.ps1'"`.
+        let mut child = Command::new(shell)
+            .args(materialized.args())
+            .env("AIT_SESSION_ID", "7")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{shell} must spawn: {e}"));
+        let run = format!("__ait_run 1 {}\n", hex_of("Write-Output smoke"));
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(format!("Write-Output hi\n{run}exit\n").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let mut bytes = output.stdout;
+        bytes.extend_from_slice(&output.stderr);
+        let text = String::from_utf8_lossy(&bytes);
+
+        for needle in [
+            "\u{1b}]133;A",
+            "\u{1b}]133;D",
+            "\u{1b}]7;",
+            "\u{1b}]7701;A\u{7}",
+            "\u{1b}]7701;R;",
+            "\u{1b}]7701;B\u{7}",
+            "736d6f6b65", // hex("smoke") inside the R-frame payload
+        ] {
+            assert!(
+                text.contains(needle),
+                "{shell} smoke missing {needle:?}\n{text}"
+            );
+        }
+        let payloads = hook_payloads(&text);
+        for hook in ["init_shell", "exit_shell"] {
+            assert!(
+                payloads.iter().any(|p| p.contains(&format!("\"{hook}\""))),
+                "{shell} emitted no {hook} hook: {payloads:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

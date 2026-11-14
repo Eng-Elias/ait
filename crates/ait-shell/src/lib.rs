@@ -1,7 +1,8 @@
 //! `ait-shell` — AIT's shell-integration crate (REQUIREMENTS.md §5.5).
 //!
-//! Owns everything that makes the terminal *know what ran*: the bash/zsh/
-//! fish rc snippets, the injection planner, and the pure codec for the
+//! Owns everything that makes the terminal *know what ran*: the
+//! bash/zsh/fish/PowerShell rc snippets, the injection planner, and the
+//! pure codec for the
 //! AIT-private OSC 7700-series channel. `ait-term` stays transport-agnostic —
 //! it surfaces every unrecognized OSC as `SessionEvent::Private{code,params}`;
 //! [`decode`] here is the single place those raw bytes gain protocol meaning:
