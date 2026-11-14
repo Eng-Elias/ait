@@ -166,7 +166,7 @@ fn choose(
 /// Where `ait ctl` connects: `AIT_CTL_SOCKET` when set (a spawned
 /// session's own instance — on Windows it carries the
 /// `\\.\pipe\ait-<user>-<pid>` name), else the platform's discovery
-/// rule for the live instance's endpoint — zero is "no running ait
+/// rule for the live instance's socket — zero is "no running ait
 /// instance", several an error listing each candidate (us-32).
 ///
 /// On Unix that's the single LIVE `*.sock` under the resolved ctl
@@ -257,13 +257,13 @@ fn pick_socket(mut sockets: Vec<PathBuf>) -> Result<PathBuf, String> {
     }
 }
 
-/// One request → one response line on `endpoint` (us-41): connect,
+/// One request → one response line on `socket` (us-41): connect,
 /// write the JSON line, read to the response's newline.
 /// [`CLIENT_TIMEOUT`] — armed by [`ipc::connect`] — bounds the wait
 /// so a wedged instance fails rather than hangs.
-fn round_trip(endpoint: &Path, request: &Request) -> Result<Response, String> {
-    let mut stream = ipc::connect(endpoint.as_os_str(), CLIENT_TIMEOUT)
-        .map_err(|e| format!("can't reach {}: {e}", endpoint.display()))?;
+fn round_trip(socket: &Path, request: &Request) -> Result<Response, String> {
+    let mut stream = ipc::connect(socket.as_os_str(), CLIENT_TIMEOUT)
+        .map_err(|e| format!("can't reach {}: {e}", socket.display()))?;
     let mut line = encode_request(request);
     line.push('\n');
     stream

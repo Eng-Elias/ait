@@ -293,7 +293,7 @@ fn which_tab(named: bool, tab: &Tab, what: &str) -> String {
 // The transport half — [`Pending`]'s buffered request/flush
 // lifecycle, the accept loop, the listener bind — lives in
 // [`crate::ipc`] (Spec R16 §5.14), shared verbatim with `ait-gui`'s
-// test-driver socket; what lives here is the endpoint choice and the
+// test-driver socket; what lives here is the socket-name choice and the
 // verb set it serves.
 // ------------------------------------------------------------------
 
@@ -331,8 +331,8 @@ pub fn socket_error_text(error: impl std::fmt::Display) -> String {
 pub struct CtlServer {
     /// The nonblocking listener.
     listener: LocalSocketListener,
-    /// The bound endpoint — the socket path on Unix, the pipe path on
-    /// Windows; what `AIT_CTL_SOCKET` exports. Unlinked on [`Drop`]
+    /// The bound socket name — the socket path on Unix, the pipe path
+    /// on Windows; what `AIT_CTL_SOCKET` exports. Unlinked on [`Drop`]
     /// on Unix (a pipe name dies with the listener — nothing to do).
     socket: PathBuf,
     /// The socket's parent dir — removed on [`Drop`] when it's empty.
@@ -343,7 +343,7 @@ pub struct CtlServer {
 }
 
 impl CtlServer {
-    /// Bind this instance's endpoint: `<pid>.sock` under the resolved
+    /// Bind this instance's socket: `<pid>.sock` under the resolved
     /// ctl dir on Unix — the dir created `0700`, the socket chmodded
     /// `0600`, an existing file unlinked first (a crashed ait's stale
     /// socket is reclaimed, never a bind failure) — or
@@ -397,7 +397,7 @@ impl CtlServer {
         })
     }
 
-    /// The bound endpoint — the socket path on Unix, the
+    /// The bound socket name — the socket path on Unix, the
     /// `\\.\pipe\…` path on Windows; what `AIT_CTL_SOCKET` exports.
     pub fn socket_path(&self) -> &Path {
         &self.socket

@@ -4,7 +4,7 @@
 //! The whole module compiles only under the off-by-default
 //! `test-driver` cargo feature, so release artifacts carry none of
 //! this code, and even a `test-driver` build binds nothing unless
-//! [`ENV_DRIVER_SOCKET`] names the endpoint — a socket path on Unix,
+//! [`ENV_DRIVER_SOCKET`] names the socket — a socket path on Unix,
 //! a `\\.\pipe\…` name on Windows.
 //!
 //! The wire follows the ctl socket's conventions exactly: a
@@ -1817,13 +1817,13 @@ fn encode_response(response: &Response) -> String {
 }
 
 /// The test-driver socket: a nonblocking local-socket listener at
-/// the endpoint [`ENV_DRIVER_SOCKET`] named — a socket path on Unix,
+/// the socket name [`ENV_DRIVER_SOCKET`] named — a socket path on Unix,
 /// a `\\.\pipe\…` name on Windows — drained in the pump loop beside
 /// ctl.
 pub struct TestDriver {
     /// The nonblocking listener.
     listener: LocalSocketListener,
-    /// The bound endpoint — unlinked on [`Drop`] on Unix (a pipe
+    /// The bound socket name — unlinked on [`Drop`] on Unix (a pipe
     /// name dies with the listener — nothing to unlink there).
     socket: PathBuf,
     /// Accepted connections mid-request.
@@ -1831,7 +1831,7 @@ pub struct TestDriver {
 }
 
 impl TestDriver {
-    /// Bind at the endpoint [`ENV_DRIVER_SOCKET`] names — `None` when
+    /// Bind at the socket name [`ENV_DRIVER_SOCKET`] names — `None` when
     /// the variable is unset or empty (ordinary runs never reach this
     /// code; only harness-spawned instances expose a socket).
     pub fn bind_env() -> Option<io::Result<Self>> {
@@ -1842,7 +1842,7 @@ impl TestDriver {
         Some(Self::bind(PathBuf::from(path)))
     }
 
-    /// Bind at an explicit endpoint — [`bind_env`](Self::bind_env)'s
+    /// Bind at an explicit socket name — [`bind_env`](Self::bind_env)'s
     /// delegate and the test seam. On Unix the parent dir is created
     /// `0700`, the socket chmodded `0600`, and an existing file
     /// unlinked first — a crashed run's stale socket is reclaimed,
@@ -1865,8 +1865,8 @@ impl TestDriver {
         })
     }
 
-    /// The bound endpoint — the tests' seam; production callers
-    /// already know the endpoint (they chose it).
+    /// The bound socket name — the tests' seam; production callers
+    /// already know the name (they chose it).
     #[allow(dead_code)]
     pub fn socket_path(&self) -> &Path {
         &self.socket
@@ -2201,10 +2201,10 @@ mod tests {
         }
     }
 
-    /// The endpoint a test server binds — a tempdir socket path on
+    /// The socket name a test server binds — a tempdir socket path on
     /// Unix (the returned `TempDir` must outlive the server), a
     /// per-process pipe name on Windows.
-    fn driver_endpoint() -> (Option<tempfile::TempDir>, PathBuf) {
+    fn driver_socket() -> (Option<tempfile::TempDir>, PathBuf) {
         #[cfg(unix)]
         {
             let dir = tempfile::tempdir().unwrap();
@@ -2222,7 +2222,7 @@ mod tests {
         }
     }
 
-    /// Connect a client to `server`'s endpoint — the same
+    /// Connect a client to `server`'s socket — the same
     /// [`ait_app::ipc::connect`] the testkit drives.
     fn client(server: &TestDriver) -> ait_app::ipc::LocalSocketStream {
         ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(10)).unwrap()
@@ -2235,7 +2235,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drain_services_requests_over_the_socket() {
-        let (_dir, socket) = driver_endpoint();
+        let (_dir, socket) = driver_socket();
         let mut server = TestDriver::bind(socket).unwrap();
         // The Unix half of the bind contract — `0600` is the mode
         // bit; Windows's same-user ACLs hold the same line.

@@ -6,10 +6,11 @@
 //! connections buffered across drain passes so a slow client never
 //! wedges the UI.
 //!
-//! An **endpoint** is the name a socket binds and clients connect
-//! to: a filesystem path on Unix (`<dir>/<pid>.sock`, socket `0600`
-//! under a `0700` dir, a stale file reclaimed on bind and unlinked
-//! on clean exit) or a `\\.\pipe\…` named-pipe path on Windows —
+//! A **socket name** is the bind target a listener takes and
+//! clients connect to: a filesystem path on Unix
+//! (`<dir>/<pid>.sock`, socket `0600` under a `0700` dir, a stale
+//! file reclaimed on bind and unlinked on clean exit) or a
+//! `\\.\pipe\…` named-pipe path on Windows —
 //! `\\.\pipe\ait-<user>-<pid>` for the control socket — whose
 //! default ACLs already scope it to the same user and which vanishes
 //! with its last handle, so nothing needs unlinking there.
@@ -44,30 +45,30 @@ pub use interprocess::local_socket::Listener as LocalSocketListener;
 /// the listener's client side.
 pub use interprocess::local_socket::Stream as LocalSocketStream;
 
-/// `endpoint` → its `interprocess` name. On Unix every endpoint is
+/// `socket` → its `interprocess` name. On Unix every socket name is
 /// a filesystem path; on Windows a `\\HOST\pipe\…` path maps
 /// verbatim (the form `socket_path`/the env vars carry) and anything
 /// else is a bare name under `\\.\pipe\`. The one interpretation
 /// [`bind_socket`] and [`connect`] share — the testkit harness
 /// mirrors it across the crate boundary.
-fn local_name(endpoint: &OsStr) -> io::Result<Name<'_>> {
+fn local_name(socket: &OsStr) -> io::Result<Name<'_>> {
     #[cfg(unix)]
     {
-        endpoint.to_fs_name::<GenericFilePath>()
+        socket.to_fs_name::<GenericFilePath>()
     }
     #[cfg(windows)]
     {
         // `\\.\pipe\…` (or `\\HOST\pipe\…`) is a pipe path already —
         // anything else is a bare pipe name.
-        match endpoint.as_encoded_bytes().starts_with(b"\\\\") {
-            true => endpoint.to_fs_name::<GenericFilePath>(),
-            false => endpoint.to_ns_name::<GenericNamespaced>(),
+        match socket.as_encoded_bytes().starts_with(b"\\\\") {
+            true => socket.to_fs_name::<GenericFilePath>(),
+            false => socket.to_ns_name::<GenericNamespaced>(),
         }
     }
 }
 
-/// `\\.\pipe\<prefix>-<user>-<pid>` — the named-pipe path an
-/// endpoint takes on Windows: the `<user>` token scopes it to the
+/// `\\.\pipe\<prefix>-<user>-<pid>` — the named-pipe path a
+/// socket name takes on Windows: the `<user>` token scopes it to the
 /// account the way the Unix `ait-<uid>` runtime dirs do, `<pid>` to
 /// the instance the way `<pid>.sock` does. Pure so its shape is
 /// pinned by tests on every platform — Windows is the only
@@ -103,30 +104,30 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 /// at the path is reclaimed (a crashed predecessor's), the socket
 /// gets its `0600`, and the listener plus its accepted streams are
 /// nonblocking so accept/read/write never stall a drain pass. On
-/// Windows `endpoint` binds a `\\.\pipe\…` named pipe under the
+/// Windows `socket` binds a `\\.\pipe\…` named pipe under the
 /// default (same-user) ACLs — there is no file to unlink or chmod.
-pub fn bind_socket(endpoint: &OsStr) -> io::Result<LocalSocketListener> {
+pub fn bind_socket(socket: &OsStr) -> io::Result<LocalSocketListener> {
     #[cfg(unix)]
     {
-        let path = Path::new(endpoint);
+        let path = Path::new(socket);
         if path.exists() {
             std::fs::remove_file(path)?;
         }
     }
     let listener = ListenerOptions::new()
-        .name(local_name(endpoint)?)
+        .name(local_name(socket)?)
         .nonblocking(ListenerNonblockingMode::Both)
         .create_sync()?;
     #[cfg(unix)]
-    set_mode(Path::new(endpoint), 0o600)?;
+    set_mode(Path::new(socket), 0o600)?;
     Ok(listener)
 }
 
-/// The client half [`bind_socket`] answers: connect to `endpoint`
+/// The client half [`bind_socket`] answers: connect to `socket`
 /// and arm `timeout` on reads and writes — one request's whole
 /// round trip lives inside it.
-pub fn connect(endpoint: &OsStr, timeout: Duration) -> io::Result<LocalSocketStream> {
-    let stream = LocalSocketStream::connect(local_name(endpoint)?)?;
+pub fn connect(socket: &OsStr, timeout: Duration) -> io::Result<LocalSocketStream> {
+    let stream = LocalSocketStream::connect(local_name(socket)?)?;
     stream.set_recv_timeout(Some(timeout))?;
     stream.set_send_timeout(Some(timeout))?;
     Ok(stream)
@@ -291,12 +292,12 @@ mod tests {
         );
     }
 
-    /// On Unix an endpoint is a filesystem path verbatim: the bind
+    /// On Unix a socket name is a filesystem path verbatim: the bind
     /// lands the socket file at `0600` and [`connect`] reaches it —
     /// the same behavior `UnixListener` used to give.
     #[cfg(unix)]
     #[test]
-    fn unix_endpoint_binds_and_connects_at_its_path() {
+    fn unix_socket_binds_and_connects_at_its_path() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("x.sock");

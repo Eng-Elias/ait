@@ -153,7 +153,7 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)
 /// The Windows arm of [`pinned_env`]: there is no XDG runtime dir or
 /// `sh`-script opener stub on Windows — the pins that still matter
 /// are the profile/config vars inside the throwaway dir and the
-/// driver's `\\.\pipe\` endpoint (which the app binds verbatim). The
+/// driver's `\\.\pipe\` socket name (which the app binds verbatim). The
 /// returned "runtime dir" is the cwd itself: the ctl client needs no
 /// dir on Windows — pipe names carry user+pid — but
 /// [`GuiE2e::runtime_dir`] still hands callers a value.
@@ -207,7 +207,7 @@ fn install_opener_stubs(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The endpoint this spawn hands [`ENV_DRIVER_SOCKET`] — a
+/// The socket name this spawn hands [`ENV_DRIVER_SOCKET`] — a
 /// `driver.sock` in the throwaway dir on Unix, a per-spawn pipe name
 /// on Windows (`ait-driver-<user>-<pid>-<seq>` — the same shape the
 /// control socket's `ait-<user>-<pid>` takes, plus a counter so
@@ -1308,7 +1308,7 @@ impl GuiE2e {
 
     /// One socket round trip — connect, send the line, read the
     /// response line (the server drops the stream after its reply,
-    /// which terminates the read). The endpoint maps the way
+    /// which terminates the read). The socket name maps the way
     /// `ait_app::ipc`'s `local_name` reads it: a filesystem-path name
     /// — the socket path on Unix, the `\\.\pipe\…` path on Windows.
     fn request(&self, request: &Request<'_>) -> Result<Response, String> {
