@@ -6,6 +6,7 @@
 # reflects the chords' dispatch — `expect_pane "none"` on that state
 # is the hold assertion.
 feature = "panes"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

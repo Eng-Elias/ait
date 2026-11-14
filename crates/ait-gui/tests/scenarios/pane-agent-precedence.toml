@@ -6,6 +6,7 @@
 # printf probe — a stray letter turns `printf` into `xprintf` and the
 # marker never lands).
 feature = "panes"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

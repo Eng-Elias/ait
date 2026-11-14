@@ -5,6 +5,7 @@
 # `file://` pages keep every assert exact and offline — their nav
 # reports echo verbatim and dedupe against the current page.
 feature = "browser"
+platforms = ["unix"]
 binary = "web"
 
 [[steps]]

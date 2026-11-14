@@ -1,6 +1,7 @@
 # Spec R02 story 9: `Ctrl+PageDown`/`Ctrl+PageUp` cycle tabs and wrap
 # around. Each tab's own marker proves which one is active.
 feature = "tabs"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

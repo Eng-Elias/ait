@@ -1,6 +1,7 @@
 # Spec R02 stories 18-20, 23: `Alt+Q` quits ait cleanly with code 0
 # from any tab count.
 feature = "lifecycle"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

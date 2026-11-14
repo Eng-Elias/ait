@@ -5,6 +5,7 @@
 # and the detection route lands: a URL opens the browser pane, a
 # path the explorer (Spec R14 §5.13 us-25/26).
 feature = "detect"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

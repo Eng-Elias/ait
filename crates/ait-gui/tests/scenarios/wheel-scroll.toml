@@ -3,6 +3,7 @@
 # wheel remainder instead of truncating to zero — the R13 dead-zone.
 # `scroll_offset > 0` is also exactly the `⤓` pill's paint condition.
 feature = "scroll"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

@@ -4,6 +4,7 @@
 # `tests/recordings/agent-tab/` (authored assets, standard 10); a
 # screen that stops matching fails as drift.
 feature = "tabs"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

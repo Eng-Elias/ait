@@ -1,0 +1,53 @@
+# Spec R16 §5.14 (ticket R16-T8): `SHELL=pwsh` resolves to PowerShell 7
+# and the injected `-NoExit -ExecutionPolicy Bypass -Command` snippet
+# goes live under ConPTY — OSC 133 marks + 7700 hooks flow, blocks
+# assemble, and the status line's `✓/✗ <code> · <dur>` segment reports
+# each finished block. The Windows PowerShell 5.1 leg is
+# shell-integration-winps.toml; the no-integration leg is
+# shell-degrade-cmd.toml; the posix half is shell-integration-bash.toml.
+#
+# The snippet's prompt function renders `PS <cwd>> ` — a line STARTING
+# `PS ` and ENDING `>` is exactly a fresh, empty prompt (rows are
+# trim_end'ed; a prompt carrying typed text ends in the command).
+# Every command is fenced by two waits: its own ECHO (until the typed
+# text renders, the previous bare prompt still satisfies `^PS …>$` and
+# a fresh-prompt wait could pass early), then a fresh bare prompt —
+# which renders only after the command finished.
+feature = "shell-integration"
+platforms = ["windows"]
+size = [80, 24]
+env = { SHELL = "pwsh" }
+
+[[steps]]
+wait_text = "1:pwsh"
+
+[[steps]]
+wait_text = "· pwsh · — · running"
+
+[[steps]]
+expect_regex = "(?m)^PS [^\\n]*>$"
+
+[[steps]]
+text = "echo R16PWSH\n"
+
+[[steps]]
+expect_regex = "echo R16PWSH"
+
+# `echo` is PowerShell's Write-Output alias — the block closes ok and
+# the status line's `✓ 0 · <dur>` segment proves the marks flowed.
+[[steps]]
+expect_regex = "✓ 0 · \\d+\\.\\ds · running"
+
+[[steps]]
+expect_regex = "(?m)^PS [^\\n]*>$"
+
+# A native command failing exits sets $LASTEXITCODE — the snippet's D
+# mark carries it, so `✗ 3 · <dur>` proves the run actually executed.
+[[steps]]
+text = "cmd /c exit 3\n"
+
+[[steps]]
+expect_regex = "cmd /c exit 3"
+
+[[steps]]
+expect_regex = "✗ 3 · \\d+\\.\\ds · running"

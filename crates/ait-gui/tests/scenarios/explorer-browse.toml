@@ -10,6 +10,7 @@
 # `platform_opener`, whose `xdg-open`/`open` shadow records instead
 # of launching (the log itself is a code-first test's assert).
 feature = "explorer-browse"
+platforms = ["unix"]
 env = { VISUAL = "", EDITOR = "", SHELL = "/bin/bash" }
 
 [[steps]]

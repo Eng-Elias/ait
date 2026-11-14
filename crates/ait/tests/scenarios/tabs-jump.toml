@@ -1,6 +1,7 @@
 # Spec R02 story 9: `Alt+N` jumps straight to tab N; an out-of-range
 # digit is inert.
 feature = "tabs"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

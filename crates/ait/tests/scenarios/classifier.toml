@@ -12,6 +12,7 @@
 # first word is a builtin, so the line submits untouched and its own
 # output renders.
 feature = "classifier"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]
