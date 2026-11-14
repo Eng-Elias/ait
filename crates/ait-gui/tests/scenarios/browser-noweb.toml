@@ -1,0 +1,51 @@
+# Spec R15-T5 — the no-web binary's external surface (Spec R14
+# §5.13): a `--no-default-features`+`test-driver` build has no
+# webview runtime, so `Ctrl+Shift+B` shows the fallback — the reason
+# line, the full chrome, and an Enter that still navigates via the
+# system browser (the stub opener on `PATH`). `webview = false` is
+# the never-a-blank-rect half: no body rect is ever staged.
+#
+# binary = "noweb" declares the feature-off leg: the
+# `--no-default-features`+`test-driver` build — needing no webkit
+# packages — or `AIT_GUI_E2E_BIN_NOWEB`.
+feature = "browser"
+binary = "noweb"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+key = "Ctrl+Shift+B"
+
+[[steps]]
+expect_pane = "browser"
+
+# The verdict names why — `WhyExternal::FeatureOff`'s line is the
+# body's first painted line — and nothing stages a webview rect.
+[[steps]]
+expect_browser = { surface = "external", reason = "no webview runtime", webview = false }
+
+# The chrome survives whole: the external-open affordance paints and
+# registers even before a page exists.
+[[steps]]
+expect_hit = "browser.external"
+
+# Enter still navigates — the drain folds `Navigate` into
+# `OpenExternal` under any non-embedded verdict, and the stub opener
+# records the hand-off.
+[[steps]]
+text = "example.com"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_open = "https://example.com"
+
+# History and the entry still track — the pane's model is identical
+# feature-off; `loads` stays flat (the system browser fetched).
+[[steps]]
+expect_browser = { entry = "https://example.com", history = 1, loads = 0, webview = false }
+
+[[steps]]
+quit = true

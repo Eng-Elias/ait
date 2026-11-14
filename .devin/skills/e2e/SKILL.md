@@ -61,6 +61,28 @@ cargo test -p ait --test scenarios <name>       # filter by scenario
 
 Watch it work: `AIT_E2E_HEADED=1 AIT_E2E_SLOWMO=400 … -- --test-threads=1`. Interactive driving: `cargo run -p ait-testkit --example drive`. Failures dump `screen.txt` + `pty-tail.bin` + `actions.log` under `target/e2e-failures/<test>/` — read those first.
 
+## Recipe: the GUI (`ait-gui`, Spec R15 / ADR-0019)
+
+Same harness, different seam: `GuiE2e` spawns the real `ait-gui` binary and talks to its **test-driver socket** — real `egui::Event` injection for keys/text/paste/wheel/resize, `RawInput` for pointer (the only seam upstream of egui's hit-test), and a versioned JSON `dump` of everything paint draws as the assertion surface. Scenarios are TOML under `crates/ait-gui/tests/scenarios/` (same `feature` + `[[steps]]` shape); code-first tests live in `crates/ait-gui/tests/scenarios.rs`.
+
+```bash
+cargo build -p ait-gui --features test-driver                     # required — release builds have no socket
+cargo test -p ait-gui --features test-driver --test scenarios     # the GUI suite (skips loudly without a display)
+cargo test -p ait-gui --features test-driver --test scenarios <name>
+AIT_GUI_E2E_HEADED=1 cargo test -p ait-gui --features test-driver --test scenarios  # on your DISPLAY
+AIT_GUI_E2E_HEADED=1 AIT_GUI_E2E_SLOWMO=400 …                                     # + pacing to watch each step
+AIT_GUI_E2E_ONLY=<stem> … -- --test-threads=1                                     # one scenario / one window at a time
+```
+
+- **Two binary legs**: `binary = "web"` (embedded webview) vs `"noweb"` (`--no-default-features` build, no webkit) — resolved via `AIT_GUI_E2E_BIN_WEB`/`_NOWEB`, else the cargo-built binary; unresolvable legs skip loudly.
+- **Assert the dump, not pixels**: `expect_text`/`expect_pane`/`expect_scroll`/`expect_explorer`/`expect_browser`/`expect_detect`/`expect_status`/`expect_toast`/`expect_tabs`/`expect_suggesting`/`expect_find`/`expect_gate`/`expect_selection`/`expect_hit`. `expect_hit` gates the hit registry — click targets register a frame after model state; use it before `click`.
+- **Click by name**: `click = "pill.scroll_bottom"` / `pointer = {event, target|x, y}` resolves the hit registry (`panes.button`, `gate.approve`, `explorer.entry.<name>`, `detect.url.<u>`); raw `x`/`y` is the escape hatch. `scroll` needs `raw = true` + a `target`/`x`/`y` hover for surfaces that own their paint (explorer listing).
+- **`agent = {event="approve", …}`** stages a real gate card; recording `xdg-open`/`open` stubs sit first on every spawned app's `PATH` (always on — `expect_open` reads their log) — `ext ↗` and editor spawns without real apps.
+- **`wait_dump = true`** is the input barrier: the dump's `input_done` catching `input_seq` proves every accepted request folded a completed frame — use it before *negative* assertions ("nothing opened/changed"), where a plain `dump` could answer pre-frame.
+- **Failures**: `target/e2e-failures/<test>/` holds `dump.json` + `stderr.txt` + `actions.log` + `screenshot.png` (real painted frame — evidence only, never a diff).
+- **Canary only**: `AIT_GUI_E2E_XTEST=1` runs the xdotool/Xvfb winit canary — non-authoritative, proves winit delivers real input, never a gate.
+- Needs `xvfb` (or `DISPLAY`), `mesa-vulkan-drivers` (lavapipe; pin `WGPU_ADAPTER_NAME=llvmpipe`+`WGPU_BACKEND=vulkan`), and the webkit2gtk-4.1 stack for the `web` leg.
+
 ## Rules
 
 - Bounded waits only (`wait_*`, `expect_*`) — never fixed sleeps in tests.

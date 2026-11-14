@@ -1,0 +1,39 @@
+# Spec R15-T1 — the harness spine's end-to-end proof: the injected
+# `Ctrl+Shift+E` chord travels the app's real dispatch and opens the
+# explorer pane (Spec R14 §5.13), and the dump exposes the pane
+# selection plus the grid's visible text.
+feature = "panes"
+
+# The tab shell's prompt — pinned `PS1 = "$ "` — must be on the grid
+# before input lands.
+[[steps]]
+wait_text = "$"
+
+# Type + run a marker command while the terminal owns focus — the
+# dump's grid rows then carry user-visible text to assert on. The
+# probe is output-only (std.15): `EXPLORER-MARKER` exists only in
+# printf's output, never in the typed line's echo.
+[[steps]]
+text = "printf 'EXPLORER-%s\\n' MARKER"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "EXPLORER-MARKER"
+
+# The chord: a `key` verb through the test-driver socket — injected at
+# frame start, resolved by the production pane-chord arm.
+[[steps]]
+key = "Ctrl+Shift+E"
+
+# The dump's pane selection shows the explorer.
+[[steps]]
+expect_pane = "explorer"
+
+# The grid still shows the session text under the open pane.
+[[steps]]
+expect_text = "EXPLORER-MARKER"
+
+[[steps]]
+quit = true

@@ -129,6 +129,95 @@ pub struct Shared {
     /// The `!Send` wry handle itself is `GuiApp`'s, never this
     /// struct's (the pump's drain thread shares `Shared`).
     pub browser: BrowserState,
+    /// Test-driver input queued for the next frame's dispatch (Spec
+    /// R15): the pump's test-socket drain pushes translated verbs here
+    /// and `dispatch_events` prepends them to the frame's native
+    /// events. Feature-gated — a default build carries no injection
+    /// path.
+    #[cfg(feature = "test-driver")]
+    pub injected: std::collections::VecDeque<crate::test_driver::Injected>,
+    /// The hit-target registry (Spec R15-T3): the paint pass's
+    /// name → rect map a `pointer`/`click` `target` resolves against
+    /// and the `dump` reports. Always present so the paint sites stay
+    /// unconditional — the map inside only exists (and only fills)
+    /// in `test-driver` builds.
+    pub hits: HitTargets,
+    /// The Ctrl-hover affordance's last-painted resolution (Spec
+    /// R15-T4): `paint_grid_pane` records the plain-Ctrl gate and
+    /// the detected token so `dump` answers "what would Ctrl+click
+    /// do" without driving one. Feature-gated like `injected` — a
+    /// release build has no socket to read it.
+    #[cfg(feature = "test-driver")]
+    pub detect_hover: crate::test_driver::DetectHover,
+    /// The cell metrics `paint_grid_pane` last laid out (Spec
+    /// R15-T4) — the dump's `grid.cell`, so a scenario turns a
+    /// `(row, column)` into a pointer position without guessing.
+    /// Feature-gated like `detect_hover`.
+    #[cfg(feature = "test-driver")]
+    pub cell_metrics: Option<(f32, f32)>,
+    /// The `wait_dump` barrier's queued half (Spec R15): `dispatch`
+    /// bumps this for every request that queues frame-folded input
+    /// — `dump`'s `input_seq` thus counts everything serviced before
+    /// it. Feature-gated like `injected`.
+    #[cfg(feature = "test-driver")]
+    pub input_seq: u64,
+    /// The `wait_dump` barrier's delivered half: `ui` sets this to
+    /// `input_seq` at a frame's end once `injected` is drained AND
+    /// the pointer plugin's queue emptied — `input_done >=
+    /// input_seq` in a dump IS "every accepted request folded
+    /// through a completed frame", the barrier negative assertions
+    /// wait on instead of a guessed sleep.
+    #[cfg(feature = "test-driver")]
+    pub input_done: u64,
+}
+
+/// The test-driver's hit-target registry (Spec R15-T3) — semantic
+/// name → the rect its `interact` owned on the last painted frame.
+/// `register`/`clear` are inline no-ops outside `test-driver` builds
+/// (no map exists to populate), so a production build pays nothing
+/// for the names the paint pass carries anyway.
+#[derive(Debug, Default)]
+pub struct HitTargets {
+    /// The names registered so far this frame — the dump's `hits`
+    /// and `target` resolution read exactly this.
+    #[cfg(feature = "test-driver")]
+    map: std::collections::BTreeMap<String, Rect>,
+}
+
+impl HitTargets {
+    /// Register `name` at `rect` — the `interact` site owns both, so
+    /// a name's rect IS the hit-tested rect. `name` is a thunk: only
+    /// `test-driver` builds have a map to fill, so release builds
+    /// never run the `format!`/clone the name costs.
+    #[inline]
+    pub fn register(&mut self, name: impl FnOnce() -> String, rect: Rect) {
+        #[cfg(feature = "test-driver")]
+        self.map.insert(name(), rect);
+        #[cfg(not(feature = "test-driver"))]
+        let _ = (name, rect);
+    }
+
+    /// Forget the last frame's targets — `ui` clears at paint start
+    /// so `hits` is always exactly one frame's registration.
+    #[inline]
+    pub fn clear(&mut self) {
+        #[cfg(feature = "test-driver")]
+        self.map.clear();
+    }
+
+    /// `name` → its last-painted rect — the `target` resolution seam
+    /// (test-driver only).
+    #[cfg(feature = "test-driver")]
+    pub fn get(&self, name: &str) -> Option<Rect> {
+        self.map.get(name).copied()
+    }
+
+    /// The registry's entries — the dump's `hits` field (test-driver
+    /// only).
+    #[cfg(feature = "test-driver")]
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Rect)> {
+        self.map.iter()
+    }
 }
 
 impl Shared {
@@ -152,14 +241,14 @@ impl Shared {
     /// Whether the active tab's agent panel claims the region — the
     /// precedence input `PaneHost` resolves against; the dispatch,
     /// the paint pass and the chord toggle all ask the same question.
-    fn agent_claiming(&self) -> bool {
+    pub(crate) fn agent_claiming(&self) -> bool {
         self.tabs.active().is_some_and(|tab| tab.agent_panel_open())
     }
 
     /// What the side region shows on the active tab right now — the
     /// agent panel's per-tab claim first, else the app-global aux
     /// selection, else the region is closed.
-    fn shown_pane(&self) -> Option<SidePane> {
+    pub(crate) fn shown_pane(&self) -> Option<SidePane> {
         self.panes.visible(self.agent_claiming())
     }
 }
@@ -216,6 +305,14 @@ pub struct GuiApp {
     /// `exists()` checks run once per hover position+content, not
     /// once per frame while Ctrl is held (§6).
     detect_cache: detect::DetectCache,
+    /// The test-driver's memoized detection-token scan (Spec R15-T3)
+    /// — the `detect.*` hit names → cell rects. Keyed on the whole
+    /// input (tab, scroll, pane, cell, remote flag, every visible
+    /// row's text) so the fs probes inside `detect::tokens` run only
+    /// on a real change — the same §6 guard `detect_cache` applies
+    /// to the Ctrl+hover, applied to the scan.
+    #[cfg(feature = "test-driver")]
+    detect_hits: Option<DetectHitScan>,
     /// The browser pane's webview slot (Spec R14 §5.13, R14-T3): the
     /// `!Send` wry child once the probe embeds it — frontend-local
     /// like the galley cache, since `Shared` is touched by the pump's
@@ -271,6 +368,16 @@ impl GuiApp {
             Ok(server) => (Some(server), None),
             Err(error) => (None, Some(ctl::socket_error_text(error))),
         };
+        // The test-driver socket (Spec R15): bound beside ctl only
+        // when the feature is compiled AND the env var names its
+        // path — a bind failure degrades to a boot toast exactly
+        // like ctl's.
+        #[cfg(feature = "test-driver")]
+        let (driver, driver_error) = match crate::test_driver::TestDriver::bind_env() {
+            Some(Ok(server)) => (Some(server), None),
+            Some(Err(error)) => (None, Some(crate::test_driver::socket_error_text(error))),
+            None => (None, None),
+        };
         let mut template = config::session_template(config.settings());
         template.ctl_socket = ctl
             .as_ref()
@@ -286,6 +393,8 @@ impl GuiApp {
                 load_error.map(|text| config::error_text(&text)),
                 store_error.map(StoreHandle::unavailable_text),
                 ctl_error,
+                #[cfg(feature = "test-driver")]
+                driver_error,
             ]
             .into_iter()
             .flatten()
@@ -311,10 +420,34 @@ impl GuiApp {
             panes: PaneHost::default(),
             explorer: ExplorerState::default(),
             browser: BrowserState::default(),
+            #[cfg(feature = "test-driver")]
+            injected: std::collections::VecDeque::new(),
+            hits: HitTargets::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hover: crate::test_driver::DetectHover::default(),
+            #[cfg(feature = "test-driver")]
+            cell_metrics: None,
+            #[cfg(feature = "test-driver")]
+            input_seq: 0,
+            #[cfg(feature = "test-driver")]
+            input_done: 0,
         }));
+        // The pointer-injection plugin (Spec R15-T3): its `input_hook`
+        // splices queued `pointer`/`click` batches into `RawInput` at
+        // `begin_pass` — the only seam upstream of egui's PointerState
+        // fold, so clicks hit-test like real input.
+        #[cfg(feature = "test-driver")]
+        ctx.add_plugin(crate::test_driver::DriverInputPlugin::default());
         let watcher = config::watcher();
-        let pump = Pump::start(ctx.clone(), Arc::clone(&shared), ctl, watcher)
-            .map_err(|error| BootError(format!("pump spawn failed: {error}")))?;
+        let pump = Pump::start(
+            ctx.clone(),
+            Arc::clone(&shared),
+            ctl,
+            watcher,
+            #[cfg(feature = "test-driver")]
+            driver,
+        )
+        .map_err(|error| BootError(format!("pump spawn failed: {error}")))?;
         Ok(Self {
             shared,
             pump: Some(pump),
@@ -330,6 +463,8 @@ impl GuiApp {
             pending_band: None,
             row_galleys: crate::paint::RowGalleys::default(),
             detect_cache: detect::DetectCache::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hits: None,
             web: WebSlot::new(),
             quit: false,
         })
@@ -340,142 +475,228 @@ impl GuiApp {
     // events translate to `ait_term::KeyEvent`, resolve through the
     // shared keymap, and only `PassThrough` may reach the PTY.
 
-    /// One frame's native events, in order — keys, composed text,
+    /// One frame's input events, in order — keys, composed text,
     /// paste, wheel. Selection drags ride `interact` in the paint pass
     /// (they need the pane rect, which is layout state).
     fn dispatch_events(&mut self, ctx: &egui::Context, shared: &mut Shared) {
-        let events = ctx.input(|input| input.events.clone());
         // Chord chars whose `Event::Text` twin would be the same input
         // twice: some platforms emit BOTH `Key{A, alt}` and `Text("a")`
         // for `Alt+A`, which typed `a` into the PTY beside the panel
         // the chord opened. The Key event carries the whole chord to
-        // the resolver — a matching Text char is its twin, eaten here.
+        // the resolver — a matching Text char in the ADJACENT Text
+        // event is its twin, eaten there (winit emits the pair from
+        // one KeyboardInput, so nothing else can interleave); any
+        // other event closes the twin window, or a burst that types
+        // right behind a chord would lose real characters.
         let mut eaten: Vec<char> = Vec::new();
-        for event in events {
-            match event {
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    repeat,
-                    modifiers,
-                    ..
+        // Spec R15: the pump's test-socket drain queued injected input
+        // between frames — it lands AHEAD of the frame's native events
+        // (it is the older input), dispatched item by item so the
+        // queue's own order holds (a `scroll` between two `key`s
+        // dispatches between them). `Quit` takes the same close path
+        // a resolved `AppAction::Quit` does.
+        #[cfg(feature = "test-driver")]
+        for item in shared.injected.drain(..).collect::<Vec<_>>() {
+            match item {
+                crate::test_driver::Injected::Event(event) => {
+                    self.dispatch_event(ctx, shared, event, &mut eaten);
+                }
+                // A wheel gesture carries its own hover: real
+                // `MouseWheel` events route on `pointer.hover_pos`,
+                // which an injected event can't reach — egui consumed
+                // the pointer state at `begin_pass` — so the verb's
+                // region resolves against last frame's pane rects.
+                crate::test_driver::Injected::Wheel {
+                    unit,
+                    delta,
+                    target,
                 } => {
-                    // GUI-local bindings the keymap can't own — zoom is
-                    // a frontend concern and these chords are unbound in
-                    // the table (Ctrl+0/=/- type nothing a shell wants).
-                    if self.zoom_key(key, modifiers) {
-                        continue;
-                    }
-                    // The find bar's open chord — Ctrl+Shift+F, or
-                    // ⌘F on macOS (Spec R13-T4). The keymap can't own
-                    // it: the TUI has no find bar, so the chord is
-                    // GUI-local like zoom. Bare Ctrl+F is readline's
-                    // forward-char — it falls through to the PTY.
-                    if find_open_chord(key, modifiers) {
-                        self.open_find(shared);
-                        continue;
-                    }
-                    // The pane host's toggle chords — `Ctrl+Shift+E`
-                    // explorer, `Ctrl+Shift+B` browser (Spec R14
-                    // §5.13). GUI-local like the find chord: the
-                    // keymap can't own them and they never reach
-                    // the PTY. They hold while an overlay owns focus
-                    // — the find bar or a modal picker would lose the
-                    // region under it mid-interaction; the chord
-                    // falls through to the overlay's swallow arm, so
-                    // nothing reaches the PTY either way.
-                    let overlay_owns_focus = shared.find.is_some()
-                        || shared.picker.is_some()
-                        || shared.conversations.is_some();
-                    if !overlay_owns_focus {
-                        if let Some(id) = pane_chord(key, modifiers) {
-                            // A held chord's autorepeat must not
-                            // strobe the toggle — one flip per
-                            // physical press; the repeat is still
-                            // swallowed, never PTY input.
-                            if !repeat {
-                                self.toggle_pane(shared, id);
-                            }
-                            continue;
+                    let hover = match target {
+                        crate::test_driver::ScrollTarget::Grid => {
+                            self.grid_pane.map(|pane| pane.center())
                         }
-                    }
-                    let translated = translate_key(key, modifiers);
-                    if let Some(KeyEvent {
-                        key: Key::Char(c), ..
-                    }) = translated
+                        crate::test_driver::ScrollTarget::Panel => {
+                            self.panel_pane.or(self.grid_pane).map(|pane| pane.center())
+                        }
+                        crate::test_driver::ScrollTarget::At(pos) => Some(pos),
+                    };
+                    // Before the first painted pane the content rect
+                    // stands in — a wheel still lands somewhere real.
+                    let hover = hover.or_else(|| Some(ctx.content_rect().center()));
+                    self.wheel(shared, ctx, unit, delta, hover);
+                }
+                // A viewport resize rides the real path: the window
+                // manager round trip, then the band's `RESIZE_SETTLE`
+                // debounce — the settle a scenario asserts IS the
+                // production one.
+                crate::test_driver::Injected::Resize(size) => {
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+                }
+                // A staged `AgentEvent` — the same `apply` fold the
+                // pump's `drain_agent_events` feeds real worker
+                // events through, so the parked gate card is the
+                // panel's real approval state.
+                crate::test_driver::Injected::AgentEvent(event) => {
+                    if let Some(panel) = shared.tabs.active_mut().and_then(|tab| tab.agent.as_mut())
                     {
-                        eaten.push(c);
-                    }
-                    self.dispatch_key(ctx, shared, translated);
-                }
-                // Releases carry no input — same as the TUI's
-                // `KeyEventKind::Release` guard.
-                egui::Event::Key { pressed: false, .. } => {}
-                // Composed text: one Char event per character through
-                // the same resolver (every Char resolves PassThrough —
-                // the trip costs nothing and keeps ONE dispatch path).
-                // While the find bar is open, text is the query —
-                // nothing reaches the PTY mid-search.
-                egui::Event::Text(text) => {
-                    // The twin/meta guard runs BEFORE any routing: on
-                    // twin-emitting platforms an `Alt+<letter>` chord
-                    // arrives as `Key{.., alt}` + `Text("a")`, and the
-                    // Text twin must land nowhere — not the PTY, not
-                    // the find query, not an aux pane's address entry.
-                    // `meta_held` also eats the twin whose Key event
-                    // lands after this Text (a Meta chord still held
-                    // while Text composes wants the chord's bytes —
-                    // Option-as-Alt — never a literal).
-                    let meta_held =
-                        ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
-                    let text: String = text
-                        .chars()
-                        .filter(|c| {
-                            !meta_held
-                                && !eaten
-                                    .iter()
-                                    .position(|e| e.eq_ignore_ascii_case(c))
-                                    .map(|pos| eaten.remove(pos))
-                                    .is_some()
-                        })
-                        .collect();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if shared.find.is_some() {
-                        self.find_text(shared, &text);
-                        continue;
-                    }
-                    // A shown aux pane owns composed text while it's
-                    // up (the find bar's focus rule) — nothing
-                    // reaches the PTY mid-pane.
-                    if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                        pane(id).text(shared, &text);
-                        continue;
-                    }
-                    for key in translate_text(&text) {
-                        self.dispatch_key(ctx, shared, Some(key));
+                        panel.apply(event);
                     }
                 }
-                // A native paste (Ctrl+V / ⌘V, menu paste): encode the
-                // payload through the shared `encode_paste` so
-                // bracketed-paste children see their mode honored.
-                // While the find bar is open it pastes into the query
-                // — the browser convention.
-                egui::Event::Paste(text) => {
-                    if shared.find.is_some() {
-                        self.find_text(shared, &text);
-                    } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                        pane(id).text(shared, &text);
-                    } else {
-                        self.paste(shared, &text);
-                    }
-                }
-                egui::Event::MouseWheel { unit, delta, .. } => {
-                    self.wheel(shared, ctx, unit, delta);
-                }
-                _ => {}
+                // The pointer verbs' frame wake — the batch already
+                // sits on the plugin; the marker only earns the
+                // frame that delivers it.
+                crate::test_driver::Injected::Repaint => {}
+                crate::test_driver::Injected::Quit => self.quit = true,
             }
+        }
+        for event in ctx.input(|input| input.events.clone()) {
+            self.dispatch_event(ctx, shared, event, &mut eaten);
+        }
+    }
+
+    /// One `egui::Event` through the input dispatch — the per-event
+    /// arm `dispatch_events` runs for native and (Spec R15) injected
+    /// events alike; `eaten` is the frame's twin-char filter, shared
+    /// across the whole stream.
+    fn dispatch_event(
+        &mut self,
+        ctx: &egui::Context,
+        shared: &mut Shared,
+        event: egui::Event,
+        eaten: &mut Vec<char>,
+    ) {
+        // Only a `Text` event consults the twin filter: winit emits
+        // `Key` + `Text` adjacently from one `KeyboardInput`, so any
+        // other event — the chord's own release, the next press, a
+        // paste, a wheel — closes the twin window. Without this a
+        // burst that types right behind a chord (injected input, a
+        // scripted macro) loses real characters to a stale `eaten`.
+        if !matches!(event, egui::Event::Text(_)) {
+            eaten.clear();
+        }
+        match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } => {
+                // GUI-local bindings the keymap can't own — zoom is
+                // a frontend concern and these chords are unbound in
+                // the table (Ctrl+0/=/- type nothing a shell wants).
+                if self.zoom_key(key, modifiers) {
+                    return;
+                }
+                // The find bar's open chord — Ctrl+Shift+F, or
+                // ⌘F on macOS (Spec R13-T4). The keymap can't own
+                // it: the TUI has no find bar, so the chord is
+                // GUI-local like zoom. Bare Ctrl+F is readline's
+                // forward-char — it falls through to the PTY.
+                if find_open_chord(key, modifiers) {
+                    self.open_find(shared);
+                    return;
+                }
+                // The pane host's toggle chords — `Ctrl+Shift+E`
+                // explorer, `Ctrl+Shift+B` browser (Spec R14
+                // §5.13). GUI-local like the find chord: the
+                // keymap can't own them and they never reach
+                // the PTY. They hold while an overlay owns focus
+                // — the find bar or a modal picker would lose the
+                // region under it mid-interaction; the chord
+                // falls through to the overlay's swallow arm, so
+                // nothing reaches the PTY either way.
+                let overlay_owns_focus = shared.find.is_some()
+                    || shared.picker.is_some()
+                    || shared.conversations.is_some();
+                if !overlay_owns_focus {
+                    if let Some(id) = pane_chord(key, modifiers) {
+                        // A held chord's autorepeat must not
+                        // strobe the toggle — one flip per
+                        // physical press; the repeat is still
+                        // swallowed, never PTY input.
+                        if !repeat {
+                            self.toggle_pane(shared, id);
+                        }
+                        return;
+                    }
+                }
+                let translated = translate_key(key, modifiers);
+                if let Some(KeyEvent {
+                    key: Key::Char(c), ..
+                }) = translated
+                {
+                    eaten.push(c);
+                }
+                self.dispatch_key(ctx, shared, translated);
+            }
+            // Releases carry no input — same as the TUI's
+            // `KeyEventKind::Release` guard.
+            egui::Event::Key { pressed: false, .. } => {}
+            // Composed text: one Char event per character through
+            // the same resolver (every Char resolves PassThrough —
+            // the trip costs nothing and keeps ONE dispatch path).
+            // While the find bar is open, text is the query —
+            // nothing reaches the PTY mid-search.
+            egui::Event::Text(text) => {
+                // The twin/meta guard runs BEFORE any routing: on
+                // twin-emitting platforms an `Alt+<letter>` chord
+                // arrives as `Key{.., alt}` + `Text("a")`, and the
+                // Text twin must land nowhere — not the PTY, not
+                // the find query, not an aux pane's address entry.
+                // `meta_held` also eats the twin whose Key event
+                // lands after this Text (a Meta chord still held
+                // while Text composes wants the chord's bytes —
+                // Option-as-Alt — never a literal).
+                let meta_held = ctx.input(|input| input.modifiers.alt || input.modifiers.mac_cmd);
+                let text: String = text
+                    .chars()
+                    .filter(|c| {
+                        !meta_held
+                            && !eaten
+                                .iter()
+                                .position(|e| e.eq_ignore_ascii_case(c))
+                                .map(|pos| eaten.remove(pos))
+                                .is_some()
+                    })
+                    .collect();
+                if text.is_empty() {
+                    return;
+                }
+                if shared.find.is_some() {
+                    self.find_text(shared, &text);
+                    return;
+                }
+                // A shown aux pane owns composed text while it's
+                // up (the find bar's focus rule) — nothing
+                // reaches the PTY mid-pane.
+                if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                    pane(id).text(shared, &text);
+                    return;
+                }
+                for key in translate_text(&text) {
+                    self.dispatch_key(ctx, shared, Some(key));
+                }
+            }
+            // A native paste (Ctrl+V / ⌘V, menu paste): encode the
+            // payload through the shared `encode_paste` so
+            // bracketed-paste children see their mode honored.
+            // While the find bar is open it pastes into the query
+            // — the browser convention.
+            egui::Event::Paste(text) => {
+                if shared.find.is_some() {
+                    self.find_text(shared, &text);
+                } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                    pane(id).text(shared, &text);
+                } else {
+                    self.paste(shared, &text);
+                }
+            }
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                let hover = ctx.input(|input| input.pointer.hover_pos());
+                self.wheel(shared, ctx, unit, delta, hover);
+            }
+            _ => {}
         }
     }
 
@@ -711,8 +932,9 @@ impl GuiApp {
         ctx: &egui::Context,
         unit: egui::MouseWheelUnit,
         delta: Vec2,
+        hover: Option<Pos2>,
     ) {
-        let Some(hover) = ctx.input(|input| input.pointer.hover_pos()) else {
+        let Some(hover) = hover else {
             return;
         };
         if self.panel_pane.is_some_and(|pane| pane.contains(hover)) {
@@ -1022,6 +1244,12 @@ impl GuiApp {
                 egui::Id::unique(("tab-close", index)),
                 Sense::click(),
             );
+            // The registry names mirror the chip's role: the body
+            // activates, the "×" closes (Spec R15-T3).
+            shared.hits.register(|| format!("tab.{index}"), chip.rect);
+            shared
+                .hits
+                .register(|| format!("tab.{index}.close"), chip.close);
             let bg = if index == active {
                 chrome::FIELD_HI
             } else if chip_hit.hovered() || close_hit.hovered() {
@@ -1072,6 +1300,7 @@ impl GuiApp {
         }
         if let Some(new_rect) = bar.new_tab {
             let new_hit = ui.interact(new_rect, egui::Id::unique("tab-new"), Sense::click());
+            shared.hits.register(|| "tab.new".to_owned(), new_rect);
             if new_hit.hovered() {
                 painter.rect_filled(new_rect, 4.0, chrome::FIELD);
             }
@@ -1098,6 +1327,9 @@ impl GuiApp {
         // chord makes, so click and chord can never disagree.
         if let Some(pane_rect) = bar.pane_button {
             let pane_hit = ui.interact(pane_rect, egui::Id::unique("pane-open"), Sense::click());
+            shared
+                .hits
+                .register(|| "panes.button".to_owned(), pane_rect);
             if pane_hit.hovered() {
                 painter.rect_filled(pane_rect, 4.0, chrome::FIELD);
             }
@@ -1133,6 +1365,8 @@ impl GuiApp {
         font: &FontId,
     ) {
         self.grid_pane = Some(pane);
+        // `grid` — the whole pane is the selection/click surface.
+        shared.hits.register(|| "grid".to_owned(), pane);
         let Some(tab) = shared.tabs.active_mut() else {
             return;
         };
@@ -1155,6 +1389,14 @@ impl GuiApp {
         let link = if ctrl {
             response.hover_pos().and_then(|pos| {
                 let (line, column) = grid_point(pos, pane, cell, scroll);
+                // Scrollback rows don't afford (Spec R15-T4): a
+                // scrollback path was written under whatever cwd the
+                // session held then — resolving it against today's
+                // cwd can afford a wrong or since-deleted file, so
+                // only the live viewport's tokens resolve.
+                if line < 0 {
+                    return None;
+                }
                 let remote = !tab.remote.is_empty();
                 let (text, cols) = tab
                     .grid()
@@ -1190,6 +1432,16 @@ impl GuiApp {
             column: hit.column,
             cells: hit.cells,
         });
+        // The dump's Ctrl-hover + cell-metric probes (Spec R15-T4):
+        // record what the affordance resolved — `ctrl` only counts
+        // over the grid — and this frame's cell geometry, so a dump
+        // answers "what Ctrl+click would route" without driving one.
+        #[cfg(feature = "test-driver")]
+        {
+            shared.cell_metrics = Some((cell.width, cell.height));
+            shared.detect_hover.ctrl = ctrl && response.hover_pos().is_some();
+            shared.detect_hover.token = link.clone();
+        }
         // `clicked` is press AND release inside the pane with no drag
         // — the affordance's release half; the route lands after the
         // paint pass, once `tab`'s borrow ends.
@@ -1281,6 +1533,7 @@ impl GuiApp {
         // offers a no-op when the view is already live.
         if scroll > 0 {
             let mut snap = false;
+            let mut pill_rect = Rect::NOTHING;
             egui::Area::new(egui::Id::unique("scroll-bottom"))
                 .order(egui::Order::Foreground)
                 .pivot(Align2::RIGHT_BOTTOM)
@@ -1289,20 +1542,121 @@ impl GuiApp {
                     let button = egui::Button::new(egui::RichText::new("⤓").monospace())
                         .fill(Color32::from_rgba_premultiplied(0x2A, 0x2A, 0x2A, 0xDC))
                         .stroke(Stroke::new(1.0, chrome::EDGE));
-                    snap = ui
-                        .add(button)
-                        .on_hover_text("jump to the live output")
-                        .clicked();
+                    let response = ui.add(button).on_hover_text("jump to the live output");
+                    pill_rect = response.rect;
+                    snap = response.clicked();
                 });
+            shared
+                .hits
+                .register(|| "pill.scroll_bottom".to_owned(), pill_rect);
             if snap {
                 tab.snap_to_bottom();
             }
         }
+        // The detection-token targets (Spec R15-T3): every
+        // `detect.*` name maps the span's cell rect, so a scenario
+        // clicks a URL like a user would — through the grid's own
+        // hit-test, not a bypass.
+        #[cfg(feature = "test-driver")]
+        self.register_detect_targets(&mut shared.hits, tab, pane, cell, scroll);
         // The Ctrl+click route — applied last so `tab`'s borrow has
         // ended: `open_detection` drives the pane host, the explorer
         // model and the browser queue off the whole `Shared`.
         if let Some(target) = route {
             self.open_detection(shared, target);
+        }
+    }
+
+    /// Register the visible rows' detected URL/path tokens as
+    /// `detect.{n}` hit targets (scan order) plus content-keyed
+    /// `detect.url.<u>`/`detect.path.<p>` aliases — so a scenario
+    /// clicks a link by name through the grid's own hit-test. The
+    /// scan rides `detect_hits`' memo: `line_cells` is the cheap
+    /// half (it rebuilds for the hover every frame), the token
+    /// scan's filesystem probes are the expensive one and re-run
+    /// only when the key — tab, scroll, pane, cell, remote flag, the
+    /// rows' text — moved.
+    #[cfg(feature = "test-driver")]
+    fn register_detect_targets(
+        &mut self,
+        hits: &mut HitTargets,
+        tab: &ait_app::tabs::Tab,
+        pane: Rect,
+        cell: CellMetrics,
+        scroll: usize,
+    ) {
+        let remote = !tab.remote.is_empty();
+        let lines: Vec<(String, Vec<usize>)> = tab
+            .grid()
+            .visible_rows()
+            .map(|row| detect::line_cells(&row))
+            .collect();
+        let texts: Vec<String> = lines.iter().map(|(text, _)| text.clone()).collect();
+        let fresh = self.detect_hits.as_ref().is_none_or(|scan| {
+            scan.tab != tab.id
+                || scan.scroll != scroll
+                || scan.remote != remote
+                || scan.pane != pane
+                || scan.cell != cell
+                || scan.rows != texts
+        });
+        if fresh {
+            let mut out: Vec<(String, Rect)> = Vec::new();
+            // `cwd_for`/`home_dir` resolve once per scan, not per
+            // row — the same laziness `DetectCache`'s `env` closure
+            // buys the hover probe.
+            let mut env: Option<(PathBuf, PathBuf)> = None;
+            let mut ordinal = 0usize;
+            for (row_index, (text, cols)) in lines.iter().enumerate() {
+                let (cwd, home) =
+                    env.get_or_insert_with(|| (PathBuf::from(suggest::cwd_for(tab)), home_dir()));
+                let tokens = if remote {
+                    detect::url_tokens(text)
+                } else {
+                    detect::tokens(text, cwd, home)
+                };
+                for token in tokens {
+                    let (Some(&first), Some(&last)) =
+                        (cols.get(token.start), cols.get(token.end.saturating_sub(1)))
+                    else {
+                        continue;
+                    };
+                    let rect = Rect::from_min_max(
+                        Pos2::new(
+                            pane.left() + first as f32 * cell.width,
+                            pane.top() + row_index as f32 * cell.height,
+                        ),
+                        Pos2::new(
+                            pane.left() + (last + 1) as f32 * cell.width,
+                            pane.top() + (row_index + 1) as f32 * cell.height,
+                        ),
+                    );
+                    match &token.target {
+                        detect::Target::Url(url) => {
+                            out.push((format!("detect.url.{url}"), rect));
+                        }
+                        detect::Target::Path(path) => {
+                            out.push((format!("detect.path.{}", path.display()), rect));
+                        }
+                    }
+                    out.push((format!("detect.{ordinal}"), rect));
+                    ordinal += 1;
+                }
+            }
+            self.detect_hits = Some(DetectHitScan {
+                tab: tab.id,
+                scroll,
+                remote,
+                pane,
+                cell,
+                rows: texts,
+                out,
+            });
+        }
+        if let Some(scan) = &self.detect_hits {
+            for (name, rect) in &scan.out {
+                hits.register(|| name.clone(), *rect);
+            }
         }
     }
 
@@ -1361,6 +1715,9 @@ impl GuiApp {
                 break;
             }
             let hit = ui.interact(chip, egui::Id::unique(("pane-chip", index)), Sense::click());
+            // `panes.chip.<label>` — the name IS the chip's label
+            // (`agent`/`explorer`/…), so a click reads like the UI.
+            shared.hits.register(|| format!("panes.chip.{label}"), chip);
             let active = *target == shown;
             let (bg, fg) = if active {
                 (self.theme.fg, PANEL_BG)
@@ -1439,6 +1796,8 @@ impl GuiApp {
         // topmost) — registered after, this rect would swallow
         // every verdict/choice click.
         let body = ui.interact(rect, egui::Id::unique("agent-focus"), Sense::click());
+        // `agent.focus` — the whole body is the focus affordance.
+        shared.hits.register(|| "agent.focus".to_owned(), rect);
         {
             let Some(panel) = shared.tabs.active().and_then(|tab| tab.agent_panel()) else {
                 return;
@@ -1477,6 +1836,7 @@ impl GuiApp {
                 ui,
                 &painter,
                 panel,
+                &mut shared.hits,
                 &GateCardLayout {
                     font: &font,
                     line_h,
@@ -1587,6 +1947,7 @@ impl GuiApp {
         ui: &mut egui::Ui,
         painter: &egui::Painter,
         panel: &AgentPanel,
+        hits: &mut HitTargets,
         layout: &GateCardLayout<'_>,
         action: &mut Option<PanelAction>,
     ) -> f32 {
@@ -1653,26 +2014,30 @@ impl GuiApp {
                         (
                             "a: once",
                             egui::Id::unique("agent-allow-once"),
+                            "gate.approve",
                             PanelAction::Verdict(ApprovalVerdict::AllowOnce),
                         ),
                         (
                             "t: task",
                             egui::Id::unique("agent-allow-task"),
+                            "gate.approve_task",
                             PanelAction::Verdict(ApprovalVerdict::AllowForTask),
                         ),
                         (
                             "d: deny",
                             egui::Id::unique("agent-deny"),
+                            "gate.deny",
                             PanelAction::BeginDenyReason,
                         ),
                     ];
                     let button_w = (card.width() - 16.0 - 8.0 * 2.0) / 3.0;
-                    for (index, (label, id, verdict)) in buttons.into_iter().enumerate() {
+                    for (index, (label, id, name, verdict)) in buttons.into_iter().enumerate() {
                         let button = Rect::from_min_size(
                             Pos2::new(card.left() + 8.0 + index as f32 * (button_w + 8.0), y),
                             Vec2::new(button_w, line_h),
                         );
                         let hit = ui.interact(button, id, Sense::click());
+                        hits.register(|| name.to_owned(), button);
                         painter.rect_filled(
                             button,
                             3.0,
@@ -1724,6 +2089,7 @@ impl GuiApp {
                             egui::Id::unique(("agent-ask", index)),
                             Sense::click(),
                         );
+                        hits.register(|| format!("gate.ask.{index}"), row);
                         let selected = index == ask.selected;
                         if selected || hit.hovered() {
                             painter.rect_filled(row, 2.0, chrome::SELECT);
@@ -1797,37 +2163,11 @@ impl GuiApp {
         painter.rect_filled(rect, 0.0, chrome::STRIP);
         let now = Instant::now();
         let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
-        let mut text = match shared.tabs.active() {
-            Some(tab) => {
-                let model = shared.config.model(&shared.profile);
-                status_text(
-                    &StatusLine {
-                        cwd: tab.cwd(),
-                        shell: tab.title(),
-                        model: &model,
-                        profile: profile::status_slot(&shared.profile),
-                        block: tab.last_block_status(),
-                        remote: tab.remote_target(),
-                        exit: tab.exit_status(),
-                    },
-                    shared.toast.as_ref(),
-                    now,
-                )
-            }
-            None => String::new(),
-        };
+        let text = status_line_text(shared, now);
         if shared.suggestion.is_some() && !toast_live {
-            // Braille spinner — one frame per ~100 ms; the repaint is
-            // requested below so the glyph animates through the
-            // request's quiet model-call stretch, not just while
-            // Delta bytes land.
-            const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let millis = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as usize;
-            let frame = FRAMES[(millis / 100) % FRAMES.len()];
-            text = format!("{text} · {frame} suggesting");
+            // The spinner animates one frame per ~100 ms — the repaint
+            // keeps the glyph turning through the request's quiet
+            // model-call stretch, not just while Delta bytes land.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         let highlighted = toast_live;
@@ -2055,6 +2395,12 @@ impl eframe::App for GuiApp {
         // 1. Input first — the frame below paints post-input state.
         self.dispatch_events(&ctx, &mut shared);
 
+        // The hit registry repaints with the frame (Spec R15-T3):
+        // cleared at the top, every `interact` site re-registers its
+        // name → rect below — the dump's `hits` is always exactly the
+        // last painted frame, never a stale union of them.
+        shared.hits.clear();
+
         // 2. Regions + cell metrics (zoom included), then the band→
         //    winsize resize — settled, not per-frame: a reflow walks
         //    each session's scrollback, so mid-drag reflows are the
@@ -2128,6 +2474,24 @@ impl eframe::App for GuiApp {
         // frames.
         let browser_shown = shown == Some(SidePane::Aux(PaneId::Browser));
         self.web.sync(&ctx, frame, &mut shared, browser_shown);
+
+        // The `wait_dump` barrier's delivered half (Spec R15): this
+        // frame folded the pointer plugin's batch at `begin_pass` and
+        // `dispatch_events` drained `injected` — with both queues
+        // empty at the frame's end, every request the socket accepted
+        // has run through a completed frame, so `input_done` catches
+        // up. A multi-batch gesture (press→release split across
+        // frames) only catches up after its LAST batch's frame.
+        #[cfg(feature = "test-driver")]
+        {
+            let plugin_drained =
+                ctx.with_plugin(|plugin: &mut crate::test_driver::DriverInputPlugin| {
+                    plugin.pending() == 0
+                });
+            if shared.injected.is_empty() && plugin_drained == Some(true) {
+                shared.input_done = shared.input_seq;
+            }
+        }
         drop(shared);
 
         if self.quit {
@@ -2202,6 +2566,26 @@ fn tone_color(tone: Tone, theme: GridTheme) -> Color32 {
 
 /// The creation-time cell estimate — fonts don't exist until the
 /// first `Context::run`, so `GuiApp::new` can't read the glyph table.
+/// One detection-token scan's cache key and result — see
+/// [`GuiApp::detect_hits`].
+#[cfg(feature = "test-driver")]
+struct DetectHitScan {
+    /// The tab the rows were scanned on.
+    tab: u64,
+    /// The scroll offset they were read at.
+    scroll: usize,
+    /// Remote sessions scan URLs only (no local fs probes).
+    remote: bool,
+    /// The pane the rects were computed against.
+    pane: Rect,
+    /// The cell metrics the rects were computed against.
+    cell: CellMetrics,
+    /// Every visible row's text — the scan's input.
+    rows: Vec<String>,
+    /// The `(name, rect)` pairs in scan order.
+    out: Vec<(String, Rect)>,
+}
+
 /// Typical monospace ratios (advance ~0.6×em, line ~1.2×em) seed the
 /// first tab's winsize; the first frame's real `cell_metrics` +
 /// `resize_all` correct it before anything paints.
@@ -2273,6 +2657,47 @@ fn find_open_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
         return false;
     }
     modifiers.mac_cmd || (modifiers.ctrl && modifiers.shift)
+}
+
+/// The status strip's text at `now` — the same composition
+/// `paint_status` draws: a live toast wins outright, else the
+/// `StatusLine` session summary, and a live suggestion appends a
+/// `· <spinner> suggesting` segment (Spec R04; the repaint cadence
+/// stays the painter's concern). Factored so the test-driver `dump`
+/// ships the exact string the user reads (Spec R15-T6) instead of a
+/// re-derived near-copy.
+pub(crate) fn status_line_text(shared: &Shared, now: Instant) -> String {
+    let toast_live = shared.toast.as_ref().is_some_and(|t| t.is_live(now));
+    let mut text = match shared.tabs.active() {
+        Some(tab) => {
+            let model = shared.config.model(&shared.profile);
+            status_text(
+                &StatusLine {
+                    cwd: tab.cwd(),
+                    shell: tab.title(),
+                    model: &model,
+                    profile: profile::status_slot(&shared.profile),
+                    block: tab.last_block_status(),
+                    remote: tab.remote_target(),
+                    exit: tab.exit_status(),
+                },
+                shared.toast.as_ref(),
+                now,
+            )
+        }
+        None => String::new(),
+    };
+    if shared.suggestion.is_some() && !toast_live {
+        // Braille spinner — one frame per ~100 ms.
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as usize;
+        let frame = FRAMES[(millis / 100) % FRAMES.len()];
+        text = format!("{text} · {frame} suggesting");
+    }
+    text
 }
 
 /// The `session_size` the shared dispatch fns take under the pane
@@ -2387,6 +2812,17 @@ mod tests {
                 panes: PaneHost::default(),
                 explorer: ExplorerState::default(),
                 browser: BrowserState::default(),
+                #[cfg(feature = "test-driver")]
+                injected: std::collections::VecDeque::new(),
+                hits: HitTargets::default(),
+                #[cfg(feature = "test-driver")]
+                detect_hover: crate::test_driver::DetectHover::default(),
+                #[cfg(feature = "test-driver")]
+                cell_metrics: None,
+                #[cfg(feature = "test-driver")]
+                input_seq: 0,
+                #[cfg(feature = "test-driver")]
+                input_done: 0,
             }));
             Self {
                 app: GuiApp {
@@ -2407,6 +2843,8 @@ mod tests {
                     pending_band: None,
                     row_galleys: crate::paint::RowGalleys::default(),
                     detect_cache: detect::DetectCache::default(),
+                    #[cfg(feature = "test-driver")]
+                    detect_hits: None,
                     web: WebSlot::new(),
                     quit: false,
                 },
@@ -3217,6 +3655,48 @@ mod tests {
         // `head -c 1` is still blocked — nothing leaked to the PTY.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The twin window is the ADJACENT Text only: a chord whose
+    /// press+release is followed by typed text in the SAME event
+    /// batch (injected input, a scripted macro — native streams
+    /// coalesce like this too) must not lose the typed char that
+    /// happens to share the chord's letter (R15-T2: `Alt+R` then
+    /// `printf` used to land `pintf`).
+    #[test]
+    fn a_chords_twin_window_closes_at_the_release() {
+        let mut harness = Harness::new(sh_manager());
+        wait_until(&harness, |h| !logical(h).is_empty());
+        let modifiers = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        feed(
+            &mut harness,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text("printf".into()),
+            ],
+        );
+        // `Alt+R` on a disabled store toasts — and the whole typed
+        // line survived, 'r' included.
+        assert_eq!(
+            harness.shared().tabs.active().unwrap().shadow.text(),
+            "printf"
+        );
     }
 
     /// The winsize invariant under the host: a pane toggle narrows

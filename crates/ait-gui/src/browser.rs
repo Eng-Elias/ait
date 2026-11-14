@@ -170,6 +170,27 @@ pub struct BrowserState {
     embed: Embed,
     /// Queued navigations the app layer hasn't drained yet.
     pending: VecDeque<NavCommand>,
+    /// Webview-bound loads the drain has issued so far — a
+    /// `Navigate`/`Reload` that stayed webview-bound counts, an
+    /// `OpenExternal` hand-off or a webview-reported navigation never
+    /// does (see [`loads`](Self::loads)). The counter exists for the
+    /// driver dump, so it's gated like the readers.
+    #[cfg(any(test, feature = "test-driver"))]
+    loads: usize,
+    /// Echo suppression for
+    /// [`webview_navigated`](Self::webview_navigated) — every
+    /// webview-bound `Navigate`/`Reload` the drain issues reports
+    /// itself back through wry's navigation handler, ASYNC (a
+    /// WebKitGTK policy decision rides IPC and can land frames after
+    /// `current` moved on), so equality with `current` alone can't
+    /// tell our own echo from a page-initiated navigation — a stale
+    /// echo would otherwise truncate the forward half and push its
+    /// own bogus entry. One outstanding entry per issued load
+    /// (`Navigate` echoes its URL, `Reload` the current page's),
+    /// consumed verbatim on arrival; a report with no matching echo
+    /// is genuinely page-initiated. Bounded — a load whose report
+    /// never arrives (a dropped webview) can't grow it past the cap.
+    echoes: VecDeque<String>,
     /// The body rect the webview should cover this frame — staged by
     /// the pane's paint while embedded, cleared by `GuiApp` before
     /// each frame's paint; `None` whenever the pane is closed or the
@@ -225,6 +246,26 @@ impl BrowserState {
     /// Whether forward can move — navigation truncated entries remain.
     pub fn can_go_forward(&self) -> bool {
         self.index + 1 < self.history.len()
+    }
+
+    /// The visited-history's depth — the entries `index` walks. The
+    /// driver dump's reader; production paths index `history`
+    /// directly.
+    #[cfg(any(test, feature = "test-driver"))]
+    pub fn history_depth(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Webview-bound loads issued so far — a `Navigate`/`Reload`
+    /// surviving [`drain_nav`](Self::drain_nav)'s embed fold counts;
+    /// an `OpenExternal` hand-off (the fetch happens in the system
+    /// browser, not our webview) and a webview-reported navigation
+    /// (the page already fetched itself) never do. A fresh submit, a
+    /// back/forward step and a reload each increment it — the reload
+    /// and the fetch-count observability the dump needs (Spec R15).
+    #[cfg(any(test, feature = "test-driver"))]
+    pub fn loads(&self) -> usize {
+        self.loads
     }
 
     /// Composed text or a paste into the entry — append and clear the
@@ -304,15 +345,26 @@ impl BrowserState {
     /// already loading it, so history records it without queueing
     /// another `NavCommand` — the entry and back/forward then track
     /// the page the webview is actually on instead of the last typed
-    /// URL. A report naming the current page is a no-op: our own
-    /// `load_url`s report back through the same hook on every
-    /// platform, and a page's same-URL refresh must not double-count.
-    /// The URL lands verbatim — the webview already fetched it, so
-    /// the `normalize_url` gate (which exists to keep unfetchable
-    /// text out of the fetch path) doesn't apply.
+    /// URL. A report naming the current page is a no-op, and so is
+    /// an echo of a load [`drain_nav`](Self::drain_nav) issued — our
+    /// own `load_url`s report back through the same hook ASYNC (a
+    /// WebKitGTK policy decision rides IPC and can land frames after
+    /// `current` moved on), so the `echoes` multiset — not equality
+    /// with `current` — is what keeps a stale echo from truncating
+    /// the forward half and pushing a bogus entry. The URL lands
+    /// verbatim — the webview already fetched it, so the
+    /// `normalize_url` gate (which exists to keep unfetchable text
+    /// out of the fetch path) doesn't apply.
     pub fn webview_navigated(&mut self, url: &str) {
         let url = url.trim();
-        if url.is_empty() || self.current() == Some(url) {
+        if url.is_empty() {
+            return;
+        }
+        if let Some(pos) = self.echoes.iter().position(|issued| issued == url) {
+            self.echoes.remove(pos);
+            return;
+        }
+        if self.current() == Some(url) {
             return;
         }
         self.bad_entry = false;
@@ -350,14 +402,52 @@ impl BrowserState {
     /// system browser owns its page's refresh.
     pub fn drain_nav(&mut self) -> Vec<NavCommand> {
         let embedded = self.embed == Embed::Embedded;
-        self.pending
+        let commands: Vec<NavCommand> = self
+            .pending
             .drain(..)
             .filter_map(|command| match command {
                 NavCommand::Navigate(url) if !embedded => Some(NavCommand::OpenExternal(url)),
                 NavCommand::Reload if !embedded => None,
                 command => Some(command),
             })
-            .collect()
+            .collect();
+        // The webview-bound tally — what survives the fold is what
+        // the webview will actually fetch. Dump-only state, gated
+        // like the field.
+        #[cfg(any(test, feature = "test-driver"))]
+        {
+            self.loads += commands
+                .iter()
+                .filter(|command| matches!(command, NavCommand::Navigate(_) | NavCommand::Reload))
+                .count();
+        }
+        // Echo bookkeeping — every webview-bound command reports
+        // back through wry's navigation handler (async — a WebKitGTK
+        // policy decision rides IPC), so `webview_navigated`
+        // consumes one outstanding entry per report: a `Navigate`
+        // echoes its URL, a `Reload` the current page's. The cap
+        // bounds a load whose report never arrives. Its edge: with
+        // >8 loads issued before their reports land, the oldest
+        // echo is evicted and its real report then reads as
+        // page-initiated — one spurious history entry + forward
+        // truncation, self-healing on the next navigation. The
+        // trade is deliberate: correctness within a plausible
+        // in-flight window (a webview can't meaningfully be 9 loads
+        // deep) over an unbounded ledger for a dropped webview.
+        for command in &commands {
+            let url = match command {
+                NavCommand::Navigate(url) => Some(url.clone()),
+                NavCommand::Reload => self.current().map(str::to_owned),
+                NavCommand::OpenExternal(_) => None,
+            };
+            if let Some(url) = url {
+                if self.echoes.len() >= 8 {
+                    self.echoes.pop_front();
+                }
+                self.echoes.push_back(url);
+            }
+        }
+        commands
     }
 }
 
@@ -454,14 +544,19 @@ impl Pane for BrowserPane {
             [bar.left_bottom(), bar.right_bottom()],
             Stroke::new(1.0, chrome::SEP),
         );
-        // One chrome button at `x`: paints and hit-tests; `enabled`
-        // dims and disarms it (the no-history back arrow). Returns
-        // (clicked, width to advance).
-        let button = |x: f32,
-                      label: &'static str,
-                      enabled: bool,
-                      tip: &'static str,
-                      ui: &mut egui::Ui|
+        // The hit registry — each chrome button registers its stable
+        // `browser.<name>` target (disabled ones included, so an
+        // `expect_hit` gate sees the chrome even before it's armed).
+        let hits = &mut shared.hits;
+        // One chrome button at `x`: paints, registers and hit-tests;
+        // `enabled` dims and disarms it (the no-history back arrow).
+        // Returns (clicked, width to advance).
+        let mut button = |x: f32,
+                          label: &'static str,
+                          name: &'static str,
+                          enabled: bool,
+                          tip: &'static str,
+                          ui: &mut egui::Ui|
          -> (bool, f32) {
             let width = painter
                 .layout_no_wrap(label.to_string(), font.clone(), Color32::WHITE)
@@ -477,6 +572,7 @@ impl Pane for BrowserPane {
                 egui::Id::unique(("browser-btn", label)),
                 Sense::click(),
             );
+            hits.register(|| format!("browser.{name}"), hit_rect);
             let (bg, fg) = if !enabled {
                 (Color32::TRANSPARENT, dim)
             } else if hit.hovered() {
@@ -500,11 +596,25 @@ impl Pane for BrowserPane {
 
         let browser = &mut shared.browser;
         let mut x = bar.left() + 6.0;
-        let (back, advance) = button(x, "‹", browser.can_go_back(), "back (Alt+←)", ui);
+        let (back, advance) = button(x, "‹", "back", browser.can_go_back(), "back (Alt+←)", ui);
         x += advance;
-        let (forward, advance) = button(x, "›", browser.can_go_forward(), "forward (Alt+→)", ui);
+        let (forward, advance) = button(
+            x,
+            "›",
+            "forward",
+            browser.can_go_forward(),
+            "forward (Alt+→)",
+            ui,
+        );
         x += advance;
-        let (reload, advance) = button(x, "⟳", browser.current().is_some(), "reload (Ctrl+R)", ui);
+        let (reload, advance) = button(
+            x,
+            "⟳",
+            "reload",
+            browser.current().is_some(),
+            "reload (Ctrl+R)",
+            ui,
+        );
         x += advance + 4.0;
 
         // The external-open button right-anchors so the entry takes
@@ -518,6 +628,7 @@ impl Pane for BrowserPane {
         let (external, _) = button(
             bar.right() - ext_w - 4.0,
             ext_label,
+            "external",
             browser.current().is_some() || !browser.entry().is_empty(),
             "open in the system browser",
             ui,
@@ -839,6 +950,101 @@ mod tests {
             ],
             "External verdict: navigate→external, reload dropped"
         );
+    }
+
+    /// The `loads` tally (Spec R15's dump surface): only commands the
+    /// fold keeps webview-bound count — submits, history steps and
+    /// reloads under `Embedded`; `OpenExternal` hand-offs and
+    /// webview-reported navigations never do. `history_depth` reports
+    /// the entries `index` walks.
+    #[test]
+    fn loads_tally_counts_only_webview_bound_commands() {
+        let mut browser = BrowserState::default();
+        browser.set_embed(Embed::Embedded);
+        assert_eq!(browser.loads(), 0);
+        assert_eq!(browser.history_depth(), 0);
+
+        // A submit, a reload and a history step are loads.
+        browser.navigate("https://a.dev");
+        browser.navigate("https://b.dev");
+        browser.reload();
+        browser.go_back();
+        browser.open_external();
+        let _ = browser.drain_nav();
+        assert_eq!(browser.loads(), 4, "2 navigates + reload + back");
+        assert_eq!(browser.history_depth(), 2);
+
+        // An external hand-off is not a webview load; a page-initiated
+        // navigation isn't either — the webview already fetched it.
+        let _ = browser.drain_nav();
+        browser.webview_navigated("https://c.dev");
+        assert_eq!(browser.loads(), 4, "hand-off + report never fetch");
+        assert_eq!(
+            browser.history_depth(),
+            2,
+            "the report lands — truncating the forward half first"
+        );
+
+        // Under an external verdict even a submit drains to the
+        // system browser — `loads` stays flat.
+        let mut browser = BrowserState::default();
+        browser.set_embed(Embed::External(WhyExternal::FeatureOff));
+        browser.navigate("https://a.dev");
+        let _ = browser.drain_nav();
+        assert_eq!(browser.loads(), 0, "the opener fetched, not us");
+        assert_eq!(browser.history_depth(), 1);
+    }
+
+    /// The echo ledger (Spec R15's history-correctness half): every
+    /// webview-bound command `drain_nav` issues reports itself back
+    /// async, so a report matching an issued load is consumed — no
+    /// history churn, no forward truncation — while a report with NO
+    /// matching echo is a real page-initiated navigation that pushes.
+    /// Stale echoes cap out rather than grow forever.
+    #[test]
+    fn issued_loads_consume_their_own_echo_reports() {
+        let mut browser = BrowserState::default();
+        browser.set_embed(Embed::Embedded);
+        browser.navigate("https://a.dev");
+        browser.navigate("https://b.dev");
+        let _ = browser.drain_nav();
+        assert_eq!(browser.history_depth(), 2);
+
+        // The two loads' echo reports land late — after `go_back`
+        // moved `current` — and still push nothing.
+        browser.go_back();
+        let _ = browser.drain_nav();
+        browser.webview_navigated("https://a.dev"); // the stale echo
+        browser.webview_navigated("https://b.dev"); // the other echo
+        assert_eq!(
+            browser.history_depth(),
+            2,
+            "the stale echoes consumed ledger entries, never pushed"
+        );
+        assert!(
+            browser.can_go_forward(),
+            "the forward half survives — no truncation happened"
+        );
+        browser.webview_navigated("https://a.dev"); // the requeue echo
+        assert_eq!(browser.history_depth(), 2);
+        assert_eq!(browser.current(), Some("https://a.dev"));
+
+        // A report with no outstanding echo is genuinely
+        // page-initiated — it truncates forward and lands.
+        browser.webview_navigated("https://c.dev");
+        assert_eq!(browser.history_depth(), 2, "a.dev, then c.dev");
+        assert_eq!(browser.current(), Some("https://c.dev"));
+        assert!(!browser.can_go_forward());
+
+        // The ledger bounds itself: nine issued loads over eight
+        // slots drop the oldest rather than grow forever.
+        let mut browser = BrowserState::default();
+        browser.set_embed(Embed::Embedded);
+        for n in 0..9 {
+            browser.navigate(&format!("https://{n}.dev"));
+        }
+        let _ = browser.drain_nav();
+        assert_eq!(browser.echoes.len(), 8, "the cap dropped the oldest");
     }
 
     /// us-18: a webview-reported navigation lands as a real history

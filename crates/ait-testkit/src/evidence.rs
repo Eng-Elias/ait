@@ -99,6 +99,28 @@ pub(crate) fn write_dump(
     Ok(dir)
 }
 
+/// The GUI dump's extra files (Spec R15): the last driver `dump`
+/// verbatim and the app's stderr tail — no PTY exists to tail.
+const DUMP_FILE: &str = "dump.json";
+const STDERR_FILE: &str = "stderr.txt";
+
+/// The GUI-side dump writer ([`crate::gui::GuiE2e::dump_evidence`]):
+/// `dump.json` + `stderr.txt` + the same `actions.log`, under the same
+/// `dump_root()/<test>/` tree the PTY harness uses.
+pub(crate) fn write_gui_dump(
+    test_name: &str,
+    dump: &str,
+    stderr: &str,
+    actions: &[ActionEntry],
+) -> io::Result<PathBuf> {
+    let dir = dump_root().join(sanitize(test_name));
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(DUMP_FILE), dump)?;
+    fs::write(dir.join(STDERR_FILE), stderr)?;
+    fs::write(dir.join(ACTIONS_FILE), render_actions(actions))?;
+    Ok(dir)
+}
+
 /// `actions.log`: one `#<seq> [t+<ms>] <action> screen=<hash>` line
 /// per entry, in the order steps ran.
 fn render_actions(actions: &[ActionEntry]) -> String {
@@ -164,5 +186,30 @@ mod tests {
         assert_eq!(describe_bytes(b"hi\n"), "send_bytes(\"hi\\n\")");
         let long = vec![b'x'; 200];
         assert!(describe_bytes(&long).ends_with("…(+104 bytes)\")"));
+    }
+
+    /// The GUI dump writes its three files under a scenario-named dir
+    /// — `dump.json` for the driver payload, `stderr.txt` for the app
+    /// tail, `actions.log` for the step order (Spec R15).
+    #[test]
+    fn gui_dump_writes_its_files() {
+        let dir = write_gui_dump(
+            "gui-test/evidence",
+            "{\"v\":1,\"pane\":{\"shown\":\"explorer\"}}",
+            "winit: ok",
+            &[ActionEntry {
+                at: Duration::from_millis(42),
+                action: "key(\"Ctrl+Shift+E\")".to_string(),
+                screen_hash: 0x1234,
+            }],
+        )
+        .expect("write the gui dump");
+        assert_eq!(dir, dump_root().join("gui-test/evidence"));
+        assert!(dir.join("dump.json").exists());
+        assert!(dir.join("stderr.txt").exists());
+        let actions = std::fs::read_to_string(dir.join("actions.log")).unwrap();
+        assert!(actions.contains("key(\"Ctrl+Shift+E\")"), "{actions}");
+        assert!(actions.contains("screen=0000000000001234"), "{actions}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

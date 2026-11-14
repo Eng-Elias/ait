@@ -13,6 +13,9 @@ if [ "$(df -Pk . | awk 'NR==2 {print $4}')" -lt 15728640 ]; then
 fi
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+# `test-driver` is off by default, so the workspace leg never lints
+# `test_driver.rs` (Spec R15) — run the feature-on leg explicitly.
+cargo clippy -p ait-gui --features test-driver --all-targets -- -D warnings
 # Known flakes (scripts/flaky-tests.txt — docs/agents/flaky-tests.md
 # owns the list): the parallel suite is the load that trips them, so
 # skip them in the sweep and run each one serially afterwards. A flake

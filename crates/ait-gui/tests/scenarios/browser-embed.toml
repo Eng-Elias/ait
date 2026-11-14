@@ -1,0 +1,53 @@
+# Spec R15-T5 — the browser pane's embedded surface end to end
+# (Spec R14 §5.13): `Ctrl+Shift+B` probes and embeds a `wry` child
+# under X11, `example.com` + Enter normalizes and loads (the `loads`
+# tally is the fetch the pane issued), and `ext ↗` hands the page to
+# the stub opener on `PATH` — the system-browser hand-off asserted
+# without a real browser.
+#
+# binary = "web" declares the embedded leg of the dual-binary matrix:
+# the `web`+`test-driver` build, or `AIT_GUI_E2E_BIN_WEB` when the
+# test target itself was built feature-off.
+feature = "browser"
+binary = "web"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+key = "Ctrl+Shift+B"
+
+[[steps]]
+expect_pane = "browser"
+
+# The probe ran and reported embedded — the body hosts a real child
+# webview (a staged rect, never the external surface).
+[[steps]]
+expect_browser = { surface = "embedded", webview = true }
+
+[[steps]]
+text = "example.com"
+
+[[steps]]
+key = "Enter"
+
+# The typed host normalized to a URL, synced the entry, pushed
+# history and issued exactly one webview-bound load. The network
+# fetch's outcome is never asserted — the pane's model is.
+[[steps]]
+expect_browser = { entry_contains = "example.com", current_contains = "example.com", history_min = 1, loads = 1 }
+
+# `ext ↗` — the chrome's open-externally button — hands the current
+# page to the platform opener whatever the verdict; the stub on
+# `PATH` records it.
+[[steps]]
+expect_hit = "browser.external"
+
+[[steps]]
+click = "browser.external"
+
+[[steps]]
+expect_open = "https://example.com"
+
+[[steps]]
+quit = true

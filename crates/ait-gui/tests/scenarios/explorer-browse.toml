@@ -1,0 +1,160 @@
+# Spec R15-T4 — the explorer pane's browse verbs end to end: a real
+# fixture under the shell's cwd, the REAL integrated shell's OSC-7
+# precmd report re-rooting the pane (the leg runs `/bin/bash` so the
+# spawn's snippet injection applies — the `cd`'s report is emitted
+# by `ait-shell`'s own `snippet.bash`, not a printf'd stand-in),
+# then ↑/↓/Enter/→/←/⌫ browsing, the `..` root clamp, the `.`
+# dotfile toggle, wheel scrolling and the three preview kinds.
+# `o`/`Enter`'s editor spawn lands on the harness's stub opener —
+# blanking VISUAL/EDITOR walks `resolve_editor` to
+# `platform_opener`, whose `xdg-open`/`open` shadow records instead
+# of launching (the log itself is a code-first test's assert).
+feature = "explorer-browse"
+env = { VISUAL = "", EDITOR = "", SHELL = "/bin/bash" }
+
+[[steps]]
+wait_text = "$"
+
+# The fixture — every probe is output-only (std.15): `FIX-READY`
+# and `CWD-OK` exist only in printf's output, never in the typed
+# line's echo. `big.txt` is one byte past the 64 KiB preview cap.
+[[steps]]
+text = "mkdir -p fx/sub fx/many && printf 'HEAD-LINE\\nsecond\\n' > fx/head.txt && printf 'x\\0y' > fx/blob.bin && head -c 70000 /dev/zero | tr '\\0' 'a' > fx/big.txt && touch fx/.dot && for i in $(seq 0 39); do touch fx/many/f$i; done && printf 'FIX-%s\\n' READY"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "FIX-READY"
+
+# `cd` — the snippet's precmd emits the real OSC 7 with the next
+# prompt, flipping `cwd_reported`; the memo key moves and the pane
+# re-roots at the reported path. `CWD-OK` is only the step's gate.
+[[steps]]
+text = "cd fx && printf 'CWD-%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "CWD-OK"
+
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+expect_pane = "explorer"
+
+# Rooted at the reported cwd; dirs sort first (`many` < `sub`),
+# `.dot` stays hidden. `dir`/`root` match as suffixes — the harness
+# tempdir's own name is never asserted.
+[[steps]]
+expect_explorer = { root = "/fx", dir = "/fx", selected = "many", has = ["many", "sub", "big.txt", "blob.bin", "head.txt"], lacks = [".dot"], hidden = false }
+
+# The `.` toggle reveals the dotfile, a second hides it again. The
+# `twin` is the real press's shape: `Key` + the composed `Text(".")`
+# the pane's verb actually reads (a bare letter's `Key` half
+# translates to nothing — text-producing keys are chord-only).
+[[steps]]
+key = { chord = ".", twin = true }
+
+[[steps]]
+expect_explorer = { hidden = true, has = [".dot"] }
+
+[[steps]]
+key = { chord = ".", twin = true }
+
+[[steps]]
+expect_explorer = { hidden = false, lacks = [".dot"] }
+
+# ↓ walks the listing; the over-cap file flags `truncated`, the
+# NUL-carrying one shows the binary placeholder, the small text
+# file previews its head.
+[[steps]]
+key = "Down"
+
+[[steps]]
+expect_explorer = { selected = "sub", preview = "none" }
+
+[[steps]]
+key = "Down"
+
+[[steps]]
+expect_explorer = { selected = "big.txt", preview = { kind = "text", truncated = true } }
+
+[[steps]]
+key = "Down"
+
+[[steps]]
+expect_explorer = { selected = "blob.bin", preview = "binary" }
+
+[[steps]]
+key = "Down"
+
+[[steps]]
+expect_explorer = { selected = "head.txt", preview = { kind = "text", contains = "HEAD-LINE", truncated = false } }
+
+# Home → Enter descends into `many` — forty rows, more than the
+# listing window, so the wheel gesture has somewhere to go.
+[[steps]]
+key = "Home"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_explorer = { dir = "/fx/many", selected = "f0", has = ["f0", "f39"] }
+
+# A real `MouseWheel` over the listing — the app-level wheel router
+# only knows the grid and the panel, so the pane's own paint reads
+# `smooth_scroll_delta` under the pointer.
+[[steps]]
+scroll = { unit = "line", dy = -5, target = "explorer.row.0", raw = true }
+
+[[steps]]
+expect_explorer = { dir = "/fx/many", scroll = 1, has = ["f39"] }
+
+# ⌫ back to the parent, once more into the clamp: `..` at the
+# session root stays at the session root.
+[[steps]]
+key = "Backspace"
+
+[[steps]]
+expect_explorer = { dir = "/fx", selected = "many" }
+
+[[steps]]
+key = "Backspace"
+
+[[steps]]
+expect_explorer = { dir = "/fx" }
+
+# Mouse navigation travels the registered hit names — a single
+# click selects (a double would descend/open), `Enter` descends,
+# clicking `..` goes up.
+[[steps]]
+click = "explorer.entry.sub"
+
+[[steps]]
+expect_explorer = { selected = "sub", dir = "/fx" }
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_explorer = { dir = "/fx/sub" }
+
+[[steps]]
+click = "explorer.up"
+
+[[steps]]
+expect_explorer = { dir = "/fx" }
+
+# Click a file row: it selects AND loads the preview.
+[[steps]]
+click = "explorer.entry.head.txt"
+
+[[steps]]
+expect_explorer = { selected = "head.txt", preview = { kind = "text", contains = "HEAD-LINE" } }
+
+[[steps]]
+quit = true

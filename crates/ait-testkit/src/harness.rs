@@ -573,13 +573,11 @@ impl Drop for E2e {
     }
 }
 
-/// Truthy `AIT_E2E_*` env-var convention shared by the harness's flags:
-/// unset, empty, `0` or `false` (any case) is off; anything else is on.
+/// Truthy `AIT_E2E_*` env-var convention shared by the harness's flags
+/// — the single implementation is [`crate::gui::env_flag`] (public so
+/// test files share the rule); this is its crate-local spelling.
 pub(crate) fn env_flag(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    }
+    crate::gui::env_flag(name)
 }
 
 /// The headed-mode mirror target: the controlling terminal (`/dev/tty`)

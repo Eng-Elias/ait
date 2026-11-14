@@ -1,0 +1,132 @@
+# Spec R15-T6 — the region's ownership precedence, both directions
+# (gui-verification.md "Pane/agent precedence"): the agent panel
+# claims the region over a live aux selection, a pane chord reclaims
+# the region while the panel's conversation survives underneath, and
+# NO chord leaks a char onto the command line (the chord-leak style
+# printf probe — a stray letter turns `printf` into `xprintf` and the
+# marker never lands).
+feature = "panes"
+
+[[steps]]
+wait_text = "$"
+
+# ---------------------------------------------------------------
+# Direction one: `Alt+A` over a shown aux pane — the panel's claim
+# wins the region while the aux SELECTION survives underneath.
+# ---------------------------------------------------------------
+
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+expect_pane_selected = "explorer"
+
+# The claim lands over the live selection: the region shows the
+# panel, the selection stays `explorer` underneath it.
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "agent"
+
+[[steps]]
+expect_pane_selected = "explorer"
+
+# The claim releases — the SAME selection re-emerges (survival, not
+# a re-open).
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "explorer"
+
+# Chord-leak probe 1 — close the region so text reaches the shell,
+# then prove the three chords typed nothing: `printf 'PP-1%s\n' OK`
+# must land verbatim (a leaked `e`/`a` prefixes the command).
+[[steps]]
+key = "Escape"
+
+[[steps]]
+expect_pane = "none"
+
+[[steps]]
+text = "printf 'PP-1%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "PP-1OK"
+
+# ---------------------------------------------------------------
+# Direction two: a pane chord over the open panel — the region
+# switches, the conversation survives underneath (`Alt+A` brings
+# back the SAME panel — the parked gate card proves it).
+# ---------------------------------------------------------------
+
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "agent"
+
+# Park an approve card — the conversation marker: if the chord's
+# close dropped panel state, the gate could not come back.
+[[steps]]
+agent = { event = "approve", name = "run", summary = "survival marker" }
+
+[[steps]]
+expect_gate = "approve"
+
+# The chord switches the region — the claim yields to the new
+# selection, the card stays parked on the closed panel.
+[[steps]]
+key = "Ctrl+Shift+B"
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+expect_pane_selected = "browser"
+
+[[steps]]
+expect_gate = "approve"
+
+# `Alt+A` brings the conversation back — same panel, same card.
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "agent"
+
+[[steps]]
+expect_gate = "approve"
+
+# Chord-leak probe 2 — close the panel (selection re-emerges), close
+# the region, then the marker probe: neither chord typed a char.
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+key = "Escape"
+
+[[steps]]
+expect_pane = "none"
+
+[[steps]]
+text = "printf 'PP-2%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "PP-2OK"
+
+[[steps]]
+quit = true

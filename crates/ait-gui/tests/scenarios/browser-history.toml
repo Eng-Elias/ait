@@ -1,0 +1,95 @@
+# Spec R15-T5 — the history surface (Spec R14 §5.13): `Alt+←`/`Alt+→`
+# and the `‹`/`›` chrome buttons walk OUR history (never the
+# webview's own back list), each step re-issues the page as a fresh
+# webview-bound load (`loads`), and `⟳`/`Ctrl+R` reload. Two
+# `file://` pages keep every assert exact and offline — their nav
+# reports echo verbatim and dedupe against the current page.
+feature = "browser"
+binary = "web"
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+key = "Ctrl+Shift+B"
+
+[[steps]]
+expect_pane = "browser"
+
+[[steps]]
+expect_browser = { surface = "embedded" }
+
+# Page one — the first history entry and first webview-bound load.
+[[steps]]
+text = "file:///etc/hostname"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hostname", history = 1, loads = 1, back = false, forward = false }
+
+# Page two — `Ctrl+U` clears the synced entry before typing.
+[[steps]]
+key = "Ctrl+U"
+
+[[steps]]
+text = "file:///etc/hosts"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hosts", history = 2, loads = 2, back = true, forward = false }
+
+# `Alt+←`/`Alt+→` — the chord walk. Each step requeues the landed
+# page (a fresh load) and resyncs the entry.
+[[steps]]
+key = "Alt+Left"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hostname", entry = "file:///etc/hostname", history = 2, loads = 3, back = false, forward = true }
+
+[[steps]]
+key = "Alt+Right"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hosts", entry = "file:///etc/hosts", history = 2, loads = 4, back = true, forward = false }
+
+# The chrome buttons — the same walk by mouse, aimed by hit name.
+[[steps]]
+expect_hit = "browser.back"
+
+[[steps]]
+click = "browser.back"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hostname", history = 2, loads = 5, forward = true }
+
+[[steps]]
+expect_hit = "browser.forward"
+
+[[steps]]
+click = "browser.forward"
+
+[[steps]]
+expect_browser = { current = "file:///etc/hosts", history = 2, loads = 6, back = true, forward = false }
+
+# `⟳` and `Ctrl+R` — the reload surface, both affordances.
+[[steps]]
+expect_hit = "browser.reload"
+
+[[steps]]
+click = "browser.reload"
+
+[[steps]]
+expect_browser = { loads = 7 }
+
+[[steps]]
+key = "Ctrl+R"
+
+[[steps]]
+expect_browser = { loads = 8, current = "file:///etc/hosts", history = 2 }
+
+[[steps]]
+quit = true

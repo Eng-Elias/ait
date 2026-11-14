@@ -1,0 +1,149 @@
+# Spec R15-T2 — the chord-leak guard: every documented chord (the
+# gui-verification checklist's set) leaves the command line clean —
+# including the twin-injected Alt-chord, where a platform delivers
+# `Key{.., alt}` plus a `Text` twin (the R13 Alt+A→`a` leak). Each
+# chord is followed by an output-only marker probe (std.15): a stray
+# char on the line turns `printf` into `tprintf`/`aprintf`, the marker
+# never lands and the bounded wait fails.
+feature = "input"
+
+[[steps]]
+wait_text = "$"
+
+# Alt+T with the derived text twin — the new tab's prompt is the
+# probe surface: a leaked `t` lands on ITS clean command line.
+[[steps]]
+key = { chord = "Alt+T", twin = true }
+
+[[steps]]
+wait_text = "$"
+
+[[steps]]
+text = "printf 'LEAK-T%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-TOK"
+
+# Alt+W with the twin — tab 2 closes and the probe lands on tab 1's
+# line; a leaked `w` prefixes the command.
+[[steps]]
+key = { chord = "Alt+W", twin = true }
+
+[[steps]]
+text = "printf 'LEAK-W%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-WOK"
+
+# Alt+A — the agent panel opens (the chord resolves), a second press
+# closes it, and the probe checks nothing rode in on either press.
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "agent"
+
+[[steps]]
+key = "Alt+A"
+
+[[steps]]
+expect_pane = "none"
+
+[[steps]]
+text = "printf 'LEAK-A%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-AOK"
+
+# Alt+P — no other execution profiles declared under the pinned
+# settings, so the chord toasts instead of opening a picker; the
+# probe still confirms nothing typed.
+[[steps]]
+key = "Alt+P"
+
+[[steps]]
+text = "printf 'LEAK-P%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-POK"
+
+# Alt+R — an empty store toasts instead of opening the conversation
+# picker.
+[[steps]]
+key = "Alt+R"
+
+[[steps]]
+text = "printf 'LEAK-R%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-ROK"
+
+# Ctrl+Shift+F — the find bar owns focus until Esc releases it.
+[[steps]]
+key = "Ctrl+Shift+F"
+
+[[steps]]
+expect_find = true
+
+[[steps]]
+key = "Escape"
+
+[[steps]]
+expect_find = false
+
+[[steps]]
+text = "printf 'LEAK-F%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-FOK"
+
+# Ctrl+W — unbound, it reaches the shell (readline's kill-word on an
+# empty line is a no-op); nothing may type.
+[[steps]]
+key = "Ctrl+W"
+
+[[steps]]
+text = "printf 'LEAK-CW%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-CWOK"
+
+# Alt+Enter — the suggestion trigger on an empty line arms nothing.
+[[steps]]
+key = "Alt+Enter"
+
+[[steps]]
+expect_suggesting = false
+
+[[steps]]
+text = "printf 'LEAK-AE%s\\n' OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+expect_text = "LEAK-AEOK"
+
+[[steps]]
+quit = true

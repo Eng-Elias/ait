@@ -53,12 +53,20 @@ pub struct PumpActivity {
     /// Settings or skills changed (reload adopt, catalog refresh, or
     /// an error toast).
     pub config: bool,
+    /// A test-driver request queued input for the next frame's
+    /// dispatch (Spec R15 — `key`/`text`/`quit`; a `dump`-only pass
+    /// answers from the socket without needing a frame).
+    #[cfg(feature = "test-driver")]
+    pub driver: bool,
 }
 
 impl PumpActivity {
     /// Whether anything this pass needs a frame.
     pub fn any(&self) -> bool {
-        self.session || self.ctl || self.agent || self.config
+        let any = self.session || self.ctl || self.agent || self.config;
+        #[cfg(feature = "test-driver")]
+        let any = any || self.driver;
+        any
     }
 }
 
@@ -87,12 +95,25 @@ impl Pump {
         shared: Arc<Mutex<Shared>>,
         ctl: Option<CtlServer>,
         watcher: Option<SettingsWatcher>,
+        // The test-driver socket — drained beside ctl on the same
+        // pass (Spec R15); `None` when the env var named no path.
+        #[cfg(feature = "test-driver")] driver: Option<crate::test_driver::TestDriver>,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("ait-gui-pump".into())
-            .spawn(move || pump_loop(ctx, shared, ctl, watcher, thread_stop))?;
+            .spawn(move || {
+                pump_loop(
+                    ctx,
+                    shared,
+                    ctl,
+                    watcher,
+                    thread_stop,
+                    #[cfg(feature = "test-driver")]
+                    driver,
+                )
+            })?;
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -124,6 +145,7 @@ fn pump_loop(
     mut ctl: Option<CtlServer>,
     watcher: Option<SettingsWatcher>,
     stop: Arc<AtomicBool>,
+    #[cfg(feature = "test-driver")] mut driver: Option<crate::test_driver::TestDriver>,
 ) {
     // Per-tab snapshots keyed by the stable `Tab::id` — positional
     // indexes shift on close.
@@ -135,6 +157,8 @@ fn pump_loop(
             &shared,
             ctl.as_mut(),
             watcher.as_ref(),
+            #[cfg(feature = "test-driver")]
+            driver.as_mut(),
             &mut cursors,
             &mut revisions,
         );
@@ -149,12 +173,15 @@ fn pump_loop(
 /// settings watcher → skills → suggester → ctl → `drain_events` (which folds
 /// `observe_event` and services each tab's `ShellBridge` internally)
 /// → `drain_agent_events` → `drain_transcripts` →
-/// `take_persisted_blocks` → the per-tab damage/cursor/revision diff.
+/// `take_persisted_blocks` → the per-tab damage/cursor/revision diff
+/// → the test-driver socket (Spec R15), last so a `dump` answers from
+/// post-drain state and queued input lands before the next frame.
 fn drain_pass(
     ctx: &Context,
     shared: &Arc<Mutex<Shared>>,
     ctl: Option<&mut CtlServer>,
     watcher: Option<&SettingsWatcher>,
+    #[cfg(feature = "test-driver")] driver: Option<&mut crate::test_driver::TestDriver>,
     cursors: &mut HashMap<u64, Cursor>,
     revisions: &mut HashMap<u64, u64>,
 ) -> PumpActivity {
@@ -300,6 +327,16 @@ fn drain_pass(
         }
     }
 
+    // The test-driver socket (Spec R15): `key`/`text`/`quit` requests
+    // queue `Shared::injected` for the next frame's `dispatch_events`,
+    // `dump` answers from the post-drain state the paint pass also
+    // reads. Runs last in the pass — after the session drains — so a
+    // dump is never one drain stale. Only queued input needs a frame.
+    #[cfg(feature = "test-driver")]
+    if let Some(server) = driver {
+        activity.driver |= server.drain(ctx, &mut shared) > 0;
+    }
+
     activity
 }
 
@@ -390,6 +427,17 @@ mod tests {
             panes: crate::pane::PaneHost::default(),
             explorer: crate::explorer::ExplorerState::default(),
             browser: crate::browser::BrowserState::default(),
+            #[cfg(feature = "test-driver")]
+            injected: std::collections::VecDeque::new(),
+            hits: crate::app::HitTargets::default(),
+            #[cfg(feature = "test-driver")]
+            detect_hover: crate::test_driver::DetectHover::default(),
+            #[cfg(feature = "test-driver")]
+            cell_metrics: None,
+            #[cfg(feature = "test-driver")]
+            input_seq: 0,
+            #[cfg(feature = "test-driver")]
+            input_done: 0,
         }))
     }
 
@@ -461,6 +509,10 @@ mod tests {
                 shared,
                 ctl,
                 watcher,
+                // These tests exercise ctl/config/store drains — never
+                // a test-driver socket.
+                #[cfg(feature = "test-driver")]
+                None,
                 &mut self.cursors,
                 &mut self.revisions,
             )

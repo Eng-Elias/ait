@@ -4,8 +4,144 @@ One-line pitch: drive the **real `ait` binary** in a real PTY with
 keystrokes and mouse, assert on the rendered screen. Deep docs:
 [testing-toolkit.md](testing-toolkit.md) (architecture, record/replay,
 dumps). Agent skill: `.devin/skills/e2e/SKILL.md`.
-GUI frontend (`ait-gui`) has no e2e harness — the manual checklist
-is [gui-verification.md](gui-verification.md).
+GUI frontend (`ait-gui`) has its own harness (`ait_testkit::gui`,
+Spec R15): TOML scenarios under `crates/ait-gui/tests/scenarios/`
+drive the real binary under Xvfb (or the developer's `DISPLAY` with
+`AIT_GUI_E2E_HEADED=1`) over a feature-gated socket. Build it with
+`cargo build -p ait-gui --features test-driver` and run
+`cargo test -p ait-gui --features test-driver --test scenarios`.
+
+The suite is a dual-binary matrix (R15-T5): the `web`+`test-driver`
+build covers the embedded-webview surface, the
+`--no-default-features`+`test-driver` build (no webkit packages
+needed) covers the external-open fallback. A scenario declares its
+leg with `binary = "web"` / `"noweb"` (absent = any binary). Each
+leg resolves through `AIT_GUI_E2E_BIN_WEB` / `AIT_GUI_E2E_BIN_NOWEB`
+first, else the cargo-built binary when its feature set matches —
+so `cargo test -p ait-gui --features test-driver` runs the `web`
+leg and skips `noweb` scenarios loudly, `--no-default-features
+--features test-driver` does the inverse, and setting the other
+leg's env var to a separately built binary runs both in one pass:
+
+```bash
+cargo build -p ait-gui --features test-driver                          # web leg
+cargo build -p ait-gui --no-default-features --features test-driver \
+  --target-dir target/gui-noweb                                      # noweb leg
+AIT_GUI_E2E_BIN_NOWEB=$PWD/target/gui-noweb/debug/ait-gui \
+  cargo test -p ait-gui --features test-driver --test scenarios
+```
+
+(The env paths are absolute — the harness spawns each app in a
+throwaway cwd, where a relative path would dissolve.)
+
+Every spawn gets recording `xdg-open`/`open` stubs first on the
+app's `PATH` (no flag — `pinned_env` always installs `stub-bin/`)
+— `expect_open = "<url substring>"` then waits on the stub's log,
+so `ext ↗`, external Enter navigations and editor spawns assert
+without real applications.
+
+A third display route exists for tests that own the X server
+themselves: `GuiSpawnConfig::display` pins the app to a named
+`DISPLAY` — no ambient display or `xvfb-run` needed — and
+`GuiE2e::pid()` hands back the spawned pid so `_NET_WM_PID` window
+lookup works. That is the winit canary's seam
+(`crates/ait-gui/tests/winit_canary.rs`, R15-T7): with
+`AIT_GUI_E2E_XTEST=1` and `xdotool`+`Xvfb` on `PATH` it raises a
+private `Xvfb :N` and injects a chord and a click *externally* over
+XTest, asserting through the dump that winit delivered them — the
+one layer socket injection skips. Canary only, non-authoritative:
+it loud-skips when the env flag or the tools are absent, and it
+never uses a shared display (a synthetic click would land on real
+windows). CI runs it on the promotion pipeline's `gui-e2e` job.
+
+Verbs: `key`/`text`/`paste`/`scroll`/`resize` (input through the
+app's own dispatch — `scroll` adds `target`/`x`/`y` aiming and
+`raw = true` for a real `MouseWheel` batch, the only delivery a
+pane-own-paint surface like the explorer's listing answers),
+`pointer = {event, target|x, y, …, modifiers?}` and
+`click = "hit.name"` (real egui pointer events aimed at the hit
+registry — `panes.button`, `panes.chip.<name>`, `gate.approve`,
+`pill.scroll_bottom`, `browser.back`/`browser.forward`/
+`browser.reload`/`browser.external`, `detect.url.<u>`,
+`detect.path.<p>`, `detect.<n>`, `explorer.up`,
+`explorer.entry.<name>`, `explorer.row.<n>`),
+`agent = {event="approve", name, summary}` (stages a real gate
+card through `AgentPanel::apply`), plus waits/asserts
+`wait_text`/`wait_dump` (the input barrier — the dump's
+`input_done` catching `input_seq` proves every accepted request
+folded through a completed frame; the sync point a negative
+assertion needs since the pump answers `dump` off the UI thread)/
+`expect_text`/`expect_pane`/`expect_find`/
+`expect_scroll`/`expect_suggesting`/`expect_gate`/
+`expect_selection`/`expect_hit` (the registry gate — use it when a
+model expectation like `expect_pane` can land a frame before the
+affordance's paint), `expect_browser = {surface, reason, entry,
+entry_contains, bad_entry, history, history_min, current,
+current_contains, back, forward, loads, loads_min, webview}`
+(every present key must hold — `loads` counts webview-bound
+fetches, so a reload or a rejected URL is provable),
+`expect_explorer` (the explorer model — `dir`/`root` as path
+suffixes, `entries`/`has`/`lacks` over the visible listing,
+`selected`, `hidden`, `scroll`, `preview` kind/head/`truncated`),
+`expect_detect` (the Ctrl-hover affordance — `"none"`,
+`"url:<u>"`/`"path:<p>"` or `{ctrl, token}`; pair `ctrl = true`
+with `token = "none"` to prove a non-affording hover frame was
+processed — combine with `wait_dump` first so the hover batch is
+provably folded), `expect_open` (the stub-opener log),
+`expect_pane_selected` (the selection *under* the agent claim —
+`expect_pane` asserts the shown region instead), `expect_status`
+(the status strip's composed text — toast while live, else the
+session summary plus a `suggesting` segment while a request is in
+flight), `expect_toast` (`true`/`false`/substring on a *live*
+toast) and `expect_tabs` (the tab strip's count), and `quit`. The
+dump's `browser` object carries the surface verdict
+(`unknown`/`embedded`/`external` + the external reason line), the
+address entry and its amber flag, history depth/position, the
+webview-bound load tally and the staged webview rect (`null` is
+the hide signal); it also carries
+`explorer`/`detect`/`agent`/`toast`/`status`/`tabs` objects for
+code-first legs — e.g. `ctl_and_driver_sockets_coexist` runs the
+real `ait ctl` client against the spawned app's pinned
+`XDG_RUNTIME_DIR` (`GuiE2e::runtime_dir`) while the driver socket
+stays bound. `env = {K = "v"}` layers extra variables after the
+harness pins; `stub-bin/` shadows `xdg-open`/`open` first on
+`PATH` and records spawns to `$AIT_GUI_E2E_STUB_LOG`
+(`GuiE2e::stub_log()` in code-first tests). The manual checklist
+stays in [gui-verification.md](gui-verification.md).
+
+A GUI scenario is the same TOML shape with the driver's verbs —
+drop a file in `crates/ait-gui/tests/scenarios/`:
+
+```toml
+feature = "scroll"                # required tag; `binary = "noweb"` pins a leg
+
+[[steps]]
+wait_text = "$"                   # gate progress on the grid, not a sleep
+
+[[steps]]
+text = "seq 1 200 | sed 's/^/X/'"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+scroll = { unit = "line", dy = 3.0 }    # injects egui::Event::MouseWheel
+
+[[steps]]
+expect_scroll = 3                 # dump assert: the model's scroll offset
+
+[[steps]]
+expect_hit = "pill.scroll_bottom" # the registry gate — the pill painted
+
+[[steps]]
+click = "pill.scroll_bottom"      # a real egui click on the named rect
+
+[[steps]]
+expect_scroll = 0
+
+[[steps]]
+quit = true
+```
 
 ## Run
 
@@ -70,12 +206,34 @@ uid-0 shells whose PS1 `\$` renders `#`), `terminal_half` /
 AIT_E2E_HEADED=1 AIT_E2E_SLOWMO=400 \
   cargo test -p ait --test scenarios -- --test-threads=1
 cargo run -p ait-testkit --example drive   # interactive manual driving
+
+# GUI headed mode — spawns on your real DISPLAY instead of xvfb (the
+# contributor cheat sheet lives in docs/running-gui-tests.md);
+# AIT_GUI_E2E_SLOWMO adds a fixed delay before each input request
+# (a scenario's `slowmo = <ms>` header does the same per file).
+# `-- --test-threads=1` serializes the test fns (one window at a
+# time — the TOML legs already run one-by-one inside `scenarios`),
+# and `AIT_GUI_E2E_ONLY=<name>` runs just matching scenario stems:
+AIT_GUI_E2E_HEADED=1 AIT_GUI_E2E_SLOWMO=400 AIT_GUI_E2E_ONLY=explorer \
+  cargo test -p ait-gui --features test-driver \
+  --test scenarios -- --test-threads=1
 ```
 
 ## When it fails
 
-`target/e2e-failures/<test>/` → `screen.txt`, `pty-tail.bin`,
-`actions.log`. A stuck terminal after a headed run: `reset`.
+`target/e2e-failures/<test>/` → for the PTY suite `screen.txt`,
+`pty-tail.bin`, `actions.log`; for the GUI suite `dump.json` (the
+last full `dump` — grid text, pane/browser/explorer state, the whole
+hit registry), `stderr.txt` (the app's stderr tail — wgpu adapter
+pick, webkit errors), `screenshot.png` (the app's real painted
+frame — a `screenshot` request queues egui's
+`ViewportCommand::Screenshot`, the post-render callback encodes the
+`ColorImage` under a `.part` sibling and renames it into place;
+best-effort, evidence for humans only — never a pixel diff) and
+the same `actions.log` (one step per line, `screen=<hash>` marking
+drift between dumps). The `gui-e2e` CI job uploads the directory
+as an artifact on failure. A stuck terminal after a headed run:
+`reset`.
 
 ## Driving the agent panel and remote sessions
 
