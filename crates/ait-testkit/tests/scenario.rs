@@ -5,6 +5,8 @@
 //! verb included. Agent-step scenarios are exercised end to end in
 //! `crates/ait/tests/scenarios.rs`.
 
+#![cfg(unix)]
+
 mod common;
 
 use ait_testkit::{E2e, Scenario, Size};

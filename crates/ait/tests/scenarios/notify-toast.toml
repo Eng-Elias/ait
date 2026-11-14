@@ -4,6 +4,7 @@
 # toast says "build done" while the command's own echo shows the escape
 # spelling, so the match can only be the toast.
 feature = "notify"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

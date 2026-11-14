@@ -21,6 +21,8 @@
 //! `<terminal cols>│<panel cols>`, so a probe on a row's left half can
 //! only be the real grid, never a card's summary.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;

@@ -1857,7 +1857,7 @@ pub fn title_for(options: &LiveSessionOptions) -> String {
         .unwrap_or_else(|| FALLBACK_TITLE.into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::ffi::OsString;

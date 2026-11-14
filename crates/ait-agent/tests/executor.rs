@@ -1065,6 +1065,7 @@ fn executor_tiers_need_no_bridge() {
 /// tests sharing this process (the R09 retro CI flake: one test's
 /// run logged into another's argv file, another's RC answered as
 /// transport).
+#[cfg(unix)]
 const SSH_STUB: &str = r#"#!/bin/sh
 {
     printf 'stub:'
@@ -1081,6 +1082,7 @@ exit @RUN_RC@
 /// Install [`SSH_STUB`] in a scratch dir with `check_rc`/`run_rc`/`out`
 /// baked into the script; returns the stub's path and the argv log
 /// it writes.
+#[cfg(unix)]
 fn install_ssh_stub(
     tag: &str,
     check_rc: u8,
@@ -1109,6 +1111,7 @@ fn install_ssh_stub(
 }
 
 /// The recorded argv lines `log` holds.
+#[cfg(unix)]
 fn stub_calls(log: &std::path::Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
 }
@@ -1117,6 +1120,7 @@ fn stub_calls(log: &std::path::Path) -> String {
 /// -o BatchMode=yes <target> -- <cmd> 2>&1` — `--` ends ssh's own
 /// option parsing so a command starting with `-` is never a client
 /// flag, and the remote shell merges stderr like `__ait_run` does.
+#[cfg(unix)]
 #[test]
 fn control_master_runs_commands_over_the_socket() {
     let (_dir, program, log) = install_ssh_stub("cm", 0, 3, b"merged remote output");
@@ -1143,6 +1147,7 @@ fn control_master_runs_commands_over_the_socket() {
 
 /// Spec R09-T5: a `255` exit is ssh's transport-failure band — it
 /// surfaces as `Transport`, never as the remote command's exit code.
+#[cfg(unix)]
 #[test]
 fn control_master_255_is_transport_not_an_exit_code() {
     let (_dir, program, _log) = install_ssh_stub("cm-255", 0, 255, b"");
@@ -1161,6 +1166,7 @@ fn control_master_255_is_transport_not_an_exit_code() {
 /// command may have partially run remote-side), and every LATER run
 /// goes straight to the user-shell fallback. The probe the
 /// demotion replaced never runs again.
+#[cfg(unix)]
 #[test]
 fn demotion_never_replays_and_never_recovers() {
     let (_dir, program, log) = install_ssh_stub("demote", 0, 255, b"");
@@ -1216,6 +1222,7 @@ fn demotion_never_replays_and_never_recovers() {
 /// selects ControlMaster (demotion-wrapped); a dead socket, no
 /// control path, and a non-remote session all stay on the user-shell
 /// tiers; no bridge selects `DetachedExecutor`.
+#[cfg(unix)]
 #[test]
 fn select_executor_picks_the_tier_the_socket_proves() {
     // Two stubs: the live one answers `-O check` 0 and `via socket`

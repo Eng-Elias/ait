@@ -10,6 +10,7 @@
 # previous bare prompt still satisfies `…[$#]$` and a fresh-prompt
 # wait could pass early), then a fresh bare prompt.
 feature = "shell-integration"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

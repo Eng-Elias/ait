@@ -4,6 +4,7 @@
 # named click both proves the pill painted and drives its snap to
 # the live output.
 feature = "scroll"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

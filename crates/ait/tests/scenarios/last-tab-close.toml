@@ -2,6 +2,7 @@
 # tab's session had itself exited, ait's exit code carries the child's
 # (`exit 3` in the shell -> ait exits 3).
 feature = "lifecycle"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

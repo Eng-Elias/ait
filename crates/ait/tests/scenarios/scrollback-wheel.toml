@@ -3,6 +3,7 @@
 # the live view ends at `100`; each wheel-up tick reveals numbers three
 # lower.
 feature = "scrollback"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

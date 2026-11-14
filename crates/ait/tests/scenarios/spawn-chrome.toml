@@ -3,6 +3,7 @@
 # `cwd · sh · — · running` status line (last row), then the inner
 # shell's prompt in the content band.
 feature = "chrome"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

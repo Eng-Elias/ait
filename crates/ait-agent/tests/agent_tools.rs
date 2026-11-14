@@ -1155,6 +1155,7 @@ fn edit_files_allow_for_task_suppresses_later_prompts() {
 /// The worker resolves the user's shell — `/bin/sh` fallback or an
 /// injected bash/zsh/fish; `read`/`echo` are builtins on all of
 /// them, so the scenario needs no external program.
+#[cfg(unix)]
 #[test]
 fn write_to_pty_gates_then_round_trips_through_the_agent_pty() {
     // Pin the worker's resolved shell to an injected one where it

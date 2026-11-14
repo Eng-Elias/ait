@@ -1089,6 +1089,7 @@ mod tests {
     }
 
     /// A fresh grid carries no output context.
+    #[cfg(unix)]
     #[test]
     fn recent_output_lines_on_a_fresh_grid_is_empty() {
         let session = session(40, b"");
@@ -1120,6 +1121,7 @@ mod tests {
     /// answers where it exists (the spawn cwd otherwise); once the
     /// shell reports OSC 7 the reported path wins outright. Real PTY
     /// spawn — needs no host TTY (same allowance as the tabs tests).
+    #[cfg(unix)]
     #[test]
     fn cwd_falls_back_to_proc_then_prefers_osc7() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1175,6 +1177,7 @@ mod tests {
     /// real `/bin/sh` produces a `SuggestRequest` carrying the request
     /// verbatim, the tab's shell name, the OS, the cwd and the output
     /// tail — plus the caller's `Settings` snapshot (us-23).
+    #[cfg(unix)]
     #[test]
     fn request_for_collects_context() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1257,6 +1260,7 @@ mod tests {
     /// real `/bin/sh` produces a `SuggestRequest` whose request is the
     /// WHOLE line verbatim — the same §5.4 context `request_for`
     /// assembles.
+    #[cfg(unix)]
     #[test]
     fn line_request_for_collects_the_whole_line() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1429,6 +1433,7 @@ mod tests {
     /// `A B C D` quadruple around a failing command, then a marker row
     /// past the block's `D` which the grid-lines source would carry
     /// and block text must not.
+    #[cfg(unix)]
     #[test]
     fn output_lines_for_draws_on_blocks_when_present() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1497,6 +1502,7 @@ mod tests {
 
     /// The fallback half of us-31: a tab with NO blocks keeps the
     /// Spec-R04 grid-lines source — same answer, same bound.
+    #[cfg(unix)]
     #[test]
     fn output_lines_for_falls_back_to_grid_lines_without_blocks() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1574,6 +1580,7 @@ mod tests {
     /// never arrived still answers its TRACKED cwd — `/proc` is not
     /// consulted, and a real `cd /` is what proves the read would have
     /// answered differently. Real `/bin/sh`, no TTY needed.
+    #[cfg(unix)]
     #[test]
     fn integrated_tabs_skip_the_proc_cwd_read() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1815,6 +1822,7 @@ mod tests {
     /// in the `Alt+Enter` whole-line form — the request text IS the
     /// line, bundled with the same §5.4 context `request_for`
     /// assembles (us-15–17). Real PTY spawn, no TTY needed.
+    #[cfg(unix)]
     #[test]
     fn classified_request_bundles_the_verified_line() {
         use crate::tabs::{SessionTemplate, TabManager};
@@ -1880,6 +1888,7 @@ mod tests {
     /// [`ait_shell::is_known_shell`], so the natural-language verdict
     /// degrades to a verbatim submission instead of a `Ctrl+U` wipe
     /// the program may not honor. Same seam as the `sh` test above.
+    #[cfg(unix)]
     #[test]
     fn classified_request_stays_verbatim_on_a_non_shell() {
         use crate::tabs::{SessionTemplate, TabManager};

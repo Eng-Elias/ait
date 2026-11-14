@@ -9,6 +9,7 @@
 # `--no-default-features`+`test-driver` build — needing no webkit
 # packages — or `AIT_GUI_E2E_BIN_NOWEB`.
 feature = "browser"
+platforms = ["unix"]
 binary = "noweb"
 
 [[steps]]

@@ -14,6 +14,8 @@
 //! `XDG_CONFIG_HOME` tempdir nor the fixture's ephemeral port can be
 //! interpolated into one.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};

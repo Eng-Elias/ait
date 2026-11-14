@@ -20,6 +20,8 @@
 //! the run_command asserts watch for. Panel-side and terminal-side
 //! text stay told apart by the `│` separator.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;

@@ -1,0 +1,57 @@
+# Spec R16 §5.14 (ticket R16-T8) graceful degrade: `SHELL=cmd` resolves
+# to cmd.exe, whose `ShellFamily::Cmd` takes no injection — the planner
+# returns `None` — so the terminal works exactly as before under
+# ConPTY: output renders, no `✓/✗ <code> · <dur>` block segment ever
+# slots onto the status line, no errors. The unix half of the same
+# story is shell-integration-sh.toml.
+#
+# cmd's interactive prompt renders `<cwd>>` — a line starting with a
+# drive letter and ending `>` is a fresh, empty prompt (rows are
+# trim_end'ed; a prompt carrying typed text ends in the command).
+# Every command is fenced by two waits: its own ECHO, then a fresh
+# prompt — cmd echoes typed input on the prompt line via the console,
+# so the echo fence doubles as the typing gate.
+feature = "shell-integration"
+platforms = ["windows"]
+size = [80, 24]
+env = { SHELL = "cmd" }
+
+[[steps]]
+wait_text = "1:cmd"
+
+[[steps]]
+wait_text = "· cmd · — · running"
+
+[[steps]]
+expect_regex = "(?m)^[A-Za-z]:[^\\n]*>$"
+
+[[steps]]
+text = "echo R16CMD\n"
+
+[[steps]]
+expect_regex = "echo R16CMD"
+
+# Back at a bare prompt — the echo ran to completion.
+[[steps]]
+expect_regex = "(?m)^[A-Za-z]:[^\\n]*>$"
+
+# `ver` prints the OS version string — output a typed echo can't
+# produce, so it proves a real cmd.exe (not a stub) ran to completion
+# under ConPTY.
+[[steps]]
+text = "ver\n"
+
+[[steps]]
+expect_regex = "ver"
+
+[[steps]]
+expect_regex = "Microsoft Windows"
+
+[[steps]]
+expect_regex = "(?m)^[A-Za-z]:[^\\n]*>$"
+
+# The summary is still `cwd · cmd · — · running` — no block segment
+# could slot between `—` and `running`, so this match proves no
+# blocks formed even across real commands.
+[[steps]]
+expect_text = "· cmd · — · running"

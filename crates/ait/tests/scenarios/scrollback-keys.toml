@@ -2,6 +2,7 @@
 # through scrollback, Shift+Home jumps to the oldest line, Shift+End
 # returns to live, and a pass-through keypress snaps back to the bottom.
 feature = "scrollback"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

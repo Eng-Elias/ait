@@ -12,6 +12,8 @@
 //! Either way the gate is the same: `AIT_E2E_SSH` unset skips before
 //! anything spawns, keeping `cargo test --workspace` unchanged.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

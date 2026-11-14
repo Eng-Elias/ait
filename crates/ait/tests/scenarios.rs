@@ -35,6 +35,18 @@ fn scenario_files() -> Vec<PathBuf> {
 /// dropping `E2e` leaves the failure dump under this thread's name.
 fn run_scenario(path: &Path, bin: &OsStr) {
     let scenario = Scenario::load(path).unwrap_or_else(|e| panic!("{e}"));
+    // The `platforms` gate (Spec R16-T8): an excluded scenario skips
+    // loudly rather than spawning `ait` — the file stays committed for
+    // the OSes it targets, and this OS's leg says why it sat out.
+    if !scenario.runs_on_current_platform() {
+        eprintln!(
+            "{}: skipped (platforms = {:?}, this OS is {})",
+            scenario.name(),
+            scenario.platforms(),
+            std::env::consts::OS,
+        );
+        return;
+    }
     let mut app = E2e::spawn(scenario.spawn_config(bin)).expect("spawn ait");
     scenario.run(&mut app);
 }

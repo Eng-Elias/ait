@@ -12,6 +12,8 @@
 //! and passes the path through [`SpawnConfig::env`], which applies after
 //! the harness's pinned `XDG_CONFIG_HOME` and therefore overrides it.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;

@@ -6,6 +6,7 @@
 # char on the line turns `printf` into `tprintf`/`aprintf`, the marker
 # never lands and the bounded wait fails.
 feature = "input"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"
