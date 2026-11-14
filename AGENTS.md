@@ -49,6 +49,11 @@ ADR-0002 procedure) and `scripts/check-src-hygiene.sh`.
 `rust-toolchain.toml` pins the exact toolchain CI reads it from — bump
 it deliberately, one line per release.
 
+A `rust-lld: failed to open … EINVAL` at the final link on an ntfs3
+workdir is its `prealloc` + near-full-volume `ftruncate` quirk, not a
+build problem — point `CARGO_TARGET_DIR` at an ext4 dir
+(`/tmp/ait-target`) and rerun.
+
 ## Workflow
 
 - Issue tracker: GitHub `Eng-Elias/ait`, via the `gh` CLI.
@@ -79,8 +84,11 @@ it deliberately, one line per release.
 - Actions minutes are budgeted (private repo): CI runs on `main` only —
   the `dev`→`main` promotion PR and the post-merge push. PRs to `dev`
   get no CI; all development checks are local — run `scripts/check.sh`
-  before pushing. Its one gap vs the CI suite is the docker SSH e2e
-  (`scripts/ssh-e2e.sh run`) — run it when touching §5.9 remote code.
+  before pushing. Its gaps vs the CI suite: the docker SSH e2e
+  (`scripts/ssh-e2e.sh run`) — run it when touching §5.9 remote
+  code — and, on hosts lacking xvfb + webkit2gtk-4.1, the `gui-e2e`
+  job; check.sh runs that leg itself where both exist
+  (docs/running-gui-tests.md).
   A draft promotion PR still skips CI; marking it ready runs the suite
   once, and a push during an in-flight run cancels it (`concurrency`).
 - Release (ADR-0015):

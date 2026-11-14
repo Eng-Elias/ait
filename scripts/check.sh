@@ -32,6 +32,13 @@ while read -r crate test_name _; do
     case "$crate" in ''|'#'*) continue ;; esac
     cargo test -p "$crate" "$test_name" -- --exact --test-threads=1
 done < "$flaky_file"
+# The CI `gui-e2e` job runs only on the main pipeline — cover it
+# locally where the host has the leg's two needs (xvfb + the webkit
+# stack; docs/running-gui-tests.md). Skip silently elsewhere.
+if command -v xvfb-run >/dev/null 2>&1 \
+    && pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+    xvfb-run -a cargo test -p ait-gui --features test-driver --test scenarios
+fi
 python3 scripts/check-dep-comments.py
 scripts/check-src-hygiene.sh
 python3 scripts/check-e2e-sentinels.py

@@ -71,8 +71,12 @@ subagents.
   R11: `git worktree remove ait-worktrees/<ticket>`
   (`--force` when its untracked `target/` blocks removal) drops the
   worktree *and* its target dir, then `git branch -D <branch>`;
-  GitHub already deleted the remote branch on merge. Round cleanup
-  verifies `git worktree list` shows none left.
+  GitHub already deleted the remote branch on merge. `pkill -f
+  ait-worktrees/<ticket>` first — e2e-spawned `ait-gui`+Xvfb children
+  outlived R15's removed worktrees, holding deleted inodes on a
+  near-full volume (and masquerading as a "process holds the link
+  target" linker failure). Round cleanup verifies `git worktree list`
+  shows none left.
 - **Gate output**: run the gate teed to a log —
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis
