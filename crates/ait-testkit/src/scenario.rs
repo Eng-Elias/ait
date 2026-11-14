@@ -450,8 +450,18 @@ pub(crate) const KNOWN_PLATFORMS: &[&str] = &["linux", "macos", "windows", "unix
 /// every unix-family target, so `platforms = ["unix"]` reads as
 /// "anywhere but Windows" without enumerating BSDs.
 const UNIX_OSES: &[&str] = &[
-    "linux", "macos", "freebsd", "netbsd", "openbsd", "dragonfly", "android", "ios", "illumos",
-    "solaris", "aix", "haiku",
+    "linux",
+    "macos",
+    "freebsd",
+    "netbsd",
+    "openbsd",
+    "dragonfly",
+    "android",
+    "ios",
+    "illumos",
+    "solaris",
+    "aix",
+    "haiku",
 ];
 
 /// The shared `platforms` evaluation: an empty list runs everywhere;
@@ -466,10 +476,7 @@ pub(crate) fn platform_gate_matches(platforms: &[String], os: &str) -> bool {
 
 /// Reject unknown `platforms` entries at load, naming the file — a
 /// typo must never silently read as "runs nowhere".
-pub(crate) fn validate_platforms(
-    source: &str,
-    platforms: &[String],
-) -> Result<(), ScenarioError> {
+pub(crate) fn validate_platforms(source: &str, platforms: &[String]) -> Result<(), ScenarioError> {
     for platform in platforms {
         if !KNOWN_PLATFORMS.contains(&platform.as_str()) {
             return Err(ScenarioError::file(
