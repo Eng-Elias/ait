@@ -157,6 +157,192 @@ function global:__ait_run {
     __ait_osc '7701;B'
 }
 
+# --- §5.9 ssh integration -------------------------------------------------
+#
+# When the [ssh] policy env is armed at spawn (`AIT_SSH_*`), `ssh` is
+# a function: an interactive ssh to an allowed host is rewritten to
+# `ssh -t <args> '<remote bootstrap>'`, bracketed by the ssh_begin /
+# ssh_end hooks. Windows OpenSSH has no connection multiplexing, so
+# the Unix wrappers' attach leg does not exist here — the wrapper
+# emits no `Control*` options, runs no `-G` config probe (there is no
+# socket to discover) and carries no control-path field in ssh_begin;
+# the reuse/control-dir env stays armed-but-unread. The remote
+# bootstrap itself is POSIX sh on the far side — unchanged (§5.14).
+# Every other shape — `ssh host cmd`, denied hosts, a non-empty
+# `AIT_SSH_OFF`, control/config operations — is a plain passthrough,
+# and spelling the client `ssh.exe` always bypasses the wrapper (the
+# function shadows the bare `ssh` name only).
+
+# The real ssh client, resolved per call through Get-Command's
+# Application type — a bare name lookup would find this `ssh`
+# function and recurse; per-call resolution also picks up PATH edits
+# mid-session and PATHEXT shims (a `ssh.cmd` ahead of OpenSSH's exe).
+function global:__ait_ssh_program {
+    $app = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -ne $app) { return $app.Source }
+    # No ssh on PATH at all — the literal spells the same
+    # not-recognized error an unintegrated session would show.
+    return 'ssh.exe'
+}
+
+# One OpenSSH Host-pattern against a token: `*`/`?` globs only.
+# PowerShell's -like adds `[…]` classes OpenSSH doesn't have, so the
+# pattern's brackets and backticks are escaped first — and -clike
+# keeps the case-sensitive read the Unix `[[ == ]]` globs make.
+function global:__ait_ssh_glob {
+    param([string]$Text, [string]$Pattern)
+    $escaped = $Pattern.Replace('`', '``').Replace('[', '`[').Replace(']', '`]')
+    return ($Text -clike $escaped)
+}
+
+# Match $Dest against the newline-separated glob list $Patterns —
+# the Unix `__ait_ssh_match` semantics: a matching `!` entry vetoes
+# outright, any non-negated match returns $true.
+function global:__ait_ssh_match {
+    param(
+        [string]$Dest,
+        [AllowNull()][AllowEmptyString()][string]$Patterns
+    )
+    if ([string]::IsNullOrEmpty($Patterns)) { return $false }
+    $matched = $false
+    foreach ($pattern in ($Patterns -split "`n")) {
+        $pattern = $pattern.TrimEnd("`r")
+        if ($pattern.Length -eq 0) { continue }
+        if ($pattern.StartsWith('!')) {
+            if (__ait_ssh_glob $Dest ($pattern.Substring(1))) { return $false }
+        } elseif (__ait_ssh_glob $Dest $pattern) {
+            $matched = $true
+        }
+    }
+    return $matched
+}
+
+# The armed allow/deny decision for one destination token — deny
+# beats allow (§5.7's rule); an empty allowlist is open.
+function global:__ait_ssh_allowed {
+    param([string]$Dest)
+    if (__ait_ssh_match $Dest $env:AIT_SSH_DENY) { return $false }
+    if (-not [string]::IsNullOrEmpty($env:AIT_SSH_ALLOW) -and
+        -not (__ait_ssh_match $Dest $env:AIT_SSH_ALLOW)) {
+        return $false
+    }
+    return $true
+}
+
+# The destination token of a plain interactive `ssh` argv —
+# `ssh [opts] dest` — or $null for anything the rewrite must not
+# touch: a remote command (any token after the destination), a
+# missing destination, or a control/config shape. Case matters —
+# `-v` is a flag, `-V` is the version passthrough — so the
+# comparisons below are the case-sensitive spellings.
+function global:__ait_ssh_dest {
+    param([string[]]$Argv)
+    $expectArg = $false
+    for ($i = 0; $i -lt $Argv.Count; $i++) {
+        $arg = $Argv[$i]
+        if ($expectArg) { $expectArg = $false; continue }
+        # Control/config/proxy shapes never get a remote shell.
+        if ($arg -cin @('-G', '-N', '-T', '-n', '-f', '-M', '-V') -or
+            $arg -clike '-O*') {
+            return $null
+        }
+        if ($arg -match '^-[bBcDEeFIiJLlmopQRSWw]$') {
+            # Options whose argument is the NEXT token.
+            $expectArg = $true
+            continue
+        }
+        if ($arg -match '^-[bBcDEeFIiJLlmopQRSWw]') {
+            # Bundled-argument options (-p22, -oKey=val, …).
+            continue
+        }
+        if ($arg.StartsWith('-')) {
+            # `--` and every flag option (-t -v -4 …) — skipped.
+            continue
+        }
+        # First non-option token: the destination. Anything after it
+        # is the remote command → not interactive.
+        if ($i + 1 -lt $Argv.Count) { return $null }
+        return $arg
+    }
+    return $null
+}
+
+# ssh_begin: session id, the typed destination, this hop's id and
+# whether a bootstrap is sent — never a control-path field: Windows
+# OpenSSH cannot multiplex, so there is no socket to report.
+function global:__ait_ssh_begin {
+    param([string]$Target, [string]$Hop)
+    $bootstrapped = 'false'
+    if (-not [string]::IsNullOrEmpty($env:AIT_SSH_BOOTSTRAP)) {
+        $bootstrapped = 'true'
+    }
+    __ait_emit ('{"hook":"ssh_begin","value":{"session_id":' + (__ait_sid) +
+        ',"target":"' + (__ait_json_escape $Target) + '","hop":"' +
+        (__ait_json_escape $Hop) + '","bootstrapped":' + $bootstrapped + '}}')
+}
+
+# ssh_end: the local `ssh` returned — the remote session is over
+# (cleanly or by a dropped connection).
+function global:__ait_ssh_end {
+    param([string]$Target, [string]$Hop)
+    __ait_emit ('{"hook":"ssh_end","value":{"session_id":' + (__ait_sid) +
+        ',"target":"' + (__ait_json_escape $Target) + '","hop":"' +
+        (__ait_json_escape $Hop) + '"}}')
+}
+
+# The remote command: export this hop's id and re-export
+# AIT_SSH_BOOTSTRAP into the remote session — POSIX single-quoted,
+# the only self-reference the protocol needs — then run it. A nested
+# ssh() on the far side sends this same text one hop further.
+function global:__ait_ssh_remote_cmd {
+    param([string]$Hop)
+    $quoted = $env:AIT_SSH_BOOTSTRAP.Replace("'", "'\''")
+    $qhop = $Hop.Replace("'", "'\''")
+    return "export AIT_SSH_HOP='$qhop'`nexport AIT_SSH_BOOTSTRAP='$quoted'`n$env:AIT_SSH_BOOTSTRAP"
+}
+
+# The §5.9 wrapper, ported to PowerShell (§5.14): the same opt-outs,
+# argv classifier and policy as the Unix `ssh()` — minus the
+# multiplex leg Windows OpenSSH cannot serve.
+function global:ssh {
+    # Opt-outs first: `AIT_SSH_OFF=<non-empty>` per session — POSIX
+    # `-n` semantics, so "0" still opts out — and the armed-off
+    # policy. The wrapper must never change what the user asked for.
+    if (-not [string]::IsNullOrEmpty($env:AIT_SSH_OFF) -or
+        (-not [string]::IsNullOrEmpty($env:AIT_SSH_ENABLED) -and
+         $env:AIT_SSH_ENABLED -ne '1')) {
+        & (__ait_ssh_program) @args
+        return
+    }
+    $dest = __ait_ssh_dest ([string[]]$args)
+    if ($null -eq $dest -or -not (__ait_ssh_allowed $dest)) {
+        & (__ait_ssh_program) @args
+        return
+    }
+    # This hop's identity — attributes this session's ssh_begin /
+    # ssh_end and (via the remote env) the remote shell's own hooks
+    # to this level of a possibly-nested chain.
+    $global:__AIT_SSH_SEQ += 1
+    $__ait_hop_sid = $env:AIT_SESSION_ID
+    if ([string]::IsNullOrEmpty($__ait_hop_sid)) { $__ait_hop_sid = '0' }
+    $hop = "$__ait_hop_sid.$PID.$global:__AIT_SSH_SEQ"
+    __ait_ssh_begin $dest $hop
+    if (-not [string]::IsNullOrEmpty($env:AIT_SSH_BOOTSTRAP)) {
+        & (__ait_ssh_program) -t @args (__ait_ssh_remote_cmd $hop)
+    } else {
+        & (__ait_ssh_program) -t @args
+    }
+    # $LASTEXITCODE keeps the ssh exit — the emissions below are
+    # function calls, which never touch it, so the caller still
+    # reads the real status.
+    __ait_ssh_end $dest $hop
+    # The remote session demoted this tab when its exit_shell landed
+    # (or a drop killed it); the local shell is back at the prompt —
+    # re-integrate it.
+    __ait_hook 'bootstrapped'
+}
+
 # --- prompt/command hooks -----------------------------------------------
 
 # OSC 7 cwd report — `]7;<path>` carries a bare local path:
@@ -241,6 +427,10 @@ try {
         try { __ait_hook 'exit_shell' } catch { }
     }
 } catch { }
+
+# The wrapped-ssh hop counter — per session, like the Unix snippets'
+# seq (§5.9).
+$global:__AIT_SSH_SEQ = 0
 
 __ait_emit ('{"hook":"init_shell","value":{"session_id":' + (__ait_sid) +
     ',"shell":"pwsh"' + (__ait_hop) + '}}')
