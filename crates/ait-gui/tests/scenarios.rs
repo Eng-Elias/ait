@@ -102,6 +102,17 @@ fn scenario_files() -> Vec<PathBuf> {
 /// name.
 fn run_scenario(path: &Path) -> bool {
     let scenario = GuiScenario::load(path).unwrap_or_else(|e| panic!("{e}"));
+    // The `platforms` gate (Spec R16-T8): an excluded scenario skips
+    // loudly before the binary leg or display are even resolved.
+    if !scenario.runs_on_current_platform() {
+        eprintln!(
+            "{}: skipped (platforms = {:?}, this OS is {})",
+            scenario.name(),
+            scenario.platforms(),
+            std::env::consts::OS,
+        );
+        return false;
+    }
     let bin = match bin_for(scenario.binary()) {
         Ok(bin) => bin,
         Err(reason) => {

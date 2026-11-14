@@ -7,6 +7,12 @@
 //! ```toml
 //! feature = "tabs"               # required — the tag a later filtered-run
 //!                                # layer maps changed paths to
+//! platforms = ["unix"]           # optional OS gate (Spec R16-T8):
+//!                                # `std::env::consts::OS` values —
+//!                                # "linux", "macos", "windows" — plus
+//!                                # the "unix" group name; absent or
+//!                                # empty runs everywhere, and a runner
+//!                                # skips an excluded scenario loudly
 //! size = [80, 24]                # optional, defaults to 80x24
 //! args = ["--version"]           # optional argv for the spawned program
 //! env = { PS1 = "E2E> " }        # optional pairs, applied after the
@@ -99,6 +105,9 @@ pub struct Scenario {
     /// The `feature` tag — metadata a later filtered-run layer maps
     /// changed paths to (Spec E01: tags land now, the map is deferred).
     pub feature: String,
+    /// The OSes the scenario runs on (`platforms = ["linux", "unix"]`,
+    /// empty = every platform) — [`runs_on`](Self::runs_on) reads it.
+    platforms: Vec<String>,
     /// The spawn size (`size = [w, h]`, default 80x24).
     pub size: Size,
     /// `argv[1..]` for the spawned program (`args`).
@@ -293,6 +302,8 @@ impl std::error::Error for ScenarioError {}
 struct RawScenario {
     feature: String,
     #[serde(default)]
+    platforms: Vec<String>,
+    #[serde(default)]
     size: Option<[usize; 2]>,
     #[serde(default)]
     args: Vec<String>,
@@ -336,6 +347,7 @@ impl Scenario {
     fn parse(name: String, source: &str, text: &str) -> Result<Self, ScenarioError> {
         let raw: RawScenario = toml::from_str(text)
             .map_err(|e| ScenarioError::file(source, format!("invalid TOML: {e}")))?;
+        validate_platforms(source, &raw.platforms)?;
         let env = raw
             .env
             .into_iter()
@@ -355,6 +367,7 @@ impl Scenario {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             feature: raw.feature,
+            platforms: raw.platforms,
             size: raw
                 .size
                 .map(|[columns, lines]| Size::new(columns, lines))
@@ -410,6 +423,66 @@ impl Scenario {
     pub fn source(&self) -> &str {
         &self.source
     }
+
+    /// The `platforms` list verbatim — empty means every OS.
+    pub fn platforms(&self) -> &[String] {
+        &self.platforms
+    }
+
+    /// Whether the scenario runs under `os` (a `std::env::consts::OS`
+    /// value) — the runner's skip check (Spec R16-T8).
+    pub fn runs_on(&self, os: &str) -> bool {
+        platform_gate_matches(&self.platforms, os)
+    }
+
+    /// [`runs_on`](Self::runs_on) for the platform this build runs on.
+    pub fn runs_on_current_platform(&self) -> bool {
+        self.runs_on(std::env::consts::OS)
+    }
+}
+
+/// The `platforms` vocabulary — `std::env::consts::OS` spellings plus
+/// the `unix` group name. The GUI scenario parser validates against
+/// the same list (the two formats share the gate, Spec R16-T8).
+pub(crate) const KNOWN_PLATFORMS: &[&str] = &["linux", "macos", "windows", "unix"];
+
+/// The `std::env::consts::OS` values the `unix` group name covers —
+/// every unix-family target, so `platforms = ["unix"]` reads as
+/// "anywhere but Windows" without enumerating BSDs.
+const UNIX_OSES: &[&str] = &[
+    "linux", "macos", "freebsd", "netbsd", "openbsd", "dragonfly", "android", "ios", "illumos",
+    "solaris", "aix", "haiku",
+];
+
+/// The shared `platforms` evaluation: an empty list runs everywhere;
+/// an entry matching `os` verbatim admits it; the `unix` entry admits
+/// the unix-family values.
+pub(crate) fn platform_gate_matches(platforms: &[String], os: &str) -> bool {
+    platforms.is_empty()
+        || platforms
+            .iter()
+            .any(|p| p == os || (p == "unix" && UNIX_OSES.contains(&os)))
+}
+
+/// Reject unknown `platforms` entries at load, naming the file — a
+/// typo must never silently read as "runs nowhere".
+pub(crate) fn validate_platforms(
+    source: &str,
+    platforms: &[String],
+) -> Result<(), ScenarioError> {
+    for platform in platforms {
+        if !KNOWN_PLATFORMS.contains(&platform.as_str()) {
+            return Err(ScenarioError::file(
+                source,
+                format!(
+                    "platforms entry {platform:?} is not a known OS — \
+                     expected one of: {}",
+                    KNOWN_PLATFORMS.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Turn one raw `[[steps]]` table into a typed [`Step`] — or explain
@@ -688,6 +761,50 @@ assert = "the thing happened"
                 "{toml:?} → {err} should contain {needle:?}"
             );
         }
+    }
+
+    /// `platforms` absent means every OS — the pre-R16 behavior for
+    /// existing scenario files (Spec R16-T8).
+    #[test]
+    fn platforms_default_runs_everywhere() {
+        let scenario = parse("feature = \"x\"\n").expect("parses");
+        assert!(scenario.platforms().is_empty());
+        for os in ["linux", "macos", "windows", "freebsd"] {
+            assert!(scenario.runs_on(os), "{os} should run");
+        }
+    }
+
+    /// `platforms` names the `std::env::consts::OS` values the
+    /// scenario runs on; `unix` is a group name covering the
+    /// unix-family values (never `windows`).
+    #[test]
+    fn platforms_gate_matches_os_and_unix_group() {
+        let scenario = parse("feature = \"x\"\nplatforms = [\"linux\"]\n").unwrap();
+        assert!(scenario.runs_on("linux"));
+        assert!(!scenario.runs_on("macos"));
+        assert!(!scenario.runs_on("windows"));
+
+        let scenario = parse("feature = \"x\"\nplatforms = [\"unix\"]\n").unwrap();
+        assert!(scenario.runs_on("linux"));
+        assert!(scenario.runs_on("macos"));
+        assert!(scenario.runs_on("freebsd"));
+        assert!(!scenario.runs_on("windows"));
+
+        let scenario = parse("feature = \"x\"\nplatforms = [\"windows\", \"linux\"]\n").unwrap();
+        assert!(scenario.runs_on("windows"));
+        assert!(scenario.runs_on("linux"));
+        assert!(!scenario.runs_on("macos"));
+    }
+
+    /// An unknown `platforms` entry fails at load naming the file —
+    /// typos must never read as "runs nowhere" (the loader convention:
+    /// malformed files fail naming file and step).
+    #[test]
+    fn unknown_platform_fails_at_load() {
+        let err = parse("feature = \"x\"\nplatforms = [\"plan9\"]\n").unwrap_err();
+        assert!(err.to_string().contains("case.toml"), "{err}");
+        assert!(err.to_string().contains("plan9"), "{err}");
+        assert!(err.to_string().contains("platforms"), "{err}");
     }
 
     /// `wait_text` and `expect_text` share the bounded-wait machinery

@@ -60,6 +60,7 @@ use interprocess::local_socket::GenericFilePath;
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{self, ActionEntry};
+use crate::scenario;
 use crate::screen::{fnv, FNV_OFFSET};
 use crate::tempdir::TempDir;
 
@@ -1989,6 +1990,11 @@ const GUI_VERBS: &[&str] = &[
 /// feature = "panes"
 /// binary = "web"                     # optional — the dual-binary leg:
 ///                                    # "web" | "noweb" | any when absent
+/// platforms = ["unix"]               # optional OS gate (Spec R16-T8) —
+///                                    # the [`Scenario`] vocabulary;
+///                                    # absent runs everywhere, the
+///                                    # runner skips excluded OSes
+///                                    # loudly
 ///
 /// [[steps]]
 /// key = "Ctrl+Shift+E"               # one chord through the app's dispatch
@@ -2027,6 +2033,9 @@ pub struct GuiScenario {
     /// `slowmo = 400` — watch pacing in milliseconds before each input
     /// request (`AIT_GUI_E2E_SLOWMO` overrides).
     pub slowmo_ms: u64,
+    /// The OSes the scenario runs on (`platforms = ["unix"]`, empty =
+    /// every platform) — [`runs_on`](Self::runs_on) reads it.
+    platforms: Vec<String>,
     /// The file stem — failure messages and dump dirs.
     name: String,
     /// The path it was loaded from.
@@ -2907,6 +2916,9 @@ struct RawGuiScenario {
     /// `slowmo = 400` — watch pacing in ms before each input request.
     #[serde(default)]
     slowmo: u64,
+    /// `platforms = ["unix", …]` — the OS gate; absent runs everywhere.
+    #[serde(default)]
+    platforms: Vec<String>,
     /// The `[[steps]]` tables.
     #[serde(default)]
     steps: Vec<toml::Table>,
@@ -2931,6 +2943,7 @@ impl GuiScenario {
     fn parse(name: String, source: &str, text: &str) -> Result<Self, ScenarioError> {
         let raw: RawGuiScenario = toml::from_str(text)
             .map_err(|e| ScenarioError::file(source, format!("invalid TOML: {e}")))?;
+        scenario::validate_platforms(source, &raw.platforms)?;
         let env = raw
             .env
             .into_iter()
@@ -2955,6 +2968,7 @@ impl GuiScenario {
             binary: raw.binary.unwrap_or(GuiBinary::Any),
             headed: raw.headed,
             slowmo_ms: raw.slowmo,
+            platforms: raw.platforms,
             name,
             source: source.to_string(),
         })
@@ -3006,6 +3020,22 @@ impl GuiScenario {
     /// The path it was loaded from.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The `platforms` list verbatim — empty means every OS.
+    pub fn platforms(&self) -> &[String] {
+        &self.platforms
+    }
+
+    /// Whether the scenario runs under `os` (a `std::env::consts::OS`
+    /// value) — the runner's skip check (Spec R16-T8).
+    pub fn runs_on(&self, os: &str) -> bool {
+        scenario::platform_gate_matches(&self.platforms, os)
+    }
+
+    /// [`runs_on`](Self::runs_on) for the platform this build runs on.
+    pub fn runs_on_current_platform(&self) -> bool {
+        self.runs_on(std::env::consts::OS)
     }
 }
 
@@ -4019,6 +4049,10 @@ quit = true
             ("[[steps]]\nwait_dump = false", "wait_dump must be true"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),
+            (
+                "feature = \"x\"\nplatforms = [\"plan9\"]",
+                "unknown platform",
+            ),
         ] {
             let outcome = GuiScenario::parse("t".into(), "t.toml", text);
             if want == "missing steps is fine" {
@@ -4027,6 +4061,25 @@ quit = true
                 assert!(outcome.is_err(), "{want}: {text}");
             }
         }
+    }
+
+    /// The `platforms` gate shares the [`Scenario`] vocabulary — the
+    /// GUI parse path validates entries and `runs_on` evaluates them
+    /// (Spec R16-T8).
+    #[test]
+    fn gui_scenario_platforms_gate() {
+        let all = GuiScenario::parse("t".into(), "t.toml", r#"feature = "x""#).unwrap();
+        assert!(all.platforms().is_empty());
+        assert!(all.runs_on("windows"));
+
+        let unix = GuiScenario::parse(
+            "t".into(),
+            "t.toml",
+            "feature = \"x\"\nplatforms = [\"unix\"]",
+        )
+        .unwrap();
+        assert!(unix.runs_on("linux"));
+        assert!(!unix.runs_on("windows"));
     }
 
     /// The skip convention lives in `choose_display`: no DISPLAY and
