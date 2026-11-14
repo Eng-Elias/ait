@@ -50,7 +50,9 @@ eframe = { version = "0.37", default-features = false, features = [
 ] }
 # The browser pane's embedded webview (Spec R14 §5.13, R14-T3; optional —
 # the `web` feature): a `wry` child webview (`build_as_child`,
-# repositioned over the pane rect each frame) on macOS and Linux/X11.
+# repositioned over the pane rect each frame) on macOS, Linux/X11 and
+# Windows (WebView2, loaded by wry at init — a missing runtime is an
+# init error, not a link dep, §5.14/R16-T7).
 # wry 0.57.1 (2026-10-23) — `>= 0.55` pins past the macOS-26
 # `build_as_child` ObjC crash (wry#1705); 0.57.2 (2026-11-10) is
 # excluded by ADR-0002's seven-day release-age rule at adoption
@@ -85,7 +87,12 @@ png = { version = "0.18", optional = true }
 # thread, and the webview needs the glib main context pumped alongside
 # the frame loop. The `0.18` line is the one wry's `os-webview` feature
 # pulls itself, so the tree carries ONE gtk (gtk 0.18.2 (2024-12-09)).
-# macOS needs nothing — WKWebView is a system framework.
+# macOS needs nothing — WKWebView is a system framework — and Windows
+# needs nothing either: wry loads WebView2 at init (§5.14/R16-T7).
+# The target gate keeps `gtk` out of the Windows tree while the `web`
+# feature's `dep:gtk` entry still resolves there (a target-gated
+# optional dep is simply absent on other targets — verified by
+# `cargo tree --target x86_64-pc-windows-msvc`).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
 

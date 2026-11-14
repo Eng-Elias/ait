@@ -107,9 +107,11 @@ impl WebSlot {
         }
 
         // Bounds + visibility — `set_bounds` every frame is the X11
-        // contract ("the webview will not auto-resize"); macOS takes
-        // the same call for free. A missing rect is the pane's hide
-        // signal: pane closed, or the body isn't a webview.
+        // contract ("the webview will not auto-resize"); macOS and
+        // Windows take the same call for free (WebView2's controller
+        // bounds track the parent through it). A missing rect is the
+        // pane's hide signal: pane closed, or the body isn't a
+        // webview.
         if let Some(host) = &self.host {
             match shared.browser.surface() {
                 Some(rect) => {
@@ -208,8 +210,12 @@ impl Host {
     /// the building thread — then the build itself inside
     /// `catch_unwind`, because wry also panics on handles it can't
     /// parent; every failure mode lands as `InitFailed` → the
-    /// external surface, never a crash (us-23). The pane's `Embed`
-    /// matrix has already rejected Wayland/unknown handles by now.
+    /// external surface, never a crash (us-23). On Windows wry loads
+    /// WebView2 itself at this point — a missing runtime surfaces as
+    /// the same `InitFailed` (§5.14/R16-T7: unlike Linux's hard
+    /// `DT_NEEDED` on webkit, WebView2's absence is a runtime error,
+    /// not a loader crash). The pane's `Embed` matrix has already
+    /// rejected Wayland/unknown handles by now.
     fn new(frame: &eframe::Frame, rect: Option<egui::Rect>) -> Result<Self, WhyExternal> {
         #[cfg(target_os = "linux")]
         gtk::init().map_err(|_| WhyExternal::InitFailed)?;
