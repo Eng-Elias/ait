@@ -154,11 +154,29 @@ impl DetectCache {
 /// `text` → the tokens that afford a route: URLs first (their spans
 /// are claimed before the path pass runs, so a `//x` inside a URL
 /// never starts a path candidate), then path-shaped tokens resolved
-/// against `cwd` (relatives — `./`/`../` included), `/`-leading
-/// tokens absolute, and `~/` under `home`. Remote tabs call
-/// [`url_tokens`] instead — `detect_at`'s `remote` flag already
-/// picks between the two.
+/// against `cwd` (relatives — `./`/`../` included), absolute forms
+/// standing alone (`/` — plus `X:\`, `\\server\share` and `\rooted`
+/// under the Windows grammar, §5.14), and `~` under `home`. Remote
+/// tabs call [`url_tokens`] instead — `detect_at`'s `remote` flag
+/// already picks between the two.
 pub fn tokens(text: &str, cwd: &Path, home: &Path) -> Vec<Token> {
+    tokens_on(text, cwd, home, cfg!(windows), Path::exists)
+}
+
+/// [`tokens`] with the platform's path grammar and the filesystem
+/// probe named — the testable seam (§5.14 / R16-T7): `windows` adds
+/// `\` to the run alphabet plus the `X:\`, `\\server\share` and `~\`
+/// forms Windows terminal text carries, and `exists` stands in for
+/// the fs so the Windows grammar resolves off-Windows (no fixture
+/// needs a literal `C:` file name). Production callers bake both:
+/// `cfg!(windows)` and [`Path::exists`].
+fn tokens_on(
+    text: &str,
+    cwd: &Path,
+    home: &Path,
+    windows: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
     let mut found = url_scan(&chars);
     // A claimed URL span can never host a path candidate — a `//`
@@ -169,15 +187,27 @@ pub fn tokens(text: &str, cwd: &Path, home: &Path) -> Vec<Token> {
     }
     let mut i = 0;
     while i < chars.len() {
-        if !is_path_char(chars[i]) || claimed[i] {
+        if !is_path_char(chars[i], windows) || claimed[i] {
             i += 1;
             continue;
         }
         let start = i;
-        while i < chars.len() && is_path_char(chars[i]) && !claimed[i] {
+        // A drive-letter absolute opens `X:` + a separator — but `:`
+        // is no path char (`file:line` must keep cutting there), so
+        // the Windows grammar consumes the `X:` head explicitly and
+        // lets the run resume on the separator.
+        if windows
+            && chars[i].is_ascii_alphabetic()
+            && chars.get(i + 1) == Some(&':')
+            && matches!(chars.get(i + 2), Some('\\') | Some('/'))
+        {
+            i += 2;
+        }
+        while i < chars.len() && is_path_char(chars[i], windows) && !claimed[i] {
             i += 1;
         }
-        if let Some((len, path)) = resolve_candidate(&chars[start..i], cwd, home) {
+        if let Some((len, path)) = resolve_candidate(&chars[start..i], cwd, home, windows, &exists)
+        {
             found.push(Token {
                 start,
                 end: start + len,
@@ -382,33 +412,39 @@ fn trim_url_end(chars: &[char], body: usize, mut end: usize) -> usize {
 /// The characters a path token may hold — conservative on purpose:
 /// `:` ends a token so `file.rs:12` affords `file.rs`, `=`, quotes
 /// and brackets delimit, and whitespace splits (escaped-space names
-/// don't afford — a documented conservatism, not a bug).
-fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-' | '+' | '%' | '@')
+/// don't afford — a documented conservatism, not a bug). `windows`
+/// adds `\` — the separator `C:\…`, `\\server\share` and `dir\file`
+/// all need (the drive colon itself is no path char; the scan
+/// consumes `X:` explicitly). Unix keeps `\` a delimiter: a `\` in a
+/// unix file name is too rare to pay the `a\b` false-join.
+fn is_path_char(c: char, windows: bool) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '.' | '_' | '~' | '/' | '-' | '+' | '%' | '@')
+        || (windows && c == '\\')
 }
 
 /// One path-shaped run → its resolved target and the trimmed length
-/// the token covers, if the fs says it exists: `/`-leading runs are
-/// absolute, `~/` joins `home`, everything else joins `cwd`. The
-/// probe trims trailing non-name characters one at a time (`main.rs.`
-/// affords `main.rs`) but never mid-run — `foo.txt` doesn't fall back
-/// to `foo`, and a run with no name character (`//`, `…`, `~/` bare)
-/// is punctuation, not a path.
-fn resolve_candidate(run: &[char], cwd: &Path, home: &Path) -> Option<(usize, PathBuf)> {
+/// the token covers, if `exists` says it's there: [`resolve_form`]
+/// maps the candidate (absolute forms stand alone, `~` joins `home`,
+/// the rest join `cwd`). The probe trims trailing non-name characters
+/// one at a time (`main.rs.` affords `main.rs`) but never mid-run —
+/// `foo.txt` doesn't fall back to `foo`, and a run with no name
+/// character (`//`, `…`, `~/` bare) is punctuation, not a path.
+fn resolve_candidate(
+    run: &[char],
+    cwd: &Path,
+    home: &Path,
+    windows: bool,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<(usize, PathBuf)> {
     if !run.iter().any(|c| c.is_alphanumeric()) {
         return None;
     }
     let mut len = run.len();
     loop {
         let candidate: String = run[..len].iter().collect();
-        let resolved = if let Some(rest) = candidate.strip_prefix("~/") {
-            home.join(rest)
-        } else if candidate.starts_with('/') {
-            PathBuf::from(&candidate)
-        } else {
-            cwd.join(&candidate)
-        };
-        if resolved.exists() {
+        let resolved = resolve_form(&candidate, cwd, home, windows);
+        if exists(&resolved) {
             return Some((len, resolved));
         }
         if len == 0 || run[len - 1].is_alphanumeric() {
@@ -416,6 +452,50 @@ fn resolve_candidate(run: &[char], cwd: &Path, home: &Path) -> Option<(usize, Pa
         }
         len -= 1;
     }
+}
+
+/// `candidate` → the path `exists` is asked about: `~` forms join
+/// `home`, [`is_absolute`] forms stand alone, everything else joins
+/// the tab's `cwd`.
+fn resolve_form(candidate: &str, cwd: &Path, home: &Path, windows: bool) -> PathBuf {
+    if let Some(rest) = tilde_rest(candidate, windows) {
+        home.join(rest)
+    } else if is_absolute(candidate, windows) {
+        PathBuf::from(candidate)
+    } else {
+        cwd.join(candidate)
+    }
+}
+
+/// The `~`-expansion's rest — `~/x` everywhere, `~\x` too under the
+/// Windows grammar (the separator a PowerShell user types).
+fn tilde_rest(candidate: &str, windows: bool) -> Option<&str> {
+    candidate.strip_prefix("~/").or_else(|| {
+        if windows {
+            candidate.strip_prefix("~\\")
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `candidate` is already absolute — `/…` everywhere; the
+/// Windows grammar adds `X:\`/`X:/` drive paths, `\\…` (UNC and
+/// `\\?\`-style device paths) and a lone leading `\` (rooted on the
+/// current drive). `X:foo` with no separator is the legacy
+/// drive-relative form — deliberately NOT absolute.
+fn is_absolute(candidate: &str, windows: bool) -> bool {
+    if candidate.starts_with('/') {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let drive = matches!(
+        candidate.as_bytes(),
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+    );
+    drive || candidate.starts_with('\\')
 }
 
 #[cfg(test)]
@@ -640,6 +720,117 @@ mod tests {
         );
         assert_eq!(found.len(), 1);
         assert!(matches!(found[0].target, Target::Url(_)));
+    }
+
+    // ---- Windows paths (§5.14 / R16-T7) ----
+    //
+    // The platform grammar + fs probe are `tokens_on`'s parameters —
+    // a Windows session's `C:\`, `\\share` and `dir\file` tokens all
+    // resolve off-Windows here, the `existing` list standing in for
+    // the filesystem (PathBuf equality is literal on Linux, which is
+    // exactly what the oracle needs).
+
+    /// The path targets found under the WINDOWS grammar — `exists`
+    /// answers for the paths `existing` lists, nothing else.
+    fn win_paths(text: &str, existing: &[&str], cwd: &Path, home: &Path) -> Vec<PathBuf> {
+        tokens_on(text, cwd, home, true, |path| {
+            existing.iter().any(|known| Path::new(known) == path)
+        })
+        .iter()
+        .filter_map(|token| match &token.target {
+            Target::Path(path) => Some(path.clone()),
+            Target::Url(_) => None,
+        })
+        .collect()
+    }
+
+    /// `X:\…` and `X:/…` afford as absolute paths — the token covers
+    /// the whole run, drive colon included.
+    #[test]
+    fn windows_drive_paths_afford_absolutely() {
+        let cwd = Path::new("/cwd");
+        for text in ["open C:\\work\\main.rs now", "open D:/work/main.rs now"] {
+            let target = text.split_whitespace().nth(1).unwrap();
+            let found = tokens_on(text, cwd, cwd, true, |path| Path::new(target) == path);
+            assert_eq!(found.len(), 1, "{text:?}");
+            assert_eq!(covered(text, &found[0]), target);
+            assert_eq!(found[0].target, Target::Path(PathBuf::from(target)));
+        }
+    }
+
+    /// A `\\server\share` UNC path is absolute — never joined under
+    /// the tab's cwd.
+    #[test]
+    fn windows_unc_paths_afford_absolutely() {
+        let cwd = Path::new("/cwd");
+        let text = "copy \\\\server\\share\\dir\\f.txt done";
+        let found = tokens_on(text, cwd, cwd, true, |path| {
+            Path::new("\\\\server\\share\\dir\\f.txt") == path
+        });
+        assert_eq!(found.len(), 1, "{text:?}");
+        assert_eq!(covered(text, &found[0]), "\\\\server\\share\\dir\\f.txt");
+        assert_eq!(
+            found[0].target,
+            Target::Path(PathBuf::from("\\\\server\\share\\dir\\f.txt"))
+        );
+    }
+
+    /// `~\x` joins the injected home like `~/x` does; a relative
+    /// `dir\file` joins the tab's cwd.
+    #[test]
+    fn windows_tilde_and_relative_backslash_forms_resolve() {
+        let home = Path::new("/home/me");
+        let cwd = Path::new("/work/proj");
+        let in_home = home.join("Docs\\a.txt").display().to_string();
+        let in_cwd = cwd.join("src\\b.rs").display().to_string();
+        let found = win_paths(
+            "open ~\\Docs\\a.txt and src\\b.rs",
+            &[&in_home, &in_cwd],
+            cwd,
+            home,
+        );
+        assert_eq!(found, [home.join("Docs\\a.txt"), cwd.join("src\\b.rs")]);
+    }
+
+    /// `file:line` keeps its meaning under the Windows grammar — the
+    /// token stops at the SECOND colon (the drive's is the path's
+    /// own), and `C:foo` without a separator is no drive path.
+    #[test]
+    fn windows_file_line_and_bare_drive_colon_stay_conservative() {
+        let cwd = Path::new("/cwd");
+        let found = tokens_on("err C:\\work\\main.rs:12 bad", cwd, cwd, true, |path| {
+            Path::new("C:\\work\\main.rs") == path
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].target,
+            Target::Path(PathBuf::from("C:\\work\\main.rs"))
+        );
+        // `C:foo` is the legacy drive-relative form — unhandled by
+        // design; `foo` joins cwd like any relative name.
+        let in_cwd = cwd.join("foo").display().to_string();
+        let found = win_paths("cat C:foo", &[&in_cwd], cwd, cwd);
+        assert_eq!(found, [cwd.join("foo")]);
+    }
+
+    /// The unix grammar is untouched: `\` still splits tokens, so a
+    /// `C:\…` read on Linux never gloms into one candidate — every
+    /// probe lands on a `\`-free fragment (`C`, `work`, `main.rs`).
+    #[test]
+    fn backslash_splits_tokens_under_the_unix_grammar() {
+        let cwd = Path::new("/cwd");
+        let text = "open C:\\work\\main.rs now";
+        // An always-true oracle still can't yield a `:`/`\`-carrying
+        // token: the scanner never merges them under unix rules.
+        let found = tokens_on(text, cwd, cwd, false, |_| true);
+        assert!(!found.is_empty(), "candidates did probe");
+        for token in &found {
+            let covered = covered(text, token);
+            assert!(
+                !covered.contains([':', '\\']),
+                "unix grammar merged a Windows run: {covered:?}"
+            );
+        }
     }
 
     // ---- The position seam ----
