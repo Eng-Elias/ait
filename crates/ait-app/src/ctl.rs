@@ -1,6 +1,7 @@
 //! The `ait ctl` control surface (REQUIREMENTS.md §5.10.5, Spec R11 /
-//! issue #143): a running `ait` listens on a per-instance Unix socket —
-//! the **control socket** — and `ait ctl <verb>` connects to drive it.
+//! issue #143): a running `ait` listens on a per-instance local
+//! socket — the **control socket** — and `ait ctl <verb>` connects to
+//! drive it.
 //!
 //! Three pieces live here so `app` stays presentation-only
 //! (CODING_STANDARDS §9):
@@ -10,12 +11,15 @@
 //! - [`dispatch`] — the single seam over `&mut TabManager`: every verb
 //!   maps to in-loop, non-blocking tab operations (`open_tab`,
 //!   `send`, `last_block`);
-//! - [`CtlServer`] — a nonblocking `UnixListener` on
-//!   `${XDG_RUNTIME_DIR}/ait/<pid>.sock` (`$TMPDIR/ait-<uid>` fallback,
-//!   the shared `ait_shell::ait_runtime_dir` rule): parent dir
-//!   `0700`, socket `0600`, unlinked on clean exit and re-bound over a
-//!   stale file on start. Accepted connections buffer across app
-//!   ticks, so a request line can never wedge the UI;
+//! - [`CtlServer`] — a nonblocking local-socket listener, drained on
+//!   the app tick over the [`crate::ipc`] transport (Spec R16 §5.14):
+//!   `${XDG_RUNTIME_DIR}/ait/<pid>.sock` on Unix (`$TMPDIR/ait-<uid>`
+//!   fallback, the shared `ait_shell::ait_runtime_dir` rule — parent
+//!   dir `0700`, socket `0600`, unlinked on clean exit and re-bound
+//!   over a stale file on start), `\\.\pipe\ait-<user>-<pid>` on
+//!   Windows under the default same-user ACLs. Accepted connections
+//!   buffer across app ticks, so a request line can never wedge the
+//!   UI;
 //!
 //! Spawned sessions get [`ENV_CTL_SOCKET`] exported through the same
 //! `options.env` seam as `AIT_SESSION_ID` (in `TabManager::spawn_tab`,
@@ -23,28 +27,16 @@
 //! integration), so `ait ctl` run inside a tab drives its own
 //! instance.
 
-use std::io::{self, Write};
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::ffi::OsStr;
-#[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::net::Shutdown;
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
-use std::path::PathBuf;
-#[cfg(unix)]
-use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 use serde::{Deserialize, Serialize};
 
-#[cfg(unix)]
-use crate::tabs::Tab;
-use crate::tabs::TabManager;
+use crate::ipc::{self, LocalSocketListener, Pending, Service};
+use crate::tabs::{Tab, TabManager};
 
 /// The env var naming the running instance's control socket —
 /// exported into every spawned session beside `AIT_SESSION_ID` and
@@ -66,7 +58,6 @@ pub const ENV_CTL_SOCKET: &str = "AIT_CTL_SOCKET";
 /// as text); absent means the active tab. `enter: false` is `send
 /// --no-enter` — the text lands on the input line verbatim, with no
 /// `\r` appended.
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum Request {
@@ -99,7 +90,6 @@ pub enum Request {
 }
 
 /// `send`'s `enter` default — off the wire the flag means `--no-enter`.
-#[cfg(unix)]
 fn send_enter() -> bool {
     true
 }
@@ -108,7 +98,6 @@ fn send_enter() -> bool {
 /// body and the source of the client's `--command`/`--exit` selectors
 /// (no flag prints `output`). `exit` is the `OSC 133;D` code: `null`
 /// when `D` carried none.
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockReadout {
     /// The command text — `preexec`-accurate when integrated.
@@ -124,7 +113,6 @@ pub struct BlockReadout {
 /// `{"ok":true,…}` with the verb's fields; failure is
 /// `{"ok":false,"error":"…"}` with a human-readable message the
 /// client relays to stderr.
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
     /// `true` on success.
@@ -140,7 +128,6 @@ pub struct Response {
     pub block: Option<BlockReadout>,
 }
 
-#[cfg(unix)]
 impl Response {
     /// `{"ok":true}` — a bare success.
     pub fn ok() -> Self {
@@ -185,25 +172,21 @@ impl Response {
 /// [`Request`] line is an error naming the failure — the server
 /// relays it as an `{"ok":false}` response rather than dropping the
 /// connection silently.
-#[cfg(unix)]
 pub fn decode_request(line: &str) -> Result<Request, String> {
     serde_json::from_str(line.trim()).map_err(|e| format!("malformed request: {e}"))
 }
 
 /// Encode one request to its single-line JSON form.
-#[cfg(unix)]
 pub fn encode_request(request: &Request) -> String {
     serde_json::to_string(request).expect("Request serialization is infallible")
 }
 
 /// Decode one response line — the client's half of the codec.
-#[cfg(unix)]
 pub fn decode_response(line: &str) -> Result<Response, String> {
     serde_json::from_str(line.trim()).map_err(|e| format!("malformed response: {e}"))
 }
 
 /// Encode one response to its single-line JSON form.
-#[cfg(unix)]
 pub fn encode_response(response: &Response) -> String {
     serde_json::to_string(response).expect("Response serialization is infallible")
 }
@@ -217,7 +200,6 @@ pub fn encode_response(response: &Response) -> String {
 /// block off the target. Errors are `{"ok":false}` responses naming
 /// the problem — this function never fails open and never panics on
 /// an empty tab set.
-#[cfg(unix)]
 pub fn dispatch(tabs: &mut TabManager, request: &Request) -> Response {
     match request {
         Request::OpenTab => match tabs.new_tab() {
@@ -271,7 +253,6 @@ pub fn dispatch(tabs: &mut TabManager, request: &Request) -> Response {
 }
 
 /// The `--tab`-or-active resolution, immutable — `last_block`'s half.
-#[cfg(unix)]
 fn target_tab<'m>(tabs: &'m TabManager, id: Option<&str>) -> Option<&'m Tab> {
     match id {
         None => tabs.active(),
@@ -280,7 +261,6 @@ fn target_tab<'m>(tabs: &'m TabManager, id: Option<&str>) -> Option<&'m Tab> {
 }
 
 /// The `--tab`-or-active resolution, mutable — `send`'s half.
-#[cfg(unix)]
 fn target_tab_mut<'m>(tabs: &'m mut TabManager, id: Option<&str>) -> Option<&'m mut Tab> {
     match id {
         None => tabs.active_mut(),
@@ -291,7 +271,6 @@ fn target_tab_mut<'m>(tabs: &'m mut TabManager, id: Option<&str>) -> Option<&'m 
 /// The shared "could not resolve the target" response — `unknown tab
 /// "9"` names the id the caller passed; a missing active tab is the
 /// empty-set edge.
-#[cfg(unix)]
 fn tab_error(id: Option<&str>, what: &str) -> Response {
     match id {
         Some(id) => Response::error(format!("{what} {id:?}")),
@@ -301,7 +280,6 @@ fn tab_error(id: Option<&str>, what: &str) -> Response {
 
 /// A per-target error naming the resolved tab — `tab "3" has
 /// exited`/`the active tab has no sealed blocks`.
-#[cfg(unix)]
 fn which_tab(named: bool, tab: &Tab, what: &str) -> String {
     if named {
         format!("tab {:?} {what}", tab.id.to_string())
@@ -312,52 +290,21 @@ fn which_tab(named: bool, tab: &Tab, what: &str) -> String {
 
 // ------------------------------------------------------------------
 // Server: the per-instance control socket drained on the app tick.
+// The transport half — [`Pending`]'s buffered request/flush
+// lifecycle, the accept loop, the listener bind — lives in
+// [`crate::ipc`] (Spec R16 §5.14), shared verbatim with `ait-gui`'s
+// test-driver socket; what lives here is the endpoint choice and the
+// verb set it serves.
 // ------------------------------------------------------------------
-
-/// Bound on one buffered request/response line — a peer that never
-/// finishes its line can't grow memory unboundedly; past this the
-/// connection gets a `{"ok":false}` and closes.
-#[cfg(unix)]
-pub const REQUEST_CAP: usize = 64 * 1024;
-
-/// How long a half-open or mid-reply connection lives before the
-/// drain drops it — a client that connects but never completes a
-/// line is never serviced forever.
-#[cfg(unix)]
-const PENDING_TTL: Duration = Duration::from_secs(30);
 
 /// The dir this instance's socket lives under — the shared runtime-dir
 /// rule [`ait_shell::ait_runtime_dir`] owns (`$XDG_RUNTIME_DIR/ait`,
 /// else the per-user `$TMPDIR/ait-<uid>`): the same `ait` dir
-/// `ait/ssh` ControlMaster sockets live beside.
+/// `ait/ssh` ControlMaster sockets live beside. Unix-only: Windows
+/// binds a named pipe, which has no dir.
 #[cfg(unix)]
 pub fn ctl_dir(runtime_dir: Option<&OsStr>) -> PathBuf {
     ait_shell::ait_runtime_dir(runtime_dir, None)
-}
-
-/// `path` at `mode` — the spec's permissions (dir `0700`, socket
-/// `0600`); same-uid is the trust boundary. Public so the
-/// test-driver socket (`ait-gui`'s `test_driver` module, Spec R15)
-/// holds the same line.
-#[cfg(unix)]
-pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-/// The listener bind every line socket shares: a stale file at the
-/// path is reclaimed (a crashed predecessor's), the socket gets its
-/// `0600`, and the listener is nonblocking so accept never stalls
-/// the drain loop.
-#[cfg(unix)]
-pub fn bind_socket(socket: &Path) -> io::Result<UnixListener> {
-    if socket.exists() {
-        std::fs::remove_file(socket)?;
-    }
-    let listener = UnixListener::bind(socket)?;
-    set_mode(socket, 0o600)?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
 }
 
 /// What a serviced request leaves for the app to finish — the pieces
@@ -378,181 +325,80 @@ pub fn socket_error_text(error: impl std::fmt::Display) -> String {
     format!("ctl socket unavailable: {error}")
 }
 
-/// Whether a pending connection survives this service pass.
-#[cfg(unix)]
-pub enum Service {
-    /// Keep it for the next tick (request incomplete, reply stalled).
-    Keep,
-    /// Drop it — answered, expired, or the client went away.
-    Close,
-}
-
-/// One accepted connection buffered across ticks: request bytes until
-/// a full line exists, then the response flushing out. This is the
-/// transport half of the line-socket protocol — shared verbatim with
-/// `ait-gui`'s test-driver socket (Spec R15), which runs the same
-/// conventions against a different verb set: the caller supplies
-/// `answer`/`reject` so this never knows the server's [`Response`]
-/// shape.
-#[cfg(unix)]
-pub struct Pending {
-    /// The accepted (nonblocking) stream.
-    stream: UnixStream,
-    /// Buffered request bytes — a complete request ends at `'\n'`.
-    request: Vec<u8>,
-    /// The response being flushed — `(bytes, written)`; a nonblocking
-    /// write that stalls mid-response resumes next tick.
-    reply: Option<(Vec<u8>, usize)>,
-    /// When the connection was accepted — the [`PENDING_TTL`] bound.
-    at: Instant,
-}
-
-#[cfg(unix)]
-impl Pending {
-    /// A fresh accepted connection.
-    fn new(stream: UnixStream) -> Self {
-        Self {
-            stream,
-            request: Vec::new(),
-            reply: None,
-            at: Instant::now(),
-        }
-    }
-
-    /// Accept every queued connection on `listener` into `pending` —
-    /// the drain's accept loop, shared by ctl and the test-driver
-    /// socket. An accept that can't go nonblocking is dropped: a
-    /// blocking conn in `pending` would wedge the tick.
-    pub fn accept(listener: &UnixListener, pending: &mut Vec<Pending>) {
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if stream.set_nonblocking(true).is_ok() {
-                        pending.push(Pending::new(stream));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-    }
-
-    /// Service the connection once: flush a queued reply, else buffer
-    /// request bytes until a full line exists and hand it to
-    /// `answer` — the server's decode+dispatch+encode fold, whose
-    /// return is queued verbatim as the reply line (the `\n` is
-    /// appended here). `reject` produces the oversized-request
-    /// refusal's line. Each closure runs at most once, and `answer`
-    /// always runs synchronously — the caller's side effects (state
-    /// reads, queued side work) happen inside it.
-    pub fn service(
-        &mut self,
-        answer: impl FnOnce(&str) -> String,
-        reject: impl FnOnce() -> String,
-    ) -> Service {
-        if self.at.elapsed() > PENDING_TTL {
-            return Service::Close;
-        }
-        if self.reply.is_some() {
-            return self.flush();
-        }
-        let mut chunk = [0u8; 8192];
-        match self.stream.read(&mut chunk) {
-            // EOF — the client went away mid-request.
-            Ok(0) => Service::Close,
-            Ok(n) => {
-                self.request.extend_from_slice(&chunk[..n]);
-                match self.request.iter().position(|b| *b == b'\n') {
-                    // A line that only terminates past the cap is the
-                    // same oversize request, not a valid line.
-                    Some(end) if end > REQUEST_CAP => self.queue(reject()),
-                    Some(end) => {
-                        let line = String::from_utf8_lossy(&self.request[..end]).into_owned();
-                        self.queue(answer(&line))
-                    }
-                    None if self.request.len() > REQUEST_CAP => self.queue(reject()),
-                    None => Service::Keep,
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Service::Keep,
-            Err(_) => Service::Close,
-        }
-    }
-
-    /// Queue `line` as the reply and start flushing it.
-    fn queue(&mut self, mut line: String) -> Service {
-        line.push('\n');
-        self.reply = Some((line.into_bytes(), 0));
-        self.flush()
-    }
-
-    /// Write out the queued reply — a full flush closes the
-    /// connection (one request per invocation), a `WouldBlock` keeps
-    /// it for the next tick.
-    fn flush(&mut self) -> Service {
-        let Some((bytes, mut written)) = self.reply.take() else {
-            return Service::Close;
-        };
-        while written < bytes.len() {
-            match self.stream.write(&bytes[written..]) {
-                Ok(0) => break,
-                Ok(n) => written += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.reply = Some((bytes, written));
-                    return Service::Keep;
-                }
-                Err(_) => return Service::Close,
-            }
-        }
-        // Half-close so the client's read sees the line's end even
-        // before its own side closes.
-        let _ = self.stream.shutdown(Shutdown::Write);
-        Service::Close
-    }
-}
-
-/// The per-instance control socket: a nonblocking `UnixListener` on
-/// `<dir>/<pid>.sock`, drained on the app tick.
-#[cfg(unix)]
+/// The per-instance control socket: a nonblocking local-socket
+/// listener — `<dir>/<pid>.sock` on Unix, `\\.\pipe\ait-<user>-<pid>`
+/// on Windows — drained on the app tick.
 pub struct CtlServer {
     /// The nonblocking listener.
-    listener: UnixListener,
-    /// The bound socket path — unlinked on [`Drop`].
+    listener: LocalSocketListener,
+    /// The bound endpoint — the socket path on Unix, the pipe path on
+    /// Windows; what `AIT_CTL_SOCKET` exports. Unlinked on [`Drop`]
+    /// on Unix (a pipe name dies with the listener — nothing to do).
     socket: PathBuf,
     /// The socket's parent dir — removed on [`Drop`] when it's empty.
-    dir: PathBuf,
+    /// `None` on Windows, where no dir exists.
+    dir: Option<PathBuf>,
     /// Accepted connections mid-request.
     pending: Vec<Pending>,
 }
 
-#[cfg(unix)]
 impl CtlServer {
-    /// Bind this instance's `<pid>.sock` under the resolved ctl dir.
-    /// The dir is created `0700`, the socket chmodded `0600`, and an
-    /// existing file unlinked first — a crashed ait's stale socket is
-    /// reclaimed, never a bind failure.
+    /// Bind this instance's endpoint: `<pid>.sock` under the resolved
+    /// ctl dir on Unix — the dir created `0700`, the socket chmodded
+    /// `0600`, an existing file unlinked first (a crashed ait's stale
+    /// socket is reclaimed, never a bind failure) — or
+    /// `\\.\pipe\ait-<user>-<pid>` on Windows, where the default
+    /// same-user ACLs take the `0600`'s place.
     pub fn bind() -> io::Result<Self> {
-        let dir = ctl_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
-        Self::bind_under(dir)
+        #[cfg(unix)]
+        {
+            let dir = ctl_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+            Self::bind_under(dir)
+        }
+        #[cfg(windows)]
+        {
+            Self::bind_named(PathBuf::from(ipc::pipe_name(
+                "ait",
+                &ipc::user_token(),
+                std::process::id(),
+            )))
+        }
     }
 
     /// [`bind`](Self::bind) at an explicit dir — the test seam.
+    #[cfg(unix)]
     fn bind_under(dir: PathBuf) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        set_mode(&dir, 0o700)?;
+        ipc::set_mode(&dir, 0o700)?;
         let socket = dir.join(format!("{}.sock", std::process::id()));
         // Re-bind over a stale file: the pid is this process's, so the
         // file can only be ours or a dead predecessor's.
-        let listener = bind_socket(&socket)?;
+        let listener = ipc::bind_socket(socket.as_os_str())?;
         Ok(Self {
             listener,
             socket,
-            dir,
+            dir: Some(dir),
             pending: Vec::new(),
         })
     }
 
-    /// The bound socket's path — what `AIT_CTL_SOCKET` exports.
+    /// [`bind`](Self::bind) at an explicit pipe path — the Windows
+    /// test seam (parallel binds pick their own names; the pid is
+    /// this process's, so a caller-chosen name can only collide with
+    /// a dead predecessor's).
+    #[cfg(windows)]
+    fn bind_named(socket: PathBuf) -> io::Result<Self> {
+        let listener = ipc::bind_socket(socket.as_os_str())?;
+        Ok(Self {
+            listener,
+            socket,
+            dir: None,
+            pending: Vec::new(),
+        })
+    }
+
+    /// The bound endpoint — the socket path on Unix, the
+    /// `\\.\pipe\…` path on Windows; what `AIT_CTL_SOCKET` exports.
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
@@ -593,48 +439,33 @@ impl CtlServer {
     }
 }
 
-#[cfg(unix)]
 impl Drop for CtlServer {
     /// Clean exit unlinks the socket (us-43) and removes the `ait`
     /// dir best-effort — `remove_dir` only succeeds when it's empty,
-    /// so sibling sockets (`ait/ssh`, other instances') keep it.
+    /// so sibling sockets (`ait/ssh`, other instances') keep it. On
+    /// Windows the pipe name dies with the listener — nothing to do.
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
-        let _ = std::fs::remove_dir(&self.dir);
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
-/// `CtlServer`'s non-unix stub — binds nothing and drains nothing, so
-/// `app`'s wiring compiles unchanged; its empty `socket_path` exports
-/// no `AIT_CTL_SOCKET`.
-#[cfg(not(unix))]
-pub struct CtlServer;
-
-#[cfg(not(unix))]
-impl CtlServer {
-    /// Never fails — there is no socket to bind.
-    pub fn bind() -> io::Result<Self> {
-        Ok(Self)
-    }
-
-    /// The empty path — [`resolve_socket`]'s env read filters it out.
-    pub fn socket_path(&self) -> &Path {
-        Path::new("")
-    }
-
-    /// A no-op — no listener exists.
-    pub fn drain(&mut self, _tabs: &mut TabManager) -> Vec<FollowUp> {
-        Vec::new()
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     //! The codec seam (Spec R11): the wire is single-line JSON —
     //! requests internally tagged on `"verb"`, responses `{"ok":…}` —
     //! and every malformed line is an error naming the failure, never
     //! a panic or a silent default.
     use super::*;
+    /// The unix-gated tests' imports (live `/bin/sh` waits and socket
+    /// reads/writes).
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     /// Every verb decodes from its documented wire shape — field
     /// names, optionality and defaults included.
@@ -772,11 +603,12 @@ mod tests {
     // --------------------------------------------------------------
     // The dispatch seam: `dispatch(&mut TabManager, &Request)` over
     // real `/bin/sh` tabs — the same byte-fed session shapes the
-    // tabs.rs tests drive.
+    // tabs.rs tests drive. Unix-gated while the spawned shell is.
     // --------------------------------------------------------------
 
     /// Options spawning an interactive `/bin/sh` — the cheap real
     /// session the ticket allows.
+    #[cfg(unix)]
     fn sh() -> ait_term::LiveSessionOptions {
         ait_term::LiveSessionOptions {
             program: Some(std::ffi::OsString::from("/bin/sh")),
@@ -785,6 +617,7 @@ mod tests {
     }
 
     /// Options spawning `/bin/sh -c <script>` — a scripted tab.
+    #[cfg(unix)]
     fn sh_script(script: &str) -> ait_term::LiveSessionOptions {
         ait_term::LiveSessionOptions {
             program: Some(std::ffi::OsString::from("/bin/sh")),
@@ -797,6 +630,7 @@ mod tests {
     }
 
     /// A manager with `tabs` interactive `/bin/sh` tabs.
+    #[cfg(unix)]
     fn manager(tabs: usize) -> TabManager {
         let mut manager = TabManager::spawn_with(
             ait_term::Size::new(40, 10),
@@ -814,9 +648,11 @@ mod tests {
 
     /// Generous bound for every wait below (mirrors tabs.rs' live
     /// tests): tiny `/bin/sh` runs finish far under it.
+    #[cfg(unix)]
     const TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Drain until `pred` holds, or the timeout kills the test.
+    #[cfg(unix)]
     fn drain_until(manager: &mut TabManager, pred: impl Fn(&TabManager) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         while !pred(manager) {
@@ -827,6 +663,7 @@ mod tests {
     }
 
     /// All text in a session's grid (scrollback then viewport).
+    #[cfg(unix)]
     fn grid_text(session: &ait_term::LiveSession) -> String {
         let grid = session.grid();
         grid.scrollback_rows()
@@ -838,6 +675,7 @@ mod tests {
 
     /// A `sh -c` script emitting one `A B C D` block (`echo hi`,
     /// output `hi`, exit `3`) — the shape tabs.rs' block tests use.
+    #[cfg(unix)]
     fn marks_script() -> ait_term::LiveSessionOptions {
         sh_script(
             "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 0.2; \
@@ -849,6 +687,7 @@ mod tests {
     }
 
     /// The error half of a response — `None` on success.
+    #[cfg(unix)]
     fn error_of(response: &Response) -> Option<&str> {
         response.error.as_deref()
     }
@@ -856,6 +695,7 @@ mod tests {
     /// `open_tab` allocates a tab in the running instance and answers
     /// its new `AIT_SESSION_ID` — the stable `Tab::id` as text that
     /// `--tab` resolution later matches.
+    #[cfg(unix)]
     #[test]
     fn open_tab_allocates_and_reports_the_new_session_id() {
         let mut tabs = manager(1);
@@ -871,6 +711,7 @@ mod tests {
     /// `send` writes the text + `\r` into the target's PTY — the
     /// command actually runs — and marks the tab's `InputShadow`
     /// stale so scripted input can never arm the triggers (us-16/44).
+    #[cfg(unix)]
     #[test]
     fn send_types_and_submits_then_stales_the_shadow() {
         let mut tabs = manager(1);
@@ -892,6 +733,7 @@ mod tests {
     /// `send --no-enter` leaves the text on the input line unexecuted
     /// — a following Enter (a later `send` without the flag) is what
     /// runs it.
+    #[cfg(unix)]
     #[test]
     fn send_no_enter_stages_text_without_submitting() {
         let mut tabs = manager(1);
@@ -934,6 +776,7 @@ mod tests {
 
     /// `--tab` routes `send` to the named tab — here the second one,
     /// while a third stays active and untouched.
+    #[cfg(unix)]
     #[test]
     fn send_targets_a_tab_by_session_id() {
         let mut tabs = manager(3);
@@ -957,6 +800,7 @@ mod tests {
 
     /// An unknown `--tab` fails naming the id; a `send` to an exited
     /// tab fails instead of writing to a dead PTY.
+    #[cfg(unix)]
     #[test]
     fn send_errors_on_unknown_and_exited_tabs() {
         let mut tabs = manager(1);
@@ -996,6 +840,7 @@ mod tests {
     /// `last_block` reads the newest *sealed* block's readout off the
     /// target — command, output rows and the `D` exit code — and a
     /// tab with no sealed blocks fails with a clear message (us-39).
+    #[cfg(unix)]
     #[test]
     fn last_block_reads_the_newest_sealed_block() {
         let mut tabs = TabManager::spawn_with(
@@ -1109,8 +954,8 @@ mod tests {
         let mut server = CtlServer::bind_under(dir.path().to_path_buf()).unwrap();
         let mut tabs = manager(1);
 
-        let mut first = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
-        let mut second = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let mut first = ipc::connect(server.socket_path().as_os_str(), TIMEOUT).unwrap();
+        let mut second = ipc::connect(server.socket_path().as_os_str(), TIMEOUT).unwrap();
         writeln!(first, r#"{{"verb":"last_block"}}"#).unwrap();
         writeln!(
             second,
@@ -1157,9 +1002,9 @@ mod tests {
         let mut server = CtlServer::bind_under(dir.path().to_path_buf()).unwrap();
         let mut tabs = manager(1);
 
-        let mut bogus = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let mut bogus = ipc::connect(server.socket_path().as_os_str(), TIMEOUT).unwrap();
         writeln!(bogus, "not json").unwrap();
-        let mut open = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        let mut open = ipc::connect(server.socket_path().as_os_str(), TIMEOUT).unwrap();
         writeln!(open, "{}", encode_request(&Request::OpenTab)).unwrap();
 
         let follows = server.drain(&mut tabs);
