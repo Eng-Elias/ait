@@ -506,7 +506,7 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 | 12 | Packaging & release | §5.11 |
 | 13 | GUI frontend | §5.12 |
 | 14 | GUI panels — file explorer & web browser | §5.13 |
-| 15 | GUI automation testing | §5.12 |
+| 15 | GUI automation testing | §5.12–13 |
 | 16 | Windows support | §5.14 |
 
 **MVP = Rounds 1–4**: a working TUI terminal that turns natural language into a
