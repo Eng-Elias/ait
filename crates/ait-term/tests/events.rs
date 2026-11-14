@@ -11,6 +11,11 @@ fn session() -> Session {
     Session::new(SessionOptions::default())
 }
 
+// On unix a `file://` URI's authority is decorative — the path is
+// what lands. On Windows a non-local authority decodes to the UNC
+// share instead (see `reported_path` and the `#[cfg(windows)]` twins
+// below), so the host-asserting fixtures are unix-only.
+#[cfg(not(windows))]
 #[test]
 fn osc7_file_uri_reports_the_working_directory() {
     let mut session = session();
@@ -20,6 +25,29 @@ fn osc7_file_uri_reports_the_working_directory() {
         events,
         vec![SessionEvent::CwdChanged(PathBuf::from("/home/user"))]
     );
+}
+
+/// The Windows arm of the file-URI decode: `localhost`/empty
+/// authorities strip to the drive path, a non-local host decodes to
+/// the UNC share — the forms Windows shells emit (Spec R16 §5.14).
+#[cfg(windows)]
+#[test]
+fn osc7_file_uri_reports_the_working_directory() {
+    let mut session = session();
+    for (uri, expected) in [
+        (b"\x1b]7;file:///C:/work/dir\x07" as &[u8], "C:/work/dir"),
+        (b"\x1b]7;file://localhost/C:/work/dir\x07", "C:/work/dir"),
+        (
+            b"\x1b]7;file://file-server/share/dir\x07",
+            "\\\\file-server\\share\\dir",
+        ),
+    ] {
+        assert_eq!(
+            session.feed_bytes(uri),
+            vec![SessionEvent::CwdChanged(PathBuf::from(expected))],
+            "uri {uri:?}"
+        );
+    }
 }
 
 #[test]
@@ -33,6 +61,7 @@ fn osc7_bare_path_reports_the_working_directory() {
     );
 }
 
+#[cfg(not(windows))]
 #[test]
 fn osc7_percent_decodes_the_path() {
     let mut session = session();
@@ -41,6 +70,20 @@ fn osc7_percent_decodes_the_path() {
     assert_eq!(
         events,
         vec![SessionEvent::CwdChanged(PathBuf::from("/home/user dir"))]
+    );
+}
+
+/// The Windows arm: percent decoding lands before the drive-path
+/// normalization.
+#[cfg(windows)]
+#[test]
+fn osc7_percent_decodes_the_path() {
+    let mut session = session();
+    let events = session.feed_bytes(b"\x1b]7;file:///C:/work%20dir\x07");
+
+    assert_eq!(
+        events,
+        vec![SessionEvent::CwdChanged(PathBuf::from("C:/work dir"))]
     );
 }
 
@@ -301,7 +344,10 @@ fn osc_sequences_split_across_feeds_complete_later() {
     let mut session = session();
     // A PTY read boundary can split an OSC mid-sequence; the parser buffers
     // it and no event fires until the terminator arrives.
-    let first = session.feed_bytes(b"pwd: \x1b]7;file://host/ho");
+    // `localhost` decodes identically on every platform — the split-
+    // feed leg stays portable (the authority-mapping tests above own
+    // the per-OS decode).
+    let first = session.feed_bytes(b"pwd: \x1b]7;file://localhost/ho");
     assert_eq!(first, vec![]);
 
     let second = session.feed_bytes(b"me/u\x07");
