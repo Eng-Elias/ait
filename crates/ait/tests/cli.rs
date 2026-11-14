@@ -65,6 +65,37 @@ fn init_writes_a_valid_template_under_xdg() {
     );
 }
 
+/// §5.14: with `XDG_CONFIG_HOME` unset, `--init` writes under the
+/// platform config root — `~/.config/ait` on unix, `%APPDATA%\ait` on
+/// Windows. Every env knob the seam reads is pinned to the tempdir so
+/// either arm lands there (the Windows branch runs on the
+/// `windows-latest` CI leg; unix exercises the same code path).
+#[test]
+fn init_writes_under_the_platform_config_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let appdata = dir.path().join("appdata");
+    let home = dir.path().join("home");
+
+    let output = Command::new(ait_bin!())
+        .args(["--init"])
+        .env_remove("XDG_CONFIG_HOME")
+        .env("APPDATA", &appdata)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("spawn the ait binary");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let root = if cfg!(windows) {
+        appdata
+    } else {
+        home.join(".config")
+    };
+    let text = std::fs::read_to_string(root.join("ait").join("settings.toml"))
+        .expect("--init must create <config root>/ait/settings.toml");
+    assert!(text.contains("# AIT settings"), "not the template");
+}
+
 /// Story 3: a second `--init` fails naming the file and leaves it
 /// untouched; `--force` — in either argument order — overrides.
 #[test]

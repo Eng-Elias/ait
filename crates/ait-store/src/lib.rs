@@ -2,7 +2,8 @@
 //! §5.8, Spec R08): the `ait-store` growth ADR-0003 anticipated.
 //!
 //! One synchronous [`Store`] facade over `rusqlite` (`bundled`) holds
-//! everything the round persists under `$XDG_DATA_HOME/ait/store.db`:
+//! everything the round persists under `$XDG_DATA_HOME/ait/store.db`
+//! (`%LOCALAPPDATA%\ait\store.db` on Windows — §5.14):
 //!
 //! - **conversations** — the agent's durable unit of work; created per
 //!   first task in a tab, listed newest-first for the `Alt+R` picker,

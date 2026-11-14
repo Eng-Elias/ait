@@ -292,9 +292,12 @@ fn sh_single_quote(value: &str) -> String {
 /// runtime dir is set and non-empty, else `$TMPDIR/ait[-<subdir>]-<uid>`.
 /// A shared `/tmp/ait` is NOT safe: the first creator wins at `0700`
 /// and every later user is silently shut out, so the fallback carries
-/// the owner's uid in its name. `ssh_control_dir` (`subdir` `"ssh"`)
-/// and the frontend's ctl socket dir (no subdir) both resolve here so
-/// every consumer names the same place.
+/// the owner's uid in its name. On Windows — where `XDG_RUNTIME_DIR`
+/// is never set — the fallback IS the rule: `std::env::temp_dir()` is
+/// already per-user ACL'd and `<uid>` is `$USER`/`$USERNAME` (§5.14;
+/// see [`owner_uid`]). `ssh_control_dir` (`subdir` `"ssh"`) and the
+/// frontend's ctl socket dir (no subdir) both resolve here so every
+/// consumer names the same place.
 pub fn ait_runtime_dir(runtime_dir: Option<&OsStr>, subdir: Option<&str>) -> PathBuf {
     match runtime_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
         Some(dir) => match subdir {
@@ -491,6 +494,37 @@ mod tests {
         assert!(
             !script.contains("export AIT_SSH_CONTROL_DIR"),
             "no remote export either: {script}"
+        );
+    }
+
+    /// `ait_runtime_dir` without a runtime dir lands under the
+    /// per-user system temp dir — the only branch Windows has
+    /// (`XDG_RUNTIME_DIR` is never set there — §5.14) — and folds
+    /// `subdir` into the dir name so a shared base can never lock a
+    /// later user out. An empty runtime dir counts as unset, not
+    /// the current dir.
+    #[test]
+    fn runtime_dir_falls_back_under_the_system_temp_dir() {
+        let bare = ait_runtime_dir(None, None);
+        assert!(
+            bare.starts_with(std::env::temp_dir()),
+            "fallback under the system temp dir: {}",
+            bare.display()
+        );
+        let ssh = ait_runtime_dir(None, Some("ssh"));
+        assert!(ssh.starts_with(std::env::temp_dir()));
+        assert!(
+            ssh.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("ait-ssh-"),
+            "subdir folds into the per-user name: {}",
+            ssh.display()
+        );
+        assert_eq!(
+            ait_runtime_dir(Some(OsStr::new("")), None),
+            bare,
+            "empty is unset"
         );
     }
 

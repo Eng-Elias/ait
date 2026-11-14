@@ -7,7 +7,8 @@
 //! (`agents.custom_endpoints.local.models[0].config_key: …`). Layered on
 //! top, this crate owns everything `settings.toml` needs:
 //! [`load`]/[`settings_path`] resolve
-//! `$XDG_CONFIG_HOME/ait/settings.toml` (falling back to `~/.config`),
+//! `$XDG_CONFIG_HOME/ait/settings.toml` (falling back to `~/.config`
+//! on unix, `%APPDATA%` on Windows — §5.14),
 //! the `watch` feature hot-reloads it onto a channel the consumer
 //! drains (Spec R03, user stories 10–11), [`Endpoint::resolve_secret`]
 //! reads secrets from the env var named by `api_key_env` or the OS keyring

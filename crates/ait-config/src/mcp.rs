@@ -150,11 +150,14 @@ impl McpConfig {
 
 /// Where the user-layer `mcp.json` lives (§5.10.1):
 /// `$XDG_CONFIG_HOME/ait/mcp.json`, falling back to
-/// `~/.config/ait/mcp.json` — beside [`settings_path`](crate::settings_path).
+/// `~/.config/ait/mcp.json` on unix and `%APPDATA%\ait\mcp.json` on
+/// Windows (§5.14) — beside [`settings_path`](crate::settings_path).
 pub fn mcp_path() -> PathBuf {
     config_dir(
         env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("APPDATA"),
         env::home_dir().unwrap_or_default(),
+        cfg!(windows),
     )
     .join("ait")
     .join(MCP_JSON)

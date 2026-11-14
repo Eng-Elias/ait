@@ -134,7 +134,8 @@ pub struct Store {
 
 impl Store {
     /// Open the store at [`store_path`] — `$XDG_DATA_HOME/ait/store.db`,
-    /// falling back to `~/.local/share/ait/store.db` — creating the
+    /// falling back to `~/.local/share/ait/store.db` on unix and
+    /// `%LOCALAPPDATA%\ait\store.db` on Windows (§5.14) — creating the
     /// directory on first use (user story 1).
     pub fn open_default() -> Result<Self, StoreError> {
         Self::open(store_path())
