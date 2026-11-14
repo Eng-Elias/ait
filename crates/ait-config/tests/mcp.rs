@@ -15,29 +15,41 @@ use std::sync::Mutex;
 
 use ait_config::{load_mcp, mcp_path, project_ait_dir, McpConfig, McpServerOrigin};
 
-/// Serializes tests that mutate `XDG_CONFIG_HOME`/`HOME`.
+/// Serializes tests that mutate the config-path environment.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Runs `body` with `XDG_CONFIG_HOME` and `HOME` pointed at `xdg`/`home`
-/// (either may be `None` = unset), restoring the previous values after —
-/// even on panic, so a failure cannot poison the next test.
-fn with_env<T>(xdg: Option<&Path>, home: Option<&Path>, body: impl FnOnce() -> T) -> T {
+/// Runs `body` with the config-path env pointed at the given dirs —
+/// `XDG_CONFIG_HOME` → `xdg`, `%APPDATA%` (the Windows config root —
+/// inert elsewhere) → `appdata`, and the home lookup → `home` (`HOME`
+/// plus `USERPROFILE`, so `env::home_dir()` is pinned on Windows too).
+/// `None` unsets. Previous values restore even on panic, so a failure
+/// cannot poison the next test.
+fn with_env<T>(
+    xdg: Option<&Path>,
+    appdata: Option<&Path>,
+    home: Option<&Path>,
+    body: impl FnOnce() -> T,
+) -> T {
     // `into_inner` rides out a poisoned lock — one panicking env test
     // must not cascade into the rest.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-    let saved_xdg = env::var_os("XDG_CONFIG_HOME");
-    let saved_home = env::var_os("HOME");
+    let saved =
+        ["XDG_CONFIG_HOME", "APPDATA", "HOME", "USERPROFILE"].map(|name| (name, env::var_os(name)));
+    let home = home.map(|p| p.as_os_str().to_os_string());
     set_or_remove("XDG_CONFIG_HOME", xdg.map(|p| p.as_os_str().to_os_string()));
-    set_or_remove("HOME", home.map(|p| p.as_os_str().to_os_string()));
+    set_or_remove("APPDATA", appdata.map(|p| p.as_os_str().to_os_string()));
+    set_or_remove("HOME", home.clone());
+    set_or_remove("USERPROFILE", home);
 
-    struct Restore(Option<OsString>, Option<OsString>);
+    struct Restore([(&'static str, Option<OsString>); 4]);
     impl Drop for Restore {
         fn drop(&mut self) {
-            set_or_remove("XDG_CONFIG_HOME", self.0.take());
-            set_or_remove("HOME", self.1.take());
+            for (name, value) in std::mem::take(&mut self.0) {
+                set_or_remove(name, value);
+            }
         }
     }
-    let _restore = Restore(saved_xdg, saved_home);
+    let _restore = Restore(saved);
 
     body()
 }
@@ -153,21 +165,28 @@ fn from_json_non_object_server_is_an_error() {
 fn mcp_path_resolves_beside_settings() {
     let dirs = tempfile::tempdir().unwrap();
     let xdg = dirs.path().join("xdg");
+    let appdata = dirs.path().join("appdata");
     let home = dirs.path().join("home");
-    with_env(Some(&xdg), Some(&home), || {
+    with_env(Some(&xdg), Some(&appdata), Some(&home), || {
         assert_eq!(mcp_path(), xdg.join("ait").join("mcp.json"));
     });
 }
 
+/// The platform default when XDG is unset: `~/.config` on unix,
+/// `%APPDATA%` verbatim on Windows (§5.14) — mcp.json always lands
+/// beside `settings.toml`.
 #[test]
-fn mcp_path_falls_back_to_home_config() {
+fn mcp_path_uses_the_platform_config_root() {
     let dirs = tempfile::tempdir().unwrap();
+    let appdata = dirs.path().join("appdata");
     let home = dirs.path().join("home");
-    with_env(None, Some(&home), || {
-        assert_eq!(
-            mcp_path(),
-            home.join(".config").join("ait").join("mcp.json")
-        );
+    with_env(None, Some(&appdata), Some(&home), || {
+        let root = if cfg!(windows) {
+            appdata.clone()
+        } else {
+            home.join(".config")
+        };
+        assert_eq!(mcp_path(), root.join("ait").join("mcp.json"));
     });
 }
 
@@ -221,7 +240,7 @@ fn load_mcp_missing_everything_is_empty() {
     let xdg = dirs.path().join("xdg");
     let cwd = dirs.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         assert!(load_mcp(&cwd).unwrap().servers.is_empty());
     });
 }
@@ -237,7 +256,7 @@ fn load_mcp_reads_the_user_layer() {
     let cwd = dirs.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let merged = load_mcp(&cwd).unwrap();
         assert_eq!(merged.servers.len(), 1);
         assert_eq!(merged.servers["db"].origin, McpServerOrigin::User);
@@ -256,7 +275,7 @@ fn load_mcp_reads_the_project_layer() {
     let cwd = dirs.path().join("project").join("src").join("deep");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let merged = load_mcp(&cwd).unwrap();
         assert_eq!(merged.servers.len(), 1);
         assert_eq!(merged.servers["lint"].origin, McpServerOrigin::Project);
@@ -279,7 +298,7 @@ fn load_mcp_merges_both_layers() {
     let cwd = dirs.path().join("project").join("src");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let merged = load_mcp(&cwd).unwrap();
         assert_eq!(merged.servers.len(), 2);
         assert_eq!(merged.servers["db"].origin, McpServerOrigin::User);
@@ -302,7 +321,7 @@ fn load_mcp_project_shadows_a_same_named_user_server() {
     let cwd = dirs.path().join("project").join("src");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let merged = load_mcp(&cwd).unwrap();
         // The more specific layer wins the name collision.
         assert_eq!(merged.servers.len(), 1);
@@ -319,7 +338,7 @@ fn load_mcp_malformed_user_file_names_its_path() {
     let cwd = dirs.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let err = load_mcp(&cwd).unwrap_err();
         assert!(
             err.to_string().contains(&*bad.to_string_lossy()),
@@ -340,7 +359,7 @@ fn load_mcp_invalid_project_file_names_its_path() {
     let cwd = dirs.path().join("project");
     std::fs::create_dir_all(cwd.join("src")).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let err = load_mcp(&cwd.join("src")).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(&*bad.to_string_lossy()), "actual: {msg}");
@@ -358,7 +377,7 @@ fn load_mcp_unreadable_file_is_an_error_naming_the_path() {
     let cwd = dirs.path().join("project");
     std::fs::create_dir_all(&cwd).unwrap();
 
-    with_env(Some(&xdg), None, || {
+    with_env(Some(&xdg), None, None, || {
         let err = load_mcp(&cwd).unwrap_err();
         assert!(err.to_string().contains("mcp.json"), "actual: {err}");
     });

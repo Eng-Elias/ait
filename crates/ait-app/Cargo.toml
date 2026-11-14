@@ -33,6 +33,12 @@ ait-store = { path = "../ait-store" }
 # persisted payload passthrough.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The ctl/test-driver sockets' transport (Spec R16 §5.14): local
+# sockets — Unix sockets on Unix, `\\.\pipe\…` named pipes on Windows
+# — behind the `ait_app::ipc` seam both servers and the `ait ctl`
+# client share. Exact pin of a >=7-day-old release per ADR-0002:
+# interprocess 2.4.7 (2026-10-23).
+interprocess = "=2.4.7"
 
 [target.'cfg(unix)'.dependencies]
 # libc 0.2.191 (2026-10-16), already in the tree — `signal`/`raise` for

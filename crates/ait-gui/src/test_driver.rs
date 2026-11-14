@@ -1,15 +1,19 @@
-//! The test-driver socket (Spec R15 / ticket R15-T1): a second,
-//! test-only Unix socket beside the [`ait_app::ctl`] control socket —
-//! the harness's way in. The whole module compiles only under the
-//! off-by-default `test-driver` cargo feature, so release artifacts
-//! carry none of this code, and even a `test-driver` build binds
-//! nothing unless [`ENV_DRIVER_SOCKET`] names the path.
+//! The test-driver socket (Spec R15 / ticket R15-T1, ported to the
+//! shared transport in R16-T6): a second, test-only local socket
+//! beside the [`ait_app::ctl`] control socket — the harness's way in.
+//! The whole module compiles only under the off-by-default
+//! `test-driver` cargo feature, so release artifacts carry none of
+//! this code, and even a `test-driver` build binds nothing unless
+//! [`ENV_DRIVER_SOCKET`] names the endpoint — a socket path on Unix,
+//! a `\\.\pipe\…` name on Windows.
 //!
 //! The wire follows the ctl socket's conventions exactly: a
-//! nonblocking `UnixListener`, one request per connection, requests
-//! and responses as single-line JSON, accepted connections buffered
-//! across drain passes so a slow client never wedges the UI, the
-//! socket `0600` under its parent dir, unlinked on drop.
+//! nonblocking local-socket listener, one request per connection,
+//! requests and responses as single-line JSON, accepted connections
+//! buffered across drain passes so a slow client never wedges the
+//! UI. On Unix the socket file is `0600` under its `0700` parent dir
+//! and unlinked on drop; on Windows the pipe's default same-user
+//! ACLs take the mode's place and the name dies with the listener.
 //!
 //! Protocol v1 verbs — every request is `{"verb":…}`:
 //!
@@ -93,11 +97,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ait_app::ctl::{self, Pending, Service};
+use ait_app::ipc::{self, LocalSocketListener, Pending, Service};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -1813,20 +1816,23 @@ fn encode_response(response: &Response) -> String {
     serde_json::to_string(response).expect("Response serialization is infallible")
 }
 
-/// The test-driver socket: a nonblocking `UnixListener` at the path
-/// [`ENV_DRIVER_SOCKET`] named, drained in the pump loop beside ctl.
+/// The test-driver socket: a nonblocking local-socket listener at
+/// the endpoint [`ENV_DRIVER_SOCKET`] named — a socket path on Unix,
+/// a `\\.\pipe\…` name on Windows — drained in the pump loop beside
+/// ctl.
 pub struct TestDriver {
     /// The nonblocking listener.
-    listener: UnixListener,
-    /// The bound socket path — unlinked on [`Drop`].
+    listener: LocalSocketListener,
+    /// The bound endpoint — unlinked on [`Drop`] on Unix (a pipe
+    /// name dies with the listener — nothing to unlink there).
     socket: PathBuf,
     /// Accepted connections mid-request.
     pending: Vec<Pending>,
 }
 
 impl TestDriver {
-    /// Bind at the path [`ENV_DRIVER_SOCKET`] names — `None` when the
-    /// variable is unset or empty (ordinary runs never reach this
+    /// Bind at the endpoint [`ENV_DRIVER_SOCKET`] names — `None` when
+    /// the variable is unset or empty (ordinary runs never reach this
     /// code; only harness-spawned instances expose a socket).
     pub fn bind_env() -> Option<io::Result<Self>> {
         let path = std::env::var_os(ENV_DRIVER_SOCKET)?;
@@ -1836,19 +1842,22 @@ impl TestDriver {
         Some(Self::bind(PathBuf::from(path)))
     }
 
-    /// Bind at an explicit path — [`bind_env`](Self::bind_env)'s
-    /// delegate and the test seam. The parent dir is created `0700`,
-    /// the socket chmodded `0600`, and an existing file unlinked
-    /// first — a crashed run's stale socket is reclaimed, never a
-    /// bind failure.
+    /// Bind at an explicit endpoint — [`bind_env`](Self::bind_env)'s
+    /// delegate and the test seam. On Unix the parent dir is created
+    /// `0700`, the socket chmodded `0600`, and an existing file
+    /// unlinked first — a crashed run's stale socket is reclaimed,
+    /// never a bind failure. On Windows `socket` is a
+    /// `\\.\pipe\…` name under the default same-user ACLs — there is
+    /// no dir to create or file to reclaim.
     pub fn bind(socket: PathBuf) -> io::Result<Self> {
+        #[cfg(unix)]
         if let Some(dir) = socket.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
-                ctl::set_mode(dir, 0o700)?;
+                ipc::set_mode(dir, 0o700)?;
             }
         }
-        let listener = ctl::bind_socket(&socket)?;
+        let listener = ipc::bind_socket(socket.as_os_str())?;
         Ok(Self {
             listener,
             socket,
@@ -1856,8 +1865,8 @@ impl TestDriver {
         })
     }
 
-    /// The bound socket's path — the tests' seam; production callers
-    /// already know the path (they chose it).
+    /// The bound endpoint — the tests' seam; production callers
+    /// already know the endpoint (they chose it).
     #[allow(dead_code)]
     pub fn socket_path(&self) -> &Path {
         &self.socket
@@ -1896,8 +1905,10 @@ impl TestDriver {
 }
 
 impl Drop for TestDriver {
-    /// Clean exit unlinks the socket — the ctl convention.
+    /// Clean exit unlinks the socket — the ctl convention. On Windows
+    /// the pipe name dies with the listener: nothing to do.
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -1924,8 +1935,9 @@ mod tests {
     use eframe::egui::Plugin;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     /// A `Shared` built like `GuiApp::new`'s minus the store, over a
     /// real interactive `/bin/sh` tab — the pump tests' shape.
@@ -2186,14 +2198,44 @@ mod tests {
         }
     }
 
+    /// The endpoint a test server binds — a tempdir socket path on
+    /// Unix (the returned `TempDir` must outlive the server), a
+    /// per-process pipe name on Windows.
+    fn driver_endpoint() -> (Option<tempfile::TempDir>, PathBuf) {
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("driver.sock");
+            (Some(dir), socket)
+        }
+        #[cfg(windows)]
+        {
+            let socket = PathBuf::from(ait_app::ipc::pipe_name(
+                "ait-driver-test",
+                &ait_app::ipc::user_token(),
+                std::process::id(),
+            ));
+            (None, socket)
+        }
+    }
+
+    /// Connect a client to `server`'s endpoint — the same
+    /// [`ait_app::ipc::connect`] the testkit drives.
+    fn client(server: &TestDriver) -> ait_app::ipc::LocalSocketStream {
+        ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(10)).unwrap()
+    }
+
     /// The full socket round trip through `drain`: `key` queues a
     /// press+release pair (the release second), `text` queues the
     /// composed event, `quit` queues `Injected::Quit`, `dump` answers
     /// in-band and queues nothing.
     #[test]
     fn drain_services_requests_over_the_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut server = TestDriver::bind(dir.path().join("driver.sock")).unwrap();
+        let (_dir, socket) = driver_endpoint();
+        let mut server = TestDriver::bind(socket).unwrap();
+        // The Unix half of the bind contract — `0600` is the mode
+        // bit; Windows's same-user ACLs hold the same line.
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(server.socket_path())
                 .unwrap()
@@ -2206,7 +2248,7 @@ mod tests {
         let mut shared = shared();
 
         // One request per connection — the ctl convention.
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
+        let mut conn = client(&server);
         writeln!(conn, r#"{{"verb":"key","chord":"Ctrl+Shift+E"}}"#).unwrap();
         assert!(server.drain(&ctx, &mut shared) > 0);
         assert_eq!(shared.injected.len(), 2, "press + release");
@@ -2230,7 +2272,7 @@ mod tests {
             other => panic!("expected the key release, got {other:?}"),
         }
 
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
+        let mut conn = client(&server);
         writeln!(conn, r#"{{"verb":"text","text":"echo hi"}}"#).unwrap();
         server.drain(&ctx, &mut shared);
         match shared.injected.pop_front().unwrap() {
@@ -2240,7 +2282,7 @@ mod tests {
         drop(conn);
 
         // `dump` answers in-band and queues no injected input.
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
+        let mut conn = client(&server);
         writeln!(conn, r#"{{"verb":"dump"}}"#).unwrap();
         server.drain(&ctx, &mut shared);
         let mut response = String::new();
@@ -2250,7 +2292,7 @@ mod tests {
         assert!(shared.injected.is_empty(), "dump injects nothing");
 
         // `quit` queues the close path's marker.
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
+        let mut conn = client(&server);
         writeln!(conn, r#"{{"verb":"quit"}}"#).unwrap();
         server.drain(&ctx, &mut shared);
         assert!(matches!(
@@ -2260,7 +2302,7 @@ mod tests {
         drop(conn);
 
         // A malformed line still earns a well-formed error.
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
+        let mut conn = client(&server);
         writeln!(conn, "not json").unwrap();
         server.drain(&ctx, &mut shared);
         let mut response = String::new();

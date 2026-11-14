@@ -6,10 +6,16 @@
 //! inside the schema beyond behavior.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use ait_store::{NewBlock, NewConversation, NewTranscriptItem, Store};
+
+/// Serializes the tests that mutate the store-path environment —
+/// `XDG_DATA_HOME`/`LOCALAPPDATA`/`HOME` are process-global, so the
+/// two `open_default` tests must not run concurrently.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A tempdir + the `store.db` path inside it; the dir owns cleanup.
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
@@ -592,9 +598,9 @@ fn finish_terminal_session_stamps_ended_at() {
 
 #[test]
 fn open_default_honours_xdg_data_home() {
-    // The only test that mutates the environment — it owns
-    // XDG_DATA_HOME for its duration; no other test in this binary
-    // touches it.
+    // One of the two tests that mutate the environment — ENV_LOCK
+    // serializes them against each other.
+    let _guard = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let previous = std::env::var_os("XDG_DATA_HOME");
     std::env::set_var("XDG_DATA_HOME", dir.path());
@@ -608,6 +614,43 @@ fn open_default_honours_xdg_data_home() {
         dir.path().join("ait").join("store.db").as_path()
     );
     assert!(dir.path().join("ait").join("store.db").exists());
+}
+
+#[test]
+fn open_default_uses_the_platform_data_root() {
+    // §5.14: with `XDG_DATA_HOME` unset the store opens under the
+    // platform data root — `~/.local/share/ait` on unix,
+    // `%LOCALAPPDATA%\ait` on Windows. Every env knob the seam reads
+    // is pinned so either arm lands in the tempdir (the Windows
+    // branch runs on the `windows-latest` CI leg). This test owns
+    // the env for its duration — ENV_LOCK serializes it against
+    // `open_default_honours_xdg_data_home`.
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("localappdata");
+    let home = dir.path().join("home");
+    let saved = ["XDG_DATA_HOME", "LOCALAPPDATA", "HOME", "USERPROFILE"]
+        .map(|name| (name, std::env::var_os(name)));
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::set_var("LOCALAPPDATA", &local);
+    std::env::set_var("HOME", &home);
+    std::env::set_var("USERPROFILE", &home);
+
+    let store = Store::open_default().unwrap();
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+    let root = if cfg!(windows) {
+        local
+    } else {
+        home.join(".local").join("share")
+    };
+    assert_eq!(store.path(), root.join("ait").join("store.db").as_path());
+    assert!(root.join("ait").join("store.db").exists());
 }
 
 #[test]

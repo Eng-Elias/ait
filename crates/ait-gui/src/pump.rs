@@ -359,7 +359,6 @@ mod tests {
     use ait_app::tabs::{SessionTemplate, Tab, TabManager};
     use ait_config::Settings;
     use std::io::{ErrorKind, Read, Write};
-    use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::time::Instant;
 
@@ -551,8 +550,9 @@ mod tests {
         pass: &mut Pass,
         request: &Request,
     ) -> Response {
-        let mut conn = UnixStream::connect(server.socket_path()).unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut conn =
+            ait_app::ipc::connect(server.socket_path().as_os_str(), Duration::from_secs(2))
+                .unwrap();
         writeln!(conn, "{}", encode_request(request)).unwrap();
         let deadline = Instant::now() + TIMEOUT;
         let mut buf = String::new();
