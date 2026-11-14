@@ -1,11 +1,14 @@
 //! The injection planner (REQUIREMENTS.md §5.5, Spec R05 / issue #71).
 //!
 //! [`plan`] maps a *resolved* program path to an [`Injection`] purely on
-//! the basename — `bash`, `zsh` and `fish` match exactly, `pwsh` and
-//! `powershell` match case-insensitively with `.exe` stripped (§5.14) —
-//! each gets argv/env rewrites plus the files a per-session `0700` dir
-//! must hold; every other program plans to `None` (§5.5 graceful
-//! degrade: unknown shells get nothing, the terminal keeps working).
+//! the basename — `bash`, `zsh` and `fish` match exactly (and, on
+//! Windows only, their `.exe`-stripped case-insensitive spellings too —
+//! a Git-bash `bash.exe` earns the real bash snippet through ConPTY),
+//! `pwsh` and `powershell` match case-insensitively with `.exe`
+//! stripped on every OS (§5.14) — each gets argv/env rewrites plus the
+//! files a per-session `0700` dir must hold; every other program plans
+//! to `None` (§5.5 graceful degrade: unknown shells get nothing, the
+//! terminal keeps working).
 //!
 //! The planner never touches the user's dotfiles: bash gets a `--rcfile`
 //! wrapper that sources `~/.bashrc` first, zsh gets a temp `ZDOTDIR`
@@ -73,9 +76,10 @@ pub fn shell_family(basename: &str) -> ShellFamily {
 /// `basename` lowercased with one trailing `.exe` stripped — the
 /// Windows-executable spelling normalization (§5.14). Applied to
 /// every name: a classifier table matching `BASH.EXE` against the
-/// bash set only errs toward `Command`, the safe direction — unlike
-/// the planner, where `BASH` must NOT inject, so [`plan`] keeps the
-/// unix names' exact-case match ahead of this lookup.
+/// bash set only errs toward `Command`, the safe direction. The
+/// planner is pickier — unix keeps the names' exact-case match
+/// (`BASH` must NOT inject); only [`windows_posix_kind`] consumes
+/// this, on Windows, where the spelling really is the same program.
 pub(crate) fn normalized_stem(basename: &str) -> String {
     let lowered = basename.to_ascii_lowercase();
     lowered.strip_suffix(".exe").unwrap_or(&lowered).to_owned()
@@ -127,7 +131,7 @@ pub fn plan_with_zdotdir(
         "bash" => ShellKind::Bash,
         "zsh" => ShellKind::Zsh,
         "fish" => ShellKind::Fish,
-        _ => powershell_kind(basename)?,
+        _ => windows_posix_kind(basename).or_else(|| powershell_kind(basename))?,
     };
     // An empty ZDOTDIR means `$HOME` in practice — record it as absent.
     let orig_zdotdir = orig_zdotdir.filter(|v| !v.is_empty());
@@ -359,12 +363,34 @@ fn zsh_forwarder(file: &str) -> String {
 /// PowerShell basename detection (§5.14): [`shell_family`]'s
 /// `PowerShell` arm maps to [`ShellKind::Pwsh`] — `pwsh`, `pwsh.exe`,
 /// `PWSH.EXE` and `powershell.exe` all integrate through the same
-/// normalization the classifier and sentinel share. The unix names
-/// stay exact-case (matched in [`plan_with_zdotdir`] before this
-/// runs — `BASH`/`Fish` aren't real program names); `cmd` and
-/// everything else plans `None`.
+/// normalization the classifier and sentinel share, on every OS.
+/// `cmd` and everything else plans `None`.
 fn powershell_kind(basename: &str) -> Option<ShellKind> {
     (shell_family(basename) == ShellFamily::PowerShell).then_some(ShellKind::Pwsh)
+}
+
+/// The Windows-only second pass beside [`powershell_kind`]: Git-bash
+/// and MSYS shells resolve as `bash.exe`, `ZSH.EXE` and friends — the
+/// `.exe`-stripped, case-insensitive [`normalized_stem`] read maps
+/// them to their real kinds (§5.14's further note: a `$SHELL`-picked
+/// POSIX shell still gets its own snippet through ConPTY).
+#[cfg(windows)]
+fn windows_posix_kind(basename: &str) -> Option<ShellKind> {
+    match normalized_stem(basename).as_str() {
+        "bash" => Some(ShellKind::Bash),
+        "zsh" => Some(ShellKind::Zsh),
+        "fish" => Some(ShellKind::Fish),
+        _ => None,
+    }
+}
+
+/// The unix arm of [`windows_posix_kind`] — no normalization: a file
+/// named `BASH` or `bash.exe` is a different program, never
+/// integrated (the exact-case match in [`plan_with_zdotdir`] already
+/// served a real `bash`).
+#[cfg(not(windows))]
+fn windows_posix_kind(_basename: &str) -> Option<ShellKind> {
+    None
 }
 
 /// `0700` on unix; a no-op elsewhere (other platforms get whatever the

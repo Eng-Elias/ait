@@ -480,13 +480,20 @@ pub fn is_known_shell(shell_name: &str) -> bool {
 /// stray-case POSIX name errs toward Command — the safe direction).
 /// An unrecognized shell resolves the POSIX set alone (§5.5 degrade).
 pub fn builtins_for(shell_name: &str) -> impl Iterator<Item = &'static str> {
-    let extras: &[&str] = match crate::inject::normalized_stem(shell_name).as_str() {
-        "bash" => BASH,
-        "zsh" => ZSH,
-        "fish" => FISH,
-        "pwsh" | "powershell" => POWERSHELL,
-        "cmd" => CMD,
-        _ => &[],
+    let extras: &[&str] = match crate::shell_family(shell_name) {
+        crate::ShellFamily::PowerShell => POWERSHELL,
+        crate::ShellFamily::Cmd => CMD,
+        // The Posix arm keeps the `.exe`/case-normalized read rather
+        // than the planner's exact match — a stray-case name hitting
+        // the bash table only errs toward Command, the safe direction.
+        crate::ShellFamily::Posix => {
+            match crate::inject::normalized_stem(shell_name).as_str() {
+                "bash" => BASH,
+                "zsh" => ZSH,
+                "fish" => FISH,
+                _ => &[],
+            }
+        }
     };
     POSIX.iter().chain(extras.iter()).copied()
 }

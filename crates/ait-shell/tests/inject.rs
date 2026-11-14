@@ -63,6 +63,48 @@ fn powershell_basenames_plan_to_pwsh() {
     }
 }
 
+/// Windows spellings of the POSIX shells plan their real kinds
+/// (§5.14's further note): a `$SHELL`-picked Git-bash `bash.exe` earns
+/// the bash snippet through ConPTY. `.exe`-stripped and
+/// case-insensitive — the same normalization the PowerShell names get.
+#[cfg(windows)]
+#[test]
+fn windows_posix_spellings_plan_their_shell_kind() {
+    let cases = [
+        ("bash.exe", ShellKind::Bash),
+        ("BASH.EXE", ShellKind::Bash),
+        (r"C:\Program Files\Git\bin\bash.exe", ShellKind::Bash),
+        ("zsh.exe", ShellKind::Zsh),
+        ("ZSH.EXE", ShellKind::Zsh),
+        ("fish.exe", ShellKind::Fish),
+        ("FISH.EXE", ShellKind::Fish),
+    ];
+    for (program, expected) in cases {
+        let injection = plan(Path::new(program)).unwrap_or_else(|| panic!("{program} should plan"));
+        assert_eq!(injection.kind(), expected, "{program}");
+    }
+}
+
+/// Unix keeps the POSIX names' exact-case read: a `BASH` or
+/// `bash.exe` file is a different program, never integrated — the
+/// `.exe` normalization is Windows-only for these shells (the
+/// PowerShell names normalize on every OS by deliberate choice).
+#[cfg(unix)]
+#[test]
+fn posix_names_plan_only_exact_case_on_unix() {
+    for program in [
+        "BASH",
+        "Bash",
+        "bash.exe",
+        "ZSH.EXE",
+        "zsh.exe",
+        "Fish",
+        "fish.exe",
+    ] {
+        assert!(plan(Path::new(program)).is_none(), "{program}");
+    }
+}
+
 #[test]
 fn unknown_programs_plan_to_none() {
     for program in [
