@@ -93,8 +93,7 @@ OPTIONS
     --init [--force]
         Write a commented default settings.toml under
         $XDG_CONFIG_HOME/ait/ (%APPDATA%\\ait on Windows); an
-        existing file is kept unless --force (the
-        `--force --init` order also works).
+        existing file is kept unless --force (either order works).
 
     --print-schema
         Print the settings JSON Schema.
