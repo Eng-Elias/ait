@@ -62,7 +62,8 @@
 //!   by `mcp_permissions` plus the literal `server`/`server:tool`
 //!   deny/allow lists.
 //! - the §5.10.2 skills loader (Spec R10-T5): a [`SkillsCatalog`]
-//!   scanned at submit time from `~/.config/ait/skills/` and the
+//!   scanned at submit time from `~/.config/ait/skills/`
+//!   (`%APPDATA%\ait\skills\` on Windows — §5.14) and the
 //!   nearest `.ait/skills/` — malformed `SKILL.md`s skipped with
 //!   surfaced errors, project shadowing user — snapshotted onto
 //!   every `AgentRequest`, rendered into the system prompt, and

@@ -19,13 +19,16 @@ const SKILLS_DIR: &str = "skills";
 
 /// The user-layer skills root (§5.10.2):
 /// `$XDG_CONFIG_HOME/ait/skills/`, falling back to
-/// `~/.config/ait/skills/` — beside [`settings_path`](crate::settings_path)
+/// `~/.config/ait/skills/` on unix and `%APPDATA%\ait\skills\` on
+/// Windows (§5.14) — beside [`settings_path`](crate::settings_path)
 /// and [`mcp_path`](crate::mcp_path), resolved by the same
 /// [`config_dir`] machinery.
 pub fn user_skills_dir() -> PathBuf {
     config_dir(
         env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("APPDATA"),
         env::home_dir().unwrap_or_default(),
+        cfg!(windows),
     )
     .join("ait")
     .join(SKILLS_DIR)

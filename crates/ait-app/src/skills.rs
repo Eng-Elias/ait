@@ -213,8 +213,9 @@ impl LiveSkills {
 
     /// The directories the watcher must cover for the current roots
     /// — each layer's PARENT, watched recursively (the settings
-    /// watcher's parent-dir rule generalized): `~/.config/ait` for
-    /// the user root, `.ait` itself for the project root. Watching
+    /// watcher's parent-dir rule generalized): the config root
+    /// (`~/.config/ait`, `%APPDATA%\ait` on Windows) for the user
+    /// root, `.ait` itself for the project root. Watching
     /// the parent catches a `skills/` directory appearing
     /// mid-session with no re-watch.
     fn desired_dirs(&self) -> Vec<PathBuf> {

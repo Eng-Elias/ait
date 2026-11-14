@@ -1,6 +1,7 @@
 //! Tests at the file-loading seam (Spec R03, user stories 1, 6–8):
 //! `settings_path()` resolves `$XDG_CONFIG_HOME/ait/settings.toml` with a
-//! `~/.config` fallback; `load()`/`load_from()` turn a missing file into
+//! platform fallback (`~/.config` on unix, `%APPDATA%` on Windows —
+//! §5.14); `load()`/`load_from()` turn a missing file into
 //! built-in defaults and a present-but-invalid file into the T1
 //! `ConfigError` naming the offending key.
 //!
@@ -14,27 +15,39 @@ use std::sync::Mutex;
 
 use ait_config::{load, load_from, settings_path, Settings};
 
-/// Serializes tests that mutate `XDG_CONFIG_HOME`/`HOME`.
+/// Serializes tests that mutate the config-path environment.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Runs `body` with `XDG_CONFIG_HOME` and `HOME` pointed at `xdg`/`home`
-/// (either may be `None` = unset), restoring the previous values after —
-/// even on panic, so a failure cannot poison the next test.
-fn with_env<T>(xdg: Option<&Path>, home: Option<&Path>, body: impl FnOnce() -> T) -> T {
+/// Runs `body` with the config-path env pointed at the given dirs —
+/// `XDG_CONFIG_HOME` → `xdg`, `%APPDATA%` (the Windows config root —
+/// inert elsewhere) → `appdata`, and the home lookup → `home` (`HOME`
+/// plus `USERPROFILE`, so `env::home_dir()` is pinned on Windows too).
+/// `None` unsets. Previous values restore even on panic, so a failure
+/// cannot poison the next test.
+fn with_env<T>(
+    xdg: Option<&Path>,
+    appdata: Option<&Path>,
+    home: Option<&Path>,
+    body: impl FnOnce() -> T,
+) -> T {
     let _guard = ENV_LOCK.lock().unwrap();
-    let saved_xdg = env::var_os("XDG_CONFIG_HOME");
-    let saved_home = env::var_os("HOME");
+    let saved =
+        ["XDG_CONFIG_HOME", "APPDATA", "HOME", "USERPROFILE"].map(|name| (name, env::var_os(name)));
+    let home = home.map(|p| p.as_os_str().to_os_string());
     set_or_remove("XDG_CONFIG_HOME", xdg.map(|p| p.as_os_str().to_os_string()));
-    set_or_remove("HOME", home.map(|p| p.as_os_str().to_os_string()));
+    set_or_remove("APPDATA", appdata.map(|p| p.as_os_str().to_os_string()));
+    set_or_remove("HOME", home.clone());
+    set_or_remove("USERPROFILE", home);
 
-    struct Restore(Option<OsString>, Option<OsString>);
+    struct Restore([(&'static str, Option<OsString>); 4]);
     impl Drop for Restore {
         fn drop(&mut self) {
-            set_or_remove("XDG_CONFIG_HOME", self.0.take());
-            set_or_remove("HOME", self.1.take());
+            for (name, value) in std::mem::take(&mut self.0) {
+                set_or_remove(name, value);
+            }
         }
     }
-    let _restore = Restore(saved_xdg, saved_home);
+    let _restore = Restore(saved);
 
     body()
 }
@@ -50,31 +63,63 @@ fn set_or_remove(name: &str, value: Option<OsString>) {
 fn xdg_config_home_wins_over_home() {
     let dirs = tempfile::tempdir().unwrap();
     let xdg = dirs.path().join("xdg");
+    let appdata = dirs.path().join("appdata");
     let home = dirs.path().join("home");
-    with_env(Some(&xdg), Some(&home), || {
+    with_env(Some(&xdg), Some(&appdata), Some(&home), || {
         assert_eq!(settings_path(), xdg.join("ait").join("settings.toml"));
     });
 }
 
+/// The platform default when XDG is unset: `~/.config` on unix,
+/// `%APPDATA%` verbatim on Windows (§5.14).
 #[test]
-fn unset_xdg_falls_back_to_home_config() {
+fn unset_xdg_uses_the_platform_config_root() {
+    let dirs = tempfile::tempdir().unwrap();
+    let appdata = dirs.path().join("appdata");
+    let home = dirs.path().join("home");
+    with_env(None, Some(&appdata), Some(&home), || {
+        let root = if cfg!(windows) {
+            appdata.clone()
+        } else {
+            home.join(".config")
+        };
+        assert_eq!(settings_path(), root.join("ait").join("settings.toml"));
+    });
+}
+
+/// The Windows-only tail of the chain (§5.14): `%APPDATA%` unset or
+/// empty resolves `~\AppData\Roaming`. Off-Windows coverage of the
+/// same chain lives in `load.rs`'s `config_dir` unit tests.
+#[cfg(windows)]
+#[test]
+fn unset_or_empty_appdata_falls_back_to_roaming() {
     let dirs = tempfile::tempdir().unwrap();
     let home = dirs.path().join("home");
-    with_env(None, Some(&home), || {
-        assert_eq!(
-            settings_path(),
-            home.join(".config").join("ait").join("settings.toml")
-        );
-    });
+    for appdata in [None, Some(Path::new(""))] {
+        with_env(None, appdata, Some(&home), || {
+            assert_eq!(
+                settings_path(),
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("ait")
+                    .join("settings.toml")
+            );
+        });
+    }
 }
 
 #[test]
 fn load_missing_file_yields_defaults() {
     // Story 6: no settings.toml on first run is not an error.
     let dirs = tempfile::tempdir().unwrap();
-    with_env(Some(dirs.path()), Some(dirs.path()), || {
-        assert_eq!(load().unwrap(), Settings::default());
-    });
+    with_env(
+        Some(dirs.path()),
+        Some(dirs.path()),
+        Some(dirs.path()),
+        || {
+            assert_eq!(load().unwrap(), Settings::default());
+        },
+    );
 }
 
 #[test]
@@ -88,7 +133,7 @@ fn load_reads_the_xdg_settings_file() {
     )
     .unwrap();
 
-    with_env(Some(dirs.path()), None, || {
+    with_env(Some(dirs.path()), Some(dirs.path()), None, || {
         let settings = load().unwrap();
         assert_eq!(settings.terminal.shell.as_deref(), Some("/bin/zsh"));
     });
@@ -102,7 +147,7 @@ fn load_invalid_file_names_the_offending_key() {
     std::fs::create_dir_all(&ait_dir).unwrap();
     std::fs::write(ait_dir.join("settings.toml"), "[terminal]\nbogus = 1\n").unwrap();
 
-    with_env(Some(dirs.path()), None, || {
+    with_env(Some(dirs.path()), Some(dirs.path()), None, || {
         let err = load().unwrap_err();
         assert!(
             err.to_string().starts_with("terminal.bogus:"),
