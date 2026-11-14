@@ -127,9 +127,9 @@ function global:__ait_hook_preexec {
 # (literal session scope isn't reachable from a function in
 # PowerShell; fine for run_command payloads, which are command lines,
 # not session setup). Every stream merges `*>&1` like bash's `2>&1`
-# capture. Replies on OSC
-# 7701: A, then R frames of <=500 decoded bytes each (a 1000-char hex
-# slice keeps every raw OSC under the 1024-byte vte budget), then B.
+# capture. Replies on OSC 7701: an `A` opener, then R frames of
+# <=500 decoded bytes each (a 1000-char hex slice keeps every raw
+# OSC under the 1024-byte vte budget), then `B`.
 # The concatenated R payload is `<id>;<merged>;<exit_code>` — merged
 # output may itself contain `;`, the codec splits first and last only.
 # Exit code: the native `$LASTEXITCODE` when the payload ran one, else
