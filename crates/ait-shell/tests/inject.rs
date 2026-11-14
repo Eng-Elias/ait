@@ -276,6 +276,65 @@ fn pwsh_command_arg_escapes_single_quotes_in_the_dir() {
     );
 }
 
+/// Spec R16-T5 (§5.9/§5.14): the snippet ships the PowerShell port of
+/// the `ssh()` wrapper — the full `AIT_SSH_*` env contract the Unix
+/// wrappers honor (opt-out, allow/deny policy, `ssh_begin`/`ssh_end`,
+/// hop minting, the bootstrap re-export) — minus every multiplexing
+/// surface, since Windows OpenSSH cannot multiplex. The env-name
+/// wiring itself is the `tests/remote_pwsh.rs` exec legs' job; here
+/// the pure asset's wire shape.
+#[test]
+fn pwsh_snippet_ssh_wrapper_honors_the_contract_without_multiplexing() {
+    let injection = plan(Path::new("pwsh")).unwrap();
+    let snippet = injection
+        .files(Path::new("/tmp/ait-test-dir"))
+        .into_iter()
+        .find(|(name, _)| *name == "snippet.ps1")
+        .map(|(_, contents)| contents)
+        .expect("pwsh plan ships snippet.ps1");
+
+    for needle in [
+        "function global:ssh",
+        "__ait_ssh_program",
+        "__ait_ssh_dest",
+        "__ait_ssh_allowed",
+        "__ait_ssh_begin",
+        "__ait_ssh_end",
+        "__ait_ssh_remote_cmd",
+        "AIT_SSH_OFF",
+        "AIT_SSH_ENABLED",
+        "AIT_SSH_ALLOW",
+        "AIT_SSH_DENY",
+        "AIT_SSH_BOOTSTRAP",
+        "AIT_SSH_HOP",
+        "ssh_begin",
+        "ssh_end",
+        "$PID",
+        "-t @args",
+    ] {
+        assert!(snippet.contains(needle), "pwsh snippet missing {needle}");
+    }
+
+    // No `Control*` attach and no `ssh -G` probe — there is no socket
+    // to find or make on Windows, so `AIT_SSH_REUSE_CM` and
+    // `AIT_SSH_CONTROL_*` stay armed-but-unread.
+    for absent in [
+        "ControlMaster",
+        "ControlPath",
+        "ControlPersist",
+        "ssh -G",
+        "control_path",
+        "AIT_SSH_REUSE_CM",
+        "AIT_SSH_CONTROL_DIR",
+        "AIT_SSH_CONTROL_PERSIST",
+    ] {
+        assert!(
+            !snippet.contains(absent),
+            "pwsh snippet must not emit {absent}"
+        );
+    }
+}
+
 #[test]
 fn materialize_writes_files_into_a_0700_dir_and_cleans_up() {
     let base = scratch_base("materialize");
