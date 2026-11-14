@@ -114,12 +114,20 @@ fn path_executables() -> Vec<String> {
     let Some(path) = std::env::var_os("PATH") else {
         return names;
     };
+    // The `PATHEXT` list is a per-process constant — read it once,
+    // not per PATH entry.
+    #[cfg(not(unix))]
+    let pathext = pathext_value();
     for dir in std::env::split_paths(&path) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if is_executable_file(&entry.path()) {
+            #[cfg(unix)]
+            let executable = is_executable_file(&entry.path());
+            #[cfg(not(unix))]
+            let executable = is_executable_file(&entry.path(), &pathext);
+            if executable {
                 if let Some(name) = entry.file_name().to_str() {
                     push_index_name(&mut names, name);
                 }
@@ -161,16 +169,18 @@ fn is_executable_file(path: &Path) -> bool {
 /// Non-unix fallback: executability isn't a mode bit, it's the
 /// `PATHEXT` extension list cmd/PowerShell resolve through (`.COM`,
 /// `.EXE`, `.BAT`, `.CMD` when the var is unset) — without it every
-/// DLL and doc on `%PATH%` would resolve as a program.
+/// DLL and doc on `%PATH%` would resolve as a program. `pathext` is
+/// the caller's hoisted [`pathext_value`] — one env read per index
+/// build, not per entry.
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+fn is_executable_file(path: &Path, pathext: &str) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
     std::fs::metadata(path)
         .map(|meta| meta.is_file())
         .unwrap_or(false)
-        && in_pathext(name, &pathext_value())
+        && in_pathext(name, pathext)
 }
 
 /// The `PATHEXT` env var's raw value — the documented default when
