@@ -288,6 +288,7 @@ impl ExplorerState {
             return;
         }
         self.selected = index.min(self.entries.len() - 1);
+        self.ensure_visible(self.page_rows());
         self.load_selected_preview();
     }
 
@@ -428,6 +429,7 @@ impl ExplorerState {
         self.show_hidden = !self.show_hidden;
         self.scroll = self.scroll.min(self.visible().count().saturating_sub(1));
         self.snap_selected_to_visible();
+        self.ensure_visible(self.page_rows());
         self.load_selected_preview();
     }
 
@@ -481,6 +483,7 @@ impl ExplorerState {
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.visible().count().saturating_sub(1));
         self.snap_selected_to_visible();
+        self.ensure_visible(self.page_rows());
         self.load_selected_preview();
     }
 
@@ -495,6 +498,7 @@ impl ExplorerState {
         if !current_visible {
             let first = self.visible().map(|(index, _)| index).next().unwrap_or(0);
             self.selected = first;
+            self.ensure_visible(self.page_rows());
         }
     }
 
@@ -916,7 +920,6 @@ impl Pane for ExplorerPane {
         // one) — it doubles as the PageUp/PageDown distance.
         let window = ((list_rect.height() / row_h).floor() as usize).saturating_sub(1);
         shared.explorer.set_page_rows(window.max(1));
-        shared.explorer.ensure_visible(window.max(1));
         let scroll = shared.explorer.scroll();
 
         // The pane's own wheel — the app-level wheel router only

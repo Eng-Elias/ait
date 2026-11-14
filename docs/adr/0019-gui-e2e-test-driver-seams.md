@@ -147,8 +147,14 @@ and land here together:
 - The suite already earned its keep: WebKitGTK navigation reports
   arrive asynchronously over IPC, and the browser scenarios caught
   our own `load_url` echoes racing real in-page nav reports into
-  history — T5 added the echo ledger to keep them distinct. A
-  product bug the manual checklist never reached.
+  history — T5 added the echo ledger to keep them distinct. The
+  explorer-browse leg caught another on a headed run: the listing's
+  `ensure_visible` ran every paint, so the frame after a wheel
+  scroll pulled `scroll` back to the selection — real users saw
+  the listing snap back on any repaint. `ensure_visible` now rides
+  the selection-changing verbs (`select`, the snap after relist
+  and the hidden toggle) instead of running unconditionally.
+  Product bugs the manual checklist never reached.
 - The review pass hardened the harness itself (Spec R15 follow-up):
   the ctl socket's transport half — `Pending`'s buffered
   request/flush lifecycle, `bind_socket`, `set_mode` — is exported
