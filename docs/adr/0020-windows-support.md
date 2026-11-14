@@ -42,8 +42,10 @@ fourth that the scenario-matrix work surfaced mid-round:
   local-socket API sits behind a new `ait_app::ipc` module: the
   `UnixListener` path on Unix (unchanged wire, unchanged
   `0600`/parent-dir rules) and `\\.\pipe\ait-<user>-<pid>` for ctl
-  / `ait-driver-<user>-<pid>` for the test driver on Windows,
-  where the pipe's default same-user ACL is the `0600` equivalent.
+  / `ait-driver-<user>-<pid>-<seq>` for the test driver on Windows
+  (the `-<seq>` tail is the harness's per-spawn counter — parallel
+  GUI legs in one test process never collide), where the pipe's
+  default same-user ACL is the `0600` equivalent.
   One-request-per-connection, single-line JSON, buffered accept —
   the codec can't tell which side it's on.
   `ENV_CTL_SOCKET`/`ENV_DRIVER_SOCKET` carry the pipe name instead
@@ -51,22 +53,35 @@ fourth that the scenario-matrix work surfaced mid-round:
   version+date comment; `ait-testkit` resolves the same line for
   its driver client.
 - **One `pwsh.ps1` snippet serves both PowerShell hosts.** Authored
-  in-house beside bash/zsh/fish and embedded via `include_str!`,
-  it feature-gates every piece at load: `$PSVersionTable` and
+  in-house beside bash/zsh/fish and embedded via `include_str!`
+  (materialized into the session dir as `snippet.ps1`), it
+  feature-gates every piece at load: `$PSVersionTable` and
   PSReadLine presence decide whether the session gets the full
   surface (prompt marks + hook events + `preexec` via a
   `Set-PSReadLineKeyHandler Enter` wrapper reading
   `GetBufferState`) or degrades to marks+hooks (the MarksOnly
-  executor tier) or plain shell. `init_shell`/`bootstrapped` emit
-  at load, `precmd`/OSC 133 `D`-with-`$LASTEXITCODE`/OSC 7/`A`
-  from the overridden `prompt` function, `preexec`/`B`/`C` from
-  the Enter wrapper, and `exit_shell` via `Register-EngineEvent
+  executor tier) or plain shell. `init_shell` emits at load;
+  `bootstrapped` is the re-source guard's reply and the `ssh()`
+  wrapper's post-return re-integration — the same split the Unix
+  snippets run. `precmd`/OSC 133 `D`-with-`$LASTEXITCODE`/OSC 7/`A`
+  come from the overridden `prompt` function, `preexec`/`B`/`C`
+  from the Enter wrapper, and `exit_shell` via `Register-EngineEvent
   PowerShell.Exiting` — clean-quit only, the same limit the Unix
   trap has. The injection planner maps basenames `pwsh` and
   `powershell` (`.exe`-stripped, case-insensitive on Windows) to
-  `ShellKind::Pwsh`; spawn args are `-NoExit -ExecutionPolicy
-  Bypass -Command ". '<sessiondir>\pwsh.ps1'"` — profiles load
+  `ShellKind::Pwsh` — the `.exe`-stripped, case-insensitive match
+  runs on every OS (only Windows spellings ever exercise it);
+  spawn args are `-NoExit -ExecutionPolicy
+  Bypass -Command ". '<sessiondir>\snippet.ps1'"` — profiles load
   first, `Bypass` is scoped to the one spawned process.
+  `__ait_run`'s payload runs as a `[ScriptBlock]` inside the
+  function's child scope — an honest narrowing of the spec's
+  "session scope" wording, which literal PowerShell cannot give a
+  function: payload-defined variables and functions die with the
+  call, while cwd (`Set-Location`) persists, location being
+  session-global rather than scope-bound. For `run_command`
+  payloads — command lines, not session setup — that is the
+  "user's own shell" guarantee that matters.
 - **Windows directories map behind the existing path seams — no
   new seams.** `XDG_CONFIG_HOME` → `%APPDATA%\ait` (settings,
   `mcp.json`, skills), `XDG_DATA_HOME` → `%LOCALAPPDATA%\ait`

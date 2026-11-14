@@ -119,9 +119,15 @@ function global:__ait_hook_preexec {
 
 # `__ait_run <id> <hex(command)>` — ait types this line on the prompt so
 # in-band execution always leaves a trace (us-23). The decoded command
-# runs as a script block: session functions, aliases and cwd all apply
-# (the same "user's own shell" guarantee the Unix `eval` gives), with
-# every stream merged `*>&1` like bash's `2>&1` capture. Replies on OSC
+# runs as a script block inside this function's CHILD scope: session
+# functions, aliases and cwd all resolve for it (the same "user's own
+# shell" guarantee the Unix `eval` gives), and a payload Set-Location
+# persists — location is session-global, not scope-bound — but
+# variables and functions the payload defines die with the call
+# (literal session scope isn't reachable from a function in
+# PowerShell; fine for run_command payloads, which are command lines,
+# not session setup). Every stream merges `*>&1` like bash's `2>&1`
+# capture. Replies on OSC
 # 7701: A, then R frames of <=500 decoded bytes each (a 1000-char hex
 # slice keeps every raw OSC under the 1024-byte vte budget), then B.
 # The concatenated R payload is `<id>;<merged>;<exit_code>` — merged

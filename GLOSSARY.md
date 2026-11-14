@@ -172,7 +172,8 @@ Domain vocabulary for AIT. Use these terms in code, issues and docs.
   beside the control socket (Spec R15, ADR-0019), compiled only under
   the off-by-default `test-driver` cargo feature and bound only when
   `AIT_TEST_DRIVER_SOCKET` names its Unix path or Windows pipe
-  (`ait-driver-<user>-<pid>`). Same wire shape as ctl (one
+  (`ait-driver-<user>-<pid>-<seq>` — the harness's per-spawn
+  counter). Same wire shape as ctl (one
   single-line JSON request/response per connection); its verbs inject
   real `egui::Event`s/`RawInput` and answer a versioned JSON **dump**
   of the state paint draws — grid, panes, browser, explorer, status
