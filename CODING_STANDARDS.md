@@ -53,4 +53,16 @@ Rules the reviewer enforces. (Seeded from REQUIREMENTS.md §10.)
     invalidate the result (position + content + cwd), never
     wall-clock. (R14: Ctrl+hover detection and the explorer's cwd
     re-root both needed a memo pass after review.)
+21. An ADR's concrete names — filenames, identifiers, wire fields —
+    are a contract: rename the artifact, update the ADR in the same
+    commit. (R16: ADR-0020 promised `pwsh.ps1` and a `<seq>`-suffixed
+    driver pipe while the code shipped `snippet.ps1` and a different
+    scheme — the ADR is the cited contract, so drift is a defect.)
+22. A test whose precondition can't be met fails loudly or gates
+    itself off (`#[ignore]`, `cfg`, scenario `platforms`) — never a
+    silent `return`. (R16: the inject smoke tests skipped on snippet
+    materialization failure, hiding a real defect path.)
+23. Check `GLOSSARY.md` before coining a domain term — a name already
+    defined for another concept gets a fresh word. (R16: `endpoint`
+    in the IPC docs collided with the existing LLM-endpoint meaning.)
 
