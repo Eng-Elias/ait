@@ -29,7 +29,7 @@
 //! [`GuiE2e`]. GUI verbs are the driver protocol's verbs plus the
 //! bounded dump assertions. `slowmo = 400` (or the
 //! `AIT_GUI_E2E_SLOWMO` env, which overrides it) paces a headed watch:
-//! a fixed delay after each input request, presentation only — the
+//! a fixed delay before each input request, presentation only — the
 //! waits stay predicate-based either way.
 //!
 //! The dual-binary matrix (R15-T5): a scenario's `binary = "web"` /
@@ -265,7 +265,7 @@ pub struct GuiSpawnConfig {
     /// external input — a synthetic click lands on whatever window
     /// sits under the coordinates.
     pub display: Option<OsString>,
-    /// Watch pacing in milliseconds — a fixed delay after each input
+    /// Watch pacing in milliseconds — a fixed delay before each input
     /// request so a headed run stays readable to a human eye
     /// (`AIT_GUI_E2E_SLOWMO=<ms>` overrides). Presentation only: the
     /// waits stay predicate-based, so a paced run observes exactly the
@@ -1252,6 +1252,7 @@ impl GuiE2e {
     /// `request` + the `ok` contract — a driver-side failure (bad
     /// chord, wedged app) is a test failure with the server's message.
     fn act(&self, request: &Request<'_>) {
+        self.pace();
         match self.request(request) {
             Ok(response) if response.ok => {}
             Ok(response) => panic!(
@@ -1260,12 +1261,13 @@ impl GuiE2e {
             ),
             Err(error) => panic!("the driver request failed: {error}"),
         }
-        self.pace();
     }
 
-    /// Watch pacing: the fixed post-input delay when `slowmo` is set —
-    /// presentation only; waits stay predicate-based (a paced run
-    /// observes exactly the same sequence, just slower).
+    /// Watch pacing: the fixed pre-input delay when `slowmo` is set —
+    /// presentation only; waits stay predicate-based. The delay lands
+    /// BEFORE the input, not after: a post-input sleep would push the
+    /// next wait's first poll past transient states it must observe
+    /// (a mid-settle winsize, a self-redirecting page).
     fn pace(&self) {
         if !self.slowmo.is_zero() {
             std::thread::sleep(self.slowmo);
@@ -1939,7 +1941,7 @@ pub struct GuiScenario {
     binary: GuiBinary,
     /// `headed = true` — drive the developer's `DISPLAY`.
     headed: bool,
-    /// `slowmo = 400` — watch pacing in milliseconds after each input
+    /// `slowmo = 400` — watch pacing in milliseconds before each input
     /// request (`AIT_GUI_E2E_SLOWMO` overrides).
     pub slowmo_ms: u64,
     /// The file stem — failure messages and dump dirs.
@@ -2819,7 +2821,7 @@ struct RawGuiScenario {
     /// `headed = true` — drive the developer's `DISPLAY`.
     #[serde(default)]
     headed: bool,
-    /// `slowmo = 400` — watch pacing in ms after each input request.
+    /// `slowmo = 400` — watch pacing in ms before each input request.
     #[serde(default)]
     slowmo: u64,
     /// The `[[steps]]` tables.

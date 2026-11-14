@@ -224,7 +224,7 @@ fn resize_settle_reflows_on_settle_not_per_frame() {
 }
 
 /// Watch pacing (`GuiSpawnConfig::slowmo_ms`, `AIT_GUI_E2E_SLOWMO`,
-/// the scenario header's `slowmo = 400`): a fixed delay lands after
+/// the scenario header's `slowmo = 400`): a fixed delay lands before
 /// each input request so a headed run stays readable — the PTY
 /// suite's `AIT_E2E_SLOWMO`, GUI-spelled. The config field is used
 /// here on purpose: the env var is process-global and would pace
