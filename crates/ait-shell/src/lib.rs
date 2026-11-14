@@ -38,7 +38,10 @@ pub use builtins::{builtins_for, is_known_shell};
 pub use codec::{
     decode, session_id, HookName, ShellEvent, OSC_HOOK_CODE, OSC_RAW_BUDGET, OSC_RUN_CODE,
 };
-pub use inject::{plan, plan_with_zdotdir, Injection, Materialized, ShellKind, ENV_SESSION_ID};
+pub use inject::{
+    plan, plan_with_zdotdir, shell_family, Injection, Materialized, ShellFamily, ShellKind,
+    ENV_SESSION_ID,
+};
 pub use remote::{
     ait_runtime_dir, bootstrap_script, policy_env, ssh_control_dir, SshPolicy,
     DEFAULT_CONTROL_PERSIST, ENV_SSH_ALLOW, ENV_SSH_BOOTSTRAP, ENV_SSH_CONTROL_DIR,

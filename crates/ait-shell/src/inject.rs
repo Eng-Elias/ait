@@ -37,6 +37,50 @@ pub const ENV_SESSION_ID: &str = "AIT_SESSION_ID";
 /// forwarders — the spawned zsh's own `ZDOTDIR` already points at us.
 const ENV_ZDOTDIR_ORIG: &str = "AIT_ZDOTDIR_ORIG";
 
+/// The family a session program's basename belongs to — the single
+/// normalization point every basename-keyed consumer shares (§5.14,
+/// std 17): the injection planner's [`powershell_kind`], the
+/// §5.10.4 classifier's builtin tables and the executor's
+/// `Absent`-tier sentinel all key off [`shell_family`]'s answer.
+/// Windows names match case-insensitively with one trailing `.exe`
+/// stripped; POSIX names — and every unrecognized basename — are
+/// [`Posix`](ShellFamily::Posix), the degrade each consumer layers
+/// its own meaning on (no injection, the shared builtin set, the
+/// `printf` sentinel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFamily {
+    /// sh/bash/zsh/fish/dash and the unknown — the POSIX forms.
+    Posix,
+    /// `pwsh` (7+) and `powershell` (5.1) — one family, exactly the
+    /// basenames [`ShellKind::Pwsh`] integrates.
+    PowerShell,
+    /// `cmd.exe` — no integration (§5.5 degrade), but its own
+    /// sentinel spelling and minimal builtin set.
+    Cmd,
+}
+
+/// Which [`ShellFamily`] a session program's basename belongs to —
+/// `pwsh`/`powershell` and `cmd`, case-insensitive with one `.exe`
+/// stripped; everything else is `Posix` (never an error).
+pub fn shell_family(basename: &str) -> ShellFamily {
+    match normalized_stem(basename).as_str() {
+        "pwsh" | "powershell" => ShellFamily::PowerShell,
+        "cmd" => ShellFamily::Cmd,
+        _ => ShellFamily::Posix,
+    }
+}
+
+/// `basename` lowercased with one trailing `.exe` stripped — the
+/// Windows-executable spelling normalization (§5.14). Applied to
+/// every name: a classifier table matching `BASH.EXE` against the
+/// bash set only errs toward `Command`, the safe direction — unlike
+/// the planner, where `BASH` must NOT inject, so [`plan`] keeps the
+/// unix names' exact-case match ahead of this lookup.
+pub(crate) fn normalized_stem(basename: &str) -> String {
+    let lowered = basename.to_ascii_lowercase();
+    lowered.strip_suffix(".exe").unwrap_or(&lowered).to_owned()
+}
+
 /// The shell family an [`Injection`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -312,18 +356,15 @@ fn zsh_forwarder(file: &str) -> String {
     )
 }
 
-/// PowerShell basename detection (§5.14): `pwsh` and `powershell` map
-/// to [`ShellKind::Pwsh`] case-insensitively with one `.exe` suffix
-/// stripped — `pwsh`, `pwsh.exe`, `PWSH.EXE` and `powershell.exe` all
-/// integrate. The unix names stay exact-case (`BASH`/`Fish` aren't
-/// real program names); `cmd` and everything else plans `None`.
+/// PowerShell basename detection (§5.14): [`shell_family`]'s
+/// `PowerShell` arm maps to [`ShellKind::Pwsh`] — `pwsh`, `pwsh.exe`,
+/// `PWSH.EXE` and `powershell.exe` all integrate through the same
+/// normalization the classifier and sentinel share. The unix names
+/// stay exact-case (matched in [`plan_with_zdotdir`] before this
+/// runs — `BASH`/`Fish` aren't real program names); `cmd` and
+/// everything else plans `None`.
 fn powershell_kind(basename: &str) -> Option<ShellKind> {
-    let lowered = basename.to_ascii_lowercase();
-    let stem = lowered.strip_suffix(".exe").unwrap_or(&lowered);
-    match stem {
-        "pwsh" | "powershell" => Some(ShellKind::Pwsh),
-        _ => None,
-    }
+    (shell_family(basename) == ShellFamily::PowerShell).then_some(ShellKind::Pwsh)
 }
 
 /// `0700` on unix; a no-op elsewhere (other platforms get whatever the
