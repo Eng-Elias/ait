@@ -21,6 +21,31 @@ pwsh planner/snippet, `ait-term`'s spawn chain or OSC-7 decode,
 the `ait-config`/`ait-store` path seams, or `ait-gui`'s
 platform arms.
 
+## What a POSIX box cannot verify
+
+Two legs are Windows-only by mechanism, not just by gate — check
+this list before spending a cycle reproducing them on Linux/macOS:
+
+- **pwsh's rendered prompt needs ConPTY.** PowerShell + PSReadLine
+  issues console queries (`ESC[6n` DSR among them) that ConPTY
+  answers natively and a bare POSIX pty does not. Under `script`,
+  `pty.fork`, or ait's own PTY on Linux, pwsh loads `pwsh.ps1`,
+  emits `init_shell`, then floods `133;D`/`OSC 7`/`133;A`/`precmd`
+  marks without ever rendering `PS …>` — answering the DSR by hand
+  doesn't recover it (the late reply lands as an `ESC` cancel on
+  the input stream, so ReadLine aborts and the prompt re-runs in a
+  loop). The mark bytes ait consumes are real and correct; the
+  prompt text never comes. Off-Windows evidence is a raw OSC
+  capture or a direct snippet exec (`pwsh -Command ". 'pwsh.ps1'"`)
+  — never a rendered transcript. (Verified on pwsh 7.7, R16.)
+- **The full workspace doesn't compile for msvc off Windows.**
+  `aws-lc-sys` and `libsqlite3-sys` need the MSVC toolchain
+  (`lib.exe`, NASM) — `cargo check --target
+  x86_64-pc-windows-msvc` covers only the pure-Rust dep trees:
+  `ait-config`, `ait-shell`, `ait-term`, `ait-testkit`.
+  `scripts/check-windows.sh` runs exactly that leg; the rest
+  belongs to the `windows-latest` runners.
+
 ## GUI legs — from the R16-T7 verification notes
 
 - **Window/render** — run `ait-gui` (or `ait gui` from a

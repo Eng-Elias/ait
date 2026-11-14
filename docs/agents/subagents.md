@@ -68,15 +68,20 @@ subagents.
   out and its `target/` on disk — the merge doesn't clean either.
   Remove each ticket's worktree *when it merges*, not at round
   cleanup — sibling target dirs filled the disk mid-gate twice in
-  R11: `git worktree remove ait-worktrees/<ticket>`
-  (`--force` when its untracked `target/` blocks removal) drops the
-  worktree *and* its target dir, then `git branch -D <branch>`;
-  GitHub already deleted the remote branch on merge. `pkill -f
-  ait-worktrees/<ticket>` first — e2e-spawned `ait-gui`+Xvfb children
-  outlived R15's removed worktrees, holding deleted inodes on a
-  near-full volume (and masquerading as a "process holds the link
-  target" linker failure). Round cleanup verifies `git worktree list`
-  shows none left.
+  R11: `scripts/remove-worktree.sh ait-worktrees/<ticket>` kills
+  leftover e2e children, drops the worktree and its target dir, and
+  deletes the branch (GitHub already deleted the remote side on
+  merge). Run it by hand instead and the steps bite twice:
+  `pkill -f <worktree>` matches the caller's own command line — a
+  chained `git worktree remove <path>` repeats the literal name, so
+  even a bracket-regex pattern still self-matches (R16 hit this 3x;
+  pkill must run in a *standalone* command with no second command
+  naming the worktree) — and an argv pattern can't see Xvfb at all,
+  which is how ~970 stale Xvfb survived R15's removed worktrees
+  holding deleted inodes on a near-full volume (and masquerading as
+  a "process holds the link target" linker failure). Round cleanup
+  verifies `git worktree list` shows none left and
+  `pgrep -fl 'Xvfb|ait-gui'` shows no orphans.
 - **Gate output**: run the gate teed to a log —
   `scripts/check.sh 2>&1 | tee /tmp/gate-<ticket>.log`. Piping to
   `tail` keeps the tail but discards the failure detail a diagnosis

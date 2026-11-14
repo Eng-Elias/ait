@@ -150,7 +150,12 @@ cargo build -p ait                       # build the binary under test
 cargo test -p ait -p ait-testkit         # the whole e2e suite
 cargo test -p ait --test scenarios       # TOML scenarios only
 cargo test -p ait --test e2e             # code-first tests only
+AIT_E2E_ONLY=tabs cargo test -p ait --test scenarios   # stems containing "tabs"
 ```
+
+`AIT_E2E_ONLY=<text>` keeps only the TOML legs whose file stem
+contains it — a miss fails listing every available stem (the
+`AIT_GUI_E2E_ONLY` convention, same shape).
 
 ## Write a scenario (acceptance coverage, no Rust)
 
