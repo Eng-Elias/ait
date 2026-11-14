@@ -93,13 +93,7 @@ fn windows_posix_spellings_plan_their_shell_kind() {
 #[test]
 fn posix_names_plan_only_exact_case_on_unix() {
     for program in [
-        "BASH",
-        "Bash",
-        "bash.exe",
-        "ZSH.EXE",
-        "zsh.exe",
-        "Fish",
-        "fish.exe",
+        "BASH", "Bash", "bash.exe", "ZSH.EXE", "zsh.exe", "Fish", "fish.exe",
     ] {
         assert!(plan(Path::new(program)).is_none(), "{program}");
     }

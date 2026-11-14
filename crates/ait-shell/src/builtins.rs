@@ -486,14 +486,12 @@ pub fn builtins_for(shell_name: &str) -> impl Iterator<Item = &'static str> {
         // The Posix arm keeps the `.exe`/case-normalized read rather
         // than the planner's exact match — a stray-case name hitting
         // the bash table only errs toward Command, the safe direction.
-        crate::ShellFamily::Posix => {
-            match crate::inject::normalized_stem(shell_name).as_str() {
-                "bash" => BASH,
-                "zsh" => ZSH,
-                "fish" => FISH,
-                _ => &[],
-            }
-        }
+        crate::ShellFamily::Posix => match crate::inject::normalized_stem(shell_name).as_str() {
+            "bash" => BASH,
+            "zsh" => ZSH,
+            "fish" => FISH,
+            _ => &[],
+        },
     };
     POSIX.iter().chain(extras.iter()).copied()
 }

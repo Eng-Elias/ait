@@ -308,4 +308,53 @@ mod tests {
         );
         let _conn = connect(socket.as_os_str(), Duration::from_secs(5)).unwrap();
     }
+
+    /// On Windows a socket name is a `\\.\pipe\…` path: the bind
+    /// lands under the default same-user ACLs, [`connect`] reaches
+    /// it, and one single-line request round-trips through
+    /// [`Pending`]'s accept/service lifecycle — the wire shape
+    /// `ait ctl` and the test driver both run (Spec R16's
+    /// named-pipe testing decision).
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_binds_connects_and_round_trips_a_line() {
+        let pipe = pipe_name("ait-ipc-test", &user_token(), std::process::id());
+        let listener = bind_socket(OsStr::new(&pipe)).unwrap();
+        let mut client = connect(OsStr::new(&pipe), Duration::from_secs(5)).unwrap();
+        client.write_all(b"{\"verb\":\"ping\"}\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pending = Vec::new();
+        while pending.is_empty() {
+            Pending::accept(&listener, &mut pending);
+            if pending.is_empty() {
+                assert!(Instant::now() < deadline, "accept never saw the client");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // The request bytes are already in the pipe — `Keep` can only
+        // mean the reply's write stalled mid-flush; the deadline still
+        // bounds that.
+        loop {
+            match pending[0].service(
+                |line| {
+                    assert_eq!(line, r#"{"verb":"ping"}"#);
+                    r#"{"ok":true}"#.to_owned()
+                },
+                || r#"{"ok":false}"#.to_owned(),
+            ) {
+                Service::Close => break,
+                Service::Keep => {
+                    assert!(Instant::now() < deadline, "service never answered");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        // One request per connection — the server stream's drop ends
+        // the client's read, exactly like production's reply-then-close.
+        drop(pending);
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "{\"ok\":true}\n");
+    }
 }

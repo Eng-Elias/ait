@@ -61,8 +61,10 @@ platform arms.
 - **`ait ctl` over a named pipe** — `ait ctl` from inside a tab
   drives its own instance (`AIT_CTL_SOCKET` carries the
   `\\.\pipe\ait-<user>-<pid>` name); a second `ait` instance is
-  addressed the same way. (CI covers the wire shape; the manual
-  leg is the named-pipe ACL/discovery behavior on a real desktop.)
+  addressed the same way. (The pipe wire test —
+  `ait_app::ipc`'s `windows_pipe_binds_connects_and_round_trips_a_line` —
+  runs in the `windows-latest` leg; the manual leg is the
+  named-pipe ACL/discovery behavior on a real desktop.)
 
 ## Data/secrets legs
 
