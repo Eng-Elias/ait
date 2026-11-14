@@ -1090,30 +1090,26 @@ impl GuiE2e {
             Display::Direct => {
                 let mut command = std::process::Command::new(&config.program);
                 command.args(&config.args);
-                if config.display.is_some() {
-                    // Same Wayland scrub the xvfb-run branch applies —
-                    // a pinned X display must actually host the window.
-                    command
-                        .env_remove("WAYLAND_DISPLAY")
-                        .env_remove("WAYLAND_SOCKET");
-                }
                 command
             }
             Display::Xvfb(xvfb) => {
                 // `-a` picks a free display number — parallel tests
-                // never race for :99. The wayland variables must not
-                // reach the child: on a wayland host winit prefers the
-                // compositor and dies ("could not find wayland
-                // compositor") instead of taking the X11 display the
-                // wrapper provides.
+                // never race for :99.
                 let mut command = std::process::Command::new(xvfb);
                 command.arg("-a").arg(&config.program).args(&config.args);
                 command
-                    .env_remove("WAYLAND_DISPLAY")
-                    .env_remove("WAYLAND_SOCKET");
-                command
             }
         };
+        // The wayland variables must not reach the child: `XDG_RUNTIME_DIR`
+        // is pinned to the throwaway dir, so a relative `WAYLAND_DISPLAY`
+        // can never resolve there — on a wayland host winit prefers the
+        // compositor and dies ("could not find wayland compositor")
+        // instead of taking the X11 display it was given. A caller can
+        // still force one through `config.env` (`envs` lands after
+        // `env_remove`) — an absolute socket path needs no runtime dir.
+        command
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET");
         command
             .envs(env)
             .current_dir(cwd.path())
