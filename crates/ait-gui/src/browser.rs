@@ -101,8 +101,10 @@ pub enum WindowKind {
     Wayland,
     /// macOS — an NSView subview of the window's content view.
     AppKit,
-    /// Windows — a child window of the parent (§5.14's platform, not
-    /// yet shipped — the decision is honest anyway).
+    /// Windows — a child window of the parent (§5.14, shipped in
+    /// R16-T7: wry's `build_as_child` embeds a WebView2 control; a
+    /// missing runtime fails init and lands `InitFailed`, the
+    /// external-open fallback rule extended to Windows).
     Windows,
     /// Any other handle — no embed.
     Other,

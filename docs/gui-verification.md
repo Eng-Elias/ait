@@ -97,7 +97,8 @@ Work top to bottom; each item is cheap once the window is up.
   disk under the remote path.
 - **Browser webview** *(scenario: browser-embed, browser-invalid,
   browser-history; tests: browser_in_page_nav_syncs_address,
-  browser_webview_tracks_resize_and_hides)* — on X11 or macOS,
+  browser_webview_tracks_resize_and_hides)* — on X11, macOS or
+  Windows (WebView2, §5.14),
   `Ctrl+Shift+B` embeds a
   `wry` child over the pane body: typing `example.com` + Enter loads
   it in place (a bare `not a url` turns amber and fetches nothing),
@@ -124,7 +125,13 @@ Work top to bottom; each item is cheap once the window is up.
   loader, before the fallback can run. The mitigation is
   `cargo build -p ait-gui --no-default-features`: that build needs
   no webkit/gtk packages and the pane reports `this build has no
-  webview runtime`.
+  webview runtime`. Windows differs (§5.14/R16-T7): WebView2 is no
+  link dep — wry loads it at `build_as_child` init — so a missing or
+  broken runtime lands `the webview runtime failed to initialize`
+  on the external-open surface, never a crash. The manual leg is:
+  uninstall/absent the WebView2 Runtime, open the pane, confirm the
+  fallback line and that Enter still hands pages to the system
+  browser.
 - **Webview frame discipline** *(manual — video/animation playback and
   heavy-page responsiveness are real-rendering judgments llvmpipe
   under Xvfb can't proxy; no dump counter for idle frames exists)*

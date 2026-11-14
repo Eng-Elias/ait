@@ -186,20 +186,22 @@ fn rxvt_notification(args: &[&[u8]]) -> Option<SessionEvent> {
 
 /// Extract the path from an OSC 7 payload: `file://host/path` (or any
 /// `file://` URI) or a bare path. Returns `None` when there is no usable
-/// path (empty payload, non-`file` URI, host with no path).
+/// path (empty payload, non-`file` URI, host with no path). The URI's
+/// authority and path feed [`reported_path`], which maps the forms
+/// each platform's shells emit to a native path.
 fn cwd_from_uri(uri: Option<&[u8]>) -> Option<PathBuf> {
     let uri = uri?;
 
-    let path = match find_subslice(uri, b"://") {
+    let (authority, path) = match find_subslice(uri, b"://") {
         Some(scheme_end) => {
             if !uri[..scheme_end].eq_ignore_ascii_case(b"file") {
                 return None;
             }
             let after_authority = &uri[scheme_end + 3..];
             let slash = after_authority.iter().position(|&b| b == b'/')?;
-            &after_authority[slash..]
+            (&after_authority[..slash], &after_authority[slash..])
         }
-        None => uri,
+        None => (&uri[..0], uri),
     };
 
     if path.is_empty() {
@@ -207,9 +209,49 @@ fn cwd_from_uri(uri: Option<&[u8]>) -> Option<PathBuf> {
     }
 
     let decoded = percent_decode(path);
-    Some(PathBuf::from(
-        String::from_utf8_lossy(&decoded).into_owned(),
+    Some(reported_path(
+        authority,
+        &String::from_utf8_lossy(&decoded),
+        cfg!(windows),
     ))
+}
+
+/// The decoded URI path (+ the URI authority) → the native path the
+/// tab records (Spec R16 §5.14). unix keeps the path verbatim — a
+/// `file://` URI's host is decorative there. Windows reads the forms
+/// its shells emit: `file:///C:/…` and `file://localhost/C:/…` carry
+/// the URI's leading `/` as syntax, not a separator, so `C:/…` is the
+/// real path; a non-local authority is a remote host, making the URI
+/// the UNC share `\\host\…`; a bare `C:\…` payload passes through.
+/// `windows` is the platform flag `cwd_from_uri` bakes — the seam
+/// keeps the Windows decode testable off-Windows.
+fn reported_path(authority: &[u8], path: &str, windows: bool) -> PathBuf {
+    if !windows {
+        return PathBuf::from(path);
+    }
+    let local = authority.is_empty() || authority.eq_ignore_ascii_case(b"localhost");
+    if !local {
+        // `file://host/…` naming a non-local host is a UNC share —
+        // separators flip to `\` under the host.
+        return PathBuf::from(format!(
+            "\\\\{host}\\{rest}",
+            host = String::from_utf8_lossy(authority),
+            rest = path.trim_start_matches('/').replace('/', "\\"),
+        ));
+    }
+    // `/C:/…` — the leading slash is URI syntax; the drive path is
+    // underneath. A non-drive `/`-leading path (MSYS `/tmp`) keeps
+    // its root.
+    match path.strip_prefix('/') {
+        Some(rest)
+            if rest.len() >= 2
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':' =>
+        {
+            PathBuf::from(rest)
+        }
+        _ => PathBuf::from(path),
+    }
 }
 
 /// First index of `needle` inside `haystack`.
@@ -246,5 +288,66 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! OSC 7's URI→native-path decode at the platform seam (Spec R16
+    //! §5.14): `reported_path` is parameterized on the platform flag,
+    //! so the forms Windows shells emit (`file://host/X:/…`,
+    //! `file://localhost/X:/…`, bare `C:\…`) decode on any test host.
+    //! The `Session`-seam coverage stays in `tests/events.rs`.
+
+    use super::*;
+
+    /// unix keeps the URI path verbatim — a `file://` URI's authority
+    /// is decorative there (the long-standing decode).
+    #[test]
+    fn unix_decode_keeps_the_uri_path_verbatim() {
+        assert_eq!(
+            reported_path(b"some-host", "/home/user", false),
+            PathBuf::from("/home/user")
+        );
+    }
+
+    /// On Windows `file:///C:/…` and `file://localhost/C:/…` carry
+    /// the URI's leading `/` as syntax, not a separator — the real
+    /// path is the drive path underneath.
+    #[test]
+    fn windows_local_file_uris_strip_the_drive_slash() {
+        for authority in ["", "localhost", "LOCALHOST"] {
+            assert_eq!(
+                reported_path(authority.as_bytes(), "/C:/work/dir", true),
+                PathBuf::from("C:/work/dir"),
+                "authority {authority:?}"
+            );
+        }
+    }
+
+    /// A `file://` URI naming a non-local host is the UNC share
+    /// `\\host\…` on Windows — the form a remote Windows session
+    /// reports (the host the unix decode discards is the share's).
+    #[test]
+    fn windows_remote_file_uris_decode_to_unc() {
+        assert_eq!(
+            reported_path(b"file-server", "/share/dir", true),
+            PathBuf::from("\\\\file-server\\share\\dir")
+        );
+    }
+
+    /// A bare `C:\…` payload (no `://` at all) passes through
+    /// verbatim, and a `/`-leading path that isn't a drive form
+    /// keeps its root — an MSYS/Git-bash `cd /tmp` reports one.
+    #[test]
+    fn windows_bare_and_rooted_payloads_pass_through() {
+        assert_eq!(
+            reported_path(b"", "C:\\work\\dir", true),
+            PathBuf::from("C:\\work\\dir")
+        );
+        assert_eq!(
+            reported_path(b"", "/msys/path", true),
+            PathBuf::from("/msys/path")
+        );
     }
 }

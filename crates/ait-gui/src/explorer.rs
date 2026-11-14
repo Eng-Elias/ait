@@ -527,12 +527,16 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         // `metadata` follows symlinks — a link to a dir navigates.
-        let kind = match fs::metadata(&path) {
-            Ok(meta) if meta.is_dir() => EntryKind::Dir,
-            Ok(meta) if meta.is_file() => EntryKind::File,
+        let meta = fs::metadata(&path).ok();
+        let kind = match meta.as_ref() {
+            Some(meta) if meta.is_dir() => EntryKind::Dir,
+            Some(meta) if meta.is_file() => EntryKind::File,
             _ => EntryKind::Other,
         };
-        let hidden = name.starts_with('.');
+        // `.` is the unix hidden convention; on Windows the hidden
+        // file ATTRIBUTE is what Explorer and `dir /a` honor — a
+        // dotfile toggle that missed it would flag nothing real.
+        let hidden = name.starts_with('.') || meta.as_ref().is_some_and(has_hidden_attr);
         entries.push(Entry {
             name,
             path,
@@ -548,6 +552,21 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<Entry>> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(entries)
+}
+
+/// Windows' real hidden marker — `FILE_ATTRIBUTE_HIDDEN` on the
+/// entry's metadata (dotfiles mean nothing to the filesystem there,
+/// so `list_dir` ORs it into the `hidden` flag, §5.14/R16-T7).
+#[cfg(windows)]
+fn has_hidden_attr(meta: &fs::Metadata) -> bool {
+    std::os::windows::fs::MetadataExt::file_attributes(meta) & 0x2 != 0
+}
+
+/// Nowhere else has a hidden attribute — `.`-names are the only
+/// convention `list_dir` flags.
+#[cfg(not(windows))]
+fn has_hidden_attr(_: &fs::Metadata) -> bool {
+    false
 }
 
 /// Read `path`'s head for the preview: at most [`PREVIEW_BYTES`], a
@@ -647,11 +666,10 @@ fn shell_eval(program: &str, path: &Path) -> Command {
 }
 
 /// The `Program` arm's shell on Windows: `cmd /c` — the same eval
-/// idiom `platform_opener`'s `cmd /c start` already uses (§5.14's
-/// platform, not yet shipped). cmd has no argv-tail trick, so the
-/// path lands quoted inside the evaluated line — safe there because
-/// `"` is a forbidden character in Windows paths and can never
-/// break the quoting.
+/// idiom `platform_opener`'s `cmd /c start` uses (§5.14, shipped in
+/// R16-T7). cmd has no argv-tail trick, so the path lands quoted
+/// inside the evaluated line — safe there because `"` is a forbidden
+/// character in Windows paths and can never break the quoting.
 #[cfg(windows)]
 fn shell_eval(program: &str, path: &Path) -> Command {
     let mut command = Command::new("cmd");
