@@ -1,24 +1,33 @@
 //! Live-PTY tests at the public `LiveSession` seam (Spec R01: a small second
 //! tier covering spawn/resize/exit paths only — everything else is byte-fed
 //! in `session.rs`/`keys.rs`). These spawn real processes in a real PTY, so
-//! every wait is bounded by a timeout.
+//! every wait is bounded by a timeout. The scripted tests are unix-only
+//! (`/bin/sh` fixtures); the ConPTY passthrough spike is Windows-only —
+//! a platform with no test in this file compiles to an empty suite.
 
 use std::ffi::OsString;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ait_term::{
-    ExitStatus, Key, KeyEvent, LiveEvent, LiveSession, LiveSessionOptions, Modifiers,
-    SessionOptions, Size,
-};
+use ait_term::{LiveEvent, LiveSession, LiveSessionOptions};
+
+#[cfg(unix)]
+use std::sync::Mutex;
+
+#[cfg(unix)]
+use ait_term::{ExitStatus, Key, KeyEvent, Modifiers, SessionOptions, Size};
+
+#[cfg(windows)]
+use ait_term::{PromptMarkKind, SessionEvent};
 
 /// Serializes the tests that mutate the process-wide `SHELL` variable.
+#[cfg(unix)]
 static SHELL_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Generous bound for every wait below: even a loaded CI runner finishes
 /// these tiny programs in well under this.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(unix)]
 fn spawn_shell_script(script: &str) -> LiveSession {
     spawn(
         "/bin/sh",
@@ -34,6 +43,7 @@ fn spawn(program: &str, args: &[OsString], mut options: LiveSessionOptions) -> L
 }
 
 /// Drain events until `pred` accepts one, or the timeout kills the test.
+#[cfg(unix)]
 fn wait_for_event(session: &mut LiveSession, pred: impl Fn(&LiveEvent) -> bool) -> LiveEvent {
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -48,6 +58,7 @@ fn wait_for_event(session: &mut LiveSession, pred: impl Fn(&LiveEvent) -> bool) 
 }
 
 /// Wait for `LiveEvent::Exited` and return its status.
+#[cfg(unix)]
 fn wait_for_exit(session: &mut LiveSession) -> ExitStatus {
     match wait_for_event(session, |event| matches!(event, LiveEvent::Exited(_))) {
         LiveEvent::Exited(status) => status,
@@ -73,6 +84,7 @@ fn assert_child_gone(pid: Option<u32>, context: &str) {
 fn assert_child_gone(_pid: Option<u32>, _context: &str) {}
 
 /// All text in the grid: scrollback then viewport, rows trimmed and joined.
+#[cfg(unix)]
 fn grid_text(session: &LiveSession) -> String {
     let grid = session.grid();
     grid.scrollback_rows()
@@ -82,6 +94,7 @@ fn grid_text(session: &LiveSession) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 #[test]
 fn spawned_program_output_lands_in_grid_and_exit_is_reported() {
     let mut session = spawn_shell_script("printf hello-ait; exit 3");
@@ -102,6 +115,7 @@ fn spawned_program_output_lands_in_grid_and_exit_is_reported() {
     assert_child_gone(session.child_pid(), "still exists after Exited");
 }
 
+#[cfg(unix)]
 #[test]
 fn shell_env_program_is_spawned_when_set() {
     let _guard = SHELL_ENV_LOCK.lock().unwrap();
@@ -125,6 +139,7 @@ fn shell_env_program_is_spawned_when_set() {
     assert!(grid_text(&session).contains("from-shell-env"));
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_shell_env_falls_back_to_bin_sh() {
     let _guard = SHELL_ENV_LOCK.lock().unwrap();
@@ -150,6 +165,7 @@ fn missing_shell_env_falls_back_to_bin_sh() {
     assert!(grid_text(&session).contains("fallback-ok"));
 }
 
+#[cfg(unix)]
 #[test]
 fn resize_forwards_the_new_winsize_to_the_pty() {
     // The shell waits for input before reporting `stty size`, so the
@@ -167,6 +183,7 @@ fn resize_forwards_the_new_winsize_to_the_pty() {
     assert!(grid_text(&session).contains("40 100"));
 }
 
+#[cfg(unix)]
 #[test]
 fn key_events_reach_the_shell() {
     let mut session = spawn_shell_script("read line; echo \"got:$line\"");
@@ -184,6 +201,7 @@ fn key_events_reach_the_shell() {
     assert!(grid_text(&session).contains("got:hi"));
 }
 
+#[cfg(unix)]
 #[test]
 fn an_output_flood_is_delivered_without_losing_bytes() {
     // 8000 numbered lines fit the default 10_000-line scrollback, so every
@@ -215,6 +233,7 @@ fn an_output_flood_is_delivered_without_losing_bytes() {
     assert_eq!(received, expected);
 }
 
+#[cfg(unix)]
 #[test]
 fn teardown_under_flood_kills_the_child_and_joins_threads() {
     // `yes` floods forever; the bounded channel fills, the reader stalls on
@@ -238,6 +257,7 @@ fn teardown_under_flood_kills_the_child_and_joins_threads() {
     assert_child_gone(Some(pid), "survived teardown");
 }
 
+#[cfg(unix)]
 #[test]
 fn input_can_still_be_sent_while_output_is_flooding() {
     // §6: a flood must not starve the input path.
@@ -262,6 +282,7 @@ fn input_can_still_be_sent_while_output_is_flooding() {
     assert!(grid_has_reply, "shell never answered input under flood");
 }
 
+#[cfg(unix)]
 #[test]
 fn try_recv_event_surfaces_output_and_exit() {
     // `read` keeps the child alive, so the first event must be the
@@ -303,6 +324,7 @@ fn try_recv_event_surfaces_output_and_exit() {
     assert!(session.try_recv_event().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn output_tail_holds_the_raw_bytes_fed_into_the_grid() {
     let mut session = spawn_shell_script("printf tail-marker; read x");
@@ -324,6 +346,7 @@ fn output_tail_holds_the_raw_bytes_fed_into_the_grid() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn output_tail_is_bounded_to_the_last_64_kib() {
     // ~700 KB of output — far past the documented 64 KiB bound.
@@ -341,6 +364,7 @@ fn output_tail_is_bounded_to_the_last_64_kib() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn osc_events_flow_through_the_live_channel() {
     // OSC 9 (notification) observed by the core while output is fed must
@@ -371,9 +395,11 @@ fn osc_events_flow_through_the_live_channel() {
 /// A `Write` shared with the test so the mirrored bytes can be
 /// inspected: the mirror is consumed as `Box<dyn Write + Send>`, so a
 /// plain buffer behind a Mutex is the simplest stand-in for a terminal.
+#[cfg(unix)]
 #[derive(Clone, Default)]
 struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
 
+#[cfg(unix)]
 impl std::io::Write for SharedBuf {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(bytes);
@@ -385,6 +411,7 @@ impl std::io::Write for SharedBuf {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_output_mirror_receives_bytes_as_the_reader_reads_them() {
     let mut session = spawn_shell_script("printf early-mark; read x; printf late-mark; read x");
@@ -435,5 +462,115 @@ fn the_output_mirror_receives_bytes_as_the_reader_reads_them() {
             .windows(b"late-mark".len())
             .any(|w| w == b"late-mark"),
         "the detached mirror still received output"
+    );
+}
+
+/// A temp dir that removes itself on drop: the ConPTY spike's fixture
+/// dir, spawned as the child's cwd so `type` needs no path quoting.
+#[cfg(windows)]
+struct FixtureDir(std::path::PathBuf);
+
+#[cfg(windows)]
+impl FixtureDir {
+    fn new(tag: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ait-term-conpty-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("fixture dir should create");
+        Self(path)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Spec R16's gating spike (testing decisions): OSC bytes a ConPTY
+/// child writes to its console must reach the session event stream
+/// intact — ConPTY's passthrough of the AIT-private 7700 series is the
+/// one unportable assumption the Windows round builds on. `cmd /c
+/// type` replays a byte-exact fixture so the assertion never depends
+/// on a shell's escape-string quoting.
+#[cfg(windows)]
+#[test]
+fn conpty_passes_osc_bytes_through_to_session_events() {
+    // The same byte families the unix snippets emit and the pwsh
+    // snippet will (Spec R16-T2/T3): the private hook channel, prompt
+    // marks — one carrying an exit-code payload — and a cwd report.
+    let fixture = FixtureDir::new("osc");
+    std::fs::write(
+        fixture.0.join("osc.raw"),
+        b"\x1b]7700;init_shell;pwsh\x07\x1b]133;A\x07\x1b]133;D;0\x07\x1b]7;C:\\ait-cwd\x07",
+    )
+    .expect("OSC fixture should write");
+
+    let mut session = spawn(
+        "cmd.exe",
+        &[
+            OsString::from("/c"),
+            OsString::from("type"),
+            OsString::from("osc.raw"),
+        ],
+        LiveSessionOptions {
+            cwd: Some(fixture.0.clone()),
+            ..Default::default()
+        },
+    );
+
+    // Collect every observed OSC event until the child exits.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut observed = Vec::new();
+    let status = 'outer: loop {
+        for event in session.drain_events() {
+            match event {
+                LiveEvent::Osc(event) => observed.push(event),
+                LiveEvent::Exited(status) => break 'outer status,
+                LiveEvent::OutputReady => {}
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for Exited");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(status.success());
+    assert_child_gone(session.child_pid(), "still exists after Exited");
+
+    assert!(
+        observed.iter().any(|event| matches!(
+            event,
+            SessionEvent::Private { code, params }
+                if code == b"7700" && params.iter().any(|p| p == b"init_shell")
+        )),
+        "the 7700 hook channel never arrived: {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|event| matches!(
+            event,
+            SessionEvent::PromptMark {
+                kind: PromptMarkKind::PromptStart,
+                ..
+            }
+        )),
+        "OSC 133;A never arrived: {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|event| matches!(
+            event,
+            SessionEvent::PromptMark {
+                kind: PromptMarkKind::CommandEnd,
+                payload,
+            } if payload.as_deref() == Some("0")
+        )),
+        "OSC 133;D;0 never arrived: {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|event| matches!(
+            event,
+            SessionEvent::CwdChanged(path) if path.ends_with("ait-cwd")
+        )),
+        "OSC 7 never arrived: {observed:?}"
     );
 }
