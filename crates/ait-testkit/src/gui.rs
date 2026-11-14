@@ -50,13 +50,13 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write as _};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::prelude::*;
+use interprocess::local_socket::GenericFilePath;
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{self, ActionEntry};
@@ -111,6 +111,7 @@ const STUB_LOG_ENV: &str = "AIT_GUI_E2E_STUB_LOG";
 /// real app. The runtime dir comes back too — [`GuiE2e::runtime_dir`]
 /// hands it to `ait ctl` clients so they scan exactly the socket dir
 /// the spawn pinned (Spec R15-T6's coexistence leg).
+#[cfg(unix)]
 fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)>, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     let runtime = cwd.join("xdg-runtime");
@@ -148,11 +149,47 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)
     Ok((env, runtime))
 }
 
+/// The Windows arm of [`pinned_env`]: there is no XDG runtime dir or
+/// `sh`-script opener stub on Windows — the pins that still matter
+/// are the profile/config vars inside the throwaway dir and the
+/// driver's `\\.\pipe\` endpoint (which the app binds verbatim). The
+/// returned "runtime dir" is the cwd itself: the ctl client needs no
+/// dir on Windows — pipe names carry user+pid — but
+/// [`GuiE2e::runtime_dir`] still hands callers a value.
+#[cfg(windows)]
+fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)>, PathBuf)> {
+    let env = vec![
+        (OsString::from("HOME"), cwd.as_os_str().to_os_string()),
+        (
+            OsString::from("USERPROFILE"),
+            cwd.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("APPDATA"),
+            cwd.join("appdata").into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            cwd.join("xdg-config").into_os_string(),
+        ),
+        (
+            OsString::from(ENV_DRIVER_SOCKET),
+            socket.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from(STUB_LOG_ENV),
+            cwd.join("open.log").into_os_string(),
+        ),
+    ];
+    Ok((env, cwd.path().to_path_buf()))
+}
+
 /// Write `dir`'s opener stubs — `xdg-open` and `open`, the names
 /// `platform_opener` resolves on Linux/macOS. Each records
 /// `basename args…` to [`STUB_LOG_ENV`]'s file (falling back to
 /// `$HOME/open.log`) and exits 0 — deterministic, recorded, and
 /// never a real application.
+#[cfg(unix)]
 fn install_opener_stubs(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir(dir)?;
@@ -167,6 +204,32 @@ fn install_opener_stubs(dir: &Path) -> io::Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
+}
+
+/// The endpoint this spawn hands [`ENV_DRIVER_SOCKET`] — a
+/// `driver.sock` in the throwaway dir on Unix, a per-spawn pipe name
+/// on Windows (`ait-driver-<user>-<pid>-<seq>` — the same shape the
+/// control socket's `ait-<user>-<pid>` takes, plus a counter so
+/// parallel harnesses in one process never collide).
+#[cfg(unix)]
+fn driver_socket(cwd: &Path) -> PathBuf {
+    cwd.join("driver.sock")
+}
+
+/// [`driver_socket`](fn@driver_socket)'s Windows arm.
+#[cfg(windows)]
+fn driver_socket(_cwd: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_owned())
+        .replace(['\\', '/'], "-");
+    PathBuf::from(format!(
+        r"\\.\pipe\ait-driver-{user}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// How the spawned binary reaches a display.
@@ -189,6 +252,7 @@ pub fn env_flag(name: &str) -> bool {
 }
 
 /// Find `xvfb-run` on `PATH`.
+#[cfg(unix)]
 fn xvfb_run() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -199,7 +263,8 @@ fn xvfb_run() -> Option<PathBuf> {
 /// The display decision's pure core — `display`'s env reads live at
 /// the seam so the policy itself is a testable function (env is
 /// process-global; a test that mutated DISPLAY/PATH would race its
-/// siblings).
+/// siblings). Unix-only: Windows's policy is `Direct`, always.
+#[cfg(unix)]
 fn choose_display(headed: bool, have_display: bool, xvfb: Option<PathBuf>) -> Option<Display> {
     if headed {
         // Headed means the developer's screen — without one there is
@@ -214,9 +279,19 @@ fn choose_display(headed: bool, have_display: bool, xvfb: Option<PathBuf>) -> Op
 }
 
 /// Resolve the display policy — `None` is the suite's skip signal.
+/// Windows needs no display indirection: a GUI app opens a real
+/// window on the caller's session — there is no xvfb to own.
+#[cfg(unix)]
 fn display(headed: bool) -> Option<Display> {
     let have_display = std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty());
     choose_display(headed, have_display, xvfb_run())
+}
+
+/// [`display`](fn@display)'s Windows arm — always direct.
+#[cfg(windows)]
+fn display(headed: bool) -> Option<Display> {
+    let _ = headed;
+    Some(Display::Direct)
 }
 
 /// Which `ait-gui` binary a scenario needs — the dual-binary matrix
@@ -1103,7 +1178,7 @@ impl GuiE2e {
             return Ok(None);
         };
         let cwd = TempDir::fresh()?;
-        let socket = cwd.path().join("driver.sock");
+        let socket = driver_socket(cwd.path());
         let (mut env, runtime_dir) = pinned_env(cwd.path(), &socket)?;
         if let Some(display_name) = &config.display {
             env.push((
@@ -1229,20 +1304,26 @@ impl GuiE2e {
     }
 
     /// One socket round trip — connect, send the line, read the
-    /// response line (the server half-closes after its reply, which
-    /// terminates the read).
+    /// response line (the server drops the stream after its reply,
+    /// which terminates the read). The endpoint maps the way
+    /// `ait_app::ipc`'s `local_name` reads it: a filesystem-path name
+    /// — the socket path on Unix, the `\\.\pipe\…` path on Windows.
     fn request(&self, request: &Request<'_>) -> Result<Response, String> {
-        let mut conn = UnixStream::connect(&self.socket)
+        let name = self
+            .socket
+            .as_os_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|e| format!("socket name {}: {e}", self.socket.display()))?;
+        let mut conn = LocalSocketStream::connect(name)
             .map_err(|e| format!("connect {}: {e}", self.socket.display()))?;
-        conn.set_read_timeout(Some(REQUEST_TIMEOUT))
-            .map_err(|e| format!("read timeout: {e}"))?;
+        conn.set_recv_timeout(Some(REQUEST_TIMEOUT))
+            .and_then(|()| conn.set_send_timeout(Some(REQUEST_TIMEOUT)))
+            .map_err(|e| format!("socket timeouts: {e}"))?;
         let mut line =
             serde_json::to_string(request).map_err(|e| format!("encode request: {e}"))?;
         line.push('\n');
         conn.write_all(line.as_bytes())
             .map_err(|e| format!("write request: {e}"))?;
-        // Signal request-complete — the server answers after the line.
-        let _ = conn.shutdown(Shutdown::Write);
         let mut reply = String::new();
         conn.read_to_string(&mut reply)
             .map_err(|e| format!("read response: {e}"))?;
@@ -3948,6 +4029,7 @@ quit = true
     /// The skip convention lives in `choose_display`: no DISPLAY and
     /// no xvfb-run yields `None`; headed requires DISPLAY; headless
     /// prefers the owned xvfb display.
+    #[cfg(unix)]
     #[test]
     fn display_policy_skips_without_a_display() {
         let xvfb = Some(PathBuf::from("/usr/bin/xvfb-run"));
