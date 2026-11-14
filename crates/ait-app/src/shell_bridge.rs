@@ -82,6 +82,10 @@ impl ShellBridge for TabBridge {
     fn remote_state(&self) -> Result<RemoteState, BridgeError> {
         self.ask(BridgeRequest::Remote)
     }
+
+    fn shell_name(&self) -> Result<String, BridgeError> {
+        self.ask(BridgeRequest::Shell)
+    }
 }
 
 impl TabBridge {
@@ -161,6 +165,9 @@ pub enum BridgeRequest {
     /// the `ssh()`-wrapped session's target and ControlPath while one
     /// is open, `Local` otherwise — `select_executor`'s tier input.
     Remote(Sender<RemoteState>),
+    /// `shell_name` — the resolved program's basename (the tab title):
+    /// the key the `Absent` tier's shell-family sentinel reads (§5.14).
+    Shell(Sender<String>),
     /// `context` — the §5.6 `AgentContext` the session's task requests
     /// carry (cwd, shell, OS, output lines): the same answer
     /// `agent_panel::context_for` assembles for a visible tab. Sent

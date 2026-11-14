@@ -3,6 +3,7 @@
 # (<signal>)` when a signal ended it. The signal text is platform
 # strsignal (`Hangup` for SIGHUP on glibc), so regex, not literal text.
 feature = "status"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

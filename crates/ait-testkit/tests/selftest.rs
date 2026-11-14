@@ -3,6 +3,8 @@
 //! bytes, resize, bounded screen waits and exit status are all proven here
 //! without `ait` involved, so harness bugs can't hide behind the app.
 
+#![cfg(unix)]
+
 use std::fs;
 
 use ait_testkit::{dump_root, E2e, MouseButton, MouseEvent, Size, SpawnConfig};

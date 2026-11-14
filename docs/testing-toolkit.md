@@ -156,8 +156,15 @@ Verbs (one per `[[steps]]`): `keys`, `text`, `bytes` (hex), `mouse`
 (`{event, col, row, button?}`, 0-based cells), `resize`, `wait_text`,
 `expect_text` / `expect_regex` / `expect_cursor` / `expect_exit` /
 `expect_clipboard`, plus `act` / `assert` (agent steps). Top level:
-`feature`, `size`, `args`, `env`. Full table:
+`feature`, `platforms`, `size`, `args`, `env`. Full table:
 `crates/ait-testkit/src/scenario.rs` module docs.
+
+`platforms` is the OS gate (R16): `std::env::consts::OS` values —
+`"linux"`, `"macos"`, `"windows"` — plus the `"unix"` group name.
+Absent or empty runs everywhere; a scenario naming other OSes skips
+loudly on this one, so a Windows leg runs only the fixtures that can
+pass there. The GUI suite's `tests/scenarios/*.toml` carries the
+same key.
 
 `wait_*` gates progress; `expect_*` asserts — both are bounded waits.
 Malformed files name file + step; failing steps name scenario + step —

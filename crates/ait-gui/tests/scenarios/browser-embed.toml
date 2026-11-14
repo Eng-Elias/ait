@@ -9,6 +9,7 @@
 # the `web`+`test-driver` build, or `AIT_GUI_E2E_BIN_WEB` when the
 # test target itself was built feature-off.
 feature = "browser"
+platforms = ["unix"]
 binary = "web"
 
 [[steps]]

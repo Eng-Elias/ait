@@ -14,6 +14,7 @@
 # cases are the code-first tests' precision work (they need
 # cell-metric coordinates TOML can't name).
 feature = "detect-routes"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

@@ -85,7 +85,8 @@ pub struct Skill {
 /// `mcp.json` uses (GLOSSARY's "project-local config layer").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillOrigin {
-    /// Declared under `$XDG_CONFIG_HOME/ait/skills/`.
+    /// Declared under `$XDG_CONFIG_HOME/ait/skills/` (the
+    /// `%APPDATA%\ait\skills\` root on Windows — §5.14).
     User,
     /// Declared under the nearest `.ait/skills/` — shadows a
     /// same-named user skill.

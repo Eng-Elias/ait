@@ -47,6 +47,12 @@ pub enum InputClass {
 #[derive(Debug, Clone)]
 pub struct ProgramIndex {
     names: HashSet<String>,
+    /// First-word resolution is case-insensitive for the Windows
+    /// families — PowerShell and cmd resolve `Get-ChildItem`,
+    /// `GET-CHILDITEM` and `get-childitem` identically (§5.14), so
+    /// both the stored names and each lookup lowercase. POSIX shells
+    /// stay exact — `LS` is not a command.
+    insensitive: bool,
 }
 
 impl ProgramIndex {
@@ -67,17 +73,36 @@ impl ProgramIndex {
         E: IntoIterator<Item = N>,
         N: Into<String>,
     {
+        // The Windows families read their first words
+        // case-insensitively — keyed on the same normalized basename
+        // (`pwsh.exe`, `cmd`) the planner and the builtin tables use.
+        let insensitive = matches!(
+            ait_shell::shell_family(shell_name),
+            ait_shell::ShellFamily::PowerShell | ait_shell::ShellFamily::Cmd
+        );
         let names = ait_shell::builtins_for(shell_name)
             .map(String::from)
             .chain(entries.into_iter().map(Into::into))
+            .map(|name| {
+                if insensitive {
+                    name.to_lowercase()
+                } else {
+                    name
+                }
+            })
             .collect();
-        Self { names }
+        Self { names, insensitive }
     }
 
     /// `word` resolves to a shell builtin or a `$PATH` executable —
-    /// an exact match on the whole word.
+    /// an exact match on the whole word, case-insensitive when the
+    /// index's shell family is (§5.14).
     pub fn contains(&self, word: &str) -> bool {
-        self.names.contains(word)
+        if self.insensitive {
+            self.names.contains(word.to_lowercase().as_str())
+        } else {
+            self.names.contains(word)
+        }
     }
 }
 
@@ -89,19 +114,46 @@ fn path_executables() -> Vec<String> {
     let Some(path) = std::env::var_os("PATH") else {
         return names;
     };
+    // The `PATHEXT` list is a per-process constant — read it once,
+    // not per PATH entry.
+    #[cfg(not(unix))]
+    let pathext = pathext_value();
     for dir in std::env::split_paths(&path) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if is_executable_file(&entry.path()) {
+            #[cfg(unix)]
+            let executable = is_executable_file(&entry.path());
+            #[cfg(not(unix))]
+            let executable = is_executable_file(&entry.path(), &pathext);
+            if executable {
                 if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_owned());
+                    push_index_name(&mut names, name);
                 }
             }
         }
     }
     names
+}
+
+/// unix: the basename as-is — what the file is named is what runs.
+#[cfg(unix)]
+fn push_index_name(names: &mut Vec<String>, name: &str) {
+    names.push(name.to_owned());
+}
+
+/// Non-unix: the basename plus its extensionless stem — users type
+/// `git`, never `git.exe`; the `PATHEXT` extension is the shell's
+/// own resolution detail, so the index holds both spellings.
+#[cfg(not(unix))]
+fn push_index_name(names: &mut Vec<String>, name: &str) {
+    names.push(name.to_owned());
+    if let Some((stem, _)) = name.rsplit_once('.') {
+        if !stem.is_empty() {
+            names.push(stem.to_owned());
+        }
+    }
 }
 
 /// An executable regular file — `std::fs::metadata` traverses the
@@ -114,13 +166,41 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Non-unix fallback: executable-ness isn't a mode bit — any regular
-/// file counts.
+/// Non-unix fallback: executability isn't a mode bit, it's the
+/// `PATHEXT` extension list cmd/PowerShell resolve through (`.COM`,
+/// `.EXE`, `.BAT`, `.CMD` when the var is unset) — without it every
+/// DLL and doc on `%PATH%` would resolve as a program. `pathext` is
+/// the caller's hoisted [`pathext_value`] — one env read per index
+/// build, not per entry.
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+fn is_executable_file(path: &Path, pathext: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
     std::fs::metadata(path)
         .map(|meta| meta.is_file())
         .unwrap_or(false)
+        && in_pathext(name, pathext)
+}
+
+/// The `PATHEXT` env var's raw value — the documented default when
+/// unset.
+#[cfg(not(unix))]
+fn pathext_value() -> String {
+    std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
+}
+
+/// Does `name`'s extension appear in a `PATHEXT`-style `;`-separated
+/// list — case-insensitive, entries `.`-prefixed or bare?
+#[cfg(not(unix))]
+fn in_pathext(name: &str, pathext: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    pathext
+        .split(';')
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| extension.eq_ignore_ascii_case(entry.trim_start_matches('.')))
 }
 
 /// One whitespace-delimited word with a per-char literal mask: `true`

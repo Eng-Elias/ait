@@ -33,6 +33,7 @@ pub mod dispatch;
 pub mod headless;
 pub mod inband;
 pub mod integration;
+pub mod ipc;
 pub mod keymap;
 pub mod profile;
 pub mod remote;

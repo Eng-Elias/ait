@@ -4,6 +4,7 @@
 # the two chrome waits give ait event-loop iterations to apply the new
 # winsize before anything types.
 feature = "resize"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

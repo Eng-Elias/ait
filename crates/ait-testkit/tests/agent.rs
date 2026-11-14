@@ -5,6 +5,8 @@
 //! dirs via `set_recordings_dir` (committed ones live under each
 //! consuming crate's `tests/recordings/`).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::fs;

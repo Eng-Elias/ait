@@ -2,6 +2,7 @@
 # drops its chunk; closing the last (still-running) tab exits ait
 # cleanly.
 feature = "tabs"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

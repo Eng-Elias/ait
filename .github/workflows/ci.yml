@@ -232,3 +232,76 @@ jobs:
 
       - name: SSH e2e against a throwaway sshd container
         run: scripts/ssh-e2e.sh run
+
+  # Spec R16 §5.14: the Windows leg. `cargo build --workspace
+  # --all-targets` proves the whole tree compiles under
+  # x86_64-pc-windows-msvc and `cargo test --workspace` runs every
+  # non-unix-gated unit/integration test — the unix-only surface is
+  # `#[cfg(unix)]`-gated, not deleted. fmt, clippy, dep-comment and
+  # hygiene stay on ubuntu (one lint leg is enough; the toolchain pin
+  # is shared).
+  windows:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same rust-toolchain.toml pin as the unix legs — read with Git
+      # Bash (`sed`); the job's default run shell is pwsh.
+      - name: Read toolchain pin
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  # Spec R16 §5.14: the e2e suite's Windows variant. `cargo test -p
+  # ait -p ait-testkit` runs the PTY suite — the `platforms` scenario
+  # gate skips the unix fixtures loudly and runs the Windows-capable
+  # subset: the config-*/version legs plus shell-integration-pwsh
+  # (PowerShell 7 ships on the runner), shell-integration-winps (the
+  # boxed Windows PowerShell 5.1) and shell-degrade-cmd (cmd.exe, the
+  # no-injection family). No xvfb, no display — ConPTY supplies the
+  # terminal.
+  windows-e2e:
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read toolchain pin
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Build
+        run: cargo build -p ait
+
+      - name: E2E tests
+        run: cargo test -p ait -p ait-testkit
+
+      - name: Upload failure dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-e2e-failures
+          path: target/e2e-failures/
+          if-no-files-found: ignore

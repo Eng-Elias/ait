@@ -1,6 +1,7 @@
 # Spec R02 stories 8-9: `Alt+T` opens a second tab and the bar shows
 # both chunks.
 feature = "tabs"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

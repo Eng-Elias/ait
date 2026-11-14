@@ -13,6 +13,8 @@
 //! The prompt text is equally host-dependent (the user's real rc files
 //! set PS1), so every gate waits on marker output, never on `$ `.
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;

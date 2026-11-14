@@ -3,6 +3,7 @@
 # explorer pane (Spec R14 §5.13), and the dump exposes the pane
 # selection plus the grid's visible text.
 feature = "panes"
+platforms = ["unix"]
 
 # The tab shell's prompt — pinned `PS1 = "$ "` — must be on the grid
 # before input lands.

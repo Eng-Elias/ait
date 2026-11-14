@@ -4,6 +4,7 @@
 # proof is the probe: if the bar had opened it would swallow the
 # Enter that runs the marker, and the marker would never land.
 feature = "input"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

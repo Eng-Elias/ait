@@ -13,6 +13,8 @@
 //! `shell_integration.rs` precedent: `SHELL` selects the spawned
 //! shell).
 
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;

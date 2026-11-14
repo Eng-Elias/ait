@@ -6,31 +6,21 @@
 //! sits here (the GUI binds the same socket convention but ships no
 //! `ctl` client).
 
-use std::io::{self, Write};
-use std::path::Path;
-use std::process::ExitCode;
-
-#[cfg(unix)]
 use std::ffi::OsStr;
-#[cfg(unix)]
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
-use std::path::PathBuf;
-#[cfg(unix)]
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Duration;
 
 #[cfg(unix)]
+use ait_app::ctl::ctl_dir;
 use ait_app::ctl::{
-    ctl_dir, decode_response, encode_request, encode_response, Request, Response, ENV_CTL_SOCKET,
-    REQUEST_CAP,
+    decode_response, encode_request, encode_response, Request, Response, ENV_CTL_SOCKET,
 };
-// `ait_app::ctl` is unix-only surface in this client — the non-unix
-// `run_client` stub below needs nothing from it.
+use ait_app::ipc::{self, REQUEST_CAP};
+
 /// Bound on the client's wait for a response — the server drains on
 /// the ~8 ms app tick, so this only ever trips on a wedged instance.
-#[cfg(unix)]
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 // ------------------------------------------------------------------
 // Client: `ait ctl <verb>` — resolve the socket, exchange one
@@ -78,7 +68,6 @@ pub enum CtlVerb {
 impl CtlVerb {
     /// The wire request this verb sends — `last_block`'s selectors
     /// are client-side over the same response.
-    #[cfg(unix)]
     fn request(&self) -> Request {
         match self {
             CtlVerb::OpenTab => Request::OpenTab,
@@ -175,12 +164,15 @@ fn choose(
 }
 
 /// Where `ait ctl` connects: `AIT_CTL_SOCKET` when set (a spawned
-/// session's own instance), else the single LIVE `*.sock` under the
-/// resolved ctl dir — zero is "no running ait instance", several an
-/// error listing each candidate (us-32). A `kill -9`'d ait leaves
-/// its socket file behind, so each candidate is probed with a
-/// connect (a dead socket refuses instantly); stale files are
-/// unlinked and never counted.
+/// session's own instance — on Windows it carries the
+/// `\\.\pipe\ait-<user>-<pid>` name), else the platform's discovery
+/// rule for the live instance's socket — zero is "no running ait
+/// instance", several an error listing each candidate (us-32).
+///
+/// On Unix that's the single LIVE `*.sock` under the resolved ctl
+/// dir: a `kill -9`'d ait leaves its socket file behind, so each
+/// candidate is probed with a connect (a dead socket refuses
+/// instantly); stale files are unlinked and never counted.
 #[cfg(unix)]
 fn resolve_socket(
     socket_env: Option<&OsStr>,
@@ -206,13 +198,50 @@ fn resolve_socket(
     // successful probe's connection closes unanswered (the server's
     // pending-connection TTL reaps it).
     sockets.retain(|path| {
-        if UnixStream::connect(path).is_ok() {
+        if ipc::connect(path.as_os_str(), CLIENT_TIMEOUT).is_ok() {
             true
         } else {
             let _ = std::fs::remove_file(path);
             false
         }
     });
+    pick_socket(sockets)
+}
+
+/// The Windows arm of [`resolve_socket`]: named pipes live under
+/// `\\.\pipe\` and die with their last server handle, so every
+/// `ait-<user>-<pid>` name the pipe root lists is live by
+/// construction — no probe, nothing to unlink. `runtime_dir` is a
+/// Unix concept the pipe namespace doesn't need.
+#[cfg(windows)]
+fn resolve_socket(
+    socket_env: Option<&OsStr>,
+    _runtime_dir: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = socket_env.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let prefix = format!("ait-{}-", ipc::user_token());
+    let mut sockets: Vec<PathBuf> = std::fs::read_dir(r"\\.\pipe\")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    sockets.sort();
+    pick_socket(sockets)
+}
+
+/// The shared end of socket resolution: zero candidates is "no
+/// running ait instance", one is it, several an error naming each —
+/// set [`ENV_CTL_SOCKET`] to pick (us-32).
+fn pick_socket(mut sockets: Vec<PathBuf>) -> Result<PathBuf, String> {
     match sockets.len() {
         0 => Err("no running ait instance".to_owned()),
         1 => Ok(sockets.remove(0)),
@@ -227,17 +256,13 @@ fn resolve_socket(
     }
 }
 
-/// One request → one response line on `path` (us-41): connect, write
-/// the JSON line, read to the response's newline. [`CLIENT_TIMEOUT`]
-/// bounds the wait so a wedged instance fails rather than hangs.
-#[cfg(unix)]
-fn round_trip(path: &Path, request: &Request) -> Result<Response, String> {
-    let mut stream =
-        UnixStream::connect(path).map_err(|e| format!("can't reach {}: {e}", path.display()))?;
-    stream
-        .set_read_timeout(Some(CLIENT_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(CLIENT_TIMEOUT)))
-        .map_err(|e| format!("socket setup failed: {e}"))?;
+/// One request → one response line on `socket` (us-41): connect,
+/// write the JSON line, read to the response's newline.
+/// [`CLIENT_TIMEOUT`] — armed by [`ipc::connect`] — bounds the wait
+/// so a wedged instance fails rather than hangs.
+fn round_trip(socket: &Path, request: &Request) -> Result<Response, String> {
+    let mut stream = ipc::connect(socket.as_os_str(), CLIENT_TIMEOUT)
+        .map_err(|e| format!("can't reach {}: {e}", socket.display()))?;
     let mut line = encode_request(request);
     line.push('\n');
     stream
@@ -266,7 +291,6 @@ fn round_trip(path: &Path, request: &Request) -> Result<Response, String> {
 /// The verb's stdout text — the response's JSON line for `open_tab`
 /// and `send` (us-41 composes with `jq`), the selected field for
 /// `last_block` (us-37/38).
-#[cfg(unix)]
 fn render(verb: &CtlVerb, response: &Response) -> Result<String, String> {
     if !response.ok {
         return Err(response
@@ -299,7 +323,6 @@ fn render(verb: &CtlVerb, response: &Response) -> Result<String, String> {
 /// `ait ctl <verb>` — the client arm `main` dispatches to. One
 /// request per invocation; the verb's answer goes to stdout and every
 /// failure exits non-zero with its message on stderr (us-41).
-#[cfg(unix)]
 pub fn run_client(verb: &CtlVerb) -> ExitCode {
     let request = verb.request();
     let outcome = resolve_socket(
@@ -320,26 +343,17 @@ pub fn run_client(verb: &CtlVerb) -> ExitCode {
     }
 }
 
-/// `run_client`'s non-unix stub — the control socket is a Unix
-/// socket; elsewhere every verb is a clean failure, never a panic.
-#[cfg(not(unix))]
-pub fn run_client(_verb: &CtlVerb) -> ExitCode {
-    let _ = writeln!(
-        io::stderr().lock(),
-        "ait ctl: the control socket is unix-only"
-    );
-    ExitCode::FAILURE
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     //! The client-side seams — socket resolution, the answer render
     //! and the argv parse — over `ait_app::ctl`'s wire types.
     use super::*;
     use ait_app::ctl::BlockReadout;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
 
     /// A per-test tempdir.
+    #[cfg(unix)]
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
@@ -406,7 +420,6 @@ mod tests {
     /// The render contract (us-37/38/41): `open_tab`/`send` print the
     /// response's JSON line; `last_block` prints the output by
     /// default, the command or exit code under its selectors.
-    #[cfg(unix)]
     #[test]
     fn render_prints_each_verbs_answer() {
         assert_eq!(

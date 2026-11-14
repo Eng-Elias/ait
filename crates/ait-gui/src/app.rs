@@ -2747,7 +2747,7 @@ impl std::fmt::Display for BootError {
 
 impl std::error::Error for BootError {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     //! Dispatch tests at the same seams the TUI's `handle_event` tests
     //! exercise (Spec R04, R11-T2 — `dispatch_key` IS the GUI's

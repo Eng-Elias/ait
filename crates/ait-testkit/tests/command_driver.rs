@@ -5,6 +5,8 @@
 //! version, timeout) fails the step with the child's stderr in the
 //! message. No model anywhere.
 
+#![cfg(unix)]
+
 mod common;
 
 use std::fs;

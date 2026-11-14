@@ -5,6 +5,7 @@
 # IS the panel's real approval flow, and the click crosses the
 # overlay the R13 dead-click-layer regression broke.
 feature = "agent"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

@@ -85,8 +85,8 @@ fn watcher_at(path: &Path) -> Option<SettingsWatcher> {
 
 /// `[terminal]` + `[ssh]` as the spawn template for NEW sessions
 /// (stories 12–13, Spec R05 us-3, Spec R09-T1): `shell` becomes the
-/// spawned program — unset keeps `ait-term`'s `$SHELL` → `/bin/sh`
-/// resolution (§5.1) — `scrollback_lines` the scrollback capacity,
+/// spawned program — unset keeps `ait-term`'s `$SHELL` → platform-shell
+/// resolution (§5.1, §5.14) — `scrollback_lines` the scrollback capacity,
 /// `osc52` the child-app clipboard-write opt-in (Spec R02) and
 /// `shell_integration` whether the injection planner runs at spawn —
 /// on when unset (§5.5). `[ssh]` arms the `AIT_SSH_*` env the
@@ -248,7 +248,7 @@ base_model = "key-1"
         let unset = session_template(&Settings::default());
         assert!(
             unset.options.program.is_none(),
-            "unset shell keeps ait-term's $SHELL → /bin/sh resolution (§5.1)"
+            "unset shell keeps ait-term's $SHELL → platform-shell resolution (§5.1)"
         );
         assert_eq!(unset.options.session.scrollback, DEFAULT_SCROLLBACK);
         assert!(!unset.options.session.osc52, "OSC 52 stays opt-in");

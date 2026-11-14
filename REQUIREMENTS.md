@@ -450,7 +450,7 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
   terminal content is never sent to the webview host or any remote service,
   and nothing is fetched except what the user navigates to.
 
-### 5.14 Windows support (Round 15, Release 2)
+### 5.14 Windows support (Round 16, Release 2)
 
 - `ait` (and `ait-gui` with its §5.13 panes where the toolkit allows) runs
   natively on Windows:
@@ -506,11 +506,12 @@ apply; anything that would ask is denied). `ait ctl <cmd>` drives a running
 | 12 | Packaging & release | §5.11 |
 | 13 | GUI frontend | §5.12 |
 | 14 | GUI panels — file explorer & web browser | §5.13 |
-| 15 | Windows support | §5.14 |
+| 15 | GUI automation testing | §5.12–13 |
+| 16 | Windows support | §5.14 |
 
 **MVP = Rounds 1–4**: a working TUI terminal that turns natural language into a
 command using any configured endpoint. **v1 = Rounds 1–12**; **Release 2 =
-Rounds 13–15**. Post-v1 candidates pending review live in §12.
+Rounds 13–16**. Post-v1 candidates pending review live in §12.
 
 ---
 

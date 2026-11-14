@@ -95,11 +95,12 @@ build problem — point `CARGO_TARGET_DIR` at an ext4 dir
   - Checklist: promotion PR `dev`→`main` → CI green → flip the repo
     public → `dist plan --tag=vX.Y.Z` and `dist generate --check`
     locally (the pre-tag sanity — the plan must list `ait` on all
-    five targets + `ait-installer.sh`, and `ait-gui` on the four
-    glibc/macOS targets + `ait-gui-installer.sh`; musl stays
+    six targets + `ait-installer.sh`/`ait-installer.ps1`, and
+    `ait-gui` on its five glibc/macOS/Windows targets +
+    `ait-gui-installer.sh`/`ait-gui-installer.ps1`; musl stays
     ait-only) → `git tag vX.Y.Z <main-sha>` →
-    `git push origin vX.Y.Z` → `release.yml` builds `ait` on all five
-    targets and `ait-gui` on its four → `verify-install` gate →
+    `git push origin vX.Y.Z` → `release.yml` builds `ait` on all six
+    targets and `ait-gui` on its five → `verify-install` gate →
     announced release.
   - Version bump for later releases: bump `[workspace.package].version`
     in the root manifest, add the `## [x.y.z]` CHANGELOG entry, and

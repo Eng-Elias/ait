@@ -1,7 +1,11 @@
 //! The injection planner (REQUIREMENTS.md §5.5, Spec R05 / issue #71).
 //!
 //! [`plan`] maps a *resolved* program path to an [`Injection`] purely on
-//! the basename — `bash`, `zsh` and `fish` get argv/env rewrites plus the
+//! the basename — `bash`, `zsh` and `fish` match exactly (and, on
+//! Windows only, their `.exe`-stripped case-insensitive spellings too —
+//! a Git-bash `bash.exe` earns the real bash snippet through ConPTY),
+//! `pwsh` and `powershell` match case-insensitively with `.exe`
+//! stripped on every OS (§5.14) — each gets argv/env rewrites plus the
 //! files a per-session `0700` dir must hold; every other program plans
 //! to `None` (§5.5 graceful degrade: unknown shells get nothing, the
 //! terminal keeps working).
@@ -9,8 +13,10 @@
 //! The planner never touches the user's dotfiles: bash gets a `--rcfile`
 //! wrapper that sources `~/.bashrc` first, zsh gets a temp `ZDOTDIR`
 //! whose forwarders source the real files from the original `ZDOTDIR`
-//! (then restore it so nested zsh behaves), and fish gets
-//! `--init-command 'source <snippet>'` which runs after its own config.
+//! (then restore it so nested zsh behaves), fish gets
+//! `--init-command 'source <snippet>'` which runs after its own config,
+//! and PowerShell gets `-NoExit -Command ". '<snippet.ps1>'"` so its
+//! profiles load before the hooks install.
 //!
 //! [`Injection::materialize_in`] writes the files into a fresh `0700`
 //! session dir and returns a [`Materialized`] guard that removes it on
@@ -34,6 +40,51 @@ pub const ENV_SESSION_ID: &str = "AIT_SESSION_ID";
 /// forwarders — the spawned zsh's own `ZDOTDIR` already points at us.
 const ENV_ZDOTDIR_ORIG: &str = "AIT_ZDOTDIR_ORIG";
 
+/// The family a session program's basename belongs to — the single
+/// normalization point every basename-keyed consumer shares (§5.14,
+/// std 17): the injection planner's [`powershell_kind`], the
+/// §5.10.4 classifier's builtin tables and the executor's
+/// `Absent`-tier sentinel all key off [`shell_family`]'s answer.
+/// Windows names match case-insensitively with one trailing `.exe`
+/// stripped; POSIX names — and every unrecognized basename — are
+/// [`Posix`](ShellFamily::Posix), the degrade each consumer layers
+/// its own meaning on (no injection, the shared builtin set, the
+/// `printf` sentinel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFamily {
+    /// sh/bash/zsh/fish/dash and the unknown — the POSIX forms.
+    Posix,
+    /// `pwsh` (7+) and `powershell` (5.1) — one family, exactly the
+    /// basenames [`ShellKind::Pwsh`] integrates.
+    PowerShell,
+    /// `cmd.exe` — no integration (§5.5 degrade), but its own
+    /// sentinel spelling and minimal builtin set.
+    Cmd,
+}
+
+/// Which [`ShellFamily`] a session program's basename belongs to —
+/// `pwsh`/`powershell` and `cmd`, case-insensitive with one `.exe`
+/// stripped; everything else is `Posix` (never an error).
+pub fn shell_family(basename: &str) -> ShellFamily {
+    match normalized_stem(basename).as_str() {
+        "pwsh" | "powershell" => ShellFamily::PowerShell,
+        "cmd" => ShellFamily::Cmd,
+        _ => ShellFamily::Posix,
+    }
+}
+
+/// `basename` lowercased with one trailing `.exe` stripped — the
+/// Windows-executable spelling normalization (§5.14). Applied to
+/// every name: a classifier table matching `BASH.EXE` against the
+/// bash set only errs toward `Command`, the safe direction. The
+/// planner is pickier — unix keeps the names' exact-case match
+/// (`BASH` must NOT inject); only [`windows_posix_kind`] consumes
+/// this, on Windows, where the spelling really is the same program.
+pub(crate) fn normalized_stem(basename: &str) -> String {
+    let lowered = basename.to_ascii_lowercase();
+    lowered.strip_suffix(".exe").unwrap_or(&lowered).to_owned()
+}
+
 /// The shell family an [`Injection`] targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -43,6 +94,10 @@ pub enum ShellKind {
     Zsh,
     /// fish — injected via `--init-command 'source <snippet>'`.
     Fish,
+    /// PowerShell — `pwsh` (7+) and `powershell.exe` (5.1) share the one
+    /// `pwsh.ps1` snippet, dot-sourced via `-NoExit -ExecutionPolicy
+    /// Bypass -Command` so the user's profiles load first (§5.14).
+    Pwsh,
 }
 
 /// A planned integration for one supported shell — pure data until
@@ -57,8 +112,9 @@ pub struct Injection {
 }
 
 /// Plan shell integration for a resolved program path. Returns `None`
-/// for any basename that isn't bash, zsh or fish — `sh`, `nu`, `sudo -i`
-/// and dumb remotes all degrade to a plain terminal (§5.5).
+/// for any basename that isn't bash, zsh, fish or PowerShell — `sh`,
+/// `nu`, `cmd`, `sudo -i` and dumb remotes all degrade to a plain
+/// terminal (§5.5).
 pub fn plan(resolved_program: &Path) -> Option<Injection> {
     plan_with_zdotdir(resolved_program, std::env::var_os("ZDOTDIR"))
 }
@@ -75,7 +131,7 @@ pub fn plan_with_zdotdir(
         "bash" => ShellKind::Bash,
         "zsh" => ShellKind::Zsh,
         "fish" => ShellKind::Fish,
-        _ => return None,
+        _ => windows_posix_kind(basename).or_else(|| powershell_kind(basename))?,
     };
     // An empty ZDOTDIR means `$HOME` in practice — record it as absent.
     let orig_zdotdir = orig_zdotdir.filter(|v| !v.is_empty());
@@ -104,6 +160,9 @@ impl Injection {
                 ("snippet.zsh", snippets::ZSH.to_owned()),
             ],
             ShellKind::Fish => vec![("snippet.fish", snippets::FISH.to_owned())],
+            // One file, no wrapper — the argv rewrite carries the
+            // profile-before-hooks ordering.
+            ShellKind::Pwsh => vec![("snippet.ps1", snippets::PWSH.to_owned())],
         }
     }
 
@@ -122,6 +181,20 @@ impl Injection {
                 OsString::from(format!(
                     "source {}",
                     fish_single_quote(&dir.join("snippet.fish").to_string_lossy())
+                )),
+            ],
+            // `-NoExit` (not `-NoProfile`): the user's profiles load
+            // first, the dot-source installs the hooks after, and the
+            // session stays interactive. `Bypass` is scoped to this one
+            // spawned process (§5.14).
+            ShellKind::Pwsh => vec![
+                OsString::from("-NoExit"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-Command"),
+                OsString::from(format!(
+                    ". {}",
+                    ps_single_quote(&dir.join("snippet.ps1").to_string_lossy())
                 )),
             ],
         }
@@ -287,6 +360,39 @@ fn zsh_forwarder(file: &str) -> String {
     )
 }
 
+/// PowerShell basename detection (§5.14): [`shell_family`]'s
+/// `PowerShell` arm maps to [`ShellKind::Pwsh`] — `pwsh`, `pwsh.exe`,
+/// `PWSH.EXE` and `powershell.exe` all integrate through the same
+/// normalization the classifier and sentinel share, on every OS.
+/// `cmd` and everything else plans `None`.
+fn powershell_kind(basename: &str) -> Option<ShellKind> {
+    (shell_family(basename) == ShellFamily::PowerShell).then_some(ShellKind::Pwsh)
+}
+
+/// The Windows-only second pass beside [`powershell_kind`]: Git-bash
+/// and MSYS shells resolve as `bash.exe`, `ZSH.EXE` and friends — the
+/// `.exe`-stripped, case-insensitive [`normalized_stem`] read maps
+/// them to their real kinds (§5.14's further note: a `$SHELL`-picked
+/// POSIX shell still gets its own snippet through ConPTY).
+#[cfg(windows)]
+fn windows_posix_kind(basename: &str) -> Option<ShellKind> {
+    match normalized_stem(basename).as_str() {
+        "bash" => Some(ShellKind::Bash),
+        "zsh" => Some(ShellKind::Zsh),
+        "fish" => Some(ShellKind::Fish),
+        _ => None,
+    }
+}
+
+/// The unix arm of [`windows_posix_kind`] — no normalization: a file
+/// named `BASH` or `bash.exe` is a different program, never
+/// integrated (the exact-case match in [`plan_with_zdotdir`] already
+/// served a real `bash`).
+#[cfg(not(windows))]
+fn windows_posix_kind(_basename: &str) -> Option<ShellKind> {
+    None
+}
+
 /// `0700` on unix; a no-op elsewhere (other platforms get whatever the
 /// filesystem gives `create_dir`).
 #[cfg(unix)]
@@ -317,4 +423,10 @@ fn sh_double_quote(text: &str) -> String {
 /// inside fish single quotes only `\'` and `\\` escape.
 fn fish_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Single-quote a path for interpolation into a PowerShell `-Command`
+/// string — inside PS single quotes a doubled `''` is the only escape.
+fn ps_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }

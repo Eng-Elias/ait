@@ -4,6 +4,7 @@
 # input shadow stale — the `# `-trigger can never verify, so the
 # suggestion path never fires.
 feature = "input"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

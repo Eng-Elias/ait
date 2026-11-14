@@ -4,6 +4,7 @@
 # selects — pointer pieces driven as separate frame batches the way
 # real input arrives.
 feature = "selection"
+platforms = ["unix"]
 
 [[steps]]
 wait_text = "$"

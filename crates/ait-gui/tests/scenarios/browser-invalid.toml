@@ -5,6 +5,7 @@
 # and a real URL then loads: a `file://` page keeps the assert
 # deterministic and offline.
 feature = "browser"
+platforms = ["unix"]
 binary = "web"
 
 [[steps]]

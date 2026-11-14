@@ -50,16 +50,17 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{self, Read, Write as _};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::prelude::*;
+use interprocess::local_socket::GenericFilePath;
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{self, ActionEntry};
+use crate::scenario;
 use crate::screen::{fnv, FNV_OFFSET};
 use crate::tempdir::TempDir;
 
@@ -111,6 +112,7 @@ const STUB_LOG_ENV: &str = "AIT_GUI_E2E_STUB_LOG";
 /// real app. The runtime dir comes back too — [`GuiE2e::runtime_dir`]
 /// hands it to `ait ctl` clients so they scan exactly the socket dir
 /// the spawn pinned (Spec R15-T6's coexistence leg).
+#[cfg(unix)]
 fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)>, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     let runtime = cwd.join("xdg-runtime");
@@ -148,11 +150,47 @@ fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)
     Ok((env, runtime))
 }
 
+/// The Windows arm of [`pinned_env`]: there is no XDG runtime dir or
+/// `sh`-script opener stub on Windows — the pins that still matter
+/// are the profile/config vars inside the throwaway dir and the
+/// driver's `\\.\pipe\` socket name (which the app binds verbatim). The
+/// returned "runtime dir" is the cwd itself: the ctl client needs no
+/// dir on Windows — pipe names carry user+pid — but
+/// [`GuiE2e::runtime_dir`] still hands callers a value.
+#[cfg(windows)]
+fn pinned_env(cwd: &Path, socket: &Path) -> io::Result<(Vec<(OsString, OsString)>, PathBuf)> {
+    let env = vec![
+        (OsString::from("HOME"), cwd.as_os_str().to_os_string()),
+        (
+            OsString::from("USERPROFILE"),
+            cwd.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("APPDATA"),
+            cwd.join("appdata").into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            cwd.join("xdg-config").into_os_string(),
+        ),
+        (
+            OsString::from(ENV_DRIVER_SOCKET),
+            socket.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from(STUB_LOG_ENV),
+            cwd.join("open.log").into_os_string(),
+        ),
+    ];
+    Ok((env, cwd.to_path_buf()))
+}
+
 /// Write `dir`'s opener stubs — `xdg-open` and `open`, the names
 /// `platform_opener` resolves on Linux/macOS. Each records
 /// `basename args…` to [`STUB_LOG_ENV`]'s file (falling back to
 /// `$HOME/open.log`) and exits 0 — deterministic, recorded, and
 /// never a real application.
+#[cfg(unix)]
 fn install_opener_stubs(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir(dir)?;
@@ -169,12 +207,39 @@ fn install_opener_stubs(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The socket name this spawn hands [`ENV_DRIVER_SOCKET`] — a
+/// `driver.sock` in the throwaway dir on Unix, a per-spawn pipe name
+/// on Windows (`ait-driver-<user>-<pid>-<seq>` — the same shape the
+/// control socket's `ait-<user>-<pid>` takes, plus a counter so
+/// parallel harnesses in one process never collide).
+#[cfg(unix)]
+fn driver_socket(cwd: &Path) -> PathBuf {
+    cwd.join("driver.sock")
+}
+
+/// [`driver_socket`](fn@driver_socket)'s Windows arm.
+#[cfg(windows)]
+fn driver_socket(_cwd: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".to_owned())
+        .replace(['\\', '/'], "-");
+    PathBuf::from(format!(
+        r"\\.\pipe\ait-driver-{user}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// How the spawned binary reaches a display.
 enum Display {
     /// Spawn directly — `DISPLAY` (or the user's) is already set.
     Direct,
     /// Wrap the spawn in `xvfb-run -a` — the suite's own virtual
     /// display, no focus stealing.
+    #[cfg(unix)]
     Xvfb(PathBuf),
 }
 
@@ -189,6 +254,7 @@ pub fn env_flag(name: &str) -> bool {
 }
 
 /// Find `xvfb-run` on `PATH`.
+#[cfg(unix)]
 fn xvfb_run() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -199,7 +265,8 @@ fn xvfb_run() -> Option<PathBuf> {
 /// The display decision's pure core — `display`'s env reads live at
 /// the seam so the policy itself is a testable function (env is
 /// process-global; a test that mutated DISPLAY/PATH would race its
-/// siblings).
+/// siblings). Unix-only: Windows's policy is `Direct`, always.
+#[cfg(unix)]
 fn choose_display(headed: bool, have_display: bool, xvfb: Option<PathBuf>) -> Option<Display> {
     if headed {
         // Headed means the developer's screen — without one there is
@@ -214,9 +281,18 @@ fn choose_display(headed: bool, have_display: bool, xvfb: Option<PathBuf>) -> Op
 }
 
 /// Resolve the display policy — `None` is the suite's skip signal.
+/// Windows needs no display indirection: a GUI app opens a real
+/// window on the caller's session — there is no xvfb to own.
+#[cfg(unix)]
 fn display(headed: bool) -> Option<Display> {
     let have_display = std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty());
     choose_display(headed, have_display, xvfb_run())
+}
+
+/// [`display`](fn@display)'s Windows arm — always direct.
+#[cfg(windows)]
+fn display(_headed: bool) -> Option<Display> {
+    Some(Display::Direct)
 }
 
 /// Which `ait-gui` binary a scenario needs — the dual-binary matrix
@@ -1103,7 +1179,7 @@ impl GuiE2e {
             return Ok(None);
         };
         let cwd = TempDir::fresh()?;
-        let socket = cwd.path().join("driver.sock");
+        let socket = driver_socket(cwd.path());
         let (mut env, runtime_dir) = pinned_env(cwd.path(), &socket)?;
         if let Some(display_name) = &config.display {
             env.push((
@@ -1119,6 +1195,7 @@ impl GuiE2e {
                 command.args(&config.args);
                 command
             }
+            #[cfg(unix)]
             Display::Xvfb(xvfb) => {
                 // `-a` picks a free display number — parallel tests
                 // never race for :99.
@@ -1229,20 +1306,26 @@ impl GuiE2e {
     }
 
     /// One socket round trip — connect, send the line, read the
-    /// response line (the server half-closes after its reply, which
-    /// terminates the read).
+    /// response line (the server drops the stream after its reply,
+    /// which terminates the read). The socket name maps the way
+    /// `ait_app::ipc`'s `local_name` reads it: a filesystem-path name
+    /// — the socket path on Unix, the `\\.\pipe\…` path on Windows.
     fn request(&self, request: &Request<'_>) -> Result<Response, String> {
-        let mut conn = UnixStream::connect(&self.socket)
+        let name = self
+            .socket
+            .as_os_str()
+            .to_fs_name::<GenericFilePath>()
+            .map_err(|e| format!("socket name {}: {e}", self.socket.display()))?;
+        let mut conn = LocalSocketStream::connect(name)
             .map_err(|e| format!("connect {}: {e}", self.socket.display()))?;
-        conn.set_read_timeout(Some(REQUEST_TIMEOUT))
-            .map_err(|e| format!("read timeout: {e}"))?;
+        conn.set_recv_timeout(Some(REQUEST_TIMEOUT))
+            .and_then(|()| conn.set_send_timeout(Some(REQUEST_TIMEOUT)))
+            .map_err(|e| format!("socket timeouts: {e}"))?;
         let mut line =
             serde_json::to_string(request).map_err(|e| format!("encode request: {e}"))?;
         line.push('\n');
         conn.write_all(line.as_bytes())
             .map_err(|e| format!("write request: {e}"))?;
-        // Signal request-complete — the server answers after the line.
-        let _ = conn.shutdown(Shutdown::Write);
         let mut reply = String::new();
         conn.read_to_string(&mut reply)
             .map_err(|e| format!("read response: {e}"))?;
@@ -1906,6 +1989,11 @@ const GUI_VERBS: &[&str] = &[
 /// feature = "panes"
 /// binary = "web"                     # optional — the dual-binary leg:
 ///                                    # "web" | "noweb" | any when absent
+/// platforms = ["unix"]               # optional OS gate (Spec R16-T8) —
+///                                    # the [`Scenario`] vocabulary;
+///                                    # absent runs everywhere, the
+///                                    # runner skips excluded OSes
+///                                    # loudly
 ///
 /// [[steps]]
 /// key = "Ctrl+Shift+E"               # one chord through the app's dispatch
@@ -1944,6 +2032,9 @@ pub struct GuiScenario {
     /// `slowmo = 400` — watch pacing in milliseconds before each input
     /// request (`AIT_GUI_E2E_SLOWMO` overrides).
     pub slowmo_ms: u64,
+    /// The OSes the scenario runs on (`platforms = ["unix"]`, empty =
+    /// every platform) — [`runs_on`](Self::runs_on) reads it.
+    platforms: Vec<String>,
     /// The file stem — failure messages and dump dirs.
     name: String,
     /// The path it was loaded from.
@@ -2824,6 +2915,9 @@ struct RawGuiScenario {
     /// `slowmo = 400` — watch pacing in ms before each input request.
     #[serde(default)]
     slowmo: u64,
+    /// `platforms = ["unix", …]` — the OS gate; absent runs everywhere.
+    #[serde(default)]
+    platforms: Vec<String>,
     /// The `[[steps]]` tables.
     #[serde(default)]
     steps: Vec<toml::Table>,
@@ -2848,6 +2942,7 @@ impl GuiScenario {
     fn parse(name: String, source: &str, text: &str) -> Result<Self, ScenarioError> {
         let raw: RawGuiScenario = toml::from_str(text)
             .map_err(|e| ScenarioError::file(source, format!("invalid TOML: {e}")))?;
+        scenario::validate_platforms(source, &raw.platforms)?;
         let env = raw
             .env
             .into_iter()
@@ -2872,6 +2967,7 @@ impl GuiScenario {
             binary: raw.binary.unwrap_or(GuiBinary::Any),
             headed: raw.headed,
             slowmo_ms: raw.slowmo,
+            platforms: raw.platforms,
             name,
             source: source.to_string(),
         })
@@ -2923,6 +3019,22 @@ impl GuiScenario {
     /// The path it was loaded from.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The `platforms` list verbatim — empty means every OS.
+    pub fn platforms(&self) -> &[String] {
+        &self.platforms
+    }
+
+    /// Whether the scenario runs under `os` (a `std::env::consts::OS`
+    /// value) — the runner's skip check (Spec R16-T8).
+    pub fn runs_on(&self, os: &str) -> bool {
+        scenario::platform_gate_matches(&self.platforms, os)
+    }
+
+    /// [`runs_on`](Self::runs_on) for the platform this build runs on.
+    pub fn runs_on_current_platform(&self) -> bool {
+        self.runs_on(std::env::consts::OS)
     }
 }
 
@@ -3795,6 +3907,7 @@ mod tests {
     /// The stub opener install: executable scripts that record the
     /// `name args…` invocation to [`STUB_LOG_ENV`]'s file — the
     /// PATH-lead trick `pinned_env` wires for every spawn.
+    #[cfg(unix)]
     #[test]
     fn opener_stub_records_invocations() {
         let dir = TempDir::fresh().unwrap();
@@ -3935,6 +4048,10 @@ quit = true
             ("[[steps]]\nwait_dump = false", "wait_dump must be true"),
             ("[[steps]]\nbogus = 1", "unknown verb"),
             ("[[steps]]\nkey = \"a\"\ntext = \"b\"", "two verbs"),
+            (
+                "feature = \"x\"\nplatforms = [\"plan9\"]",
+                "unknown platform",
+            ),
         ] {
             let outcome = GuiScenario::parse("t".into(), "t.toml", text);
             if want == "missing steps is fine" {
@@ -3945,9 +4062,29 @@ quit = true
         }
     }
 
+    /// The `platforms` gate shares the [`Scenario`] vocabulary — the
+    /// GUI parse path validates entries and `runs_on` evaluates them
+    /// (Spec R16-T8).
+    #[test]
+    fn gui_scenario_platforms_gate() {
+        let all = GuiScenario::parse("t".into(), "t.toml", r#"feature = "x""#).unwrap();
+        assert!(all.platforms().is_empty());
+        assert!(all.runs_on("windows"));
+
+        let unix = GuiScenario::parse(
+            "t".into(),
+            "t.toml",
+            "feature = \"x\"\nplatforms = [\"unix\"]",
+        )
+        .unwrap();
+        assert!(unix.runs_on("linux"));
+        assert!(!unix.runs_on("windows"));
+    }
+
     /// The skip convention lives in `choose_display`: no DISPLAY and
     /// no xvfb-run yields `None`; headed requires DISPLAY; headless
     /// prefers the owned xvfb display.
+    #[cfg(unix)]
     #[test]
     fn display_policy_skips_without_a_display() {
         let xvfb = Some(PathBuf::from("/usr/bin/xvfb-run"));

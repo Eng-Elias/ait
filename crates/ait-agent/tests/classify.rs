@@ -9,6 +9,17 @@
 
 use ait_agent::{classify, InputClass, ProgramIndex};
 
+/// `PATH`/`PATHEXT` are process-global — the harvest tests below that
+/// point them at fixtures serialize on this so two writers never race.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the env lock, surviving a poisoned guard.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The test index: bash's builtin table plus a seeded `$PATH` set —
 /// `with_path_entries` is the explicit-construction seam; `harvest`
 /// reads the real `$PATH` and is exercised separately below.
@@ -232,12 +243,47 @@ fn the_index_merges_builtins_and_path_entries() {
     assert!(!index.contains("nosuchbin"));
 }
 
+/// §5.14: PowerShell and cmd resolve first words case-insensitively —
+/// the index lowercases its names AND its lookups for those families
+/// (keyed on the same normalized basename the planner uses), while
+/// POSIX shells keep exact matching (`LS` is not `ls`).
+#[test]
+fn windows_shells_match_first_words_case_insensitively() {
+    let pwsh = ProgramIndex::with_path_entries("pwsh.exe", ["Git.exe"]);
+    assert!(pwsh.contains("Get-ChildItem"), "cmdlet, PascalCase");
+    assert!(pwsh.contains("get-childitem"), "cmdlet, lowercase");
+    assert!(pwsh.contains("GET-CHILDITEM"), "cmdlet, upper");
+    assert!(pwsh.contains("GIT.EXE"), "a $PATH entry resolves any case");
+    assert!(pwsh.contains("function"), "a keyword resolves");
+    // The classifier treats PowerShell syntax as commands (§5.10.4).
+    assert_eq!(
+        classify("Get-ChildItem the big files", &pwsh),
+        InputClass::Command
+    );
+    assert_eq!(
+        classify("foreach item in the list", &pwsh),
+        InputClass::Command
+    );
+    assert_eq!(classify("param name and value", &pwsh), InputClass::Command);
+
+    let cmd = ProgramIndex::with_path_entries("cmd.exe", ["MyTool.exe"]);
+    assert!(cmd.contains("DIR"), "cmd builtins match any case");
+    assert!(cmd.contains("goto"));
+
+    // POSIX stays exact — a case-flipped word doesn't resolve.
+    let bash = index();
+    assert!(bash.contains("ls"));
+    assert!(!bash.contains("LS"));
+    assert!(!bash.contains("SHOPT"));
+}
+
 /// `harvest` builds the same shape from the real environment —
 /// builtins always resolve; a temp-dir `$PATH` contributes its
 /// executable basenames and nothing else.
 #[test]
 fn harvest_merges_builtins_with_path_basenames() {
     use std::io::Write;
+    let _guard = env_lock();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("ait-harvest-testbin");
     std::fs::File::create(&bin)
@@ -281,5 +327,57 @@ fn harvest_merges_builtins_with_path_basenames() {
     assert_eq!(
         classify("ait-harvest-testbin the thing", &index),
         InputClass::Command
+    );
+}
+
+/// §5.14's non-unix harvest: `PATHEXT`, not a mode bit — a `.EXE`
+/// resolves (and its extensionless stem, so `tool` finds `tool.exe`
+/// the way cmd/PowerShell do), a `.DLL` or extensionless file on
+/// PATH never does. Windows-only: the unix arm keys on `0o111` and
+/// is covered above — this runs on the windows-latest CI leg.
+#[cfg(windows)]
+#[test]
+fn harvest_filters_path_entries_by_pathext() {
+    let _guard = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        "ait-pathext-tool.EXE",
+        "ait-pathext-doc.dll",
+        "ait-pathext-note.txt",
+        "ait-pathext-bare",
+    ] {
+        std::fs::write(dir.path().join(name), b"").unwrap();
+    }
+    let saved_path = std::env::var_os("PATH");
+    let saved_pathext = std::env::var_os("PATHEXT");
+    std::env::set_var("PATH", dir.path());
+    std::env::set_var("PATHEXT", ".EXE;.TXT");
+    let index = ProgramIndex::harvest("cmd.exe");
+    match saved_path {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
+    match saved_pathext {
+        Some(pathext) => std::env::set_var("PATHEXT", pathext),
+        None => std::env::remove_var("PATHEXT"),
+    }
+
+    assert!(index.contains("ait-pathext-tool.exe"), "the .exe resolves");
+    assert!(
+        index.contains("ait-pathext-tool"),
+        "its extensionless stem resolves (the name users type)"
+    );
+    assert!(
+        index.contains("ait-pathext-note.txt"),
+        "a PATHEXT-listed .txt counts"
+    );
+    assert!(
+        !index.contains("ait-pathext-doc.dll"),
+        "a DLL is never a program"
+    );
+    assert!(!index.contains("ait-pathext-doc"), "nor its stem");
+    assert!(
+        !index.contains("ait-pathext-bare"),
+        "extensionless files don't resolve on Windows"
     );
 }

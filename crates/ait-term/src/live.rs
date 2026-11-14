@@ -20,11 +20,12 @@
 //! - **waiter** — polls `try_wait` on the child (so it can also service a
 //!   kill request from `Drop`) and reports the exit status.
 //!
-//! Dropping the session requests a kill (`SIGHUP` escalating to `SIGKILL`
-//! inside `portable-pty`), disconnects the output channel so a reader
-//! blocked on `send` wakes up, and joins both threads. A process that
-//! outlives its session leader (a backgrounded grandchild holding the PTY
-//! slave) cannot hang `Drop`: the reader join is bounded, after which the
+//! Dropping the session requests a kill (`portable-pty` signals the
+//! child — SIGHUP escalating to SIGKILL on unix, terminate on Windows),
+//! disconnects the output channel so a reader blocked on `send` wakes
+//! up, and joins both threads. A process that outlives the spawned
+//! child (a backgrounded grandchild holding its side of the PTY open)
+//! cannot hang `Drop`: the reader join is bounded, after which the
 //! thread is simply detached.
 
 use std::ffi::OsString;
@@ -46,11 +47,14 @@ use crate::key::KeyEvent;
 use crate::session::{Session, SessionOptions, Size};
 
 /// `TERM` advertised to the spawned program: the baseline the VT emulator
-/// renders faithfully.
+/// renders faithfully. ConPTY ignores it; unix children and MSYS/Git-bash
+/// ones on Windows read it (Spec R16, §5.14).
 const DEFAULT_TERM: &str = "xterm-256color";
 
-/// Fallback program when neither an explicit program nor `$SHELL` is set
-/// (REQUIREMENTS.md §5.1).
+/// Unix fallback program when neither an explicit program nor `$SHELL`
+/// is set (REQUIREMENTS.md §5.1). Windows has its own chain — see
+/// [`windows_default_shell`].
+#[cfg(not(windows))]
 const FALLBACK_SHELL: &str = "/bin/sh";
 
 /// Read size for the reader thread.
@@ -68,7 +72,8 @@ const POLL: Duration = Duration::from_millis(10);
 /// After the child exits, `drain_events` waits this long for the reader to
 /// deliver trailing output before reporting `Exited`. Normally the reader
 /// hits PTY EOF within milliseconds of `wait` returning; a grandchild that
-/// inherited the slave can hold the PTY open longer, so the wait is bounded.
+/// inherited its side of the PTY can hold it open longer, so the wait is
+/// bounded.
 const READER_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Bound on the reader-thread join inside `Drop`.
@@ -87,7 +92,9 @@ pub struct LiveSessionOptions {
     /// PTY's initial winsize.
     pub session: SessionOptions,
     /// Program to spawn in the PTY. `None` resolves `$SHELL`, falling back
-    /// to `/bin/sh` when unset or empty.
+    /// to the platform shell when unset or empty: `/bin/sh` on unix, the
+    /// `pwsh.exe` → `powershell.exe` → `%ComSpec%` probe on Windows
+    /// (Spec R16, §5.14).
     pub program: Option<OsString>,
     /// Arguments for the program (`argv[1..]`).
     pub args: Vec<OsString>,
@@ -100,10 +107,12 @@ pub struct LiveSessionOptions {
 
 impl LiveSessionOptions {
     /// The program [`LiveSession::spawn`] will launch for these options:
-    /// `program` when explicit, else `$SHELL`, else `/bin/sh` (an empty
-    /// `$SHELL` counts as unset). Frontends derive display names — a tab
-    /// title is the basename — from the same source of truth the spawn
-    /// uses, instead of re-resolving `$SHELL` themselves.
+    /// `program` when explicit, else `$SHELL`, else the platform default
+    /// (`/bin/sh` on unix, the PowerShell probe on Windows — an empty
+    /// `$SHELL` counts as unset on both). Frontends derive display
+    /// names — a tab title is the basename — from the same source of
+    /// truth the spawn uses, instead of re-resolving `$SHELL`
+    /// themselves.
     pub fn resolved_program(&self) -> OsString {
         resolve_shell(self.program.clone(), std::env::var_os("SHELL"))
     }
@@ -119,7 +128,8 @@ pub enum SpawnError {
     /// The program could not be spawned in the PTY.
     #[error("failed to spawn {program:?} in the PTY: {reason}")]
     Spawn {
-        /// The resolved program (`$SHELL` or `/bin/sh` when not explicit).
+        /// The resolved program (see
+        /// [`LiveSessionOptions::resolved_program`]).
         program: OsString,
         /// The underlying error.
         reason: String,
@@ -138,7 +148,8 @@ pub struct ExitStatus {
     /// The process exit code (`0` on a clean exit).
     pub code: u32,
     /// How the process was signaled, if it was (e.g. `"Terminated by
-    /// SIGHUP"`), as reported by the platform.
+    /// SIGHUP"`), as reported by the platform — signals are a unix
+    /// concept, so this is `None` on Windows.
     pub signal: Option<String>,
 }
 
@@ -186,9 +197,9 @@ pub enum LiveEvent {
     /// The spawned program exited.
     ///
     /// `Exited` is withheld until the reader thread has delivered all
-    /// output the kernel hands us (see [`READER_EXIT_GRACE`]), so by the
+    /// output the OS hands us (see [`READER_EXIT_GRACE`]), so by the
     /// time it surfaces the grid holds everything the program printed —
-    /// unless a process that outlived the session leader is still holding
+    /// unless a process that outlived the spawned child is still holding
     /// the PTY open, in which case trailing output may arrive as further
     /// `OutputReady`/`Osc` events after `Exited`.
     Exited(ExitStatus),
@@ -372,9 +383,10 @@ impl LiveSession {
         self.session.size()
     }
 
-    /// Resize: forward the new winsize to the PTY (the kernel signals the
-    /// child's foreground process group) and resize the grid. The grid
-    /// resizes even if the PTY write fails (e.g. the child already died).
+    /// Resize: forward the new winsize to the PTY (on unix the kernel
+    /// signals the child's foreground process group; ConPTY resizes its
+    /// buffer) and resize the grid. The grid resizes even if the PTY
+    /// write fails (e.g. the child already died).
     pub fn resize(&mut self, size: Size) -> io::Result<()> {
         let result = self
             .master
@@ -572,7 +584,8 @@ impl LiveSession {
 
 impl Drop for LiveSession {
     fn drop(&mut self) {
-        // Ask the waiter to kill the child (SIGHUP, escalating to SIGKILL).
+        // Ask the waiter to kill the child (portable-pty's kill —
+        // SIGHUP escalating to SIGKILL on unix, terminate on Windows).
         self.kill_requested.store(true, Ordering::SeqCst);
 
         // Disconnect the output channel: a reader blocked on `send` (the
@@ -585,9 +598,10 @@ impl Drop for LiveSession {
         }
 
         // Once the child is dead the PTY hits EOF and the reader exits;
-        // bound the join anyway — a leaked grandchild holding the slave
-        // must not hang drop. `JoinHandle` detaches when dropped, so an
-        // unfinished reader simply outlives us without blocking anyone.
+        // bound the join anyway — a leaked grandchild holding its side
+        // of the PTY must not hang drop. `JoinHandle` detaches when
+        // dropped, so an unfinished reader simply outlives us without
+        // blocking anyone.
         let deadline = Instant::now() + READER_JOIN_GRACE;
         while let Some(handle) = &self.reader {
             if handle.is_finished() {
@@ -643,7 +657,8 @@ fn mirror_write(mirror: &OutputMirror, chunk: &[u8]) {
 
 /// The reader thread's loop: push PTY output into the bounded channel.
 /// Blocks on `read` (no output) or on `send` (consumer behind); exits on
-/// EOF/EIO (child's slave closed) or when the receiver is gone (teardown).
+/// EOF/EIO (the child's side of the PTY fully closed) or when the
+/// receiver is gone (teardown).
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     tx: mpsc::SyncSender<Vec<u8>>,
@@ -695,9 +710,10 @@ fn wait_loop(
             }
         }
         if kill_requested.swap(false, Ordering::SeqCst) {
-            // `Child::kill` (the std::process::Child impl portable-pty
-            // returns on unix) sends SIGHUP, waits briefly, then escalates
-            // to SIGKILL — unlike clone_killer's SIGHUP-only signaller.
+            // `Child::kill` is portable-pty's per-platform impl: on unix
+            // (std::process::Child) it sends SIGHUP, waits briefly, then
+            // escalates to SIGKILL — unlike clone_killer's SIGHUP-only
+            // signaller; on Windows it terminates the ConPTY child.
             if let Err(e) = child.kill() {
                 tracing::debug!("PTY child kill request failed (already dead?): {e}");
             }
@@ -733,15 +749,60 @@ fn acquire_io(master: &dyn MasterPty) -> Result<PtyIo, SpawnError> {
     Ok((reader, writer))
 }
 
-/// Program resolution: explicit option, else `$SHELL`, else `/bin/sh`.
-/// An empty `$SHELL` counts as unset.
+/// Program resolution: explicit option, else `$SHELL`, else the
+/// platform default shell. An empty `$SHELL` counts as unset — and the
+/// same `program`-then-`$SHELL` precedence holds on every OS, so a
+/// Git/MSYS `bash.exe` on `%SHELL%` beats the Windows probe too
+/// (Spec R16, §5.14).
 fn resolve_shell(program: Option<OsString>, env_shell: Option<OsString>) -> OsString {
     program
         .or_else(|| env_shell.filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| OsString::from(FALLBACK_SHELL))
+        .unwrap_or_else(platform_default_shell)
 }
 
-/// Grid [`Size`] → kernel winsize, clamped to the `u16` range and at least
+/// The platform default once explicit program and `$SHELL` both miss:
+/// `/bin/sh` on unix (REQUIREMENTS.md §5.1).
+#[cfg(not(windows))]
+fn platform_default_shell() -> OsString {
+    OsString::from(FALLBACK_SHELL)
+}
+
+/// The platform default once explicit program and `$SHELL` both miss:
+/// the PowerShell probe on Windows (Spec R16, §5.14).
+#[cfg(windows)]
+fn platform_default_shell() -> OsString {
+    windows_default_shell(std::env::var_os("PATH"), std::env::var_os("ComSpec"))
+}
+
+/// The Windows default-shell chain: the first of `pwsh.exe` /
+/// `powershell.exe` found probing `path` (the name preference outranks
+/// PATH order — `pwsh.exe` wins even when `powershell.exe` sits in an
+/// earlier dir), else `%ComSpec%`, else `cmd.exe` as the last resort
+/// (`%ComSpec%` is a system variable but nothing guarantees it is set).
+/// Returns full paths so the spawn never depends on the child's own
+/// search and the resolved basename stays `pwsh.exe`/`powershell.exe`
+/// for the injection planner (Spec R16-T3). Parameterized on the env
+/// values so unit tests exercise the chain off-Windows — ConPTY itself
+/// is Windows-only.
+#[cfg(any(windows, test))]
+fn windows_default_shell(path: Option<OsString>, comspec: Option<OsString>) -> OsString {
+    if let Some(path) = path {
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        for name in ["pwsh.exe", "powershell.exe"] {
+            for dir in &dirs {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+    }
+    comspec
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("cmd.exe"))
+}
+
+/// Grid [`Size`] → PTY winsize, clamped to the `u16` range and at least
 /// one cell.
 fn pty_size(size: Size) -> PtySize {
     let clamp = |cells: usize| u16::try_from(cells.max(1)).unwrap_or(u16::MAX);
@@ -776,11 +837,15 @@ mod tests {
         );
     }
 
+    /// The `/bin/sh` fallback is the unix default only — on Windows the
+    /// same call resolves through `windows_default_shell`.
+    #[cfg(not(windows))]
     #[test]
     fn missing_shell_env_falls_back_to_bin_sh() {
         assert_eq!(resolve_shell(None, None), OsString::from("/bin/sh"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn empty_shell_env_counts_as_unset() {
         assert_eq!(
@@ -798,6 +863,105 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(options.resolved_program(), OsString::from("/bin/zsh"));
+    }
+
+    /// A temp dir that removes itself on drop — the PATH-probe tests'
+    /// fixture: `windows_default_shell` stats real paths, so the probe
+    /// needs real files to find.
+    struct ProbeDir(PathBuf);
+
+    impl ProbeDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("ait-term-probe-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("probe dir should create");
+            Self(path)
+        }
+
+        /// Create an empty entry named like an executable on PATH.
+        fn touch(&self, name: &str) {
+            std::fs::write(self.0.join(name), b"").expect("probe file should write");
+        }
+
+        /// The dir alone as a one-entry PATH value.
+        fn path(&self) -> OsString {
+            std::env::join_paths([&self.0]).expect("probe dir should join")
+        }
+    }
+
+    impl Drop for ProbeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn windows_probe_returns_the_full_path_of_pwsh_on_path() {
+        let dir = ProbeDir::new("pwsh");
+        dir.touch("pwsh.exe");
+        assert_eq!(
+            windows_default_shell(Some(dir.path()), None),
+            dir.0.join("pwsh.exe").into_os_string()
+        );
+    }
+
+    #[test]
+    fn windows_probe_prefers_pwsh_over_powershell_regardless_of_path_order() {
+        // powershell.exe sits in the EARLIER dir — pwsh still wins: the
+        // name preference outranks PATH order (Spec R16, §5.14).
+        let earlier = ProbeDir::new("earlier");
+        let later = ProbeDir::new("later");
+        earlier.touch("powershell.exe");
+        later.touch("pwsh.exe");
+        let path = std::env::join_paths([&earlier.0, &later.0]).expect("probe dirs should join");
+        assert_eq!(
+            windows_default_shell(Some(path), None),
+            later.0.join("pwsh.exe").into_os_string()
+        );
+    }
+
+    #[test]
+    fn windows_probe_uses_powershell_when_pwsh_is_absent() {
+        let dir = ProbeDir::new("winps");
+        dir.touch("powershell.exe");
+        assert_eq!(
+            windows_default_shell(
+                Some(dir.path()),
+                Some(OsString::from("C:\\Windows\\System32\\cmd.exe")),
+            ),
+            dir.0.join("powershell.exe").into_os_string()
+        );
+    }
+
+    #[test]
+    fn windows_comspec_wins_when_no_powershell_is_on_path() {
+        // Real dirs, just no PowerShell in them.
+        let dir = ProbeDir::new("empty");
+        let comspec = OsString::from("C:\\Windows\\System32\\cmd.exe");
+        assert_eq!(
+            windows_default_shell(Some(dir.path()), Some(comspec.clone())),
+            comspec
+        );
+    }
+
+    #[test]
+    fn windows_comspec_wins_when_path_is_unset() {
+        let comspec = OsString::from("C:\\Windows\\System32\\cmd.exe");
+        assert_eq!(windows_default_shell(None, Some(comspec.clone())), comspec);
+    }
+
+    #[test]
+    fn windows_cmd_exe_is_the_last_resort() {
+        let dir = ProbeDir::new("bare");
+        // Nothing on PATH and `%ComSpec%` unset or empty — `cmd.exe`
+        // resolves through the system directory search at spawn.
+        for comspec in [None, Some(OsString::new())] {
+            assert_eq!(
+                windows_default_shell(Some(dir.path()), comspec),
+                OsString::from("cmd.exe")
+            );
+        }
     }
 
     #[test]

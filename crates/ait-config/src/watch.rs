@@ -43,7 +43,8 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 ///
 /// Returns a [`ConfigError`] (never panics) when the OS watcher cannot be
 /// created or the directory does not exist yet — on a first run without
-/// `--init`, `~/.config/ait/` may be absent; the caller surfaces the error
+/// `--init`, the config dir (`~/.config/ait/`, `%APPDATA%\ait\` on
+/// Windows) may be absent; the caller surfaces the error
 /// and runs without hot reload.
 ///
 /// [`load`]: crate::load

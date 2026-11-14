@@ -56,9 +56,16 @@ use crate::store::StoreHandle;
 use crate::suggest::InputShadow;
 
 /// Title shown when the resolved program has no usable basename — the
-/// resolved program is `$SHELL` or `ait-term`'s `/bin/sh` fallback, so
-/// this only guards pathological paths (e.g. `/`).
+/// resolved program is `$SHELL` or `ait-term`'s platform-shell fallback,
+/// so this only guards pathological paths (e.g. `/`).
+#[cfg(unix)]
 const FALLBACK_TITLE: &str = "sh";
+
+/// [`FALLBACK_TITLE`]'s Windows arm — the platform fallback there is
+/// `pwsh.exe`/`powershell.exe`/`cmd.exe`, and "shell" stays honest
+/// without naming one.
+#[cfg(windows)]
+const FALLBACK_TITLE: &str = "shell";
 
 /// How many prompt marks a tab retains — four arrive per shell
 /// command (A/B/C/D), so this covers ~1000 commands of history; the
@@ -717,6 +724,13 @@ impl Tab {
                     None => ait_agent::RemoteState::Local,
                 };
                 let _ = reply.send(state);
+            }
+            BridgeRequest::Shell(reply) => {
+                // The resolved program's basename — the same
+                // `title_for` answer the tab bar paints and the
+                // classifier's `ProgramIndex` keyed on (§5.14: the
+                // sentinel's family reads the one name).
+                let _ = reply.send(self.title.clone());
             }
             BridgeRequest::Context(reply) => {
                 // Spec R11 us-30: the headless driver's §5.6 context —
@@ -1443,7 +1457,7 @@ impl TabManager {
     /// Spawn the manager with its first tab in the directory `ait` was
     /// launched from: `template` — the app's `[terminal]`-derived
     /// template (Spec R03), `SessionTemplate::default()` for
-    /// `$SHELL`-or-`/bin/sh` — shapes the first tab AND every
+    /// `$SHELL`-or-platform-shell — shapes the first tab AND every
     /// `new_tab` after it.
     pub fn spawn_with(size: Size, template: SessionTemplate) -> Result<Self, SpawnError> {
         let launch_cwd = std::env::current_dir().unwrap_or_default();
@@ -1850,7 +1864,7 @@ pub fn title_for(options: &LiveSessionOptions) -> String {
         .unwrap_or_else(|| FALLBACK_TITLE.into())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::ffi::OsString;
@@ -3367,6 +3381,33 @@ mod tests {
         let tab = manager.active_mut().expect("an active tab");
         tab.bridge = Some(service);
         (handle, manager.active().unwrap())
+    }
+
+    /// §5.14: the bridge's `shell_name` answers the resolved
+    /// program's basename — the key the `Absent` tier's sentinel
+    /// family reads (the same `title_for` the tab bar and the
+    /// classifier use).
+    #[test]
+    fn bridge_shell_name_answers_the_program_basename() {
+        if !Path::new("/bin/sh").exists() {
+            return; // sh isn't installed everywhere tests run
+        }
+        let mut manager = TabManager::spawn_at(
+            Size::new(40, 10),
+            PathBuf::from("/tmp"),
+            SessionTemplate {
+                options: LiveSessionOptions {
+                    program: Some(OsString::from("/bin/sh")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (bridge, _) = attach_bridge(&mut manager);
+        use ait_agent::ShellBridge;
+        let name = bridge_call(&mut manager, &bridge, |b| b.shell_name().expect("shell"));
+        assert_eq!(name, "sh");
     }
 
     /// Spec R06-T4 (issue #87) through a REAL injected bash: the

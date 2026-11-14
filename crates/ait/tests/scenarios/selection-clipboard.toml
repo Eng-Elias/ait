@@ -8,6 +8,7 @@
 # `HELLOWORLD` starting at column 0 — the drag covers columns 0..9,
 # and the release extends the copy through its cell.
 feature = "selection"
+platforms = ["unix"]
 size = [80, 24]
 
 [[steps]]

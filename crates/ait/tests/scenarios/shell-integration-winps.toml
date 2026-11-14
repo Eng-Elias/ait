@@ -1,0 +1,34 @@
+# Spec R16 §5.14 (ticket R16-T8): `SHELL=powershell` resolves to the
+# boxed Windows PowerShell 5.1 — the same `ShellFamily::PowerShell`
+# plan and the same PS 5.1-compatible snippet as the PowerShell 7 leg
+# (shell-integration-pwsh.toml), exercised here so the 5.1 syntax
+# surface (no `&&`, Get-Location fallbacks, PSReadLine 2.x) proves
+# itself under ConPTY rather than only on the newer shell.
+#
+# Same fences as the pwsh leg: `PS <cwd>> ` is the fresh prompt, each
+# command is bracketed by its own echo then a fresh prompt.
+feature = "shell-integration"
+platforms = ["windows"]
+size = [80, 24]
+env = { SHELL = "powershell" }
+
+[[steps]]
+wait_text = "1:powershell"
+
+[[steps]]
+wait_text = "· powershell · — · running"
+
+[[steps]]
+expect_regex = "(?m)^PS [^\\n]*>$"
+
+[[steps]]
+text = "echo R16WINPS\n"
+
+[[steps]]
+expect_regex = "echo R16WINPS"
+
+[[steps]]
+expect_regex = "✓ 0 · \\d+\\.\\ds · running"
+
+[[steps]]
+expect_regex = "(?m)^PS [^\\n]*>$"
