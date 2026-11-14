@@ -27,7 +27,10 @@
 //! is a TOML file under `crates/ait-gui/tests/scenarios/` — `feature`
 //! tag, `env` pairs, ordered `[[steps]]` — run through a spawned
 //! [`GuiE2e`]. GUI verbs are the driver protocol's verbs plus the
-//! bounded dump assertions.
+//! bounded dump assertions. `slowmo = 400` (or the
+//! `AIT_GUI_E2E_SLOWMO` env, which overrides it) paces a headed watch:
+//! a fixed delay after each input request, presentation only — the
+//! waits stay predicate-based either way.
 //!
 //! The dual-binary matrix (R15-T5): a scenario's `binary = "web"` /
 //! `"noweb"` declares which `ait-gui` build it needs — the
@@ -68,6 +71,10 @@ pub const ENV_DRIVER_SOCKET: &str = "AIT_TEST_DRIVER_SOCKET";
 /// The env var that forces headed mode for every GUI spawn — the
 /// `AIT_E2E_HEADED` convention, GUI-spelled.
 const HEADED_ENV: &str = "AIT_GUI_E2E_HEADED";
+
+/// The env var overriding [`GuiSpawnConfig::slowmo_ms`] — the
+/// `AIT_E2E_SLOWMO` convention, GUI-spelled.
+const SLOWMO_ENV: &str = "AIT_GUI_E2E_SLOWMO";
 
 /// How long a wait/poll may run — the harness's bounded-wait bound:
 /// generous for a cold Xvfb+wgpu boot, never open-ended.
@@ -258,6 +265,12 @@ pub struct GuiSpawnConfig {
     /// external input — a synthetic click lands on whatever window
     /// sits under the coordinates.
     pub display: Option<OsString>,
+    /// Watch pacing in milliseconds — a fixed delay after each input
+    /// request so a headed run stays readable to a human eye
+    /// (`AIT_GUI_E2E_SLOWMO=<ms>` overrides). Presentation only: the
+    /// waits stay predicate-based, so a paced run observes exactly the
+    /// same sequence, just slower.
+    pub slowmo_ms: u64,
 }
 
 impl GuiSpawnConfig {
@@ -270,7 +283,18 @@ impl GuiSpawnConfig {
             env: Vec::new(),
             headed: false,
             display: None,
+            slowmo_ms: 0,
         }
+    }
+}
+
+/// The watch pacing for a spawn: `AIT_GUI_E2E_SLOWMO=<ms>` overrides
+/// [`GuiSpawnConfig::slowmo_ms`] (it's the runtime knob a watcher
+/// turns).
+fn slowmo(config_ms: u64) -> Duration {
+    match std::env::var(SLOWMO_ENV) {
+        Ok(value) => Duration::from_millis(value.parse().unwrap_or(0)),
+        Err(_) => Duration::from_millis(config_ms),
     }
 }
 
@@ -1054,6 +1078,9 @@ pub struct GuiE2e {
     /// The exit status once observed — a dead app fails waits fast
     /// instead of polling to timeout.
     exited: RefCell<Option<ExitStatus>>,
+    /// Watch pacing — the fixed post-input delay when a run should
+    /// stay readable (`slowmo_ms`/`AIT_GUI_E2E_SLOWMO`).
+    slowmo: Duration,
 }
 
 impl GuiE2e {
@@ -1167,6 +1194,7 @@ impl GuiE2e {
             last_dump: RefCell::new(None),
             stderr,
             exited: RefCell::new(None),
+            slowmo: slowmo(config.slowmo_ms),
         };
 
         // Boot window: the socket file's existence precedes the pump
@@ -1231,6 +1259,16 @@ impl GuiE2e {
                 response.error.unwrap_or_else(|| "(no message)".into())
             ),
             Err(error) => panic!("the driver request failed: {error}"),
+        }
+        self.pace();
+    }
+
+    /// Watch pacing: the fixed post-input delay when `slowmo` is set —
+    /// presentation only; waits stay predicate-based (a paced run
+    /// observes exactly the same sequence, just slower).
+    fn pace(&self) {
+        if !self.slowmo.is_zero() {
+            std::thread::sleep(self.slowmo);
         }
     }
 
@@ -1901,6 +1939,9 @@ pub struct GuiScenario {
     binary: GuiBinary,
     /// `headed = true` — drive the developer's `DISPLAY`.
     headed: bool,
+    /// `slowmo = 400` — watch pacing in milliseconds after each input
+    /// request (`AIT_GUI_E2E_SLOWMO` overrides).
+    pub slowmo_ms: u64,
     /// The file stem — failure messages and dump dirs.
     name: String,
     /// The path it was loaded from.
@@ -2778,6 +2819,9 @@ struct RawGuiScenario {
     /// `headed = true` — drive the developer's `DISPLAY`.
     #[serde(default)]
     headed: bool,
+    /// `slowmo = 400` — watch pacing in ms after each input request.
+    #[serde(default)]
+    slowmo: u64,
     /// The `[[steps]]` tables.
     #[serde(default)]
     steps: Vec<toml::Table>,
@@ -2825,6 +2869,7 @@ impl GuiScenario {
             steps,
             binary: raw.binary.unwrap_or(GuiBinary::Any),
             headed: raw.headed,
+            slowmo_ms: raw.slowmo,
             name,
             source: source.to_string(),
         })
@@ -2837,6 +2882,7 @@ impl GuiScenario {
         let mut config = GuiSpawnConfig::new(program);
         config.env = self.env.clone();
         config.headed = self.headed;
+        config.slowmo_ms = self.slowmo_ms;
         config
     }
 

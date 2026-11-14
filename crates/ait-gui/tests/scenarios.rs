@@ -205,6 +205,43 @@ fn resize_settle_reflows_on_settle_not_per_frame() {
     app.quit();
 }
 
+/// Watch pacing (`GuiSpawnConfig::slowmo_ms`, `AIT_GUI_E2E_SLOWMO`,
+/// the scenario header's `slowmo = 400`): a fixed delay lands after
+/// each input request so a headed run stays readable — the PTY
+/// suite's `AIT_E2E_SLOWMO`, GUI-spelled. The config field is used
+/// here on purpose: the env var is process-global and would pace
+/// the sibling threads running the TOML legs.
+#[test]
+fn slowmo_paces_input_verbs() {
+    if !cfg!(feature = "test-driver") {
+        eprintln!("skipping slowmo_paces: ait-gui was built without the `test-driver` feature");
+        return;
+    }
+    let bin = match bin_for(GuiBinary::Any) {
+        Ok(bin) => bin,
+        Err(reason) => {
+            eprintln!("slowmo_paces: skipped ({reason})");
+            return;
+        }
+    };
+    let mut config = GuiSpawnConfig::new(bin);
+    config.slowmo_ms = 200;
+    let Some(app) = GuiE2e::spawn(config).unwrap_or_else(|e| panic!("spawn ait-gui: {e}")) else {
+        eprintln!("slowmo_paces: skipped (no display reachable)");
+        return;
+    };
+    let start = Instant::now();
+    app.key("Ctrl+Shift+E");
+    app.key("Ctrl+Shift+E");
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "two 200ms-paced keys should take ≥400ms, took {:?}",
+        start.elapsed()
+    );
+    app.quit();
+    app.wait_exit();
+}
+
 /// Spawn `ait-gui` for a code-first leg with the suite's whole skip
 /// matrix — the `test-driver` feature, the `binary` leg's
 /// resolution, and the display — each skip naming the leg loudly
