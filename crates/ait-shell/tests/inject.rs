@@ -412,10 +412,9 @@ fn bash_snippet_emits_marks_hooks_and_a_run_response() {
     let Some(injection) = plan(Path::new("/bin/bash")) else {
         unreachable!()
     };
-    let materialized = match injection.materialize_in(&base) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
+    let materialized = injection
+        .materialize_in(&base)
+        .expect("the bash session dir must materialize");
     let mut args: Vec<OsString> = materialized.args().to_vec();
     args.push(OsString::from("-i"));
 
@@ -519,10 +518,9 @@ fn pwsh_snippet_emits_hooks_marks_and_a_run_response() {
         }
         let base = scratch_base(&format!("{shell}-smoke"));
         let injection = plan(Path::new(shell)).unwrap();
-        let materialized = match injection.materialize_in(&base) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
+        let materialized = injection
+            .materialize_in(&base)
+            .unwrap_or_else(|e| panic!("{shell} session dir must materialize: {e}"));
         // The materialized argv already carries the full
         // `-NoExit -ExecutionPolicy Bypass -Command ". '<dir>\snippet.ps1'"`.
         let mut child = Command::new(shell)
