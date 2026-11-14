@@ -134,9 +134,27 @@ fn scenarios() {
         );
         return;
     }
+    let mut files = scenario_files();
+    // `AIT_GUI_E2E_ONLY=<name>` — run just the scenario(s) whose file
+    // stem contains it (one window to watch); a miss names the stems.
+    if let Ok(only) = std::env::var("AIT_GUI_E2E_ONLY") {
+        files.retain(|path| {
+            path.file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().contains(&only))
+        });
+        assert!(
+            !files.is_empty(),
+            "AIT_GUI_E2E_ONLY={only:?} matched no scenario — the stems are: {}",
+            scenario_files()
+                .iter()
+                .filter_map(|path| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let mut failures = Vec::new();
     let mut ran = 0;
-    for path in scenario_files() {
+    for path in files {
         let name = path
             .file_stem()
             .expect("a scenario file has a stem")

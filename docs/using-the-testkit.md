@@ -209,10 +209,13 @@ cargo run -p ait-testkit --example drive   # interactive manual driving
 
 # GUI headed mode — spawns on your real DISPLAY instead of xvfb;
 # AIT_GUI_E2E_SLOWMO adds a fixed delay after each input request
-# (a scenario's `slowmo = <ms>` header does the same per file):
-AIT_GUI_E2E_HEADED=1 AIT_GUI_E2E_SLOWMO=400 \
+# (a scenario's `slowmo = <ms>` header does the same per file).
+# `-- --test-threads=1` serializes the test fns (one window at a
+# time — the TOML legs already run one-by-one inside `scenarios`),
+# and `AIT_GUI_E2E_ONLY=<name>` runs just matching scenario stems:
+AIT_GUI_E2E_HEADED=1 AIT_GUI_E2E_SLOWMO=400 AIT_GUI_E2E_ONLY=explorer \
   cargo test -p ait-gui --features test-driver \
-  --test scenarios scroll-pill-click
+  --test scenarios -- --test-threads=1
 ```
 
 ## When it fails

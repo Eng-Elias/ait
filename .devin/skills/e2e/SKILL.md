@@ -71,6 +71,7 @@ cargo test -p ait-gui --features test-driver --test scenarios     # the GUI suit
 cargo test -p ait-gui --features test-driver --test scenarios <name>
 AIT_GUI_E2E_HEADED=1 cargo test -p ait-gui --features test-driver --test scenarios  # on your DISPLAY
 AIT_GUI_E2E_HEADED=1 AIT_GUI_E2E_SLOWMO=400 …                                     # + pacing to watch each step
+AIT_GUI_E2E_ONLY=<stem> … -- --test-threads=1                                     # one scenario / one window at a time
 ```
 
 - **Two binary legs**: `binary = "web"` (embedded webview) vs `"noweb"` (`--no-default-features` build, no webkit) — resolved via `AIT_GUI_E2E_BIN_WEB`/`_NOWEB`, else the cargo-built binary; unresolvable legs skip loudly.
