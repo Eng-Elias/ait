@@ -177,6 +177,15 @@ Other verbs: `text`, `bytes` (hex), `mouse = {event, col, row}`,
 `.jsonl` under `tests/recordings/` — regenerate with
 `AIT_E2E_RECORD=1 AIT_E2E_DRIVER=<cmd>`; replay needs no model).
 
+`platforms = ["unix"]` in the header limits a scenario to named OSes
+— `std::env::consts::OS` values (`"linux"`, `"macos"`, `"windows"`)
+plus the `"unix"` group; absent runs everywhere. An excluded
+scenario skips loudly on this OS rather than deleting the file, and
+`env = { SHELL = "pwsh" }` (or `"powershell"`, `"cmd"`) picks the
+Windows shell a scenario spawns — the `shell-integration-pwsh` /
+`shell-integration-winps` / `shell-degrade-cmd` legs' shape. GUI
+scenarios take the same `platforms` key.
+
 ## Wait on execution, not echo
 
 `wait_text` and `expect_*` see everything the PTY renders — including
