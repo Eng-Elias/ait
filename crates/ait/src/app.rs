@@ -65,7 +65,8 @@ use std::time::{Duration, Instant, SystemTime};
 use ait_agent::CommandSuggester;
 use ait_config::Settings;
 use ait_term::{
-    Cell, ClipboardSelection, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent,
+    Cell, ClipboardSelection, Cursor, CursorShape, Damage, ExitStatus, Key, KeyEvent, LiveEvent,
+    Modifiers, SessionEvent,
 };
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
@@ -868,6 +869,41 @@ fn handle_event<W: Write>(
                         }
                         return Handled::Continue;
                     }
+                    // `Ctrl+C`'s terminal rule (us-2): a live selection
+                    // copies through the same OSC-52 path a drag release
+                    // uses and clears; no selection falls through as
+                    // SIGINT. `Ctrl+Shift+C` — `Char('C')` or `Char('c')`
+                    // + CONTROL|SHIFT depending on the host's reporting —
+                    // is always the copy chord: a copy key never
+                    // interrupts the shell.
+                    if let Some(KeyEvent {
+                        key: Key::Char('c') | Key::Char('C'),
+                        modifiers,
+                    }) = key
+                    {
+                        if modifiers.contains(Modifiers::CONTROL)
+                            && !modifiers.contains(Modifiers::ALT)
+                        {
+                            let copy_chord = modifiers.contains(Modifiers::SHIFT);
+                            // A collapsed range — the click-selects-a-cell
+                            // leftover — doesn't count: `Ctrl+C` still
+                            // interrupts; `Ctrl+Shift+C` copies the cell.
+                            let selected = tabs.active().is_some_and(|tab| {
+                                tab.selection_range()
+                                    .is_some_and(|range| range.start != range.end)
+                            });
+                            if copy_chord || selected {
+                                if let Some(tab) = tabs.active_mut() {
+                                    if let Some(range) = tab.selection_range() {
+                                        copy_range(tab, range, state, host);
+                                        state.toast = Some(Toast::new("copied", Instant::now()));
+                                    }
+                                    tab.clear_selection();
+                                }
+                                return Handled::Continue;
+                            }
+                        }
+                    }
                     // The pass-through tail — a focused agent panel owns
                     // the keystroke (Spec R06); an in-flight suggestion
                     // swallows Enter/cancels on Esc scoped to the pinned
@@ -973,6 +1009,10 @@ fn copy_range<W: Write>(
     state.copied_text = Some(text.clone());
     let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
     let _ = host.flush();
+    // The copy's visible ack — the status strip's toast (us-2: the
+    // release itself never interrupts the shell, so the "copied"
+    // signal is the only confirmation the range landed).
+    state.toast = Some(Toast::new("copied", Instant::now()));
 }
 
 /// Service the host input queue once: wait up to [`INPUT_POLL`] for the
@@ -2028,7 +2068,7 @@ mod tests {
             &path,
         );
 
-        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit");
+        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit", "# ");
 
         assert_eq!(
             wait_file(&mut harness, &path, 17),

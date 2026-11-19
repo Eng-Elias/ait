@@ -70,6 +70,12 @@ eframe = { version = "0.37", default-features = false, features = [
 wry = { version = "0.57.1", optional = true }
 dpi = { version = "0.1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+# Wayland embeds need XWayland: webkit2gtk can't parent a child
+# webview inside a Wayland surface, so `run`'s event-loop hook asks
+# winit for the X11 backend under a Wayland session (`with_x11()`)
+# and the window arrives as an Xcb handle `build_as_child` accepts.
+# The same 0.30 line eframe resolves (winit 0.30.13, 2025-11-12).
+winit = { version = "0.30", optional = true }
 # The test-driver socket's wire codec — compiled ONLY under the
 # off-by-default `test-driver` feature (Spec R15): release binaries
 # carry none of it. Semver requirements per ADR-0002, the same lines
@@ -105,7 +111,7 @@ gtk = { version = "0.18", optional = true }
 # external-open surface only, and the build needs no webkit2gtk/gtk
 # system packages.
 default = ["web"]
-web = ["dep:wry", "dep:dpi", "dep:raw-window-handle", "dep:gtk"]
+web = ["dep:wry", "dep:dpi", "dep:raw-window-handle", "dep:gtk", "dep:winit"]
 # `test-driver` (off by default, Spec R15): the test-only injection/
 # dump socket beside ctl, bound only when AIT_TEST_DRIVER_SOCKET names
 # its path. Release artifacts never see it — cargo-dist builds default

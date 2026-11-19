@@ -784,6 +784,19 @@ impl Tab {
         self.scroll.snap_to_bottom();
     }
 
+    /// Scroll directly to `offset` lines above the live viewport —
+    /// the GUI scrollbar's drag/click target. Clamped at the
+    /// scrollback depth; an offset equal to the current one is a
+    /// no-op.
+    pub fn scroll_to_offset(&mut self, offset: usize) {
+        let offset = offset.min(self.scrollback());
+        match offset.cmp(&self.scroll.offset()) {
+            std::cmp::Ordering::Greater => self.scroll_up(offset - self.scroll.offset()),
+            std::cmp::Ordering::Less => self.scroll_down(self.scroll.offset() - offset),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
     /// `Alt+↑` (Spec R05 §5.5/us-16): scroll the view to the previous
     /// block's start line. "Previous" is measured against the view's
     /// top row in live coordinates: the highest block start above it —
@@ -1046,6 +1059,39 @@ impl Tab {
     /// before PTY input (Spec R06: focused keys never reach the PTY).
     pub fn agent_focused(&self) -> bool {
         self.agent.as_ref().is_some_and(AgentPanel::is_focused)
+    }
+
+    /// A click on the terminal grid returns keyboard focus to it —
+    /// the panel's Esc-unfocused state, reached by mouse. A running
+    /// task is NOT cancelled (unlike `escape`, a click is never a
+    /// verdict): the split stays open and the task keeps running.
+    pub fn unfocus_agent(&mut self) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.unfocus();
+        }
+    }
+
+    /// A click inside the panel's region claims the keyboard for it —
+    /// the mouse form of `Alt+A`'s refocus step. No-op while the
+    /// panel is absent.
+    pub fn focus_agent(&mut self) {
+        if let Some(panel) = self.agent.as_mut() {
+            panel.focus();
+        }
+    }
+
+    /// A native clipboard paste while the panel is focused — the
+    /// GUI's `Event::Paste` route: the payload lands on the input
+    /// line rather than the PTY, mirroring how the terminal surface
+    /// pastes. No-op while the panel is unfocused or absent (the
+    /// caller's PTY arm already handles those).
+    pub fn agent_paste(&mut self, text: &str) {
+        if !self.agent_focused() {
+            return;
+        }
+        if let Some(panel) = self.agent.as_mut() {
+            panel.paste_input(text);
+        }
     }
 
     /// The panel, if this tab owns one — the paint path reads it.

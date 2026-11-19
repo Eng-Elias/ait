@@ -98,6 +98,17 @@ impl Settings {
     ///   is a contradiction, also a load error.
     fn validate(&self) -> Result<(), ConfigError> {
         self.validate_redaction()?;
+        // `input.suggest_trigger`: an empty trigger would arm on every
+        // line and a control character could never be typed — both are
+        // config mistakes, so they surface like every other bad value.
+        if let Some(trigger) = &self.input.suggest_trigger {
+            if trigger.is_empty() || trigger.chars().any(char::is_control) {
+                return Err(ConfigError::at(
+                    "input.suggest_trigger".to_owned(),
+                    "must be non-empty and contain no control characters",
+                ));
+            }
+        }
         // `config_key` -> key path of its first declaration, for duplicate
         // reporting and role-reference lookups.
         let mut declared: BTreeMap<&str, String> = BTreeMap::new();
@@ -315,6 +326,26 @@ pub struct InputSettings {
     /// feature and is a load error today.
     #[serde(default)]
     pub classifier: ClassifierMode,
+    /// The explicit suggestion trigger prefix (§5.4, Spec R04 us-1):
+    /// a submitted input line starting with this text is a
+    /// natural-language command request. `"# "` is the default — a
+    /// shell comment, so a request the suggester declines stays a
+    /// harmless no-op to the shell. `#` heads real shell comments
+    /// though (and pasted scripts), so users who hit the false
+    /// trigger can pick a longer prefix — `"## "` keeps the comment
+    /// property while almost never heading real input; `"? "` or
+    /// `"! "` work too but lose it (an unanswered request submits a
+    /// syntax-error line). Must be non-empty and free of control
+    /// characters.
+    pub suggest_trigger: Option<String>,
+}
+
+impl InputSettings {
+    /// The armed suggestion-trigger prefix — `suggest_trigger` or
+    /// the spec's `"# "` default.
+    pub fn trigger_prefix(&self) -> &str {
+        self.suggest_trigger.as_deref().unwrap_or("# ")
+    }
 }
 
 /// `classifier` under `[input]` (§5.10.4). `Heuristic` is the default;

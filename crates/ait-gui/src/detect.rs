@@ -23,9 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use ait_term::GridView;
-use ait_term::{CellKind, Row};
+use ait_term::{CellKind, GridView, Row};
 
 /// What a detected token routes to — the Ctrl+click targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +65,7 @@ pub struct Detection {
 /// isn't here: [`DetectCache::resolve`] takes it as a closure it
 /// calls only on a miss, so a held Ctrl at an unchanged position
 /// never reads `/proc` or the env at all.
+#[cfg(test)]
 pub struct HoverAt<'a> {
     /// The hovered tab's id — the same (line, column, text) on
     /// another tab is another position.
@@ -122,6 +121,7 @@ impl DetectCache {
     /// touching the filesystem OR `env` (and, per the struct doc,
     /// possibly a stale one). `env` supplies the expensive half —
     /// the tab's `cwd` and the `~` root — and runs only on a miss.
+    #[cfg(test)]
     pub fn resolve(
         &mut self,
         at: &HoverAt<'_>,
@@ -149,6 +149,63 @@ impl DetectCache {
         self.hit = hit.clone();
         hit
     }
+
+    /// `resolve`'s wrapped sibling — [`HoverAtLogical`]'s logical
+    /// line text is the key's text half, so a neighbor row's edit
+    /// lands a fresh probe exactly like a hovered-row one does.
+    pub fn resolve_logical(
+        &mut self,
+        at: &HoverAtLogical<'_>,
+        env: impl FnOnce() -> (PathBuf, PathBuf),
+    ) -> Option<Detection> {
+        let remembered = self.key.as_ref().is_some_and(|key| {
+            key.tab == at.tab
+                && key.line == at.line
+                && key.column == at.column
+                && key.remote == at.remote
+                && key.text == at.text
+        });
+        if remembered {
+            return self.hit.clone();
+        }
+        let (cwd, home) = env();
+        let hit = detect_in_logical(
+            at.text,
+            at.cols,
+            (at.line, at.column),
+            at.remote,
+            &cwd,
+            &home,
+        );
+        self.key = Some(OwnedKey {
+            tab: at.tab,
+            line: at.line,
+            column: at.column,
+            remote: at.remote,
+            text: at.text.to_owned(),
+        });
+        self.hit = hit.clone();
+        hit
+    }
+}
+
+/// The wrapped hover probe's inputs — `HoverAt`'s shape with the
+/// char map in (line, column) pairs ([`logical_cells`]'s second
+/// half) and `text` the WHOLE logical line, so a wrap-chain
+/// neighbor's text keys the cache too.
+pub struct HoverAtLogical<'a> {
+    /// `HoverAt::tab`.
+    pub tab: u64,
+    /// The pointer's hovered grid line.
+    pub line: i32,
+    /// The pointer's cell column on `line`.
+    pub column: usize,
+    /// The logical line's text — [`logical_cells`]'s first half.
+    pub text: &'a str,
+    /// The logical line's char→(line, column) map.
+    pub cols: &'a [(i32, usize)],
+    /// `HoverAt::remote`.
+    pub remote: bool,
 }
 
 /// `text` → the tokens that afford a route: URLs first (their spans
@@ -252,6 +309,7 @@ pub fn detect_at(
 /// `detect_at` with the row already split — the pure half the unit
 /// tests drive without a live grid: `cols[i]` is the column char
 /// `i` of `text` paints on (identity for ASCII rows).
+#[cfg(test)]
 pub fn detect_in(
     text: &str,
     cols: &[usize],
@@ -276,6 +334,75 @@ pub fn detect_in(
         cells: last - first + 1,
         target: token.target.clone(),
     })
+}
+
+/// `detect_in`'s logical-line sibling: `cols[i]` is the
+/// (physical line, column) pair char `i` of `text` paints on —
+/// [`logical_cells`]'s map — and `at` the hovered (line, column).
+/// The token containing `at`'s char affords; the returned span
+/// covers the token's cells ON `at`'s row alone.
+pub fn detect_in_logical(
+    text: &str,
+    cols: &[(i32, usize)],
+    at: (i32, usize),
+    remote: bool,
+    cwd: &Path,
+    home: &Path,
+) -> Option<Detection> {
+    let index = cols.iter().position(|&cell| cell == at)?;
+    let all = if remote {
+        url_tokens(text)
+    } else {
+        tokens(text, cwd, home)
+    };
+    let token = all
+        .iter()
+        .find(|token| token.start <= index && index < token.end)?;
+    let (line, _) = at;
+    // The token's chars are contiguous per row (a logical line is
+    // strictly increasing physical lines), so the hovered row's
+    // share is the contiguous run of `cols[i].0 == line` inside the
+    // token that contains `index`.
+    let first = (token.start..=index)
+        .rev()
+        .find(|&i| cols[i].0 != line)
+        .map(|i| i + 1)
+        .unwrap_or(token.start);
+    let last = (index..token.end)
+        .find(|&i| cols[i].0 != line)
+        .map(|i| i - 1)
+        .unwrap_or(token.end - 1);
+    Some(Detection {
+        column: cols[first].1,
+        cells: cols[last].1 - cols[first].1 + 1,
+        target: token.target.clone(),
+    })
+}
+
+/// `grid` row `line`'s logical line: walk back over soft-wrap chains
+/// (`Row::wrapped` marks a row flowing into the next) to the chain's
+/// head, then concatenate forward — `text` is every row's `Row::text`
+/// joined (a wrap splits mid-token, so the join is what the writer
+/// typed) and `cols[i]` the (line, column) cell char `i` paints on.
+pub fn logical_cells(grid: &GridView<'_>, line: i32) -> (String, Vec<(i32, usize)>) {
+    let mut head = line;
+    while grid.line(head - 1).is_some_and(|row| row.wrapped()) {
+        head -= 1;
+    }
+    let mut text = String::new();
+    let mut cols = Vec::new();
+    let mut at = head;
+    while let Some(row) = grid.line(at) {
+        let wrapped = row.wrapped();
+        let (row_text, row_cols) = line_cells(&row);
+        text.push_str(&row_text);
+        cols.extend(row_cols.iter().map(|&column| (at, column)));
+        if !wrapped {
+            break;
+        }
+        at += 1;
+    }
+    (text, cols)
 }
 
 /// `row` → its `Row::text` plus, per text char, the grid column it
