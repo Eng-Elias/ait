@@ -527,6 +527,12 @@ impl Pane for BrowserPane {
         shared.browser.push_text(text);
     }
 
+    /// The entry IS a text field — a native paste lands on it like
+    /// any typed run (unlike the explorer's letter-verbs pane).
+    fn accepts_paste(&self) -> bool {
+        true
+    }
+
     /// The chrome row — `‹`/`›` history, `⟳` reload, the address
     /// entry, `↗` open-externally — then the body: the staged webview
     /// rect while embedded, else the external-open surface. Clicks
@@ -669,16 +675,25 @@ impl Pane for BrowserPane {
             font.clone(),
             fg,
         );
-        if !entry.is_empty() {
-            let galley = painter.layout_no_wrap(shown, font.clone(), fg);
-            let caret_x = galley_x + galley.size().x + 2.0;
-            painter.line_segment(
-                [
-                    Pos2::new(caret_x, entry_rect.top() + 2.0),
-                    Pos2::new(caret_x, entry_rect.bottom() - 2.0),
-                ],
-                Stroke::new(1.5, theme.fg),
-            );
+        // The tail caret blinks while the pane owns the keyboard —
+        // the visible answer to where typing lands. Unfocused (a grid
+        // click handed input back to the shell), the entry shows no
+        // caret at all; focused, it schedules its own repaint.
+        if shared.panes.focused() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(530));
+            let blink_on = ((ui.input(|input| input.time) * 1.9) as u64).is_multiple_of(2);
+            if blink_on {
+                let galley = painter.layout_no_wrap(shown, font.clone(), fg);
+                let caret_x = galley_x + galley.size().x + 2.0;
+                painter.line_segment(
+                    [
+                        Pos2::new(caret_x, entry_rect.top() + 2.0),
+                        Pos2::new(caret_x, entry_rect.bottom() - 2.0),
+                    ],
+                    Stroke::new(1.5, theme.fg),
+                );
+            }
         }
 
         if back {

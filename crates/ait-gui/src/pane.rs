@@ -72,6 +72,15 @@ pub trait Pane: Sync {
     /// `Event::Text`/`Event::Paste` payloads land here, never on the
     /// PTY.
     fn text(&self, shared: &mut Shared, text: &str);
+    /// Whether a native `Event::Paste` routes into [`text`](Self::text)
+    /// — true for panes with a real text field (the browser's address
+    /// entry). Panes whose `text` is command keys (the explorer's
+    /// `.`/`r`/`o` verbs) reject: a paste must never burst-fire verbs.
+    /// The payload is swallowed rather than forwarded to the PTY — a
+    /// focused pane owns its input either way.
+    fn accepts_paste(&self) -> bool {
+        false
+    }
     /// The pane's body paint inside `rect` (the region below the
     /// switcher strip).
     fn paint(&self, ui: &mut egui::Ui, shared: &mut Shared, rect: Rect, theme: GridTheme);
@@ -110,12 +119,17 @@ pub fn pane_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<PaneId> 
 /// The host's app-global, ephemeral selection state — the `Shared`
 /// field. `selected` is which auxiliary pane would fill the region
 /// once the agent claim releases; `None` means no aux pane is up.
-/// Nothing here persists (us-31) and the selection follows the
-/// active tab: it's one selection for the window, while the agent
-/// claim resolves per tab.
+/// `focused` is whether the SHOWN pane owns unbound input: a pane
+/// opens focused, a click on its body keeps it, a click on the
+/// terminal's grid hands input back to the shell while the region
+/// stays open (typing in the terminal with a pane up). Nothing here
+/// persists (us-31) and the selection follows the active tab: it's
+/// one selection for the window, while the agent claim resolves per
+/// tab.
 #[derive(Debug, Default)]
 pub struct PaneHost {
     selected: Option<PaneId>,
+    focused: bool,
 }
 
 impl PaneHost {
@@ -126,15 +140,39 @@ impl PaneHost {
     }
 
     /// Select an auxiliary pane — idempotent (the "the claim must
-    /// yield" half of a toggle is the caller's job).
+    /// yield" half of a toggle is the caller's job). A selection
+    /// arrives focused: the pane's keys work the moment it opens.
     pub fn select(&mut self, id: PaneId) {
         self.selected = Some(id);
+        self.focused = true;
     }
 
     /// Drop the aux selection — the shown pane's second chord press
     /// and its Esc both land here.
     pub fn clear(&mut self) {
         self.selected = None;
+        self.focused = false;
+    }
+
+    /// Whether the shown aux pane owns unbound input — `true` right
+    /// after it opens, `false` once a grid click hands focus back to
+    /// the terminal.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// A click inside the pane's body — focus stays (or returns to)
+    /// the pane.
+    pub fn focus(&mut self) {
+        if self.selected.is_some() {
+            self.focused = true;
+        }
+    }
+
+    /// A click on the terminal's grid — the pane stays visible as a
+    /// spectator while unbound input belongs to the shell again.
+    pub fn unfocus(&mut self) {
+        self.focused = false;
     }
 
     /// What the region shows given the active tab's agent-open flag:
@@ -292,5 +330,31 @@ mod tests {
         assert!(host.showing(PaneId::Explorer, false));
         // A different slot is never "showing" this one.
         assert!(!host.showing(PaneId::Browser, false));
+    }
+    /// The focus lifecycle behind the input-routing rule: a selection
+    /// arrives focused (the pane owns input immediately), a grid click
+    /// unfocuses it into spectator mode (the pane stays selected — it
+    /// just no longer swallows keys), a pane-body click refocuses, and
+    /// `clear` resets both halves. `focus` on nothing selected never
+    /// arms the flag.
+    #[test]
+    fn focus_tracks_the_click_flow() {
+        let mut host = PaneHost::default();
+        host.focus();
+        assert!(!host.focused(), "nothing selected — nothing to focus");
+
+        host.select(PaneId::Explorer);
+        assert!(host.focused(), "a selection arrives focused");
+
+        host.unfocus();
+        assert!(!host.focused());
+        assert_eq!(host.selected(), Some(PaneId::Explorer), "still spectating");
+
+        host.focus();
+        assert!(host.focused());
+
+        host.clear();
+        assert!(!host.focused());
+        assert_eq!(host.selected(), None);
     }
 }

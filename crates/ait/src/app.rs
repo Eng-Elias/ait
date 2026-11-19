@@ -65,7 +65,8 @@ use std::time::{Duration, Instant, SystemTime};
 use ait_agent::CommandSuggester;
 use ait_config::Settings;
 use ait_term::{
-    Cell, ClipboardSelection, Cursor, CursorShape, Damage, ExitStatus, LiveEvent, SessionEvent,
+    Cell, ClipboardSelection, Cursor, CursorShape, Damage, ExitStatus, Key, KeyEvent, LiveEvent,
+    Modifiers, SessionEvent,
 };
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::cursor::SetCursorStyle;
@@ -868,6 +869,41 @@ fn handle_event<W: Write>(
                         }
                         return Handled::Continue;
                     }
+                    // `Ctrl+C`'s terminal rule (us-2): a live selection
+                    // copies through the same OSC-52 path a drag release
+                    // uses and clears; no selection falls through as
+                    // SIGINT. `Ctrl+Shift+C` — `Char('C')` or `Char('c')`
+                    // + CONTROL|SHIFT depending on the host's reporting —
+                    // is always the copy chord: a copy key never
+                    // interrupts the shell.
+                    if let Some(KeyEvent {
+                        key: Key::Char('c') | Key::Char('C'),
+                        modifiers,
+                    }) = key
+                    {
+                        if modifiers.contains(Modifiers::CONTROL)
+                            && !modifiers.contains(Modifiers::ALT)
+                        {
+                            let copy_chord = modifiers.contains(Modifiers::SHIFT);
+                            // A collapsed range — the click-selects-a-cell
+                            // leftover — doesn't count: `Ctrl+C` still
+                            // interrupts; `Ctrl+Shift+C` copies the cell.
+                            let selected = tabs.active().is_some_and(|tab| {
+                                tab.selection_range()
+                                    .is_some_and(|range| range.start != range.end)
+                            });
+                            if copy_chord || selected {
+                                if let Some(tab) = tabs.active_mut() {
+                                    if let Some(range) = tab.selection_range() {
+                                        copy_range(tab, range, state, host);
+                                        state.toast = Some(Toast::new("copied", Instant::now()));
+                                    }
+                                    tab.clear_selection();
+                                }
+                                return Handled::Continue;
+                            }
+                        }
+                    }
                     // The pass-through tail — a focused agent panel owns
                     // the keystroke (Spec R06); an in-flight suggestion
                     // swallows Enter/cancels on Esc scoped to the pinned
@@ -973,6 +1009,10 @@ fn copy_range<W: Write>(
     state.copied_text = Some(text.clone());
     let _ = queue!(host, CopyToClipboard::to_clipboard_from(&text));
     let _ = host.flush();
+    // The copy's visible ack — the status strip's toast (us-2: the
+    // release itself never interrupts the shell, so the "copied"
+    // signal is the only confirmation the range landed).
+    state.toast = Some(Toast::new("copied", Instant::now()));
 }
 
 /// Service the host input queue once: wait up to [`INPUT_POLL`] for the
@@ -1543,6 +1583,124 @@ mod tests {
         );
     }
 
+    /// `Ctrl+C`'s two faces (us-2): a live selection turns the chord
+    /// into copy+clear through the OSC-52 path; no selection forwards
+    ///  to the PTY — `sleep` dies and the shell echoes the next
+    /// command. `Ctrl+Shift+C` is always copy — it copies even the
+    /// collapsed one-cell range a click leaves.
+    #[test]
+    fn ctrl_c_copies_a_selection_and_sigints_without_one() {
+        use crossterm::event::MouseEvent;
+        let mut harness = Harness::new(manager());
+        wait_until(&mut harness, |h| {
+            h.tabs
+                .active()
+                .unwrap()
+                .grid()
+                .visible_rows()
+                .any(|row| !row.text().trim_end().is_empty())
+        });
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"printf 'COPYME\n'
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().starts_with("COPYME"))
+            })
+        });
+        // Drag across COPYME on its screen row, then Ctrl+C.
+        let line = {
+            let tab = harness.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines())
+                .find(|&line| {
+                    grid.line(line as i32)
+                        .is_some_and(|row| row.text().starts_with("COPYME"))
+                })
+                .unwrap()
+        };
+        let row = (line + 1) as u16;
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        harness.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        harness.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+        harness.handle(mouse(MouseEventKind::Up(MouseButton::Left), 6));
+        // The drag already copies — park it so the Ctrl+C copy is the
+        // observed one.
+        harness.state.copied_text = None;
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            harness.state.copied_text.as_deref(),
+            Some("COPYME"),
+            "Ctrl+C over a live selection copies it"
+        );
+        assert!(
+            harness.tabs.active().unwrap().selection_range().is_none(),
+            "the copy clears the selection"
+        );
+
+        // No selection: Ctrl+C is SIGINT. `sleep` must die — the next
+        // command echoes.
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"sleep 60
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().contains("sleep 60"))
+            })
+        });
+        harness.state.copied_text = None;
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"printf 'AFTERINT\n'
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().contains("AFTERINT"))
+            })
+        });
+        assert_eq!(
+            harness.state.copied_text, None,
+            "SIGINT never populates the copy slot"
+        );
+    }
+
     /// A manager whose single `/bin/sh -c` tab emits two complete
     /// `A B C D` quadruples with scrollback padding between them —
     /// the block-UX dispatch tests' fixture (the same scripted-marks
@@ -2028,7 +2186,7 @@ mod tests {
             &path,
         );
 
-        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit");
+        suggest::rewrite_as_comment(harness.tabs.active_mut().unwrap(), "undo a commit", "# ");
 
         assert_eq!(
             wait_file(&mut harness, &path, 17),

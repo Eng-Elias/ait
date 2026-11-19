@@ -549,10 +549,49 @@ impl AgentPanel {
         self.revision += 1;
     }
 
+    /// Drop input focus without touching `open` or a running task —
+    /// a click on the terminal's grid hands the keyboard back to the
+    /// shell while the split stays open (unlike [`escape`](Self::escape),
+    /// which would cancel a running task: a click is never a verdict).
+    pub fn unfocus(&mut self) {
+        if self.focused {
+            self.focused = false;
+            self.revision += 1;
+        }
+    }
+
+    /// Take input focus — a click inside the panel's region, the
+    /// mouse form of `Alt+A`'s refocus step. A closed panel stays
+    /// closed (the split is gone, there is nothing to focus).
+    pub fn focus(&mut self) {
+        if self.open && !self.focused {
+            self.focused = true;
+            self.revision += 1;
+        }
+    }
+
     /// Append one typed character — plain and SHIFT-modified chars
     /// only reach here; everything else is swallowed upstream.
     pub fn push_input(&mut self, c: char) {
         self.input.push(c);
+        self.revision += 1;
+    }
+
+    /// Paste into the input line — the GUI's `Event::Paste` route.
+    /// The buffer is one line, so newline runs flatten to a single
+    /// space: a pasted paragraph joins rather than truncating or
+    /// breaking the input row's paint.
+    pub fn paste_input(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\r' | '\n' => {
+                    if !self.input.is_empty() && !self.input.ends_with(' ') {
+                        self.input.push(' ');
+                    }
+                }
+                _ => self.input.push(c),
+            }
+        }
         self.revision += 1;
     }
 

@@ -22,7 +22,7 @@ pub fn default_template() -> String {
     let builtins = pattern_names::BUILTINS.join(", ");
     let pii = pattern_names::PII.join(", ");
     format!(
-        r#"# AIT settings
+        r##"# AIT settings
 #
 # The full model is documented in REQUIREMENTS.md §4/§5.7;
 # `ait --print-schema` emits the JSON Schema for editor completion.
@@ -43,6 +43,11 @@ pub fn default_template() -> String {
 # history and the suggestion streams onto the fresh prompt.
 # [input]
 # classifier = "heuristic"   # "heuristic" | "off" (default: heuristic)
+# suggest_trigger = "# "     # prefix that arms a command suggestion on
+#                           # Enter (§5.4). A shell-comment trigger keeps
+#                           # an unanswered request a no-op — '## ' works
+#                           # too if you write real comments; "? "/"! "
+#                           # work but submit a syntax-error line when idle.
 
 # SSH integration (§5.9): sessions started by `ssh` inside an
 # integrated tab get the remote shell bootstrapped with the same
@@ -106,7 +111,7 @@ base_model    = "{config_key}"
 coding_model  = ""
 command_model = ""
 context_window_limit = 0 # 0 = the model's own limit
-"#
+"##
     )
 }
 

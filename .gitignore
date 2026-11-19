@@ -18,3 +18,9 @@ target/
 
 # Python bytecode caches (script import side-effects)
 __pycache__/
+
+BUILD_RUNBOOK.md
+manual-tour.md-
+manual-tour.md
+notes-after-maual-testing.md
+

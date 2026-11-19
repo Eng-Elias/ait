@@ -131,6 +131,10 @@ pub struct ExplorerState {
     /// The selected file's preview — `None` on dirs, `Other`s and
     /// while remote.
     preview: Option<Preview>,
+    /// The preview's own scroll offset, in visible LINES — the pane
+    /// caps the preview to the split's height, and the wheel over it
+    /// scrolls here rather than moving the listing (`scroll`).
+    preview_scroll: usize,
     /// The listing's io error (unreadable dir, vanished path) —
     /// rendered as the error row, toasted once per new error by the
     /// pane's sync.
@@ -267,6 +271,26 @@ impl ExplorerState {
     /// The listing's scroll offset in visible rows.
     pub fn scroll(&self) -> usize {
         self.scroll
+    }
+
+    /// The preview's scroll offset in visible lines — the pane's
+    /// wheel-over-preview route writes it; the paint skips it.
+    pub fn preview_scroll(&self) -> usize {
+        self.preview_scroll
+    }
+
+    /// Scroll the preview by `delta` lines (positive = down),
+    /// clamped to the loaded text's overflow — a text preview scrolls
+    /// one line past its last line at most; the binary/error
+    /// placeholders are single-row and never scroll.
+    pub fn scroll_preview_by(&mut self, delta: i32, window: usize) {
+        let lines = match self.preview.as_ref() {
+            Some(Preview::Text { text, .. }) => text.lines().count(),
+            _ => 0,
+        };
+        let max = lines.saturating_sub(window.max(1));
+        self.preview_scroll =
+            (self.preview_scroll as i64 + i64::from(delta)).clamp(0, max as i64) as usize;
     }
 
     /// What `Enter` resolves to on the selection — descend, open or
@@ -509,6 +533,9 @@ impl ExplorerState {
             .selected_entry()
             .filter(|entry| entry.kind == EntryKind::File)
             .map(|entry| load_preview(&entry.path));
+        // A new selection re-reads the preview — the offset rewinds
+        // with it (scrolled state belongs to the file it scrolled).
+        self.preview_scroll = 0;
     }
 }
 
@@ -1064,16 +1091,28 @@ impl Pane for ExplorerPane {
         }
 
         // The preview split: separator, then the capped text or the
-        // binary/error placeholder.
-        if let (Some(preview), Some(preview_rect)) = (shared.explorer.preview(), preview_rect) {
+        // binary/error placeholder. The preview has its own scroll —
+        // a wheel flick over it pages the TEXT (us-10's capped cap
+        // still holds; `preview_scroll` walks lines inside the cap),
+        // never the listing above it.
+        if let Some(preview_rect) = preview_rect.filter(|_| shared.explorer.preview().is_some()) {
             painter.line_segment(
                 [preview_rect.left_top(), preview_rect.right_top()],
                 Stroke::new(1.0, sep),
             );
             let rows = (preview_rect.height() / row_h).floor() as usize;
-            match preview {
+            if ui.rect_contains_pointer(preview_rect) {
+                let delta = ui.input(|input| input.smooth_scroll_delta.y / row_h) as i32;
+                if delta != 0 {
+                    shared.explorer.scroll_preview_by(-delta, rows);
+                }
+            }
+            let preview_scroll = shared.explorer.preview_scroll();
+            match shared.explorer.preview().expect("filtered above") {
                 Preview::Text { text, truncated } => {
-                    for (line_index, line) in text.lines().take(rows).enumerate() {
+                    for (line_index, line) in
+                        text.lines().skip(preview_scroll).take(rows).enumerate()
+                    {
                         painter.text(
                             Pos2::new(
                                 preview_rect.left() + 8.0,
@@ -1609,6 +1648,32 @@ mod tests {
         assert_eq!(state.scroll(), 0);
         state.scroll_by(100, window);
         assert_eq!(state.scroll(), 30 - window);
+        // ---- preview scroll (us-9/10) ----
+
+        let mut state = ExplorerState {
+            preview: Some(Preview::Text {
+                text: "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n".to_owned(),
+                truncated: false,
+            }),
+            ..Default::default()
+        };
+        // The window holds 4 lines → the offset clamps at lines−window.
+        state.scroll_preview_by(100, 4);
+        assert_eq!(state.preview_scroll(), 6);
+        state.scroll_preview_by(-100, 4);
+        assert_eq!(state.preview_scroll(), 0);
+        // Binary/error placeholders are single-row — nothing to scroll.
+        state.preview = Some(Preview::Binary);
+        state.scroll_preview_by(5, 4);
+        assert_eq!(state.preview_scroll(), 0);
+        // A new selection rewinds the offset with the new preview.
+        state.preview_scroll = 3;
+        state.preview = Some(Preview::Text {
+            text: "x\n".to_owned(),
+            truncated: false,
+        });
+        state.load_selected_preview();
+        assert_eq!(state.preview_scroll(), 0);
         state.scroll_by(-100, window);
         assert_eq!(state.scroll(), 0);
     }

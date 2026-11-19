@@ -75,6 +75,24 @@ pub fn run() -> eframe::Result<()> {
         // wgpu is the renderer (ADR-0017); `Renderer::Wgpu` is enabled
         // by the manifest's `wgpu` feature.
         renderer: eframe::Renderer::Wgpu,
+        // Wayland can't host the browser pane's child webview
+        // (webkit2gtk's `build_as_child` needs an X window — a Wayland
+        // handle falls back to external-open, Spec R14). With the web
+        // stack built in, a Wayland session runs the whole window on
+        // XWayland instead: `with_x11()` makes winit pick the X11
+        // backend so the handle comes back `Xcb` and the embed works.
+        // Sessions without `DISPLAY` (no XWayland) keep Wayland and the
+        // external-open surface. Feature-off builds carry no hook at
+        // all — plain native Wayland, the pane degrading as designed.
+        #[cfg(all(feature = "web", target_os = "linux"))]
+        event_loop_builder: Some(Box::new(|builder| {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && std::env::var_os("DISPLAY").is_some()
+            {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }
+        })),
         ..Default::default()
     };
     eframe::run_native(

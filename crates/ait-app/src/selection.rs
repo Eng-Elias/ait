@@ -83,7 +83,9 @@ impl Selection {
     }
 
     /// End the drag; the range stays for highlighting (and is what was
-    /// just copied). Returns the normalized range, `None` outside a drag.
+    /// just copied). Returns the normalized range, `None` outside a
+    /// drag. A press-and-release in place is a one-cell selection —
+    /// the spec's click-selects-a-cell rule.
     pub fn finish(&mut self) -> Option<SelectionRange> {
         if !self.dragging {
             return None;

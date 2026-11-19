@@ -63,6 +63,10 @@ use crate::webview::WebSlot;
 /// needs exactly one frame when the toast ages out).
 const TOAST_REFRESH: Duration = Duration::from_millis(500);
 
+/// The grid scrollbar's track width — thin enough to read as an
+/// affordance, not a lane; wide enough to grab.
+const SCROLLBAR_W: f32 = 8.0;
+
 /// How still the content band must sit before a winsize reflow
 /// applies — a reflow walks each session's full scrollback, so
 /// resizing on every frame of a window drag is the resize jank.
@@ -582,6 +586,24 @@ impl GuiApp {
                 modifiers,
                 ..
             } => {
+                // `Ctrl+C`'s terminal rule (us-2): a live selection
+                // copies and clears; no selection passes through as
+                // SIGINT below. `Ctrl+Shift+C` — and ⌘C on macOS —
+                // is always the copy chord: nothing selected, nothing
+                // sent (a copy key never interrupts the shell).
+                if key == egui::Key::C && modifiers.command && !modifiers.alt {
+                    // A collapsed range (the click-selects-a-cell
+                    // rule) doesn't arm the copy — `Ctrl+C` still
+                    // interrupts; `Ctrl+Shift+C` copies the cell.
+                    let selected = shared.tabs.active().is_some_and(|tab| {
+                        tab.selection_range()
+                            .is_some_and(|range| range.start != range.end)
+                    });
+                    if modifiers.shift || selected {
+                        self.copy_selection(shared, ctx);
+                        return;
+                    }
+                }
                 // GUI-local bindings the keymap can't own — zoom is
                 // a frontend concern and these chords are unbound in
                 // the table (Ctrl+0/=/- type nothing a shell wants).
@@ -667,12 +689,15 @@ impl GuiApp {
                     self.find_text(shared, &text);
                     return;
                 }
-                // A shown aux pane owns composed text while it's
-                // up (the find bar's focus rule) — nothing
-                // reaches the PTY mid-pane.
+                // A focused aux pane owns composed text (the find
+                // bar's focus rule); shown-but-unfocused — after a
+                // grid click — it spectates and text types into the
+                // terminal like always.
                 if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                    pane(id).text(shared, &text);
-                    return;
+                    if shared.panes.focused() {
+                        pane(id).text(shared, &text);
+                        return;
+                    }
                 }
                 for key in translate_text(&text) {
                     self.dispatch_key(ctx, shared, Some(key));
@@ -682,12 +707,29 @@ impl GuiApp {
             // payload through the shared `encode_paste` so
             // bracketed-paste children see their mode honored.
             // While the find bar is open it pastes into the query
-            // — the browser convention.
+            // — the browser convention. A focused agent panel pastes
+            // onto its input line; a focused aux pane that accepts
+            // text gets the payload (the browser's entry); everything
+            // else pastes into the PTY.
             egui::Event::Paste(text) => {
                 if shared.find.is_some() {
                     self.find_text(shared, &text);
-                } else if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                    pane(id).text(shared, &text);
+                } else if shared.tabs.active().is_some_and(|tab| tab.agent_focused()) {
+                    if let Some(tab) = shared.tabs.active_mut() {
+                        tab.agent_paste(&text);
+                    }
+                } else if matches!(shared.shown_pane(), Some(SidePane::Aux(_)))
+                    && shared.panes.focused()
+                {
+                    // The payload never reaches the PTY either way —
+                    // a focused pane owns its input — but only a pane
+                    // with a real text field accepts it (the
+                    // explorer's verbs aren't a text field).
+                    if let Some(SidePane::Aux(id)) = shared.shown_pane() {
+                        if pane(id).accepts_paste() {
+                            pane(id).text(shared, &text);
+                        }
+                    }
                 } else {
                     self.paste(shared, &text);
                 }
@@ -882,15 +924,20 @@ impl GuiApp {
                     }
                     return;
                 }
-                // A shown aux pane owns unbound keys the same way
+                // A focused aux pane owns unbound keys the same way
                 // (Spec R14 §5.13 — the find bar's focus rule): Esc
-                // returns focus to the grid, everything else routes
-                // to the pane; nothing reaches the PTY mid-pane.
+                // releases the pane, everything else routes to it.
+                // A SHOWN-but-unfocused pane (a grid click handed
+                // focus back to the terminal) spectates instead —
+                // input falls through to the PTY path like the region
+                // weren't there.
                 if let Some(SidePane::Aux(id)) = shared.shown_pane() {
-                    if let Some(key) = key {
-                        self.pane_key(shared, id, key);
+                    if shared.panes.focused() {
+                        if let Some(key) = key {
+                            self.pane_key(shared, id, key);
+                        }
+                        return;
                     }
-                    return;
                 }
                 // The pass-through tail — a focused agent panel owns
                 // the keystroke (Spec R06); an in-flight suggestion
@@ -902,6 +949,27 @@ impl GuiApp {
                 dispatch::passthrough_key(key, &mut shared.key_ctx());
             }
         }
+    }
+
+    /// Copy the active tab's live selection — the `Ctrl+C` selection
+    /// arm, `Ctrl+Shift+C` and ⌘C all land here: clipboard, ait's own
+    /// `copied_text` for `Shift+Insert`, a "copied" toast, then the
+    /// highlight drops — the same shape the drag-release copy paints.
+    fn copy_selection(&mut self, shared: &mut Shared, ctx: &egui::Context) {
+        let Some(tab) = shared.tabs.active_mut() else {
+            return;
+        };
+        let Some(range) = tab.selection_range() else {
+            return;
+        };
+        let text = selection::extract(&tab.grid(), range);
+        if text.is_empty() {
+            return;
+        }
+        shared.copied_text = Some(text.clone());
+        ctx.copy_text(text);
+        shared.toast = Some(Toast::new("copied", Instant::now()));
+        tab.clear_selection();
     }
 
     /// A native `Event::Paste` — the payload went through the OS
@@ -1398,18 +1466,18 @@ impl GuiApp {
                     return None;
                 }
                 let remote = !tab.remote.is_empty();
-                let (text, cols) = tab
-                    .grid()
-                    .line(line)
-                    .map(|row| detect::line_cells(&row))
-                    .unwrap_or_default();
+                // The LOGICAL line — a soft wrap splits a path or URL
+                // mid-token, so the scan joins the wrap chain and the
+                // hovered cell maps back through (line, column) pairs
+                // (us-27's affordance, wrap-complete).
+                let (text, cols) = detect::logical_cells(&tab.grid(), line);
                 // The expensive halves — the `/proc` readlink
                 // `cwd_for` can cost and `home_dir`'s env resolve —
                 // ride the cache's `env` closure: a held Ctrl at an
                 // unchanged position never evaluates either (§6).
                 self.detect_cache
-                    .resolve(
-                        &detect::HoverAt {
+                    .resolve_logical(
+                        &detect::HoverAtLogical {
                             tab: tab.id,
                             line,
                             column,
@@ -1457,16 +1525,30 @@ impl GuiApp {
         if let Some(pos) = response.interact_pointer_pos() {
             let (line, column) = grid_point(pos, pane, cell, scroll);
             if response.drag_started() && !ctrl {
+                // Pressing on the terminal IS its focus claim: a side
+                // pane (or the agent panel) keeps its region open but
+                // hands unbound input back to the shell.
+                shared.panes.unfocus();
+                tab.unfocus_agent();
                 tab.begin_selection(GridPoint::new(line, column));
             } else if response.dragged() {
                 tab.extend_selection(GridPoint::new(line, column));
             }
+        }
+        // A plain click — press AND release with no drag, and not the
+        // Ctrl affordance — drops a live selection the way terminals
+        // clear on click, and takes the same focus claim a drag does.
+        if response.clicked() && !ctrl {
+            shared.panes.unfocus();
+            tab.unfocus_agent();
+            tab.clear_selection();
         }
         if response.drag_stopped() {
             if let Some(range) = tab.finish_selection() {
                 let text = selection::extract(&tab.grid(), range);
                 shared.copied_text = Some(text.clone());
                 ctx.copy_text(text);
+                shared.toast = Some(Toast::new("copied", Instant::now()));
             }
         }
         // The find bar rides the tab it opened on: a tab switch
@@ -1553,6 +1635,46 @@ impl GuiApp {
                 tab.snap_to_bottom();
             }
         }
+        // The scrollbar (Spec R02's scroll affordance, mouse form):
+        // a right-edge track painted whenever scrollback exists —
+        // the thumb's size is the viewport's share of the buffer,
+        // its position the view's distance from the bottom. Dragging
+        // or clicking the track scrolls directly to that depth —
+        // the fast-scroll path wheel and Page keys can't offer.
+        let scrollback = tab.scrollback();
+        if scrollback > 0 {
+            let track = Rect::from_min_max(
+                Pos2::new(pane.right() - SCROLLBAR_W, pane.top()),
+                pane.right_bottom(),
+            );
+            let rows = (pane.height() / cell.height).floor().max(1.0);
+            let thumb_h = (track.height() * rows / (scrollback + rows as usize) as f32).max(16.0);
+            let bar = ui.interact(
+                track,
+                egui::Id::unique("scrollbar"),
+                Sense::click_and_drag(),
+            );
+            // offset 0 → the bottom of the track; `scrollback` → top.
+            let pos = (scrollback - scroll) as f32 / scrollback as f32;
+            let thumb = Rect::from_min_size(
+                Pos2::new(track.left(), track.top() + pos * (track.height() - thumb_h)),
+                Vec2::new(track.width(), thumb_h),
+            );
+            let active = bar.hovered() || bar.dragged();
+            painter.rect_filled(
+                thumb,
+                3.0,
+                self.theme.fg.gamma_multiply(if active { 0.6 } else { 0.3 }),
+            );
+            if let Some(pointer) = bar.interact_pointer_pos() {
+                if bar.dragged() || bar.clicked() {
+                    let travel = (track.height() - thumb_h).max(1.0);
+                    let frac = ((pointer.y - track.top() - thumb_h / 2.0) / travel).clamp(0.0, 1.0);
+                    let pos = (frac * scrollback as f32).round() as usize;
+                    tab.scroll_to_offset(scrollback - pos);
+                }
+            }
+        }
         // The detection-token targets (Spec R15-T3): every
         // `detect.*` name maps the span's cell rect, so a scenario
         // clicks a URL like a user would — through the grid's own
@@ -1607,28 +1729,49 @@ impl GuiApp {
             // buys the hover probe.
             let mut env: Option<(PathBuf, PathBuf)> = None;
             let mut ordinal = 0usize;
-            for (row_index, (text, cols)) in lines.iter().enumerate() {
+            let grid = tab.grid();
+            for row_index in 0..lines.len() {
+                // A row mid-wrap is covered by its chain's head — the
+                // wrap-aware scan (`logical_cells`, like the hover
+                // probe) emits every token once from the head.
+                if grid
+                    .line(row_index as i32 - 1)
+                    .is_some_and(|row| row.wrapped())
+                {
+                    continue;
+                }
+                let (text, cols) = detect::logical_cells(&grid, row_index as i32);
                 let (cwd, home) =
                     env.get_or_insert_with(|| (PathBuf::from(suggest::cwd_for(tab)), home_dir()));
                 let tokens = if remote {
-                    detect::url_tokens(text)
+                    detect::url_tokens(&text)
                 } else {
-                    detect::tokens(text, cwd, home)
+                    detect::tokens(&text, cwd, home)
                 };
                 for token in tokens {
-                    let (Some(&first), Some(&last)) =
-                        (cols.get(token.start), cols.get(token.end.saturating_sub(1)))
-                    else {
+                    // The hit rect covers the token's first VIEWPORT
+                    // row's contiguous share — a wrapped token's click
+                    // target is its head segment.
+                    let Some(seg_start) = (token.start..token.end).find(|&i| cols[i].0 >= 0) else {
                         continue;
                     };
+                    let seg_line = cols[seg_start].0;
+                    let seg_end = (seg_start..token.end)
+                        .find(|&i| cols[i].0 != seg_line)
+                        .map(|i| i - 1)
+                        .unwrap_or(token.end - 1);
+                    if seg_line as usize >= lines.len() {
+                        continue;
+                    }
+                    let (first, last) = (cols[seg_start].1, cols[seg_end].1);
                     let rect = Rect::from_min_max(
                         Pos2::new(
                             pane.left() + first as f32 * cell.width,
-                            pane.top() + row_index as f32 * cell.height,
+                            pane.top() + seg_line as f32 * cell.height,
                         ),
                         Pos2::new(
                             pane.left() + (last + 1) as f32 * cell.width,
-                            pane.top() + (row_index + 1) as f32 * cell.height,
+                            pane.top() + (seg_line + 1) as f32 * cell.height,
                         ),
                     );
                     match &token.target {
@@ -1740,12 +1883,46 @@ impl GuiApp {
             x = chip.right() + 4.0;
         }
 
-        // The body: everything under the switcher strip.
+        // The body: everything under the switcher strip. Clicking it
+        // claims input for the pane — the mouse form of the chord's
+        // second press — so the terminal can't silently keep the
+        // keyboard while the user types into a pane.
         let body = Rect::from_min_max(Pos2::new(rect.left(), bar.bottom()), rect.right_bottom());
+        let focused = match shown {
+            SidePane::Agent => shared.tabs.active().is_some_and(|tab| tab.agent_focused()),
+            SidePane::Aux(_) => shared.panes.focused(),
+        };
+        if ui
+            .interact(body, egui::Id::unique("pane-body"), Sense::click())
+            .clicked()
+        {
+            match shown {
+                SidePane::Agent => {
+                    if let Some(tab) = shared.tabs.active_mut() {
+                        tab.focus_agent();
+                    }
+                }
+                SidePane::Aux(_) => shared.panes.focus(),
+            }
+        }
         match shown {
             SidePane::Agent => self.paint_panel(ui, shared, body),
             SidePane::Aux(id) => pane(id).paint(ui, shared, body, self.theme),
         }
+        // The focus affordance: the region's border brightens while
+        // the pane owns the keyboard — the visible answer to "will my
+        // typing land here or in the shell?"
+        let border = if focused {
+            self.theme.fg.gamma_multiply(0.55)
+        } else {
+            Color32::TRANSPARENT
+        };
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(2.0, border),
+            egui::StrokeKind::Inside,
+        );
 
         if let Some(target) = action {
             match target {
@@ -1910,16 +2087,23 @@ impl GuiApp {
                 self.theme.fg,
             );
             if panel.is_focused() {
-                let caret_x = (left
-                    + (panel::PROMPT_WIDTH + shown.chars().count()) as f32 * cell_w)
-                    .min(right - 1.0);
-                painter.line_segment(
-                    [
-                        Pos2::new(caret_x, input_rect.top() + 1.0),
-                        Pos2::new(caret_x, input_rect.bottom() - 1.0),
-                    ],
-                    Stroke::new(1.5, self.theme.fg),
-                );
+                // The beam blinks — the panel's "typing lands here"
+                // signal. Blinking needs frames, so a focused input
+                // schedules its own next repaint.
+                ui.ctx().request_repaint_after(Duration::from_millis(530));
+                let blink_on = ((ui.input(|input| input.time) * 1.9) as u64).is_multiple_of(2);
+                if blink_on {
+                    let caret_x = (left
+                        + (panel::PROMPT_WIDTH + shown.chars().count()) as f32 * cell_w)
+                        .min(right - 1.0);
+                    painter.line_segment(
+                        [
+                            Pos2::new(caret_x, input_rect.top() + 1.0),
+                            Pos2::new(caret_x, input_rect.bottom() - 1.0),
+                        ],
+                        Stroke::new(1.5, self.theme.fg),
+                    );
+                }
             }
         }
         if body.clicked()
@@ -2182,10 +2366,15 @@ impl GuiApp {
         painter.text(
             rect.left_center() + Vec2::new(8.0, 0.0),
             Align2::LEFT_CENTER,
-            text,
+            text.clone(),
             FontId::monospace(12.0),
             color,
         );
+        // The strip clips its text at the pane's right edge — a long
+        // cwd truncates against a narrow window. Hovering shows the
+        // whole status line, so the full path is always reachable.
+        ui.interact(rect, egui::Id::unique("status"), Sense::hover())
+            .on_hover_text(text);
     }
 
     /// The modal layer — painted last so overlays always win. Hosts
@@ -3495,6 +3684,122 @@ mod tests {
         // `head -c 1` is still blocked on its first byte — nothing
         // leaked through three chord presses.
         assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// us-2: `Ctrl+C` on a live selection copies + clears through
+    /// `copy_selection` — and \x03 never leaves. A collapsed range
+    /// (the click-selects-a-cell leftover) does NOT arm the copy: the
+    /// same chord forwards \x03 to the PTY. `Ctrl+Shift+C` is always
+    /// copy — it takes even the collapsed cell, and the host sees a
+    /// toast.
+    #[test]
+    fn ctrl_c_copies_a_live_selection_and_sigints_without_one() {
+        let path = capture_path("ctrlc");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let c = |modifiers| {
+            vec![egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let shift_ctrl = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+
+        // A live selection: Ctrl+C copies + clears — nothing reaches
+        // the still-blocked `head`.
+        {
+            let mut shared = harness.shared();
+            let tab = shared.tabs.active_mut().unwrap();
+            tab.begin_selection(ait_app::selection::GridPoint::new(0, 0));
+            tab.extend_selection(ait_app::selection::GridPoint::new(0, 4));
+        }
+        feed(&mut harness, c(ctrl));
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .selection_range()
+                .is_none(),
+            "the copy drops the highlight"
+        );
+        assert!(
+            harness.shared().copied_text.is_some(),
+            "the copy slot fills for Shift+Insert"
+        );
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0, "no SIGINT left");
+
+        // The collapsed leftover: Ctrl+C is SIGINT — the raw-mode
+        // capture sees the literal \x03 byte.
+        {
+            let mut shared = harness.shared();
+            let tab = shared.tabs.active_mut().unwrap();
+            tab.begin_selection(ait_app::selection::GridPoint::new(0, 0));
+            tab.extend_selection(ait_app::selection::GridPoint::new(0, 0));
+        }
+        feed(&mut harness, c(ctrl));
+        assert_eq!(wait_file(&harness, &path, 1), b"\x03");
+
+        // Ctrl+Shift+C on the collapsed cell: copy, clear, no byte.
+        feed(&mut harness, c(shift_ctrl));
+        assert!(harness.shared().copied_text.is_some());
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .selection_range()
+                .is_none(),
+            "the explicit copy also clears"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The spectator rule behind the input-routing fix: an unfocused
+    /// pane still paints but its input ownership ends — `Event::Text`
+    /// falls through to the PTY. Refocusing re-arms the swallow (the
+    /// explorer's unbound-key arm — a letter never reaches the PTY).
+    #[test]
+    fn an_unfocused_pane_spectates() {
+        let path = capture_path("spectate");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        {
+            let mut shared = harness.shared();
+            shared.panes.select(PaneId::Explorer);
+            shared.panes.unfocus();
+        }
+        feed(&mut harness, vec![egui::Event::Text("x".to_owned())]);
+        assert_eq!(wait_file(&harness, &path, 1), b"x");
+        assert_eq!(
+            harness.shared().panes.selected(),
+            Some(PaneId::Explorer),
+            "the pane spectates — it does not close"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

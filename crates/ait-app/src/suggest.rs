@@ -60,9 +60,12 @@ use crate::selection::{extract, GridPoint, SelectionRange, PASTE_BEGIN, PASTE_EN
 use crate::status::Toast;
 use crate::tabs::{Tab, TabManager};
 
-/// The request prefix: a submitted input line starting `# ` is a
-/// natural-language command request — while remaining a perfectly
-/// ordinary comment to the shell (us-1/2).
+/// The spec's default request prefix (us-1/2): a submitted input
+/// line starting `# ` is a natural-language command request — while
+/// remaining a perfectly ordinary comment to the shell. Configurable
+/// through `input.suggest_trigger` (§4.3): `#` heads real shell
+/// comments, so users can pick a longer prefix.
+#[cfg(test)]
 const TRIGGER_PREFIX: &str = "# ";
 
 /// A per-tab shadow of the printable input typed since the last line
@@ -199,13 +202,13 @@ impl InputShadow {
 
     /// The verified request, or `None` — the pure trigger seam
     /// (us-29): `Some` only when the shadow verifies through
-    /// [`verified_shadow`](Self::verified_shadow), starts with `# `,
-    /// and carries a non-empty request. The returned text is the
-    /// request verbatim — the shadow minus the prefix (us-19).
-    pub fn request_text(&self, logical_line: &str) -> Option<String> {
-        let request = self
-            .verified_shadow(logical_line)?
-            .strip_prefix(TRIGGER_PREFIX)?;
+    /// [`verified_shadow`](Self::verified_shadow), starts with
+    /// `trigger` (the configured `input.suggest_trigger` prefix —
+    /// `# ` by default), and carries a non-empty request. The
+    /// returned text is the request verbatim — the shadow minus the
+    /// prefix (us-19).
+    pub fn request_text(&self, logical_line: &str, trigger: &str) -> Option<String> {
+        let request = self.verified_shadow(logical_line)?.strip_prefix(trigger)?;
         if request.is_empty() {
             return None;
         }
@@ -217,8 +220,8 @@ impl InputShadow {
     /// [`verified_shadow`](Self::verified_shadow) — the same
     /// echo-agreement check [`request_text`](Self::request_text) runs,
     /// minus the `# ` prefix requirement. The returned text is the
-    /// whole line — a `# ` line keeps its prefix, because here the
-    /// line itself is the request (us-19). An empty, whitespace-only,
+    /// whole line — a trigger-prefixed line keeps its prefix, because
+    /// here the line itself is the request (us-19). An empty, whitespace-only,
     /// stale or unverifiable line returns `None`: desync is inert.
     pub fn verified_line(&self, logical_line: &str) -> Option<String> {
         self.verified_shadow(logical_line).map(str::to_owned)
@@ -391,15 +394,16 @@ fn assemble(tab: &Tab, settings: &Settings, profile: &str, request: String) -> S
     }
 }
 
-/// The verified `# ` request for `tab` with its §5.4 context, or
-/// `None` — the trigger seam in one call (us-13, 29). On `Some` the
-/// caller forwards Enter to the PTY normally (us-2) and sends the
-/// returned [`SuggestRequest`] into the `CommandSuggester`; on `None`
-/// nothing about the keypress changes.
+/// The verified trigger-prefix request for `tab` with its §5.4
+/// context, or `None` — the trigger seam in one call (us-13, 29). On
+/// `Some` the caller forwards Enter to the PTY normally (us-2) and
+/// sends the returned [`SuggestRequest`] into the `CommandSuggester`;
+/// on `None` nothing about the keypress changes.
 pub fn request_for(tab: &Tab, settings: &Settings, profile: &str) -> Option<SuggestRequest> {
-    let request = tab
-        .shadow
-        .request_text(&logical_line(&tab.grid(), tab.cursor()))?;
+    let request = tab.shadow.request_text(
+        &logical_line(&tab.grid(), tab.cursor()),
+        settings.input.trigger_prefix(),
+    )?;
     Some(assemble(tab, settings, profile, request))
 }
 
@@ -479,20 +483,22 @@ pub fn classified_request(
 /// The natural-language verdict's rewrite (Spec R11-T2, ADR-0014):
 /// `Ctrl+U` (`\x15` — readline's kill-to-start-of-line, the same byte
 /// [`SuggestionPin::cancel`] wipes with) erases the typed line, then
-/// `# <line>` + `\r` submits the request through the shell as a
-/// comment — it lands in history and scrollback exactly like an
-/// explicit `# ` request (ADR-0007 semantics) and the fresh prompt
+/// `<trigger><line>` + `\r` submits the request through the shell as
+/// a comment — it lands in history and scrollback exactly like an
+/// explicit trigger request (ADR-0007 semantics) and the fresh prompt
 /// that follows is where the armed suggestion streams (us-2/3). The
 /// shadow resets rather than going stale: the input line really is
 /// empty, so the next line's shadow starts honest. Called only AFTER
 /// `fire` accepted the request — a refused request leaves the typed
 /// line alone and the Enter forwards verbatim: the erase-after-fire
-/// ordering `suggest_from_line` established.
-pub fn rewrite_as_comment(tab: &mut Tab, line: &str) {
+/// ordering `suggest_from_line` established. `trigger` is the
+/// configured `input.suggest_trigger` prefix the request armed
+/// through.
+pub fn rewrite_as_comment(tab: &mut Tab, line: &str, trigger: &str) {
     let _ = tab.session.send_bytes(b"\x15");
     let _ = tab
         .session
-        .send_bytes(format!("{TRIGGER_PREFIX}{line}\r").as_bytes());
+        .send_bytes(format!("{trigger}{line}\r").as_bytes());
     tab.shadow.reset();
 }
 
@@ -944,14 +950,14 @@ mod tests {
         let mut shadow = InputShadow::new();
         shadow.update_pasted("# list files");
         assert_eq!(
-            shadow.request_text("user@box:~$ # list files"),
+            shadow.request_text("user@box:~$ # list files", TRIGGER_PREFIX),
             Some("list files".to_string())
         );
 
         // Typing continues onto a pasted prefix.
         shadow.update(&char_key('s'));
         assert_eq!(
-            shadow.request_text("user@box:~$ # list filess"),
+            shadow.request_text("user@box:~$ # list filess", TRIGGER_PREFIX),
             Some("list filess".to_string())
         );
 
@@ -967,7 +973,7 @@ mod tests {
     #[test]
     fn agreeing_hash_line_fires() {
         assert_eq!(
-            typed("# list files").request_text("user@box:~$ # list files"),
+            typed("# list files").request_text("user@box:~$ # list files", TRIGGER_PREFIX),
             Some("list files".to_string())
         );
     }
@@ -977,22 +983,37 @@ mod tests {
     #[test]
     fn only_a_verified_hash_line_fires() {
         // Plain commands never trigger.
-        assert_eq!(typed("ls -la").request_text("$ ls -la"), None);
+        assert_eq!(
+            typed("ls -la").request_text("$ ls -la", TRIGGER_PREFIX),
+            None
+        );
         // `#` alone is not a request.
-        assert_eq!(typed("#").request_text("$ #"), None);
-        assert_eq!(typed("# ").request_text("$ # "), None);
+        assert_eq!(typed("#").request_text("$ #", TRIGGER_PREFIX), None);
+        assert_eq!(typed("# ").request_text("$ # ", TRIGGER_PREFIX), None);
         // A stale shadow never fires — not even on an agreeing line.
         let mut stale = typed("# list files");
         stale.update(&KeyEvent::new(Key::Left, Modifiers::NONE));
-        assert_eq!(stale.request_text("$ # list files"), None);
+        assert_eq!(stale.request_text("$ # list files", TRIGGER_PREFIX), None);
         // History recall / heredoc / REPL desyncs: the line on the
         // grid is not the shadow's line.
-        assert_eq!(typed("# list files").request_text("$ make install"), None);
-        assert_eq!(typed("# list files").request_text(">>> print(1)"), None);
-        assert_eq!(typed("# list files").request_text("> some body"), None);
+        assert_eq!(
+            typed("# list files").request_text("$ make install", TRIGGER_PREFIX),
+            None
+        );
+        assert_eq!(
+            typed("# list files").request_text(">>> print(1)", TRIGGER_PREFIX),
+            None
+        );
+        assert_eq!(
+            typed("# list files").request_text("> some body", TRIGGER_PREFIX),
+            None
+        );
         // Trailing edits desync: "# list filesX" does not end with
         // "# list files".
-        assert_eq!(typed("# list files").request_text("$ # list filesX"), None);
+        assert_eq!(
+            typed("# list files").request_text("$ # list filesX", TRIGGER_PREFIX),
+            None
+        );
     }
 
     /// The grid side of the check: a prompt + echoed `# ` line at the
@@ -1002,7 +1023,7 @@ mod tests {
         let session = session(40, b"$ # list files");
         assert_eq!(logical(&session), "$ # list files");
         assert_eq!(
-            typed("# list files").request_text(&logical(&session)),
+            typed("# list files").request_text(&logical(&session), TRIGGER_PREFIX),
             Some("list files".to_string())
         );
     }
@@ -1014,7 +1035,7 @@ mod tests {
         let session = session(10, b"$ # list all files here");
         assert_eq!(logical(&session), "$ # list all files here");
         assert_eq!(
-            typed("# list all files here").request_text(&logical(&session)),
+            typed("# list all files here").request_text(&logical(&session), TRIGGER_PREFIX),
             Some("list all files here".to_string())
         );
     }
@@ -1028,7 +1049,10 @@ mod tests {
         let mut shadow = typed("# list files");
         shadow.update(&KeyEvent::new(Key::Up, Modifiers::NONE));
         let session = session(40, b"$ make install");
-        assert_eq!(shadow.request_text(&logical(&session)), None);
+        assert_eq!(
+            shadow.request_text(&logical(&session), TRIGGER_PREFIX),
+            None
+        );
     }
 
     /// A REPL or heredoc where the echoed continuation differs from
@@ -1037,7 +1061,7 @@ mod tests {
     fn continuation_desync_does_not_fire() {
         let session = session(40, b"$ cat <<EOF\r\n> some typed body");
         assert_eq!(
-            typed("# some typed body").request_text(&logical(&session)),
+            typed("# some typed body").request_text(&logical(&session), TRIGGER_PREFIX),
             None
         );
     }

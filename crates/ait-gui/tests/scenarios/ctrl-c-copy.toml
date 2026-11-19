@@ -1,0 +1,101 @@
+# Spec R02/us-2 — `Ctrl+C`'s two faces end to end: a live selection
+# turns the chord into copy+clear (the "copied" toast paints, the
+# highlight drops, no SIGINT leaves); no selection forwards the
+# interrupt — `sleep` dies and the next command echoes. Then the
+# pane-spectator rule: a click on the grid hands input back while
+# the pane stays open — typed text reaches the shell again.
+feature = "selection"
+platforms = ["unix"]
+
+[[steps]]
+wait_text = "$"
+
+# Marker rows to select — output-only (std.15): `CCM-` exists only
+# in sed's output, never in the typed line's echo.
+[[steps]]
+text = "seq 1 5 | sed 's/^/CCM-/'"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "CCM-5"
+
+# Drag across the grid — a live selection exists.
+[[steps]]
+expect_hit = "grid"
+
+[[steps]]
+pointer = { event = "press", target = "grid" }
+
+[[steps]]
+pointer = { event = "move", target = "grid", dx = 60.0, dy = 0.0 }
+
+[[steps]]
+pointer = { event = "release", target = "grid", dx = 60.0, dy = 0.0 }
+
+[[steps]]
+expect_selection = true
+
+# Ctrl+C over it: copy + clear + toast — and the shell is untouched
+# (the next command runs uninterrupted below).
+[[steps]]
+key = "Ctrl+C"
+
+[[steps]]
+expect_toast = "copied"
+
+[[steps]]
+expect_selection = false
+
+# No selection now: Ctrl+C is SIGINT — `sleep` dies, the shell
+# echoes the next command.
+[[steps]]
+text = "sleep 60"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "sleep 60"
+
+[[steps]]
+key = "Ctrl+C"
+
+[[steps]]
+expect_toast = false
+
+[[steps]]
+text = "echo INT-OK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "INT-OK"
+
+# The spectator rule: open the explorer (arrives focused), click the
+# grid — the pane stays up but typing reaches the shell again.
+[[steps]]
+key = "Ctrl+Shift+E"
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+click = "grid"
+
+[[steps]]
+expect_pane = "explorer"
+
+[[steps]]
+text = "echo SPEC-BACK"
+
+[[steps]]
+key = "Enter"
+
+[[steps]]
+wait_text = "SPEC-BACK"
+
+[[steps]]
+quit = true

@@ -215,7 +215,11 @@ pub fn passthrough_key(key: Option<KeyEvent>, ctx: &mut KeyCtx<'_>) {
                         .suggestion
                         .fire(ctx.suggester, tab.id, request, ctx.toast)
                     {
-                        suggest::rewrite_as_comment(tab, &line);
+                        suggest::rewrite_as_comment(
+                            tab,
+                            &line,
+                            ctx.settings.input.trigger_prefix(),
+                        );
                         return;
                     }
                 }
