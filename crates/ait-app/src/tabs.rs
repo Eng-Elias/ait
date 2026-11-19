@@ -2728,6 +2728,37 @@ mod tests {
         );
     }
 
+    /// The GUI scrollbar's drag target: `scroll_to_offset` lands
+    /// exactly on the offset in both directions and clamps at the
+    /// scrollback depth — never past the top, never below the live
+    /// viewport.
+    #[test]
+    fn scroll_to_offset_lands_exactly_and_clamps() {
+        let mut manager = manager(1, "/tmp");
+        manager
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(b"i=0; while [ $i -lt 40 ]; do echo line$i; i=$((i+1)); done\n")
+            .unwrap();
+        drain_until(&mut manager, |m| m.active().unwrap().scrollback() >= 30);
+
+        let tab = manager.active_mut().unwrap();
+        let depth = tab.scrollback();
+        tab.scroll_to_offset(5);
+        assert_eq!(tab.scroll_offset(), 5);
+        tab.scroll_to_offset(2);
+        assert_eq!(tab.scroll_offset(), 2);
+        tab.scroll_to_offset(usize::MAX);
+        assert_eq!(
+            tab.scroll_offset(),
+            depth,
+            "clamped at the scrollback depth"
+        );
+        tab.scroll_to_offset(0);
+        assert_eq!(tab.scroll_offset(), 0);
+    }
+
     /// `OSC 7700 ; <hex(json)>` as a line an interactive shell prints —
     /// how the tests below hand-emit hook events through a real
     /// `/bin/sh` (the seam `prompt_marks_are_recorded_on_the_tab`

@@ -715,3 +715,38 @@ fn gui_rejects_unknown_keys() {
         "the typo'd key must be named: {message:?}"
     );
 }
+
+// ---- the [input] section: classifier + suggest_trigger ----
+
+/// `[input]` parses; `suggest_trigger` defaults to the spec's `"# "`
+/// and a custom value rounds through `trigger_prefix`.
+#[test]
+fn input_section_parses_and_trigger_defaults_apply() {
+    let settings = Settings::from_toml("[input]\nsuggest_trigger = \"## \"\n").unwrap();
+    assert_eq!(settings.input.suggest_trigger.as_deref(), Some("## "));
+    assert_eq!(settings.input.trigger_prefix(), "## ");
+
+    for input in ["", "[input]\n"] {
+        let settings = Settings::from_toml(input).unwrap();
+        assert_eq!(settings.input.suggest_trigger, None, "input {input:?}");
+        assert_eq!(settings.input.trigger_prefix(), "# ", "input {input:?}");
+    }
+}
+
+/// An empty trigger would arm on every line and a control character
+/// could never be typed — both are load errors naming
+/// `input.suggest_trigger` (ADR-0006).
+#[test]
+fn a_bad_suggest_trigger_names_the_key() {
+    for input in [
+        "[input]\nsuggest_trigger = \"\"\n",
+        "[input]\nsuggest_trigger = \"#\\u0001\"\n",
+    ] {
+        let err = Settings::from_toml(input).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with("input.suggest_trigger:"),
+            "input {input:?}\nexpected the key path\nactual   {message:?}"
+        );
+    }
+}

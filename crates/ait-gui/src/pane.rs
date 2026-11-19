@@ -331,4 +331,30 @@ mod tests {
         // A different slot is never "showing" this one.
         assert!(!host.showing(PaneId::Browser, false));
     }
+    /// The focus lifecycle behind the input-routing rule: a selection
+    /// arrives focused (the pane owns input immediately), a grid click
+    /// unfocuses it into spectator mode (the pane stays selected — it
+    /// just no longer swallows keys), a pane-body click refocuses, and
+    /// `clear` resets both halves. `focus` on nothing selected never
+    /// arms the flag.
+    #[test]
+    fn focus_tracks_the_click_flow() {
+        let mut host = PaneHost::default();
+        host.focus();
+        assert!(!host.focused(), "nothing selected — nothing to focus");
+
+        host.select(PaneId::Explorer);
+        assert!(host.focused(), "a selection arrives focused");
+
+        host.unfocus();
+        assert!(!host.focused());
+        assert_eq!(host.selected(), Some(PaneId::Explorer), "still spectating");
+
+        host.focus();
+        assert!(host.focused());
+
+        host.clear();
+        assert!(!host.focused());
+        assert_eq!(host.selected(), None);
+    }
 }

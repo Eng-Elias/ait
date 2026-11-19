@@ -1087,4 +1087,35 @@ mod tests {
             .resolve(&moved, || (fixture.path().to_path_buf(), cwd.clone()))
             .is_none());
     }
+    /// A soft wrap splits a path mid-token: the logical-line scan
+    /// joins the rows, so the token resolves whole, and the hit's
+    /// underline covers only the hovered row's share of it.
+    #[test]
+    fn a_wrapped_path_resolves_across_the_soft_wrap() {
+        let fixture = fixture();
+        // `open sub/inn` on row 0 + `er.txt here` on row 1 — the path
+        // "sub/inner.txt" is contiguous only in the logical line.
+        let row0 = "open sub/inn";
+        let row1 = "er.txt here";
+        let text = format!("{row0}{row1}");
+        let cols: Vec<(i32, usize)> = (0..row0.chars().count())
+            .map(|c| (0, c))
+            .chain((0..row1.chars().count()).map(|c| (1, c)))
+            .collect();
+        let cwd = fixture.path().to_path_buf();
+        // Hover the tail half on row 1 — the token spans the wrap.
+        let hit = detect_in_logical(&text, &cols, (1, 2), false, &cwd, &cwd)
+            .expect("a wrapped path still affords");
+        assert_eq!(hit.target, Target::Path(cwd.join("sub").join("inner.txt")));
+        // The underline is row-local: cols 0..6 of row 1 (`er.txt`).
+        assert_eq!((hit.column, hit.cells), (0, 6));
+        // Hovering the head half on row 0 underlines its share.
+        let head = detect_in_logical(&text, &cols, (0, 10), false, &cwd, &cwd)
+            .expect("the head half affords too");
+        assert_eq!((head.column, head.cells), (5, 7));
+        // A non-covered cell never affords.
+        assert!(detect_in_logical(&text, &cols, (1, 9), false, &cwd, &cwd).is_none());
+        // Remote: only URLs afford — the same wrap logic gates on it.
+        assert!(detect_in_logical(&text, &cols, (1, 2), true, &cwd, &cwd).is_none());
+    }
 }

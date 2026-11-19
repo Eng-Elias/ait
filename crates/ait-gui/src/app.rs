@@ -3687,6 +3687,122 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// us-2: `Ctrl+C` on a live selection copies + clears through
+    /// `copy_selection` — and \x03 never leaves. A collapsed range
+    /// (the click-selects-a-cell leftover) does NOT arm the copy: the
+    /// same chord forwards \x03 to the PTY. `Ctrl+Shift+C` is always
+    /// copy — it takes even the collapsed cell, and the host sees a
+    /// toast.
+    #[test]
+    fn ctrl_c_copies_a_live_selection_and_sigints_without_one() {
+        let path = capture_path("ctrlc");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        let c = |modifiers| {
+            vec![egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        };
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        let shift_ctrl = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+
+        // A live selection: Ctrl+C copies + clears — nothing reaches
+        // the still-blocked `head`.
+        {
+            let mut shared = harness.shared();
+            let tab = shared.tabs.active_mut().unwrap();
+            tab.begin_selection(ait_app::selection::GridPoint::new(0, 0));
+            tab.extend_selection(ait_app::selection::GridPoint::new(0, 4));
+        }
+        feed(&mut harness, c(ctrl));
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .selection_range()
+                .is_none(),
+            "the copy drops the highlight"
+        );
+        assert!(
+            harness.shared().copied_text.is_some(),
+            "the copy slot fills for Shift+Insert"
+        );
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0, "no SIGINT left");
+
+        // The collapsed leftover: Ctrl+C is SIGINT — the raw-mode
+        // capture sees the literal \x03 byte.
+        {
+            let mut shared = harness.shared();
+            let tab = shared.tabs.active_mut().unwrap();
+            tab.begin_selection(ait_app::selection::GridPoint::new(0, 0));
+            tab.extend_selection(ait_app::selection::GridPoint::new(0, 0));
+        }
+        feed(&mut harness, c(ctrl));
+        assert_eq!(wait_file(&harness, &path, 1), b"\x03");
+
+        // Ctrl+Shift+C on the collapsed cell: copy, clear, no byte.
+        feed(&mut harness, c(shift_ctrl));
+        assert!(harness.shared().copied_text.is_some());
+        assert!(
+            harness
+                .shared()
+                .tabs
+                .active()
+                .unwrap()
+                .selection_range()
+                .is_none(),
+            "the explicit copy also clears"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The spectator rule behind the input-routing fix: an unfocused
+    /// pane still paints but its input ownership ends — `Event::Text`
+    /// falls through to the PTY. Refocusing re-arms the swallow (the
+    /// explorer's unbound-key arm — a letter never reaches the PTY).
+    #[test]
+    fn an_unfocused_pane_spectates() {
+        let path = capture_path("spectate");
+        let mut harness = Harness::new(sh_manager());
+        run_capture(
+            &harness,
+            &format!("stty raw; head -c 1 > {}", path.display()),
+            &path,
+        );
+        {
+            let mut shared = harness.shared();
+            shared.panes.select(PaneId::Explorer);
+            shared.panes.unfocus();
+        }
+        feed(&mut harness, vec![egui::Event::Text("x".to_owned())]);
+        assert_eq!(wait_file(&harness, &path, 1), b"x");
+        assert_eq!(
+            harness.shared().panes.selected(),
+            Some(PaneId::Explorer),
+            "the pane spectates — it does not close"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The chords hold while an overlay owns focus — the find bar's
     /// query and a picker's rows would lose the region under them,
     /// so `Ctrl+Shift+E` is swallowed rather than toggled (and the

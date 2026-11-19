@@ -1648,6 +1648,32 @@ mod tests {
         assert_eq!(state.scroll(), 0);
         state.scroll_by(100, window);
         assert_eq!(state.scroll(), 30 - window);
+        // ---- preview scroll (us-9/10) ----
+
+        let mut state = ExplorerState {
+            preview: Some(Preview::Text {
+                text: "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n".to_owned(),
+                truncated: false,
+            }),
+            ..Default::default()
+        };
+        // The window holds 4 lines → the offset clamps at lines−window.
+        state.scroll_preview_by(100, 4);
+        assert_eq!(state.preview_scroll(), 6);
+        state.scroll_preview_by(-100, 4);
+        assert_eq!(state.preview_scroll(), 0);
+        // Binary/error placeholders are single-row — nothing to scroll.
+        state.preview = Some(Preview::Binary);
+        state.scroll_preview_by(5, 4);
+        assert_eq!(state.preview_scroll(), 0);
+        // A new selection rewinds the offset with the new preview.
+        state.preview_scroll = 3;
+        state.preview = Some(Preview::Text {
+            text: "x\n".to_owned(),
+            truncated: false,
+        });
+        state.load_selected_preview();
+        assert_eq!(state.preview_scroll(), 0);
         state.scroll_by(-100, window);
         assert_eq!(state.scroll(), 0);
     }

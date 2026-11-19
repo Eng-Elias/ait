@@ -1583,6 +1583,124 @@ mod tests {
         );
     }
 
+    /// `Ctrl+C`'s two faces (us-2): a live selection turns the chord
+    /// into copy+clear through the OSC-52 path; no selection forwards
+    ///  to the PTY — `sleep` dies and the shell echoes the next
+    /// command. `Ctrl+Shift+C` is always copy — it copies even the
+    /// collapsed one-cell range a click leaves.
+    #[test]
+    fn ctrl_c_copies_a_selection_and_sigints_without_one() {
+        use crossterm::event::MouseEvent;
+        let mut harness = Harness::new(manager());
+        wait_until(&mut harness, |h| {
+            h.tabs
+                .active()
+                .unwrap()
+                .grid()
+                .visible_rows()
+                .any(|row| !row.text().trim_end().is_empty())
+        });
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"printf 'COPYME\n'
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().starts_with("COPYME"))
+            })
+        });
+        // Drag across COPYME on its screen row, then Ctrl+C.
+        let line = {
+            let tab = harness.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines())
+                .find(|&line| {
+                    grid.line(line as i32)
+                        .is_some_and(|row| row.text().starts_with("COPYME"))
+                })
+                .unwrap()
+        };
+        let row = (line + 1) as u16;
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        harness.handle(mouse(MouseEventKind::Down(MouseButton::Left), 0));
+        harness.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 3));
+        harness.handle(mouse(MouseEventKind::Up(MouseButton::Left), 6));
+        // The drag already copies — park it so the Ctrl+C copy is the
+        // observed one.
+        harness.state.copied_text = None;
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            harness.state.copied_text.as_deref(),
+            Some("COPYME"),
+            "Ctrl+C over a live selection copies it"
+        );
+        assert!(
+            harness.tabs.active().unwrap().selection_range().is_none(),
+            "the copy clears the selection"
+        );
+
+        // No selection: Ctrl+C is SIGINT. `sleep` must die — the next
+        // command echoes.
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"sleep 60
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().contains("sleep 60"))
+            })
+        });
+        harness.state.copied_text = None;
+        harness.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        harness
+            .tabs
+            .active()
+            .unwrap()
+            .session
+            .send_bytes(
+                b"printf 'AFTERINT\n'
+",
+            )
+            .unwrap();
+        wait_until(&mut harness, |h| {
+            let tab = h.tabs.active().unwrap();
+            let grid = tab.session.grid();
+            (0..grid.lines()).any(|line| {
+                grid.line(line as i32)
+                    .is_some_and(|row| row.text().contains("AFTERINT"))
+            })
+        });
+        assert_eq!(
+            harness.state.copied_text, None,
+            "SIGINT never populates the copy slot"
+        );
+    }
+
     /// A manager whose single `/bin/sh -c` tab emits two complete
     /// `A B C D` quadruples with scrollback padding between them —
     /// the block-UX dispatch tests' fixture (the same scripted-marks

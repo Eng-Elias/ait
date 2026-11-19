@@ -47,6 +47,30 @@ code bug) · ⏭️ deferred (needs manual/hardware retest)
 | 19 | ssh() session browsing-unavailable couldn't be tested | ❓ | Needs a live SSH session: inside an `ssh()`-integrated tab the explorer correctly refuses to list local paths (`remote session — browsing unavailable`) because the cwd is remote. Run `scripts/ssh-e2e.sh run` for the docker SSH e2e, or `ssh localhost` inside a tab to see the marker. |
 | 20 | `detect.path./nonexistent` test point unclear | ❓ | That test asserts Ctrl+hover shows NO affordance on a path that doesn't exist (detection only offers files that resolve) and that inside an `ssh()` session only URLs afford (remote paths can't be resolved against the local fs). To test: type `./nonexistent` at the prompt, Ctrl+hover → no underline; `ssh localhost`, Ctrl+hover a filename → no path affordance, a URL still underlines. |
 
+## Automation added for these fixes
+
+- `crates/ait/src/app.rs` — `ctrl_c_copies_a_selection_and_sigints_without_one`:
+  selection → Ctrl+C copies+clears via OSC 52; no selection → real SIGINT
+  (a `sleep` dies and the next command echoes).
+- `crates/ait-gui/src/app.rs` — `ctrl_c_copies_a_live_selection_and_sigints_without_one`
+  (raw-PTY capture sees the literal `\x03`) and `an_unfocused_pane_spectates`
+  (unfocused pane lets `Event::Text` reach the shell while staying open).
+- `crates/ait-gui/tests/scenarios/ctrl-c-copy.toml` — the same flow end to
+  end through the test-driver socket: drag-select → Ctrl+C → `copied`
+  toast + cleared selection → SIGINT on a `sleep` → explorer open → grid
+  click → typing reaches the shell while the pane stays up.
+- `crates/ait-gui/src/pane.rs` — `focus_tracks_the_click_flow`: select
+  arrives focused, unfocus spectates, refocus re-arms, clear resets.
+- `crates/ait-gui/src/explorer.rs` — preview-scroll clamp/rewind in
+  `scroll_tracks_the_selection_into_the_window`.
+- `crates/ait-gui/src/detect.rs` — `a_wrapped_path_resolves_across_the_soft_wrap`:
+  a path split mid-token across a soft wrap resolves whole; the underline
+  is row-local on both halves; remote tabs still gate to URLs.
+- `crates/ait-app/src/tabs.rs` — `scroll_to_offset_lands_exactly_and_clamps`:
+  the scrollbar's drag target in both directions plus the depth clamp.
+- `crates/ait-config/tests/from_toml.rs` — `suggest_trigger` parsing,
+  the `"# "` default, and empty/control-char load errors naming the key.
+
 ## Notes for reviewers
 
 - `Selection::finish` dropping collapsed ranges is the shared piece both
